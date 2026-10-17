@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from backend.app.control.motion import OpenArmV2Controller
-from backend.app.simulation.openarm_v2.definition import ARM_JOINTS, EE_SITES, ZONES
+from backend.app.simulation.openarm_v2.definition import ARM_JOINTS, EE_SITES, SPAWN_ARM_QPOS, ZONES
 from backend.app.simulation.openarm_v2.scene import (
     initial_object_positions,
     resolved_scene_xml,
@@ -86,6 +86,12 @@ def test_reset_matches_the_official_model(env, official):
         assert env.object_pose(name)[0] == pytest.approx(position, abs=1e-5)
     for zone in ZONES:
         assert env.zone_position(zone) == pytest.approx(official.site_pose(f"{zone}_site")[0], abs=1e-5)
+
+
+def test_spawn_pose_is_the_official_model_keyframe(official):
+    """`SPAWN_ARM_QPOS` is an explicit project decision, and it equals the model's keyframe."""
+    for side in ("left", "right"):
+        assert official.arm_qpos(side) == pytest.approx(SPAWN_ARM_QPOS, abs=1e-6)
 
 
 def test_forward_kinematics_matches_the_official_model(env, official):

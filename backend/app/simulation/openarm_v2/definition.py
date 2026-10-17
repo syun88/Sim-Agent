@@ -33,6 +33,17 @@ OBJECTS = ("red_cube", "blue_cube")
 #: Target zones of the demo scene, each carrying a `<name>_site` marker in the MJCF.
 ZONES = ("blue_zone", "green_zone")
 
+#: Spawn pose for each arm, expressed in degrees.
+#:
+#: This is the official OpenArm v2 model keyframe: the elbow (joint 4) is at 90 degrees and all
+#: other arm joints are at 0 degrees.  The request "spawn the joints at 90 degrees" has two
+#: readings: the elbow already spawns at 90 degrees, while setting *all seven* arm joints to
+#: 90 degrees makes the two arms interpenetrate (measured worst arm-arm penetration -0.072 m
+#: on the compiled MJCF).  The project therefore keeps the official keyframe as the documented
+#: spawn pose.
+SPAWN_ARM_QPOS_DEG = np.array([0.0, 0.0, 0.0, 90.0, 0.0, 0.0, 0.0])
+SPAWN_ARM_QPOS = np.deg2rad(SPAWN_ARM_QPOS_DEG)
+
 #: Offset from the grasped object centre to the gripper control point, in world axes.
 GRASP_OFFSET = np.array([0.083, 0.0, -0.019])
 #: Gripper approach orientation used by the verified demonstration.

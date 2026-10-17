@@ -7,7 +7,12 @@ import pytest
 from backend.app.agent.world_state import build_world_state
 from backend.app.control.motion import OpenArmV2Controller
 from backend.app.planning.agent_planner import AgentPlanner, validate_plan
-from backend.app.simulation.openarm_v2.definition import ARM_JOINTS, OBJECTS, ZONES
+from backend.app.simulation.openarm_v2.definition import (
+    ARM_JOINTS,
+    OBJECTS,
+    SPAWN_ARM_QPOS,
+    ZONES,
+)
 from backend.app.simulation.openarm_v2.scene import initial_object_positions, resolved_scene_xml
 from backend.app.skills.robot_skills import SkillRunner
 from backend.app.verification.goal_verification import verify_place_goal
@@ -37,17 +42,20 @@ def test_scene_carries_the_official_openarm_v2_model():
 
 
 def test_starts_in_the_documented_scene(fresh_engine_state):
-    """A freshly constructed engine is already in the initial scene, without anyone calling `reset`.
+    """A freshly constructed engine is already in the documented spawn pose, before any `reset`.
 
     The server builds one backend at startup and never resets it, so a task that arrives first must
     not begin from the model's zero configuration: the arm would sweep across the table on its way to
-    the first waypoint.
+    the first waypoint.  The documented spawn pose is `SPAWN_ARM_QPOS`.
     """
     documented = initial_object_positions()
     assert set(fresh_engine_state["objects"]) == set(documented)
     for name, position in documented.items():
         assert fresh_engine_state["objects"][name] == pytest.approx(position, abs=1e-6)
     assert set(fresh_engine_state["zones"]) == set(ZONES)
+    for side in ("left", "right"):
+        assert fresh_engine_state[f"arm_{side}"] == pytest.approx(SPAWN_ARM_QPOS, abs=1e-5)
+    # The chosen spawn pose is the official model keyframe, so it must still match the model.
     model = mujoco.MjModel.from_xml_string(resolved_scene_xml())
     for side in ("left", "right"):
         names = ARM_JOINTS[side]

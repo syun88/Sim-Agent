@@ -37,6 +37,7 @@ from backend.app.simulation.openarm_v2.definition import (
     GRASP_OFFSET,
     GRIPPER_JOINTS,
     OBJECTS,
+    SPAWN_ARM_QPOS,
     ZONES,
 )
 from backend.app.simulation.openarm_v2.scene import initial_object_positions, resolved_scene_xml
@@ -332,12 +333,29 @@ class GenesisOpenArmV2Environment(SimulationBackend):
     def timestep(self) -> float:
         return float(self._scene.dt)
 
+    def _spawn_qpos(self) -> np.ndarray:
+        """Full qpos of the documented spawn pose: the official keyframe with the arm joints fixed.
+
+        The non-arm dofs (lifter, grippers, cube free joints) keep the values declared by the
+        model's keyframe.  The arm joints are pinned to `SPAWN_ARM_QPOS` so the spawn pose is an
+        explicit project decision rather than an accidental reuse of the model keyframe.
+        """
+        mujoco = self._meta._mujoco
+        model = self._meta.model
+        qpos = self._meta.keyframe_qpos.copy()
+        for side in ARM_JOINTS:
+            for joint_name, value in zip(ARM_JOINTS[side], SPAWN_ARM_QPOS):
+                joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+                adr = int(model.jnt_qposadr[joint_id])
+                qpos[adr] = value
+        return qpos
+
     def reset(self, randomize: bool = False) -> None:
         self._holds.clear()
         self._sim_step = 0
         self._gravity_torque_at_step = -1
         entity = self._entity
-        entity.set_qpos(self._meta.keyframe_qpos[: entity.n_qs].astype(np.float32), zero_velocity=True)
+        entity.set_qpos(self._spawn_qpos()[: entity.n_qs].astype(np.float32), zero_velocity=True)
         for joint_name, value in self._meta.keyframe_ctrl.items():
             dof = int(entity.get_joint(joint_name).dofs_idx_local[0])
             entity.control_dofs_position(np.array([value], dtype=np.float32), np.array([dof]))

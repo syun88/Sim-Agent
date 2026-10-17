@@ -50,6 +50,32 @@ naming, the keyframe, the actuator mapping and the grasp geometry all come from 
 Contacts at the fingers are monitored and reported, but this engine does not claim contact-only
 manipulation.
 
+### Spawn pose
+
+The request "spawn the joints at 90 degrees" has two readings.  The elbow (joint 4) already spawns at
+90 degrees in the official model keyframe.  Setting *all seven* arm joints to 90 degrees makes the two
+arms interpenetrate, so the project keeps the official keyframe as the single documented spawn pose.
+`SPAWN_ARM_QPOS` in `backend/app/simulation/openarm_v2/definition.py` names that decision, and
+`GenesisOpenArmV2Environment.reset()` builds the full qpos from it.
+
+Measured on the compiled MJCF with `mj_kinematics` + `mj_collision` (both arms at the same pose):
+
+| Pose | Joint values (deg) | left ee (m) | right ee (m) | height above table (m) | collision-free | worst penetration |
+|---|---|---|---|---|---|---|
+| official keyframe | [0, 0, 0, 90, 0, 0, 0] | (0.401, 0.153, 1.120) | (0.401, -0.153, 1.120) | 0.120 | **yes** | — |
+| only joint4 = 90° | [0, 0, 0, 90, 0, 0, 0] | (0.401, 0.153, 1.120) | (0.401, -0.153, 1.120) | 0.120 | **yes** | — |
+| all seven joints = 90° | [90, 90, 90, 90, 90, 90, 90] | (0.401, -0.067, 1.340) | (-0.031, -0.373, 1.340) | 0.340 | **no** | arm-arm -0.072 m |
+| joints 2 and 4 = 90° | [0, 90, 0, 90, 0, 0, 0] | (0.401, -0.067, 1.340) | (0.401, -0.374, 1.340) | 0.340 | **no** | arm-arm -0.072 m |
+| joint2 = 45°, joint4 = 90° | [0, 45, 0, 90, 0, 0, 0] | (0.401, -0.002, 1.184) | (0.401, -0.309, 1.184) | 0.184 | **no** | arm-arm -0.018 m |
+| joint2 = -45°, joint4 = 90° | [0, -45, 0, 90, 0, 0, 0] | (0.401, 0.309, 1.184) | (0.401, 0.002, 1.184) | 0.184 | **no** | arm-arm -0.018 m |
+
+Only the official keyframe (which is also "only joint4 = 90°") is collision-free.  The all-90° pose
+produces 19 arm-arm contacts, the deepest being `openarm_lifter_link | openarm_left_link3` at -0.072 m
+and `openarm_left_link3 | openarm_right_base_link` at -0.064 m.  No arm-cube or arm-table contacts
+appear in any candidate.  `test_spawn_pose_is_the_official_model_keyframe` asserts the project constant
+matches the model, and `test_starts_in_the_documented_scene` asserts a freshly constructed engine is in
+that pose.
+
 ### Genesis World engine: status
 
 Verified by `backend/tests/test_official_model_fidelity.py`, `backend/tests/test_openarm.py` and
