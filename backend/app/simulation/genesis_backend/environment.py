@@ -212,12 +212,15 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         self._holds: dict[str, tuple[str, np.ndarray, np.ndarray]] = {}
         self._scene = self._gs.Scene(
             sim_options=self._gs.options.SimOptions(dt=0.001),
-            # Honor what the official MJCF declares: its friction cone and its torsional and
-            # rolling friction (the model uses condim 4 and 6 geoms).
             rigid_options=self._gs.options.RigidOptions(
                 friction_cone=self._gs.friction_cone.elliptic,
                 enable_torsional_friction=True,
                 enable_rolling_friction=True,
+                # Enable self-collision and adjacent collision so the free cubes collide
+                # with the arm links, the cell table and walls. Without these, objects
+                # pass through geometry that shares the same entity.
+                enable_self_collision=True,
+                enable_adjacent_collision=True,
             ),
             show_viewer=show_viewer,
         )

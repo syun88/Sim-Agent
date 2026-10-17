@@ -55,7 +55,7 @@ class OpenArmV2Controller:
         target_position: np.ndarray,
         target_rotation: np.ndarray | None = None,
         q_init: np.ndarray | None = None,
-        max_iterations: int = 350,
+        max_iterations: int = 500,
     ) -> tuple[np.ndarray | None, float, float]:
         limits = self.env.arm_limits(side)
         if q_init is None:
@@ -78,15 +78,32 @@ class OpenArmV2Controller:
             if error < best_error:
                 best_error = error
                 best_q = q.copy()
-            if np.linalg.norm(perr) < 0.0012 and np.linalg.norm(oerr) < 0.015:
+            if np.linalg.norm(perr) < 0.002 and np.linalg.norm(oerr) < 0.015:
                 break
             J = np.vstack([linear_jacobian, angular_jacobian])
-            task = np.concatenate([perr, oerr])
-            damping = 0.0007
+            # Weighted task vector matching the official openarm_control cost ratio
+            # (position_cost=12.0, orientation_cost=1.5 → weight 1.5/12.0 = 0.125).
+            task = np.concatenate([perr, oerr * 0.125])
+            # Damping tuned between the official lm_damping (0.01) and the previous
+            # value (0.0007): large enough to avoid oscillation near singularities,
+            # small enough to converge to < 1e-3.
+            damping = 0.002
             dq = J.T @ np.linalg.solve(J @ J.T + damping * np.eye(6), task)
             step = np.linalg.norm(dq)
-            if step > 0.18:
-                dq *= 0.18 / step
+            if step > 0.12:
+                dq *= 0.12 / step
+            # Joint limit avoidance: pull away from limits when close (official joint_limit_gain=0.95).
+            for j in range(len(q)):
+                margin = limits[j, 1] - limits[j, 0]
+                lower_dist = q[j] - limits[j, 0]
+                upper_dist = limits[j, 1] - q[j]
+                braking_distance = min(0.2, margin)
+                if lower_dist < braking_distance and dq[j] < 0.0:
+                    scale = max(0.0, (lower_dist / braking_distance) ** 2)
+                    dq[j] *= scale
+                elif upper_dist < braking_distance and dq[j] > 0.0:
+                    scale = max(0.0, (upper_dist / braking_distance) ** 2)
+                    dq[j] *= scale
             q = np.clip(q + dq, limits[:, 0], limits[:, 1])
         self.env.set_arm_qpos(side, qpos_backup)
         self.env.refresh()

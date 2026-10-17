@@ -10,7 +10,7 @@ if [[ ! -f .env ]]; then
   exit 1
 fi
 
-uv sync --extra genesis
+uv sync
 
 # Start the web backend in the background so the Genesis viewer can poll it.
 uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-access-log --log-level warning &
