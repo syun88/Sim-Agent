@@ -53,29 +53,38 @@ in `/api/health`, and in the dashboard badge.
 
 Verified by `backend/tests/test_engines.py` (run with `SIM_AGENT_TEST_GENESIS=1`):
 
-- the official model loads with the same link and joint names, 19 robot degrees of freedom and the
+- the official model loads with the same link and joint names, the same degrees of freedom and the
   same timestep as MuJoCo;
 - the initial state after `reset()` and after `reset(randomize=True)` matches MuJoCo to 1e-5;
 - forward kinematics, the gripper control point pose, and the 3x7 linear and angular Jacobians the
   controller consumes match MuJoCo to 1e-6;
 - the same inverse kinematics target produces the same solution and the same residual, and the
   documented unreachable target is rejected by both engines;
-- the complete approach/grasp/lift/place/release/retreat sequence executes and reports its labelled
-  grasp mode (`test_openarm.py`, parametrized over both engines).
+- the complete approach/grasp/lift/place/release/retreat sequence executes, reports its labelled
+  grasp mode, and its result passes the same independent verification as MuJoCo, for both arms
+  (`test_openarm.py`, parametrized over both engines).
 
-**Known limitation (not verified):** the Genesis engine does not complete the pick-and-place task.
-With the arm at the home pose the red cube is ejected within the first steps of a reset and then sits
-against the arm, so the grasp closes on a displaced cube and the final placement misses the zone. The
-divergence is a contact/impulse difference, not a kinematic one, and appears before any robot motion:
-`red_cube` and `openarm_left_link5/6` report a 54 mm penetration ten steps after a reset, while
-MuJoCo's reset reports only cube-to-table contacts. Reproduction:
+Three engine differences had to be handled explicitly, and each is covered by the tests above:
 
-```bash
-SIM_AGENT_TEST_GENESIS=1 uv run pytest -q backend/tests/test_openarm.py -k pick_place
-```
+1. **Inactive equalities.** The scene declares its four grasp welds `active="false"` so MuJoCo keeps
+   them inert until `set_grasp_hold` turns one on. Genesis builds every equality it parses and reads
+   no `active` flag, and it has no runtime enable/disable, so the welds would be permanent and would
+   snap the cube to the gripper at reset. `genesis_scene_xml()` drops exactly the equalities MuJoCo
+   reports as inactive (`eq_active0 == 0`) from the XML handed to Genesis.
+2. **Bias feed-forward.** MuJoCo's path adds `qfrc_bias`; Genesis's position controller holds a pose
+   `gravity_torque / kp` short of its target (measured: 9.6 mm versus 0.4 mm). `apply_gravity_compensation()`
+   writes the arm's gravity torque into the constant term of Genesis's actuator model
+   (`act_bias[0]`, the analogue of MuJoCo's `biasprm[0]`), which brings a free-space hold to 0.87 mm
+   against MuJoCo's 0.88 mm, keeps the damping implicit in the solver, and leaves the cubes their own
+   gravity.
+3. **Kinematic hold and velocities.** While a hold is active the object's pose is written every step.
+   `set_qpos(..., zero_velocity=True)` zeroes *all* of the entity's velocities, which also stopped the
+   arm mid-path; only the held object's dofs have their velocity reset now.
 
-`test_complete_pick_place[genesis]` and `test_right_arm_blue_cube_place[genesis]` are marked `xfail`
-with this reason until it is fixed.
+Measured placement error of the same red-cube task: 10.8 mm on MuJoCo and 34 mm on Genesis, both inside
+the 40 mm tolerance. The Genesis error is larger because the object is held rigidly at the documented
+grasp offset, while MuJoCo's equality weld is a compliant constraint that lets the object hang under
+load, and because the two solvers end a joint path in slightly different poses.
 
 ## OpenArm v2
 

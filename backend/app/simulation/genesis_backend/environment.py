@@ -38,6 +38,7 @@ from backend.app.simulation.openarm_v2.definition import (
     ARM_JOINTS,
     EE_LINKS,
     EE_SITES,
+    GRASP_OFFSET,
     GRIPPER_JOINTS,
     OBJECTS,
     ZONES,
@@ -58,6 +59,8 @@ CAMERA_AZIMUTH = 135.0
 CAMERA_ELEVATION = 18.0
 CAMERA_FOV = 45.0
 CAMERA_RESOLUTION = (720, 480)
+#: Steps between two gravity-torque refreshes of the feed-forward (see `apply_gravity_compensation`).
+GRAVITY_TORQUE_REFRESH_STEPS = 5
 
 _INIT_LOCK = threading.Lock()
 _INITIALISED = False
@@ -137,6 +140,20 @@ class _OfficialModelMetadata:
         return name
 
     @property
+    def inactive_equality_names(self) -> set[str]:
+        """Equalities the model declares as inactive, read from MuJoCo's compiled `eq_active0`."""
+        names = set()
+        for index in range(self.model.neq):
+            if float(self.model.eq_active0[index]) != 0.0:
+                continue
+            name = self._mujoco.mj_id2name(
+                self.model, self._mujoco.mjtObj.mjOBJ_EQUALITY, index
+            )
+            if name:
+                names.add(name)
+        return names
+
+    @property
     def keyframe_qpos(self) -> np.ndarray:
         """Joint positions of the model's first keyframe (the canonical 'home' pose)."""
         return self.model.key_qpos[0].astype(float).copy()
@@ -148,6 +165,29 @@ class _OfficialModelMetadata:
             self.joint_of_actuator(index): float(self.model.key_ctrl[0, index])
             for index in range(self.model.nu)
         }
+
+
+def genesis_scene_xml(xml: str, metadata: _OfficialModelMetadata) -> str:
+    """Remove the model's inactive equalities from the XML handed to Genesis.
+
+    Genesis builds every equality it parses and reads no `active` flag (see
+    `genesis/utils/mjcf.py: parse_equalities`), and it offers no runtime enable/disable either. The
+    demonstration scene declares its four grasp welds as `active="false"` so MuJoCo keeps them
+    inert until `set_grasp_hold` turns one on; handed to Genesis unchanged they are permanent welds,
+    which snap the cube to the gripper at reset. Inactive equalities are therefore dropped here, and
+    the grasp is the backend's labelled kinematic hold instead.
+    """
+    import xml.etree.ElementTree as ET
+
+    inactive = metadata.inactive_equality_names
+    if not inactive:
+        return xml
+    root = ET.fromstring(xml)
+    for block in root.findall("equality"):
+        for element in list(block):
+            if element.attrib.get("name") in inactive:
+                block.remove(element)
+    return ET.tostring(root, encoding="unicode")
 
 
 class GenesisOpenArmV2Environment(SimulationBackend):
@@ -170,6 +210,7 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         self._gs = _ensure_genesis_init(prefer_gpu)
         self._xml = resolved_scene_xml()
         self._meta = _OfficialModelMetadata(self._xml)
+        self._scene_xml = genesis_scene_xml(self._xml, self._meta)
         self._holds: dict[str, tuple[str, np.ndarray, np.ndarray]] = {}
         self._scene = self._gs.Scene(
             sim_options=self._gs.options.SimOptions(dt=0.001),
@@ -182,7 +223,7 @@ class GenesisOpenArmV2Environment(SimulationBackend):
             ),
             show_viewer=False,
         )
-        self._entity = self._scene.add_entity(self._gs.morphs.MJCF(file=self._xml))
+        self._entity = self._scene.add_entity(self._gs.morphs.MJCF(file=self._scene_xml))
         self._camera = self._scene.add_camera(
             res=camera_resolution,
             pos=free_camera_position(),
@@ -210,7 +251,41 @@ class GenesisOpenArmV2Environment(SimulationBackend):
             for side, name in GRIPPER_JOINTS.items()
         }
         self._object_qs = {name: int(entity.get_joint(name).qs_idx_local[0]) for name in OBJECTS}
+        self._object_dofs = {
+            name: np.asarray(entity.get_joint(name).dofs_idx_local) for name in OBJECTS
+        }
         self._link_names_by_index = {link.idx: link.name for link in entity.links}
+        self._arm_links = {side: self._arm_descendants(side) for side in ARM_JOINTS}
+        self._arm_link_indices = {
+            side: np.array([link.idx_local for link in links])
+            for side, links in self._arm_links.items()
+        }
+        self._act_biases = {
+            side: tuple(
+                tensor.numpy().astype(float) for tensor in entity.get_dofs_act_bias(self._dofs[side])[1:]
+            )
+            for side in ARM_JOINTS
+        }
+        self._gravity = np.asarray(self._scene.rigid_solver.get_gravity(), dtype=float).reshape(3)
+        self._sim_step = 0
+        self._gravity_torque_at_step = -1
+        self._gravity_torque_values = {side: np.zeros(7) for side in ARM_JOINTS}
+
+    def _arm_descendants(self, side: str) -> list:
+        """Every link carried by one arm, including the gripper, in link order."""
+        entity = self._entity
+        root = entity.get_joint(ARM_JOINTS[side][0]).link.parent_idx
+        parents = {link.idx: link.parent_idx for link in entity.links}
+        descendants = []
+        for link in entity.links:
+            ancestors = []
+            index = link.idx
+            while index in parents and index not in ancestors:
+                ancestors.append(index)
+                index = parents[index]
+            if root in ancestors:
+                descendants.append(link)
+        return descendants
 
     def _site_parents(self) -> tuple[str, ...]:
         names = []
@@ -237,6 +312,8 @@ class GenesisOpenArmV2Environment(SimulationBackend):
 
     def reset(self, randomize: bool = False) -> None:
         self._holds.clear()
+        self._sim_step = 0
+        self._gravity_torque_at_step = -1
         entity = self._entity
         entity.set_qpos(self._meta.keyframe_qpos[: entity.n_qs].astype(np.float32), zero_velocity=True)
         for joint_name, value in self._meta.keyframe_ctrl.items():
@@ -251,14 +328,20 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         for _ in range(steps):
             self._apply_holds()
             self._scene.step()
+            self._sim_step += 1
 
     def _apply_holds(self) -> None:
+        entity = self._entity
         for object_name, (arm, local_offset, local_quat) in self._holds.items():
             position, rotation = self._link_pose(EE_LINKS[arm])
             world_position, world_rotation = compose_pose(position, rotation, local_offset, local_quat)
             qpos = np.array([*world_position, *mat_to_quat(world_rotation)], dtype=np.float32)
-            self._entity.set_qpos(
-                qpos, self._object_qs[object_name] + np.arange(7), zero_velocity=True
+            entity.set_qpos(qpos, self._object_qs[object_name] + np.arange(7), zero_velocity=False)
+            # Only the held object's velocity is reset: `zero_velocity=True` would zero the whole
+            # entity's velocities, including the arm's, and stop the arm mid-path.
+            entity.set_dofs_velocity(
+                np.zeros(len(self._object_dofs[object_name]), dtype=np.float32),
+                self._object_dofs[object_name],
             )
 
     # -- observation -------------------------------------------------------------
@@ -372,17 +455,61 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         )
 
     def apply_gravity_compensation(self, side: str) -> None:
-        """No-op: Genesis holds the arm with the model's PD gains instead of a bias feed-forward."""
+        """Feed the arm's gravity torque forward, the way the MuJoCo path feeds `qfrc_bias`.
+
+        The constant bias term of Genesis's actuator model (`act_bias[0]`, the analogue of MuJoCo's
+        `biasprm[0]`) is added to the position controller's force, so the arm holds a commanded pose
+        to a few millimetres instead of `gravity_torque / kp` short of it, while the damping stays
+        implicit in the solver. Only the arm's dofs are compensated: the cubes keep their gravity.
+        """
+        dofs = self._dofs[side]
+        bias1, bias2 = self._act_biases[side]
+        self._entity.set_dofs_act_bias(self._gravity_torque(side), bias1, bias2, dofs)
+
+    def _gravity_torque(self, side: str) -> np.ndarray:
+        """Torque holding one arm's links against gravity.
+
+        Recomputed every `GRAVITY_TORQUE_REFRESH_STEPS` steps: the load changes slowly compared to
+        the PD response that absorbs the residual, and the Jacobian reads are the expensive part.
+        """
+        if self._gravity_torque_at_step + GRAVITY_TORQUE_REFRESH_STEPS <= self._sim_step:
+            self._refresh_gravity_torque()
+        return self._gravity_torque_values[side]
+
+    def _refresh_gravity_torque(self) -> None:
+        entity = self._entity
+        for side, dofs in self._dofs.items():
+            indices = self._arm_link_indices[side]
+            masses = entity.get_links_mass(indices).numpy().astype(float)
+            coms = entity.get_links_COM(indices).numpy().astype(float)
+            torque = np.zeros(len(dofs))
+            for link, mass, com in zip(self._arm_links[side], masses, coms):
+                if mass <= 0.0:
+                    continue
+                jacobian = entity.get_jacobian(
+                    link, local_point=com.astype(np.float32)
+                ).numpy().astype(float)
+                # Hold the link: the actuator torque cancels the gravity torque the link applies.
+                torque -= jacobian[:3][:, dofs].T @ (mass * self._gravity)
+            self._gravity_torque_values[side] = torque
+        self._gravity_torque_at_step = self._sim_step
 
     # -- grasp hold --------------------------------------------------------------
 
     def set_grasp_hold(self, arm: str, object_name: str, active: bool) -> None:
+        """Hold the object at the documented grasp offset from the gripper base link.
+
+        The offset rule is the MuJoCo weld's: `GRASP_OFFSET` in world axes frozen into the link frame
+        at grasp time, with the object's orientation relative to the link taken from the current
+        poses. Both engines therefore hold the object in the same nominal place, and the difference
+        left between them is the arm's own trajectory difference rather than a second grasp rule.
+        """
         if not active:
             self._holds.pop(object_name, None)
             return
         position, rotation = self._link_pose(EE_LINKS[arm])
-        object_position, object_rotation = self.object_pose(object_name)
-        local_offset = rotation.T @ (object_position - position)
+        _, object_rotation = self.object_pose(object_name)
+        local_offset = rotation.T @ GRASP_OFFSET.astype(float)
         local_quat = quat_mul(
             quat_conjugate(mat_to_quat(rotation)), mat_to_quat(object_rotation)
         )

@@ -10,12 +10,6 @@ from backend.app.planning.agent_planner import AgentPlanner, validate_plan
 from backend.app.skills.robot_skills import SkillRunner
 from backend.app.verification.goal_verification import verify_place_goal
 
-#: Genesis ejects the cube at the initial pose, so its end-to-end place is not verified yet.
-#: Reproduction and diagnosis: docs/ARCHITECTURE.md, "Genesis World engine" section.
-GENESIS_PICK_AND_PLACE_DEFECT = (
-    "known defect: the Genesis engine loses the pick-and-place result; see docs/ARCHITECTURE.md"
-)
-
 PICK_AND_PLACE = [
     {"skill": "approach_object", "arm": "left", "object": "red_cube"},
     {"skill": "grasp_object", "arm": "left", "object": "red_cube"},
@@ -80,8 +74,6 @@ def test_complete_pick_place(env):
     assert all(result["success"] for result in results), results
     assert results[1]["grasp_mode"] == env.grasp_mode
     assert results[1]["grasp_is_physical_contact"] is False
-    if env.name == "genesis":
-        pytest.xfail(GENESIS_PICK_AND_PLACE_DEFECT)
     verification = verify_place_goal(env, "red_cube", "blue_zone")
     assert verification["success"], verification
     assert verification["horizontal_position_error"] <= 0.04
@@ -106,8 +98,6 @@ def test_right_arm_blue_cube_place(env):
     ]
     results = runner.execute_plan(plan)
     assert all(result["success"] for result in results), results
-    if env.name == "genesis":
-        pytest.xfail(GENESIS_PICK_AND_PLACE_DEFECT)
     assert verify_place_goal(env, "blue_cube", "green_zone")["success"]
 
 

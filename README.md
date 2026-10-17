@@ -20,7 +20,7 @@ This repository contains a hackathon implementation of an embodied agent that ac
 - Neo4j AuraDB integration with local JSON fallback, parameterized Cypher persistence, and retrieval.
 - Deterministic memory selection that changes the approach offset from an exploratory 55 mm to a remembered safe 60 mm after a related successful execution.
 - OpenAI-compatible `ai&` client with deterministic fallback when credentials are missing.
-- 31 automated tests. MuJoCo runs everywhere; the Genesis World parity tests are enabled with `SIM_AGENT_TEST_GENESIS=1`.
+- 31 automated tests, all passing on both engines (MuJoCo alone: 11 tests plus 20 parametrized Genesis cases skipped unless `SIM_AGENT_TEST_GENESIS=1`).
 
 ### Verified demonstration
 
@@ -45,14 +45,14 @@ enable/disable for them, so the held object's pose is prescribed from the grippe
 step. Finger contacts are still monitored and reported, but neither engine claims contact-only
 manipulation.
 
-Verified on both engines (`SIM_AGENT_TEST_GENESIS=1 uv run pytest -q`): the official model loads with
-the same link and joint names, `reset()` and `reset(randomize=True)` produce the same initial state to
-1e-5, forward kinematics and the 3x7 linear/angular Jacobians agree to 1e-6, the same IK target solves
-to the same joint solution, and the whole skill sequence executes.
+Verified on both engines (`SIM_AGENT_TEST_GENESIS=1 uv run pytest -q`, 31 passed): the official model
+loads with the same link and joint names, `reset()` and `reset(randomize=True)` produce the same initial
+state to 1e-5, forward kinematics and the 3x7 linear/angular Jacobians agree to 1e-6, the same IK target
+solves to the same joint solution, and both arms' pick & place pass the same independent verification.
 
-**Not** verified on Genesis: the pick-and-place result. The cube is ejected from its start pose within
-the first steps of a reset, before the robot moves, so the placement misses the zone. The two failing
-tests are marked `xfail` with that reason; reproduction and diagnosis are in
+Three engine differences had to be handled explicitly, each covered by those tests: Genesis ignores
+MuJoCo's `active` flag on equalities, has no bias feed-forward in its position controller, and zeroes
+every dof velocity on `set_qpos(zero_velocity=True)`. They are described in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#genesis-world-engine-status).
 
 
@@ -162,7 +162,6 @@ The robot and Cell scene originate from the official [openarm_mujoco](https://gi
 
 ## Known limitations
 
-- **Genesis World pick & place is not verified.** The cube is ejected from its start pose within the first steps of a reset, so the placement misses the zone. Everything else listed as verified for that engine passed the checks named in the engine section above.
 - Neo4j AuraDB connection was not yet available during the initial validation run (`ServiceUnavailable: Unable to retrieve routing information`), so the app correctly used the labeled local fallback. The AuraDB integration remains implemented and will activate automatically once the instance accepts routing connections.
 - No `ai&` credentials were configured, so planning used the labeled deterministic fallback. The OpenAI-compatible client is implemented and will activate automatically when all three variables are set.
 - Grasping is never presented as contact-only: MuJoCo uses the documented weld fallback after gripper closure (`contact-assisted-weld`) and Genesis uses a documented kinematic hold (`kinematic-grasp-hold`). Physical contacts are monitored on both, but not yet reliable enough to claim contact-only manipulation.
