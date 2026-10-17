@@ -25,4 +25,8 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["backend/tests", "tests"]
+# `backend` and `tests` are namespace packages (no __init__.py at the project root), so pytest's
+# prepend import mode does not put the project root on sys.path. This makes `uv run pytest -q`
+# work from a clean checkout on any machine.
+pythonpath = ["."]
 

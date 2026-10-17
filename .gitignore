@@ -16,3 +16,7 @@ node_modules/
 dist/
 outputs/*.json
 *.log
+
+# Machine-local Python pin for uv (the system Python here is out of the supported range).
+# Deliberately not committed: it changes which interpreter uv picks, so each machine pins its own.
+.python-version
