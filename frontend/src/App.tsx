@@ -9,7 +9,7 @@ const examples = [
 
 export default function App() {
   const [instruction, setInstruction] = useState(examples[0])
-  const [status, setStatus] = useState({ provider: '...', neo4j: '...', agent: '...', engine: 'genesis', description: 'Genesis World', graspMode: 'kinematic-grasp-hold' })
+  const [status, setStatus] = useState({ provider: '...', neo4j: '...', agent: '...', engine: 'genesis', description: 'Genesis World', graspMode: 'physical-friction-pinch' })
   const [frame, setFrame] = useState<Frame | null>(null)
   const [plan, setPlan] = useState<Plan | null>(null)
   const [history, setHistory] = useState<Execution[]>([])
@@ -72,7 +72,7 @@ export default function App() {
         </div>
         <div className="flex gap-2 text-xs">
           <Badge label="Engine" value={frame?.engine ?? status.engine} tone="blue" />
-          <Badge label="Grasp" value={frame?.grasp_mode ?? status.graspMode} tone="amber" />
+          <Badge label="Grasp" value={frame?.grasp_mode ?? status.graspMode} tone="green" />
           <Badge label="Robot" value="OpenArm v2" tone="blue" />
           <Badge label="AI" value={status.provider} tone={status.provider === 'ai&' ? 'green' : 'amber'} />
           <Badge label="Neo4j" value={status.neo4j} tone={status.neo4j === 'Connected' ? 'green' : 'amber'} />
@@ -110,7 +110,7 @@ export default function App() {
         <section className="col-span-6">
           <Panel title="OpenArm v2 Physical Simulation">
             {frame?.image ? <img src={frame.image} alt="OpenArm v2 simulation" className="w-full rounded-lg border border-white/10" /> : <div className="h-[480px] rounded-lg bg-white/5" />}
-            <div className="mt-3 text-xs text-slate-400">Sim time {frame?.sim_time.toFixed(2)}s · Grasp hold: {frame?.grasp_mode ?? status.graspMode} (kinematic, not contact)</div>
+            <div className="mt-3 text-xs text-slate-400">Sim time {frame?.sim_time.toFixed(2)}s · Grasp: {frame?.grasp_mode ?? status.graspMode} (physical fingertip pinch)</div>
           </Panel>
         </section>
 

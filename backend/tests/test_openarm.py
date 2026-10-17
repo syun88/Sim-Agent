@@ -36,9 +36,11 @@ def test_scene_carries_the_official_openarm_v2_model():
         for i in range(1, 8):
             assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"openarm_{side}_joint{i}") >= 0
         assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"{side}_finger1_ctrl") >= 0
-    # The model's four grasp welds are declared inactive: they exist for the agent to enable when a
-    # grasp is commanded, and an engine that ignores the flag would weld the cubes from reset on.
-    assert list(model.eq_active0) == [0, 0, 0, 0, 1, 1]
+    # The only equalities are the official Cell's two finger mimics, both active. The scene declares
+    # no grasp welds: a grasp is the fingers' physical friction pinch, so no constraint that could
+    # move an object is declared at all, and an engine that builds every equality (Genesis) builds
+    # exactly the official two.
+    assert list(model.eq_active0) == [1, 1]
 
 
 def test_starts_in_the_documented_scene(fresh_engine_state):
@@ -117,11 +119,21 @@ def test_complete_pick_place(env, controller):
     results = runner.execute_plan(PICK_AND_PLACE)
     # The whole skill sequence executes on every engine.
     assert all(result["success"] for result in results), results
-    assert results[1]["grasp_mode"] == env.grasp_mode
-    assert results[1]["grasp_is_physical_contact"] is False
+    approach, grasp = results[0], results[1]
+    # The approach must not shove the cube: it is measured, and a shove fails the skill.
+    assert approach["object_displacement"] < 0.005, approach
+    # The grasp is a physical pinch: both fingers contact the cube, the cube follows a
+    # verification lift, and the engine reports its grasp as physical contact.
+    assert grasp["grasp_mode"] == env.grasp_mode
+    assert grasp["grasp_is_physical_contact"] is True
+    fingers = grasp["pinch_contacts"]
+    assert any("inner" in finger for finger in fingers) and any("outer" in finger for finger in fingers), grasp
+    assert grasp["object_rose"] >= 0.02, grasp
     verification = verify_place_goal(env, "red_cube", "blue_zone")
     assert verification["success"], verification
     assert verification["horizontal_position_error"] <= 0.04
+    # Released means no gripper finger touches the object any more.
+    assert verification["released"] is True
 
 
 def test_unreachable_fault_is_classified(env, controller):
@@ -129,6 +141,21 @@ def test_unreachable_fault_is_classified(env, controller):
     result = runner.approach_object("left", "red_cube", fault_offset=-0.12)
     assert result["success"] is False
     assert result["error"] == "IK_FAILURE"
+
+
+def test_grasp_fails_without_physical_contact(env, controller):
+    """A grasp with nothing between the fingers is a failure, not a success.
+
+    The gripper approaches the red cube, then the plan asks it to grasp the *blue* cube: the
+    fingers close on air, the contact check finds no pinch, and the skill must fail. This is
+    the guard that a grasp can never be reported as successful without physical contact.
+    """
+    runner = SkillRunner(env, controller)
+    approach = runner.approach_object("left", "red_cube")
+    assert approach["success"], approach
+    result = runner.grasp_object("left", "blue_cube")
+    assert result["success"] is False
+    assert result["error"] == "GRASP_FAILED"
 
 
 def test_right_arm_blue_cube_place(env, controller):

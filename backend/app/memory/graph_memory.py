@@ -93,6 +93,27 @@ class MemoryStore:
             self.local_path.write_text(json.dumps(self.records + [record], default=str, indent=2))
         return record
 
+    @staticmethod
+    def _summary(record: dict) -> dict:
+        """A compact experience summary, the only form a retrieved record is ever embedded in.
+
+        A whole record must not go into the planner: the record carries its attempts, each attempt
+        carries the plan, and the plan carries `memory_used` - the records retrieved when it ran.
+        Embedding whole records therefore nests the entire history exponentially (measured: one
+        record grew to 345 MB). The summary keeps what the planner and the prompt actually read.
+        """
+        return {
+            "task_id": record.get("task_id"),
+            "execution_id": record.get("execution_id"),
+            "instruction": record.get("instruction"),
+            "object_ids": record.get("object_ids"),
+            "success": record.get("success"),
+            "failure_category": record.get("failure_category"),
+            "retry_count": record.get("retry_count"),
+            "skills": record.get("skills"),
+            "stored_at": record.get("stored_at"),
+        }
+
     def retrieve(self, goal_type: str, object_id: str, failure_category: str | None = None, limit: int = 4) -> list[dict]:
         if self.available:
             query = """MATCH (t:EmbodiedTask)-[:HAS_EXECUTION]->(e)
@@ -100,13 +121,19 @@ class MemoryStore:
             RETURN e {.*} AS experience
             ORDER BY e.success DESC, e.stored_at DESC LIMIT $limit"""
             with self.driver.session(database=self.database) as session:
-                return [dict(rec["experience"]) for rec in session.run(query, object_id=object_id, limit=limit)]
+                return [
+                    self._summary(dict(rec["experience"]))
+                    for rec in session.run(query, object_id=object_id, limit=limit)
+                ]
         relevant = [
             rec for rec in self.records
             if object_id in rec.get("object_ids", [])
             and (failure_category is None or rec.get("failure_category") == failure_category)
         ]
-        return sorted(relevant, key=lambda x: x.get("stored_at", ""), reverse=True)[:limit]
+        return [
+            self._summary(record)
+            for record in sorted(relevant, key=lambda x: x.get("stored_at", ""), reverse=True)[:limit]
+        ]
 
     def history(self, limit: int = 50) -> list[dict]:
         if self.available:

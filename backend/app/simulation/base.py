@@ -6,9 +6,14 @@ The agent never talks to a physics engine directly:
 - the skills and the verification step drive the robot through the operations below.
 
 Genesis World is the implementation of this contract. It declares how it implements the parts the
-model description expresses natively (grasp hold, gravity compensation), so nothing engine specific
+model description expresses natively (gravity compensation), so nothing engine specific
 leaks into the agent, and every engine specific behaviour stays labelled - which is what lets a
 replacement engine be added, or this one be swapped, without touching the agent layers.
+
+A grasp is physical contact in every engine that implements this contract: the skills close the
+gripper's fingers, read back the finger-object contacts through `object_contacts`, and verify the
+hold by moving the gripper and checking that the object followed. No operation here may write an
+object's pose directly; the only pose writes are scene reset and setup.
 """
 
 from __future__ import annotations
@@ -44,7 +49,7 @@ class SimulationBackend(ABC):
     name: str = "unknown"
     #: How the current engine holds a grasped object, reported with every grasp result.
     grasp_mode: str = "unknown"
-    #: Whether the grasp hold is a physical constraint or a documented fallback.
+    #: Whether the grasp is physical contact between the fingers and the object.
     grasp_is_physical_contact: bool = False
 
     # -- lifecycle ---------------------------------------------------------------
@@ -55,12 +60,16 @@ class SimulationBackend(ABC):
         """Simulation timestep in seconds."""
 
     @abstractmethod
-    def reset(self, randomize: bool = False) -> None:
-        """Restore the initial scene, optionally randomizing the cube placement."""
+    def reset(self, randomize: bool = False, object_positions: dict[str, np.ndarray] | None = None) -> None:
+        """Restore the initial scene.
+
+        `object_positions` overrides where the objects start - a scene *setup* operation that runs
+        before a task, exactly like `randomize`; it never runs during an execution.
+        """
 
     @abstractmethod
     def step(self, steps: int = 1) -> None:
-        """Advance the simulation and keep any active grasp hold applied."""
+        """Advance the simulation."""
 
     # -- observation -------------------------------------------------------------
 
@@ -90,7 +99,7 @@ class SimulationBackend(ABC):
 
     @abstractmethod
     def object_contacts(self, object_name: str, side: str | None = None) -> list[str]:
-        """Active contacts between an object and the gripper of one arm."""
+        """Active contacts between an object and the gripper fingers of one arm (or both)."""
 
     # -- actuation ---------------------------------------------------------------
 
@@ -134,12 +143,9 @@ class SimulationBackend(ABC):
     def apply_gravity_compensation(self, side: str) -> None:
         """Compensate the arm's own bias forces, where the engine needs it."""
 
-    # -- grasp hold --------------------------------------------------------------
+    # -- grasp -------------------------------------------------------------------
 
-    @abstractmethod
-    def set_grasp_hold(self, arm: str, object_name: str, active: bool) -> None:
-        """Start or release the engine specific grasp hold for one arm/object pair."""
-
-    @abstractmethod
-    def grasp_hold_active(self, arm: str, object_name: str) -> bool:
-        """Whether the grasp hold for one arm/object pair is currently active."""
+    # `object_contacts` (see the observation section) is the physical evidence a grasp is
+    # verified against: the skills require the object to be touched by both fingers after
+    # closing and to follow the gripper through a verification lift, and the goal verification
+    # requires the object to be untouched by any finger before declaring it released.

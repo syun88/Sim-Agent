@@ -20,7 +20,6 @@ class PlanStep(BaseModel):
     object: str | None = None
     target: str | None = None
     fault_offset: float | None = None
-    approach_offset: float | None = None
 
 
 class AgentPlan(BaseModel):

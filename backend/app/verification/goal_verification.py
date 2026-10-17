@@ -3,6 +3,9 @@
 The check reads the engine's own state through `SimulationBackend` and never consults the
 plan or the agent's claim, so a failed execution cannot be reported as a success. The
 tolerances are the ones the verified MuJoCo demonstration was measured against.
+
+`released` is physical: the object must be untouched by any gripper finger. With the friction
+pinch there is no engine-side grasp state that could be left on, so contact is the evidence.
 """
 
 from __future__ import annotations
@@ -10,8 +13,6 @@ from __future__ import annotations
 import numpy as np
 
 from backend.app.simulation.base import SimulationBackend
-
-ARMS = ("left", "right")
 
 
 def verify_place_goal(
@@ -23,7 +24,7 @@ def verify_place_goal(
     vertical_error = float(abs(position[2] - target[2]))
     speed = env.object_linear_speed(object_id)
     stable = bool(speed < 0.08)
-    released = not any(env.grasp_hold_active(arm, object_id) for arm in ARMS)
+    released = not env.object_contacts(object_id)
     success = error <= tolerance and vertical_error <= 0.05 and stable and released
     return {
         "success": bool(success),

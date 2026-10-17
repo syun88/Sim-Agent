@@ -15,13 +15,25 @@ class PlannerProviderError(Exception):
         self.category = category
 
 
+def _credential(name: str) -> str:
+    """An environment value that is really a credential.
+
+    `.env.example` marks its placeholders with a `replace-` prefix (`replace-if-available`,
+    `replace-with-official-ai-and-endpoint`, `replace-with-approved-model`). A verbatim copy of
+    that file must behave like missing credentials, not like a configured provider, so those
+    values count as absent.
+    """
+    value = os.getenv(name, "").strip()
+    return "" if value.startswith("replace-") else value
+
+
 class AgentPlanner:
     """LLM planner with a deterministic OpenArm v2 skill fallback."""
 
     def __init__(self):
-        self.api_key = os.getenv("AI_AND_API_KEY", "")
-        self.base_url = os.getenv("AI_AND_BASE_URL", "")
-        self.model = os.getenv("AI_AND_MODEL", "")
+        self.api_key = _credential("AI_AND_API_KEY")
+        self.base_url = _credential("AI_AND_BASE_URL")
+        self.model = _credential("AI_AND_MODEL")
         self.enabled = bool(self.api_key and self.base_url and self.model)
 
     def _extract_json(self, text: str) -> dict[str, Any]:
@@ -92,14 +104,12 @@ class AgentPlanner:
         raw = None
         usage = None
         if any(item.get("success") for item in memory):
-            approach_offset = 0.06
-            memory_decision = "Reusing the remembered successful approach offset (60 mm)."
+            memory_decision = "Related success found in memory; the grasp alignment itself is measured from the official model, so the plan is unchanged."
         elif memory:
-            approach_offset = 0.06
-            memory_decision = "Avoiding the previously recorded failure; using the safe approach offset."
+            memory_decision = "Related failure found in memory; the grasp alignment itself is measured from the official model, so the plan is unchanged."
         else:
-            approach_offset = 0.055
-            memory_decision = "No related experience; using the exploratory approach offset."
+            memory_decision = "No related experience; the grasp alignment is measured from the official model."
+        payload = None
         if self.enabled:
             try:
                 ai = self._ai_plan(instruction, state, memory)
@@ -107,13 +117,16 @@ class AgentPlanner:
                 raw = ai["raw"]
                 usage = {"input": getattr(ai.get("usage"), "prompt_tokens", None), "output": getattr(ai.get("usage"), "completion_tokens", None)}
             except Exception as exc:
+                # The provider failed. The deterministic plan below is the documented fallback - the
+                # `provider` labelling after this block already expects it - so `payload` stays None
+                # and the fallback payload is built instead of crashing on an unbound variable.
                 raw = f"AI provider failed: {type(exc).__name__}: {str(exc).splitlines()[0]}"
-        else:
+        if payload is None:
             payload = {
                 "goal": {"type": "place_in_zone", "object": obj, "target": target},
                 "arm": arm,
                 "steps": [
-                    {"skill": "approach_object", "arm": arm, "object": obj, "approach_offset": approach_offset},
+                    {"skill": "approach_object", "arm": arm, "object": obj},
                     {"skill": "grasp_object", "arm": arm, "object": obj},
                     {"skill": "lift_object", "arm": arm, "object": obj},
                     {"skill": "move_to_target", "arm": arm, "target": target},

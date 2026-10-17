@@ -1,7 +1,7 @@
 # Live demo
 
 1. Open `http://127.0.0.1:8000`.
-2. Confirm the status badges show `Engine: genesis`, the active grasp mode (`kinematic-grasp-hold`, amber: it is not a contact-only grasp), `Robot: OpenArm v2`, and `Agent: Idle`.
+2. Confirm the status badges show `Engine: genesis`, the active grasp mode (`physical-friction-pinch`, green: a real contact pinch between the fingertip pads), `Robot: OpenArm v2`, and `Agent: Idle`.
 3. Press **Reset**.
 4. Use `Move the red cube into the blue zone.`
 5. Press **Execute**.

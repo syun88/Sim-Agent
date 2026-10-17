@@ -5,21 +5,22 @@ objects), addresses the same joint and link names, uses the same grasp geometry 
 controller, and exposes its state through `SimulationBackend`, so `build_world_state()` and the
 verification step never see engine specifics.
 
-Three things Genesis does differently from the model description, each handled explicitly here so
+Two things Genesis does differently from the model description, each handled explicitly here so
 that nothing is silently implied:
 
-- **Grasp hold.** Genesis takes MJCF equality constraints at build time and exposes no runtime
-  enable/disable for them, and `RigidEntity.attach()` is a one-way structural change with no
-  detach. A grasp is therefore a *kinematic grasp hold* (`grasp_mode`, reported in every grasp
-  result, in `/api/health` and on the dashboard): while the hold is active the object's free-joint
-  pose is prescribed from the gripper base link on every step. Finger contacts are still monitored
-  and reported, but this engine does not claim contact-only manipulation.
 - **Gravity compensation.** `apply_gravity_compensation()` feeds the arm's gravity torque into the
   constant term of the actuator model, the analogue of the bias force the model description
   provides, so the arm holds a commanded pose instead of sagging by `gravity_torque / kp`.
 - **Sites.** Genesis does not implement MJCF sites, so the gripper control point and the zone
   origins are resolved as a parent link plus a local offset, read from the same XML string with
   MuJoCo's compiler (`_OfficialModelMetadata`). The model description has one source.
+
+Grasping is plain physics in this engine, the same as in the model description: the
+position-controlled fingers close onto the object (the official finger mimic equality couples the
+two fingers of a hand), the contact solver produces the finger-object contacts, and friction holds
+the object. The skills verify a grasp from `object_contacts` and from the object following the
+gripper. Nothing in this engine can move an object on its own: the only object pose writes are the
+scene reset and setup in `reset`.
 """
 
 from __future__ import annotations
@@ -34,7 +35,6 @@ from backend.app.simulation.openarm_v2.definition import (
     ARM_JOINTS,
     EE_LINKS,
     EE_SITES,
-    GRASP_OFFSET,
     GRIPPER_JOINTS,
     OBJECTS,
     SPAWN_ARM_QPOS,
@@ -43,9 +43,6 @@ from backend.app.simulation.openarm_v2.definition import (
 from backend.app.simulation.openarm_v2.scene import initial_object_positions, resolved_scene_xml
 from backend.app.simulation.transform import (
     compose_pose,
-    mat_to_quat,
-    quat_conjugate,
-    quat_mul,
     quat_to_mat,
 )
 
@@ -184,11 +181,11 @@ def genesis_scene_xml(xml: str, metadata: _OfficialModelMetadata) -> str:
     """Remove the model's inactive equalities from the XML handed to Genesis.
 
     Genesis builds every equality it parses and reads no `active` flag (see
-    `genesis/utils/mjcf.py: parse_equalities`), and it offers no runtime enable/disable either. The
-    demonstration scene declares its four grasp welds as `active="false"` so MuJoCo keeps them
-    inert until `set_grasp_hold` turns one on; handed to Genesis unchanged they are permanent welds,
-    which snap the cube to the gripper at reset. Inactive equalities are therefore dropped here, and
-    the grasp is the backend's labelled kinematic hold instead.
+    `genesis/utils/mjcf.py: parse_equalities`), and it offers no runtime enable/disable either. A
+    constraint that must not act from reset on therefore cannot be expressed for this engine as
+    an inactive equality, and the demo scene declares none: the grasp is the fingers' physical
+    friction pinch. This guard still drops any inactive equality a future scene edit introduces,
+    because handed to Genesis it would silently become a permanent constraint.
     """
     import xml.etree.ElementTree as ET
 
@@ -207,9 +204,9 @@ class GenesisOpenArmV2Environment(SimulationBackend):
     """OpenArm v2 Cell simulation run by Genesis World."""
 
     name = "genesis"
-    #: Genesis prescribes the held object pose instead of constraining it; labelled as such.
-    grasp_mode = "kinematic-grasp-hold"
-    grasp_is_physical_contact = False
+    #: A grasp is the official fingers' friction pinch; nothing else moves the object.
+    grasp_mode = "physical-friction-pinch"
+    grasp_is_physical_contact = True
 
     def __init__(
         self,
@@ -225,7 +222,6 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         self._xml = resolved_scene_xml()
         self._meta = _OfficialModelMetadata(self._xml)
         self._scene_xml = genesis_scene_xml(self._xml, self._meta)
-        self._holds: dict[str, tuple[str, np.ndarray, np.ndarray]] = {}
         self._scene = self._gs.Scene(
             sim_options=self._gs.options.SimOptions(dt=0.001),
             rigid_options=self._gs.options.RigidOptions(
@@ -289,9 +285,6 @@ class GenesisOpenArmV2Environment(SimulationBackend):
             for side, name in GRIPPER_JOINTS.items()
         }
         self._object_qs = {name: int(entity.get_joint(name).qs_idx_local[0]) for name in OBJECTS}
-        self._object_dofs = {
-            name: np.asarray(entity.get_joint(name).dofs_idx_local) for name in OBJECTS
-        }
         self._link_names_by_index = {link.idx: link.name for link in entity.links}
         self._arm_links = {side: self._arm_descendants(side) for side in ARM_JOINTS}
         self._arm_link_indices = {
@@ -357,8 +350,17 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         """
         return self._meta.qpos_with_arm_pose(SPAWN_ARM_QPOS)
 
-    def reset(self, randomize: bool = False) -> None:
-        self._holds.clear()
+    def reset(
+        self,
+        randomize: bool = False,
+        object_positions: dict[str, np.ndarray] | None = None,
+    ) -> None:
+        """Restore the initial scene.
+
+        `object_positions` overrides the documented placement of some objects. This is scene
+        *setup*: it runs before a task starts, exactly like `randomize`; the skills themselves
+        never write an object pose.
+        """
         self._sim_step = 0
         self._gravity_torque_at_step = -1
         entity = self._entity
@@ -366,30 +368,21 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         for joint_name, value in self._meta.keyframe_ctrl.items():
             dof = int(entity.get_joint(joint_name).dofs_idx_local[0])
             entity.control_dofs_position(np.array([value], dtype=np.float32), np.array([dof]))
-        for name, position in initial_object_positions(randomize).items():
+        placements = initial_object_positions(randomize)
+        if object_positions:
+            placements = {
+                **placements,
+                **{name: np.asarray(position, float) for name, position in object_positions.items()},
+            }
+        for name, position in placements.items():
             qpos = np.array([*position, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
             entity.set_qpos(qpos, self._object_qs[name] + np.arange(7), zero_velocity=True)
         self.refresh()
 
     def step(self, steps: int = 1) -> None:
         for _ in range(steps):
-            self._apply_holds()
             self._scene.step()
             self._sim_step += 1
-
-    def _apply_holds(self) -> None:
-        entity = self._entity
-        for object_name, (arm, local_offset, local_quat) in self._holds.items():
-            position, rotation = self._link_pose(EE_LINKS[arm])
-            world_position, world_rotation = compose_pose(position, rotation, local_offset, local_quat)
-            qpos = np.array([*world_position, *mat_to_quat(world_rotation)], dtype=np.float32)
-            entity.set_qpos(qpos, self._object_qs[object_name] + np.arange(7), zero_velocity=False)
-            # Only the held object's velocity is reset: `zero_velocity=True` would zero the whole
-            # entity's velocities, including the arm's, and stop the arm mid-path.
-            entity.set_dofs_velocity(
-                np.zeros(len(self._object_dofs[object_name]), dtype=np.float32),
-                self._object_dofs[object_name],
-            )
 
     # -- observation -------------------------------------------------------------
 
@@ -540,28 +533,3 @@ class GenesisOpenArmV2Environment(SimulationBackend):
                 torque -= jacobian[:3][:, dofs].T @ (mass * self._gravity)
             self._gravity_torque_values[side] = torque
         self._gravity_torque_at_step = self._sim_step
-
-    # -- grasp hold --------------------------------------------------------------
-
-    def set_grasp_hold(self, arm: str, object_name: str, active: bool) -> None:
-        """Hold the object at the documented grasp offset from the gripper base link.
-
-        The offset is the documented grasp rule: `GRASP_OFFSET` in world axes frozen into the link frame
-        at grasp time, with the object's orientation relative to the link taken from the current
-        poses. Both engines therefore hold the object in the same nominal place, and the difference
-        left between them is the arm's own trajectory difference rather than a second grasp rule.
-        """
-        if not active:
-            self._holds.pop(object_name, None)
-            return
-        position, rotation = self._link_pose(EE_LINKS[arm])
-        _, object_rotation = self.object_pose(object_name)
-        local_offset = rotation.T @ GRASP_OFFSET.astype(float)
-        local_quat = quat_mul(
-            quat_conjugate(mat_to_quat(rotation)), mat_to_quat(object_rotation)
-        )
-        self._holds[object_name] = (arm, local_offset, local_quat)
-
-    def grasp_hold_active(self, arm: str, object_name: str) -> bool:
-        hold = self._holds.get(object_name)
-        return hold is not None and hold[0] == arm

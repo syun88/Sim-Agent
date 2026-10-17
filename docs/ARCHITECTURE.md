@@ -36,19 +36,51 @@ control point and the zone origins are read from the *same XML string* by MuJoCo
 (`_OfficialModelMetadata`) as a parent link plus a local offset. Genesis supplies the physics; the
 naming, the keyframe, the actuator mapping and the grasp geometry all come from the official asset.
 
+### The physical grasp
+
+The grasp is the official hand's own mechanism, measured from the official model:
+
+- **Fingertip midpoint.** Each finger body's `*_collision_00` geom is the fingertip pad (the hand's
+  foremost, pad-facing segment, `condim=4` so torsional friction keeps a pinched object from
+  spinning). The midpoint of the two pads' centroids at the closed configuration, in the gripper
+  control point frame, is `(-0.0066, 0, -0.1634)` for both hands (`FINGERTIP_MIDPOINT`);
+  `scripts/measure_grasp_geometry.py` re-measures it from the installed model and the fidelity
+  test fails if the constant drifts.
+- **Gripper travel.** The official keyframe holds both hands fully open (`key_ctrl` `+/-0.7854`, the
+  open range end); 0 closes the pads onto the symmetry plane. The project commands open `0.7854` /
+  `-0.7854` and closes to `0.02` / `-0.02` (the pads stop short of touching each other; on an object the
+  position actuators press into it from there, and the official finger mimic equality keeps the two
+  fingers symmetric).
+- **Approach orientation.** Fingers forward (+x world) so the pads close across the object's `+-y`
+  side faces, tilted 10 deg nose-down: at the pinch alignment the palm's lowest point sits 14.5 mm
+  above the cell table at 10 deg versus 1.7 mm at 0 deg (measured), so the tilt is what keeps the
+  official palm geometry off the table while the fingertips stay on the object's centre.
+- **Approach path.** The arm first rises to a 1.24 m staging altitude above its current pose (the
+  highest the official arm reaches with the horizontal orientation; measured 1.0 mm IK residual at
+  1.24, 12.7 mm at 1.26), because a joint-interpolated swing toward a lateral target otherwise yaws
+  the extended hand through the workspace and can sweep an object off its place. It then swings
+  above the object, drops onto the approach axis 6 cm behind the pinch point, and slides straight in.
+  The skill measures how much the approach displaced the object and fails (`APPROACH_COLLISION`)
+  beyond 5 mm.
+- **Grasp verification.** After closing, both the inner and the outer finger must contact the
+  object (`GRASP_FAILED` otherwise), and a 3 cm verification lift must carry the object with the
+  gripper, with contact maintained (`GRASP_LOST` otherwise). Nothing writes the object's pose:
+  the only pose writes are scene reset and setup.
+
 ### What the engine does differently
 
 | | Genesis World |
 |---|---|
 | Scene | the resolved official MJCF string, Genesis physics and rasterizer |
-| Grasp | **kinematic grasp hold**: the object's free-joint pose is prescribed from the gripper base link each step: `kinematic-grasp-hold` |
-| Grasp offset | `GRASP_OFFSET` in world axes frozen into the gripper base link frame at grasp time, so the hold rule is one documented rule |
+| Grasp | **physical friction pinch**: the position-controlled fingertip pads press the object's side faces; the official finger mimic equality keeps the two fingers symmetric; friction holds the object: `physical-friction-pinch` |
+| Grasp alignment | the hand's `FINGERTIP_MIDPOINT`, measured from the official fingertip pad geoms, is IK-aligned to the object centre |
 | Bias torque during a joint path | `apply_gravity_compensation()` writes the gravity torque into the constant term of the actuator model |
 | Camera | one fixed dashboard camera aimed at the middle of the table |
 
 `env.grasp_mode` is reported with every grasp result, in `/api/health`, and in the dashboard badge.
-Contacts at the fingers are monitored and reported, but this engine does not claim contact-only
-manipulation.
+The skills verify the pinch from the finger-object contacts and from the object following a short
+verification lift, and the goal verification requires the object to be untouched by any finger before
+declaring it released.
 
 ### Spawn pose
 
@@ -79,7 +111,7 @@ that pose.
 ### Genesis World engine: status
 
 Verified by `backend/tests/test_official_model_fidelity.py`, `backend/tests/test_openarm.py` and
-`backend/tests/test_transform.py` (26 tests, `pytest -q`):
+`backend/tests/test_transform.py`, `tests/test_memory_serialization.py` (34 tests, `pytest -q`):
 
 - the ground truth for structure is the model description, compiled by MuJoCo and evaluated with its own
   kinematics routines (`mj_kinematics`, `mj_comPos`, `mj_jac`) - pure kinematics, no solver, no stepping;
@@ -92,16 +124,18 @@ Verified by `backend/tests/test_official_model_fidelity.py`, `backend/tests/test
 - an inverse kinematics solution is checked by the official model's forward kinematics, so a wrong
   convention cannot pass by agreeing with itself;
 - the complete approach/grasp/lift/place/release/retreat sequence executes for both arms, reports its
-  labelled grasp mode, and passes independent verification.
+  labelled grasp mode, asserts the both-finger pinch and the verification lift on every grasp, and
+  passes independent verification.
 
-Four engine differences had to be handled explicitly, and each is covered by a test:
+Three engine differences had to be handled explicitly, and each is covered by a test:
 
-1. **Inactive equalities.** The scene declares its four grasp welds `active="false"` so they stay inert
-   until a grasp is commanded. Genesis builds every equality it parses and reads no `active` flag, and it
-   has no runtime enable/disable, so the welds would be permanent and would snap the cube to the gripper at
-   reset (measured: 3.5 m/s in the first step, no contact reported). `genesis_scene_xml()` drops exactly
-   the equalities MuJoCo reports as inactive (`eq_active0 == 0`) from the XML handed to Genesis.
-   `test_genesis_builds_the_official_model` asserts Genesis built the two remaining equalities.
+1. **Equalities.** Genesis builds every equality it parses and reads no `active` flag, and it has no
+   runtime enable/disable. The scene therefore declares no inactive equalities at all: a grasp is the
+   fingers' physical pinch, so no constraint that could move an object is expressed.
+   `genesis_scene_xml()` remains as a guard, dropping any inactive equality a future scene edit
+   introduces before the XML reaches Genesis.
+   `test_genesis_builds_the_official_model` asserts Genesis built exactly the official two finger
+   mimics.
 2. **Bias feed-forward.** A Genesis position controller holds a commanded pose `gravity_torque / kp` short
    of its target. Measured on this machine with the same commanded pose and the same control path: 10.16 mm
    of sag without compensation, 0.41 mm with it. `apply_gravity_compensation()` writes the arm's gravity
@@ -109,18 +143,18 @@ Four engine differences had to be handled explicitly, and each is covered by a t
    `biasprm[0]`), which keeps the damping implicit in the solver and leaves the cubes their own gravity. An
    earlier attempt to feed the same torque through `control_dofs_force` diverged on long joint paths,
    because FORCE mode skips the implicit damping the solver folds into the mass matrix for POSITION mode.
-3. **Kinematic hold and velocities.** While a hold is active the object's pose is written every step.
-   `set_qpos(..., zero_velocity=True)` zeroes *all* of the entity's velocities, which also stopped the arm
-   mid-path; only the held object's dofs have their velocity reset.
-4. **Sites.** Genesis has no MJCF site, so the gripper control point and the zone origins come from the
+3. **Sites.** Genesis has no MJCF site, so the gripper control point and the zone origins come from the
    model description as a parent link plus a local offset (above).
 
-Measured placement error of the red-cube task through the task API: 34.2 mm horizontally and 23 mm
-vertically against a 40 mm / 50 mm tolerance (30.1 mm with the default 55 mm approach offset, without the
-memory-remembered 60 mm; measured before the inverse-kinematics damping tuning in commit `74af002`). The
-residual is the difference between where the gripper finishes its joint path
-and where the zone is, not a constraint failure: the object is held rigidly at the documented grasp offset
-while the arm converges to within a few millimetres of its commanded pose.
+Measured placement error of the red-cube task through the task API, with the physical friction pinch:
+7.6 mm horizontally and 23.0 mm vertically against a 40 mm / 50 mm tolerance (right-arm blue-cube task:
+5.4 mm). The residual is where the released object comes to rest after its 4 cm release drop onto the
+zone, not a grasp defect: the transport holds the object between the fingertip pads the whole way.
+
+`scripts/verify_pick_place_genesis.py` runs the same physical pick & place from nine initial object
+positions (six left-arm, three right-arm); all nine passed on this machine with 0.0 mm approach
+displacement, a both-finger pinch, the object following the verification lift, and 5.3-18.5 mm final
+horizontal error (`outputs/pick_place_positions.json`).
 
 ## OpenArm v2
 
@@ -143,5 +177,7 @@ while the arm converges to within a few millimetres of its commanded pose.
 
 - AuraDB uses parameterized Cypher and constraints.
 - Experience is keyed by task, execution, object, skill, outcome, and failure.
-- In fallback mode, a related successful execution changes the plan's approach offset from 55 mm to 60 mm and shows the decision in the dashboard.
 - If AuraDB is unavailable, records go to `outputs/memory-fallback.json` and the UI reports `Fallback`.
+- Retrieved experience is stored back into plans only as a compact summary (instruction, outcome, retry
+  count, skills). Embedding whole records nested the entire history inside one record and grew the
+  fallback file to 4.2 GB (one record: 345 MB); the summaries keep it flat.
