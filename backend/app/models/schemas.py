@@ -28,6 +28,8 @@ class AgentPlan(BaseModel):
     arm: ArmName = "left"
     steps: list[PlanStep]
     provider: str = "deterministic_fallback"
+    model: str | None = None
+    provider_error: str | None = None
     memory_used: list[dict] = Field(default_factory=list)
     memory_decision: str | None = None
     planning_latency: float | None = None

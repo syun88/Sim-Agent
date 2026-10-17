@@ -12,6 +12,7 @@ export default function App() {
   const [status, setStatus] = useState({ provider: '...', neo4j: '...', agent: '...', engine: 'genesis', description: 'Genesis World', graspMode: 'kinematic-grasp-hold' })
   const [frame, setFrame] = useState<Frame | null>(null)
   const [plan, setPlan] = useState<Plan | null>(null)
+  const [currentSkill, setCurrentSkill] = useState<string | null>(null)
   const [history, setHistory] = useState<Execution[]>([])
   const [events, setEvents] = useState<any[]>([])
   const [verification, setVerification] = useState<any | null>(null)
@@ -57,6 +58,12 @@ export default function App() {
   useEffect(() => {
     const planEvent = events.find(e => e.kind === 'plan_generated')
     if (planEvent) setPlan(planEvent.plan)
+    const progressEvent = events.find(e => e.kind === 'skill_progress')
+    if (progressEvent) {
+      const phase = progressEvent.phase ?? ''
+      if (!phase.startsWith('joint_path')) setCurrentSkill(phase)
+    }
+    else if (['SUCCEEDED', 'FAILED', 'STOPPED'].includes(frame?.agent_state ?? '')) setCurrentSkill(null)
     const memoryEvent = events.find(e => e.kind === 'memory_retrieved')
     if (memoryEvent) setMemory((prev: any) => ({ ...prev, retrieved: memoryEvent.memories, count: memoryEvent.count }))
     const verificationEvent = events.find(e => e.kind === 'verification_completed')
@@ -98,10 +105,20 @@ export default function App() {
           <Panel title="Agent Plan">
             {!plan ? <Empty text="No plan yet" /> : (
               <div className="space-y-2 text-xs">
-                <Line label="Provider" value={plan.provider ?? ''} />
+                <Line label="Model" value={plan.model ?? plan.provider ?? ''} />
                 <Line label="Latency" value={`${(plan.planning_latency ?? 0).toFixed(4)} s`} />
+                {plan.provider_error && (
+                  <div className="rounded bg-amber-500/10 px-2 py-1 text-amber-300">AI fallback: {plan.provider_error}</div>
+                )}
                 {plan.memory_decision && <div className="rounded bg-emerald-500/10 px-2 py-1 text-emerald-300">{plan.memory_decision}</div>}
-                {plan.steps.map((step, index) => <div key={index} className="rounded bg-white/5 px-2 py-1">{index + 1}. {step.skill} {step.object ?? step.target ?? ''}</div>)}
+                {plan.steps.map((step, index) => (
+                  <div key={index} className={`rounded px-2 py-1 ${
+                    currentSkill?.includes(step.skill) ? 'bg-blue-500/20 text-blue-200' : 'bg-white/5'
+                  }`}>
+                    {index + 1}. {step.skill} {step.object ?? step.target ?? ''}
+                    {currentSkill?.includes(step.skill) && <span className="ml-1 text-blue-400">●</span>}
+                  </div>
+                ))}
               </div>
             )}
           </Panel>
