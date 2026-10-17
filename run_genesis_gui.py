@@ -9,6 +9,7 @@ Press Ctrl+C to exit.
 from __future__ import annotations
 
 import time
+import threading
 
 import httpx
 
@@ -34,16 +35,27 @@ def main() -> None:
 
     while True:
         time.sleep(0.5)
-        instruction = _poll_next_command()
-        if instruction is None:
+        try:
+            response = httpx.get(f"{BACKEND_URL}/api/genesis/next", timeout=1.0)
+            response.raise_for_status()
+            instruction = response.json().get("instruction")
+        except Exception:
+            print(".", end="", flush=True)
+            continue
+        if not instruction:
             continue
         if len(instruction) < 3:
             continue
 
         print(f"\nReceived: {instruction}", flush=True)
 
-        state = build_world_state(env)
-        plan = planner.plan(instruction, state, [])
+        try:
+            state = build_world_state(env)
+            plan = planner.plan(instruction, state, [])
+        except Exception as exc:
+            print(f"Planning failed: {type(exc).__name__}: {exc}", flush=True)
+            _report_result(instruction, False)
+            continue
         valid, errors = validate_plan(plan, state)
         if not valid:
             print(f"Plan invalid: {errors}")
@@ -63,18 +75,6 @@ def main() -> None:
         _report_result(instruction, success)
 
     print("Closing Genesis viewer...")
-
-
-def _poll_next_command() -> str | None:
-    try:
-        response = httpx.get(f"{BACKEND_URL}/api/genesis/next", timeout=1.0)
-        response.raise_for_status()
-        return response.json().get("instruction")
-    except Exception:
-        time.sleep(2.0)
-        return None
-
-    time.sleep(0.5)
 
 
 def _report_result(instruction: str, success: bool) -> None:

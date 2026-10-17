@@ -449,7 +449,13 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         return contacts
 
     def _contact_link_pairs(self) -> list[tuple[int, int]]:
-        contacts = self._entity.get_contacts()
+        try:
+            contacts = self._entity.get_contacts()
+        except KeyError:
+            # Genesis 1.4.4 raises KeyError("force") when there are zero active
+            # contacts and the collider returns no force tensor. No contacts means
+            # no pairs to report.
+            return []
         link_a, link_b = contacts.get("link_a"), contacts.get("link_b")
         if link_a is None or link_b is None or len(link_a) == 0:
             return []
