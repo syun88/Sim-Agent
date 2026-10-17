@@ -7,7 +7,11 @@ if [[ ! -f .env ]]; then
   exit 1
 fi
 
-uv sync
+if [[ "${SIM_BACKEND:-mujoco}" == "genesis" ]]; then
+  uv sync --extra genesis
+else
+  uv sync
+fi
 if [[ ! -f frontend/dist/index.html ]]; then
   (cd frontend && npm install && npm run build)
 fi

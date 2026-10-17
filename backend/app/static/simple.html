@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenArm v2 — Simple Commands</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; background: #050910; color: #e5eef8; min-height: 100vh; }
+    main { max-width: 680px; margin: auto; padding: 32px 20px; }
+    h1 { font-size: 22px; margin: 0; }
+    p.sub { color: #93a4bb; font-size: 13px; margin: 6px 0 24px; }
+    .panel { background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.10); border-radius: 12px; padding: 18px; }
+    textarea { width: 100%; box-sizing: border-box; min-height: 90px; resize: vertical; border-radius: 8px; border: 1px solid rgba(255,255,255,.15); background: rgba(255,255,255,.07); color: inherit; padding: 12px; font-size: 15px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    button { border: 0; border-radius: 8px; padding: 10px 16px; font-size: 14px; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .primary { background: #2563eb; color: white; }
+    .danger { background: #e11d48; color: white; }
+    .secondary { background: rgba(255,255,255,.12); color: inherit; }
+    .status { margin-top: 18px; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .ok { color: #34d399; }
+    .bad { color: #fb7185; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>OpenArm v2 指令入力</h1>
+  <p class="sub">Genesis / MuJoCo バックエンドに同じAPIで指令を送ります。</p>
+
+  <section class="panel">
+    <label for="instruction">自然言語指令</label>
+    <textarea id="instruction" maxlength="500">Move the red cube into the blue zone.</textarea>
+    <div class="row">
+      <button id="execute" class="primary">実行</button>
+      <button id="stop" class="danger">停止</button>
+      <button id="reset" class="secondary">Reset</button>
+      <button id="randomize" class="secondary">Random</button>
+    </div>
+    <div id="status" class="status">状態を確認しています…</div>
+  </section>
+</main>
+
+<script type="module">
+const instruction = document.getElementById('instruction');
+const execute = document.getElementById('execute');
+const stopButton = document.getElementById('stop');
+const status = document.getElementById('status');
+
+let currentTaskId = null;
+let polling = false;
+
+function setStatus(text, tone = '') {
+  status.className = `status ${tone}`;
+  status.textContent = text;
+}
+
+function setBusy(busy) {
+  execute.disabled = busy;
+  stopButton.disabled = !busy || !currentTaskId;
+}
+
+async function refreshHealth() {
+  try {
+    const response = await fetch('/api/health');
+    const health = await response.json();
+    return `${health.simulation_engine.toUpperCase()} / Agent: ${health.agent} / Robot: ${health.robot}`;
+  } catch {
+    return 'Backend offline';
+  }
+}
+
+async function pollTask() {
+  if (!currentTaskId || polling) return;
+  polling = true;
+  try {
+    while (currentTaskId) {
+      const response = await fetch(`/api/tasks/${currentTaskId}`);
+      if (response.status === 404) {
+        await refreshHealth();
+        await new Promise(resolve => setTimeout(resolve, 500));
+        continue;
+      }
+      const task = await response.json();
+      const verification = task.verification;
+      const state = task.status ?? task.state ?? 'RUNNING';
+      if (['SUCCEEDED', 'FAILED', 'STOPPED'].includes(state)) {
+        const result = verification
+          ? `\n判定: ${verification.success ? 'SUCCESS' : 'FAILED'} / 誤差: ${(verification.horizontal_position_error * 1000).toFixed(1)} mm`
+          : '';
+        setStatus(`${state}${result}`, state === 'SUCCEEDED' ? 'ok' : 'bad');
+        currentTaskId = null;
+      } else {
+        setStatus(`${state} を実行中…`);
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+  } finally {
+    polling = false;
+    setBusy(false);
+  }
+}
+
+async function submit() {
+  const text = instruction.value.trim();
+  if (text.length < 3) {
+    setStatus('指令は3文字以上入力してください。', 'bad');
+    return;
+  }
+  setBusy(true);
+  setStatus('指令を送信しています…');
+  try {
+    const response = await fetch('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ instruction: text, randomize: false, force_failure: false }),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      setStatus(`送信失敗: ${result.detail ?? response.status}`, 'bad');
+      setBusy(false);
+      return;
+    }
+    currentTaskId = result.task_id;
+    setStatus(`受付しました: ${currentTaskId}`);
+    pollTask();
+  } catch (error) {
+    setStatus(`送信失敗: ${error}`, 'bad');
+    setBusy(false);
+  }
+}
+
+async function stop() {
+  if (!currentTaskId) return;
+  try {
+    await fetch(`/api/tasks/${currentTaskId}/stop`, { method: 'POST' });
+    setStatus('停止を要求しました。');
+  } catch (error) {
+    setStatus(`停止失敗: ${error}`, 'bad');
+  }
+}
+
+async function reset(randomize) {
+  try {
+    const response = await fetch(`/api/scene/reset?randomize=${randomize}`, { method: 'POST' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail ?? response.status);
+    setStatus(randomize ? 'Random reset 完了。' : 'Reset 完了。', 'ok');
+  } catch (error) {
+    setStatus(`Reset失敗: ${error}`, 'bad');
+  }
+}
+
+execute.addEventListener('click', submit);
+stopButton.addEventListener('click', stop);
+document.getElementById('reset').addEventListener('click', () => reset(false));
+document.getElementById('randomize').addEventListener('click', () => reset(true));
+
+refreshHealth().then(text => {
+  if (!status.textContent.startsWith('指令')) setStatus(text);
+});
+setInterval(refreshHealth, 2000);
+setBusy(false);
+</script>
+</body>
+</html>

@@ -202,6 +202,7 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         self,
         prefer_gpu: bool = False,
         camera_resolution: tuple[int, int] = CAMERA_RESOLUTION,
+        show_viewer: bool = False,
     ):
         if not genesis_available():
             raise RuntimeError(
@@ -221,7 +222,7 @@ class GenesisOpenArmV2Environment(SimulationBackend):
                 enable_torsional_friction=True,
                 enable_rolling_friction=True,
             ),
-            show_viewer=False,
+            show_viewer=show_viewer,
         )
         self._entity = self._scene.add_entity(self._gs.morphs.MJCF(file=self._scene_xml))
         self._camera = self._scene.add_camera(

@@ -82,6 +82,7 @@ every dof velocity on `set_qpos(zero_velocity=True)`. They are described in
    ```
 
    Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
+   For a command-only page, open [http://127.0.0.1:8000/simple](http://127.0.0.1:8000/simple).
 
 ## Development commands
 

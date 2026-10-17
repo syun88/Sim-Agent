@@ -52,5 +52,8 @@ def create_backend(name: str | None = None) -> SimulationBackend:
             GenesisOpenArmV2Environment,
         )
 
-        return GenesisOpenArmV2Environment(prefer_gpu=os.getenv("GENESIS_USE_GPU", "") == "1")
+        return GenesisOpenArmV2Environment(
+            prefer_gpu=os.getenv("GENESIS_USE_GPU", "") == "1",
+            show_viewer=os.getenv("GENESIS_SHOW_VIEWER", "") == "1",
+        )
     raise ValueError(f"Unknown SIM_BACKEND {selected!r}; use 'mujoco' or 'genesis'")
