@@ -79,7 +79,7 @@ that pose.
 ### Genesis World engine: status
 
 Verified by `backend/tests/test_official_model_fidelity.py`, `backend/tests/test_openarm.py` and
-`backend/tests/test_transform.py` (25 tests, `pytest -q`):
+`backend/tests/test_transform.py` (26 tests, `pytest -q`):
 
 - the ground truth for structure is the model description, compiled by MuJoCo and evaluated with its own
   kinematics routines (`mj_kinematics`, `mj_comPos`, `mj_jac`) - pure kinematics, no solver, no stepping;
@@ -117,7 +117,8 @@ Four engine differences had to be handled explicitly, and each is covered by a t
 
 Measured placement error of the red-cube task through the task API: 34.2 mm horizontally and 23 mm
 vertically against a 40 mm / 50 mm tolerance (30.1 mm with the default 55 mm approach offset, without the
-memory-remembered 60 mm). The residual is the difference between where the gripper finishes its joint path
+memory-remembered 60 mm; measured before the inverse-kinematics damping tuning in commit `74af002`). The
+residual is the difference between where the gripper finishes its joint path
 and where the zone is, not a constraint failure: the object is held rigidly at the documented grasp offset
 while the arm converges to within a few millimetres of its commanded pose.
 

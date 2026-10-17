@@ -151,6 +151,21 @@ class _OfficialModelMetadata:
                 names.add(name)
         return names
 
+    def qpos_with_arm_pose(self, arm_qpos: np.ndarray) -> np.ndarray:
+        """The model's keyframe with every arm's seven joints pinned to `arm_qpos`.
+
+        Everything else the keyframe declares - the lifter, the gripper fingers, the cubes' free
+        joints - keeps its model value, so a spawn pose is one decision about the arms rather than a
+        second, hand-rolled copy of the model's initial state.
+        """
+        mujoco = self._mujoco
+        qpos = self.keyframe_qpos.copy()
+        for joints in ARM_JOINTS.values():
+            for joint_name, value in zip(joints, arm_qpos):
+                joint = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+                qpos[int(self.model.jnt_qposadr[joint])] = value
+        return qpos
+
     @property
     def keyframe_qpos(self) -> np.ndarray:
         """Joint positions of the model's first keyframe (the canonical 'home' pose)."""
@@ -336,19 +351,11 @@ class GenesisOpenArmV2Environment(SimulationBackend):
     def _spawn_qpos(self) -> np.ndarray:
         """Full qpos of the documented spawn pose: the official keyframe with the arm joints fixed.
 
-        The non-arm dofs (lifter, grippers, cube free joints) keep the values declared by the
-        model's keyframe.  The arm joints are pinned to `SPAWN_ARM_QPOS` so the spawn pose is an
-        explicit project decision rather than an accidental reuse of the model keyframe.
+        The arm joints come from `SPAWN_ARM_QPOS` so the spawn pose is an explicit project decision
+        rather than an accidental reuse of the model keyframe; everything else in the qpos (the
+        lifter, the gripper fingers, the cubes' free joints) keeps the model's own keyframe value.
         """
-        mujoco = self._meta._mujoco
-        model = self._meta.model
-        qpos = self._meta.keyframe_qpos.copy()
-        for side in ARM_JOINTS:
-            for joint_name, value in zip(ARM_JOINTS[side], SPAWN_ARM_QPOS):
-                joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
-                adr = int(model.jnt_qposadr[joint_id])
-                qpos[adr] = value
-        return qpos
+        return self._meta.qpos_with_arm_pose(SPAWN_ARM_QPOS)
 
     def reset(self, randomize: bool = False) -> None:
         self._holds.clear()

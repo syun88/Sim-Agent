@@ -37,7 +37,7 @@ physical result, records experience, and reuses memory on later tasks.
 - Deterministic memory selection that changes the approach offset from an exploratory 55 mm to a
   remembered safe 60 mm after a related successful execution.
 - OpenAI-compatible `ai&` client with deterministic fallback when credentials are missing.
-- **25 automated tests, all passing** (`pytest -q`).
+- **26 automated tests, all passing** (`pytest -q`).
 
 ### Verified demonstration
 
@@ -53,6 +53,8 @@ verification: horizontal error 34.2 mm (tolerance 40 mm), vertical error 23 mm,
 ```
 
 Repeat runs land between 30 and 35 mm horizontally, from both the documented and the randomized start pose.
+These figures were measured before the inverse-kinematics damping tuning in commit `74af002`; re-measuring
+them on the current controller is outstanding, and the tests that assert the tolerances pass either way.
 
 The grasp is **never presented as contact-only manipulation**. Finger contacts are monitored and reported
 per skill result, but the hold itself is the engine's fallback, and it is labelled everywhere it appears:
@@ -110,7 +112,7 @@ labelled `kinematic-grasp-hold`, and this project does not claim contact-only ma
 
 ```bash
 uv sync
-uv run pytest -q                          # 25 tests, the engine is required
+uv run pytest -q                          # 26 tests, the engine is required
 uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --reload
 uv run python scripts/record_demo.py      # regenerates outputs/openarm-v2-demo.mp4
 cd frontend && npm install && npm run dev
