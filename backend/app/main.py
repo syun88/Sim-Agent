@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+from typing import Any
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -36,6 +37,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Embodied AI Agent — OpenArm v2", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_methods=["*"], allow_headers=["*"])
+
+simple_page = Path(__file__).resolve().parent / "static" / "simple.html"
+
+# Simple queue that bridges web instructions to the standalone Genesis viewer process.
+genesis_command_queue: list[str] = []
+
+
+@app.get("/simple", include_in_schema=False)
+def simple_commands():
+    """A minimal command-only page for operators who do not need the full dashboard."""
+    return FileResponse(simple_page)
 
 
 class Health(BaseModel):
@@ -89,11 +101,26 @@ def reset_scene(randomize: bool = False):
 @app.post("/api/tasks", response_model=TaskResponse)
 async def create_task(request: TaskRequest):
     engine: ExecutionEngine = app.state.engine
+    genesis_command_queue.append(request.instruction)
     try:
         task_id = engine.start(request)
         return TaskResponse(task_id=task_id, status=engine.state, message="Task accepted")
     except RuntimeError as exc:
         raise HTTPException(409, str(exc))
+
+
+@app.get("/api/genesis/next", include_in_schema=False)
+def genesis_next_command():
+    """Return the next pending instruction for the standalone Genesis viewer process."""
+    if genesis_command_queue:
+        return {"instruction": genesis_command_queue.pop(0)}
+    return {"instruction": None}
+
+
+@app.post("/api/genesis/result", include_in_schema=False)
+def genesis_result(result: dict[str, Any]):
+    """Accept execution results from the standalone Genesis viewer process."""
+    return {"status": "ok", "received": result}
 
 
 @app.get("/api/tasks/{task_id}")

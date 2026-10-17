@@ -31,4 +31,7 @@ def prefer_gpu_from_environment() -> bool:
 
 def create_backend() -> SimulationBackend:
     """Create the simulation backend."""
-    return GenesisOpenArmV2Environment(prefer_gpu=prefer_gpu_from_environment())
+    return GenesisOpenArmV2Environment(
+        prefer_gpu=prefer_gpu_from_environment(),
+        show_viewer=os.getenv("GENESIS_SHOW_VIEWER", "") == "1",
+    )
