@@ -116,11 +116,13 @@ class AgentPlanner:
             if index >= 0:
                 target_candidates.append((index, name))
         non_object_targets = [candidate for candidate in target_candidates if candidate[1].split("_")[0] != obj.split("_")[0]]
-        target = min(non_object_targets or target_candidates)[1] if target_candidates else None
+        target = min(non_object_targets)[1] if non_object_targets else None
         if obj is None:
             raise PlannerProviderError("UNKNOWN_OBJECT", "No known cube named in instruction")
         if target is None:
-            target = "blue_zone"
+            # Cross-colour default: the red cube goes to the blue zone and the blue
+            # cube goes to the green zone, matching the verified task assignment.
+            target = "green_zone" if obj == "blue_cube" else "blue_zone"
         arm = "right" if obj == "blue_cube" else "left"
         raw = None
         usage = None
