@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import time
-from dataclasses import asdict
 from typing import Callable
 
-import mujoco
 import numpy as np
 
 from backend.app.control.motion import GRASP_OFFSET, OpenArmV2Controller
-from backend.app.simulation.openarm_v2.environment import OpenArmV2Environment
+from backend.app.simulation.base import SimulationBackend
 
 
 class SkillError(Exception):
@@ -18,32 +16,18 @@ class SkillError(Exception):
 
 
 class SkillRunner:
-    def __init__(self, env: OpenArmV2Environment, controller: OpenArmV2Controller):
+    def __init__(self, env: SimulationBackend, controller: OpenArmV2Controller):
         self.env = env
         self.controller = controller
 
-    def _weld(self, arm: str, obj: str) -> int:
-        return mujoco.mj_name2id(
-            self.env.model, mujoco.mjtObj.mjOBJ_EQUALITY, f"grasp_{arm}_{obj}"
-        )
+    def _set_hold(self, arm: str, obj: str, active: bool) -> None:
+        """Start or release the engine's grasp hold for one arm/object pair.
 
-    def _set_weld(self, arm: str, obj: str, active: bool) -> None:
-        eid = self._weld(arm, obj)
-        if eid >= 0:
-            if active:
-                arm_body = mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_BODY, f"openarm_{arm}_ee_base_link")
-                obj_body = self.env._object_bodies[obj]
-                relative_rotation = np.zeros(4)
-                inverse_arm_rotation = np.zeros(4)
-                mujoco.mju_negQuat(inverse_arm_rotation, self.env.data.xquat[arm_body])
-                mujoco.mju_mulQuat(relative_rotation, inverse_arm_rotation, self.env.data.xquat[obj_body])
-                desired_world = GRASP_OFFSET.copy()
-                desired_local = self.env.data.xmat[arm_body].reshape(3, 3).T @ desired_world
-                self.env.model.eq_data[eid, 3:6] = desired_local
-                self.env.model.eq_data[eid, 6:10] = relative_rotation
-                self.env.model.eq_data[eid, 10] = 1.0
-            self.env.data.eq_active[eid] = bool(active)
-            mujoco.mj_forward(self.env.model, self.env.data)
+        MuJoCo uses the documented equality weld fallback; another engine may implement a
+        kinematic hold instead. `env.grasp_mode` says which, and it is reported with every
+        grasp result so a non-physical hold is never presented as contact-only manipulation.
+        """
+        self.env.set_grasp_hold(arm, obj, active)
 
     def _skill(self, name: str, run: Callable[[], dict], started: float) -> dict:
         try:
@@ -84,10 +68,11 @@ class SkillRunner:
         before = self.env.object_pose(obj)[0].copy()
         self.controller.wait_gripper(arm, True, 0.65)
         contacts = self.env.object_contacts(obj, arm)
-        self._set_weld(arm, obj, True)
+        self._set_hold(arm, obj, True)
         after = self.env.object_pose(obj)[0].copy()
         return {
-            "grasp_mode": "contact-assisted-weld",
+            "grasp_mode": self.env.grasp_mode,
+            "grasp_is_physical_contact": self.env.grasp_is_physical_contact,
             "physical_contacts": contacts,
             "position_before": before.tolist(),
             "position_after": after.tolist(),
@@ -117,7 +102,7 @@ class SkillRunner:
 
     def _release(self, arm: str, obj: str) -> dict:
         pos_before = self.env.object_pose(obj)[0].copy()
-        self._set_weld(arm, obj, False)
+        self._set_hold(arm, obj, False)
         self.controller.wait_gripper(arm, False, 0.45)
         return {"position_before": pos_before.tolist(), "position_after": self.env.object_pose(obj)[0].tolist()}
 

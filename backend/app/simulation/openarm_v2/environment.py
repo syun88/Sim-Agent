@@ -1,46 +1,53 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import mujoco
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[4]
-SCENE_PATH = ROOT / "assets" / "scenes" / "openarm_v2_demo.xml"
+from backend.app.simulation.base import Frame, SimulationBackend
+from backend.app.simulation.openarm_v2.definition import (
+    ARM_ACTUATORS,
+    ARM_JOINTS,
+    EE_SITES,
+    GRASP_OFFSET,
+    GRIPPER_ACTUATORS,
+    GRIPPER_CLOSED,
+    GRIPPER_OPEN,
+)
+from backend.app.simulation.openarm_v2.scene import (
+    DEMO_SCENE_PATH,
+    initial_object_positions,
+    resolved_scene_xml,
+)
 
-ARM_JOINTS = {
-    "left": [f"openarm_left_joint{i}" for i in range(1, 8)],
-    "right": [f"openarm_right_joint{i}" for i in range(1, 8)],
-}
-ARM_ACTUATORS = {
-    "left": [f"left_joint{i}_ctrl" for i in range(1, 8)],
-    "right": [f"right_joint{i}_ctrl" for i in range(1, 8)],
-}
-GRIPPER_ACTUATORS = {"left": "left_finger1_ctrl", "right": "right_finger1_ctrl"}
-GRIPPER_OPEN = {"left": 0.0, "right": -0.7854}
-GRIPPER_CLOSED = {"left": 0.02, "right": -0.02}
-EE_SITES = {"left": "left_ee_control_point", "right": "right_ee_control_point"}
+SCENE_PATH = DEMO_SCENE_PATH
+
+__all__ = [
+    "ARM_ACTUATORS",
+    "ARM_JOINTS",
+    "EE_SITES",
+    "GRIPPER_ACTUATORS",
+    "GRIPPER_CLOSED",
+    "GRIPPER_OPEN",
+    "Frame",
+    "OpenArmV2Environment",
+    "SCENE_PATH",
+]
 
 
-@dataclass
-class Frame:
-    sim_time: float
-    qpos: list[float]
-    objects: dict[str, list[float]]
-    zones: dict[str, list[float]]
-    ee: dict[str, list[float]]
-    grippers: dict[str, float]
-    contacts: list[str]
+class OpenArmV2Environment(SimulationBackend):
+    """Authoritative OpenArm v2 Cell simulation, run by MuJoCo."""
 
-
-class OpenArmV2Environment:
-    """Authoritative OpenArm v2 Cell simulation."""
+    name = "mujoco"
+    #: MuJoCo holds the object with the documented equality constraint after gripper closure.
+    grasp_mode = "contact-assisted-weld"
+    grasp_is_physical_contact = False
 
     def __init__(self, model_path: Path = SCENE_PATH):
         self.model_path = Path(model_path)
-        self.model = mujoco.MjModel.from_xml_path(str(self.model_path))
+        self.model = mujoco.MjModel.from_xml_string(resolved_scene_xml(self.model_path))
         self.data = mujoco.MjData(self.model)
         self._object_bodies = {
             name: self._body_id(name) for name in ("red_cube", "blue_cube")
@@ -64,6 +71,18 @@ class OpenArmV2Environment:
             side: self._actuator_id(name) for side, name in GRIPPER_ACTUATORS.items()
         }
         self._site_ids = {side: self._site_id(name) for side, name in EE_SITES.items()}
+        self._arm_joint_ids = {
+            side: np.array([self._joint_id(name) for name in ARM_JOINTS[side]])
+            for side in ARM_JOINTS
+        }
+        self._arm_qadr = {
+            side: np.array([int(self.model.jnt_qposadr[j]) for j in ids])
+            for side, ids in self._arm_joint_ids.items()
+        }
+        self._arm_dofadr = {
+            side: np.array([int(self.model.jnt_dofadr[j]) for j in ids])
+            for side, ids in self._arm_joint_ids.items()
+        }
         self.renderer: mujoco.Renderer | None = None
         self.reset()
 
@@ -102,18 +121,7 @@ class OpenArmV2Environment:
 
     def reset(self, randomize: bool = False) -> None:
         mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
-        base_positions = {
-            "red_cube": np.array([0.44, 0.15, 1.032]),
-            "blue_cube": np.array([0.50, -0.22, 1.032]),
-        }
-        if randomize:
-            base_positions["red_cube"] = np.array(
-                [self.rng.uniform(0.37, 0.42), self.rng.uniform(0.11, 0.18), 1.032]
-            )
-            base_positions["blue_cube"] += np.array(
-                [self.rng.uniform(-0.012, 0.012), self.rng.uniform(-0.012, 0.012), 0]
-            )
-        for name, pos in base_positions.items():
+        for name, pos in initial_object_positions(randomize).items():
             joint = self._object_joints[name]
             adr = self.model.jnt_qposadr[joint]
             self.data.qpos[adr : adr + 7] = [*pos.tolist(), 1, 0, 0, 0]
@@ -121,12 +129,70 @@ class OpenArmV2Environment:
         mujoco.mj_forward(self.model, self.data)
 
     @property
-    def rng(self) -> np.random.Generator:
-        return np.random.default_rng(20261017)
+    def timestep(self) -> float:
+        return float(self.model.opt.timestep)
 
     def step(self, steps: int = 1) -> None:
         for _ in range(steps):
             mujoco.mj_step(self.model, self.data)
+
+    # -- engine-neutral contract -------------------------------------------------
+
+    def arm_qpos(self, side: str) -> np.ndarray:
+        return self.data.qpos[self._arm_qadr[side]].copy()
+
+    def set_arm_qpos(self, side: str, targets: np.ndarray) -> None:
+        limits = self.arm_limits(side)
+        self.data.qpos[self._arm_qadr[side]] = np.clip(np.asarray(targets, float), limits[:, 0], limits[:, 1])
+
+    def arm_limits(self, side: str) -> np.ndarray:
+        return self.model.jnt_range[self._arm_joint_ids[side]].copy()
+
+    def kinematics(self) -> None:
+        mujoco.mj_kinematics(self.model, self.data)
+        mujoco.mj_comPos(self.model, self.data)
+
+    def refresh(self) -> None:
+        mujoco.mj_forward(self.model, self.data)
+
+    def ee_jacobian(self, side: str) -> tuple[np.ndarray, np.ndarray]:
+        site = self._site_ids[side]
+        dof = self._arm_dofadr[side]
+        jacp = np.zeros((3, self.model.nv))
+        jacr = np.zeros((3, self.model.nv))
+        mujoco.mj_jac(self.model, self.data, jacp, jacr, self.data.site_xpos[site], self.model.site_bodyid[site])
+        return jacp[:, dof], jacr[:, dof]
+
+    def apply_gravity_compensation(self, side: str) -> None:
+        dof = self._arm_dofadr[side]
+        self.data.qfrc_applied[dof] = self.data.qfrc_bias[dof]
+
+    def object_linear_speed(self, name: str) -> float:
+        dof = int(self.model.jnt_dofadr[self._object_joints[name]])
+        return float(np.linalg.norm(self.data.qvel[dof : dof + 3]))
+
+    def set_grasp_hold(self, arm: str, object_name: str, active: bool) -> None:
+        """Activate or release the documented MuJoCo equality weld used as the grasp fallback."""
+        eid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_EQUALITY, f"grasp_{arm}_{object_name}")
+        if eid < 0:
+            return
+        if active:
+            arm_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"openarm_{arm}_ee_base_link")
+            obj_body = self._object_bodies[object_name]
+            relative_rotation = np.zeros(4)
+            inverse_arm_rotation = np.zeros(4)
+            mujoco.mju_negQuat(inverse_arm_rotation, self.data.xquat[arm_body])
+            mujoco.mju_mulQuat(relative_rotation, inverse_arm_rotation, self.data.xquat[obj_body])
+            desired_local = self.data.xmat[arm_body].reshape(3, 3).T @ GRASP_OFFSET.copy()
+            self.model.eq_data[eid, 3:6] = desired_local
+            self.model.eq_data[eid, 6:10] = relative_rotation
+            self.model.eq_data[eid, 10] = 1.0
+        self.data.eq_active[eid] = bool(active)
+        mujoco.mj_forward(self.model, self.data)
+
+    def grasp_hold_active(self, arm: str, object_name: str) -> bool:
+        eid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_EQUALITY, f"grasp_{arm}_{object_name}")
+        return eid >= 0 and bool(self.data.eq_active[eid])
 
     def set_arm(self, side: str, targets: list[float] | np.ndarray) -> None:
         ids = self._actuator_ids[side]

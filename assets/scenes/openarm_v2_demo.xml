@@ -4,7 +4,9 @@
   Copyright 2026 Enactic, Inc. Official model components are Apache-2.0.
 -->
 <mujoco model="openarm_v20_embodied_demo">
-  <compiler angle="radian" meshdir="/Users/syun/Sim-Agent/.venv/share/openarm_mujoco/v2/assets"/>
+  <!-- The two path tokens are resolved from the installed openarm-mujoco package
+       by backend/app/simulation/openarm_v2/scene.py, so the scene is machine independent. -->
+  <compiler angle="radian" meshdir="@OPENARM_MUJOCO_V2_ASSETS_DIR@"/>
   <statistic center="1.3 0 0.6" extent="3.5" meansize="0.05"/>
   <option timestep="0.001" cone="elliptic" impratio="10"/>
 
@@ -16,7 +18,7 @@
   </visual>
 
   <asset>
-    <model name="cell" file="/Users/syun/Sim-Agent/.venv/share/openarm_mujoco/v2/cell/cell.xml"/>
+    <model name="cell" file="@OPENARM_MUJOCO_V2_CELL_XML@"/>
   </asset>
 
   <worldbody>

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from backend.app.simulation.openarm_v2.environment import OpenArmV2Environment
+from backend.app.simulation.base import SimulationBackend
 
 
-def build_world_state(env: OpenArmV2Environment) -> dict:
+def build_world_state(env: SimulationBackend) -> dict:
     frame = env.frame()
     objects = []
     for name, position in frame.objects.items():

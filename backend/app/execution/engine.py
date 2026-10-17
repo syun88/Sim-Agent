@@ -10,13 +10,13 @@ from backend.app.control.motion import OpenArmV2Controller
 from backend.app.memory.graph_memory import MemoryStore
 from backend.app.models.schemas import AgentPlan, TaskRequest
 from backend.app.planning.agent_planner import AgentPlanner, validate_plan
-from backend.app.simulation.openarm_v2.environment import OpenArmV2Environment
+from backend.app.simulation.base import SimulationBackend
 from backend.app.skills.robot_skills import SkillRunner
 from backend.app.verification.goal_verification import verify_place_goal
 
 
 class ExecutionEngine:
-    def __init__(self, env: OpenArmV2Environment, memory: MemoryStore):
+    def __init__(self, env: SimulationBackend, memory: MemoryStore):
         self.env = env
         self.memory = memory
         self.controller = OpenArmV2Controller(env)

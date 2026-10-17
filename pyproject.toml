@@ -19,3 +19,15 @@ dependencies = [
     "python-dotenv>=1.2.4",
     "uvicorn[standard]>=0.54.0",
 ]
+
+# Optional second physics engine. Install with `uv sync --extra genesis`; the MuJoCo path never
+# imports it, and Genesis needs Python <3.14 and its own PyTorch build.
+[project.optional-dependencies]
+genesis = ["genesis-world>=1.4.4"]
+
+[tool.pytest.ini_options]
+markers = [
+    "genesis: requires the optional Genesis World engine (started with SIM_AGENT_TEST_GENESIS=1)",
+]
+testpaths = ["backend/tests", "tests"]
+

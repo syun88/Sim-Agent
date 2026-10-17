@@ -18,14 +18,14 @@ from backend.app.agent.world_state import build_world_state
 from backend.app.execution.engine import ExecutionEngine
 from backend.app.memory.graph_memory import MemoryStore
 from backend.app.models.schemas import TaskRequest, TaskResponse
-from backend.app.simulation.openarm_v2.environment import OpenArmV2Environment
+from backend.app.simulation import available_backends, create_backend
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.env = OpenArmV2Environment()
+    app.state.env = create_backend()
     app.state.memory = MemoryStore()
     app.state.engine = ExecutionEngine(app.state.env, app.state.memory)
     app.state.engine.subscribe(lambda event: app.state.latest_events.append(event))
@@ -42,6 +42,9 @@ class Health(BaseModel):
     status: str
     robot: str
     simulation: str
+    simulation_engine: str
+    simulation_authoritative: bool
+    grasp_mode: str
     provider: str
     memory: str
     agent: str
@@ -50,10 +53,14 @@ class Health(BaseModel):
 @app.get("/api/health", response_model=Health)
 def health() -> Health:
     engine: ExecutionEngine = app.state.engine
+    env = app.state.env
     return Health(
         status="ok",
         robot="OpenArm v2",
         simulation="Connected",
+        simulation_engine=env.name,
+        simulation_authoritative=bool(next(item["authoritative"] for item in available_backends() if item["name"] == env.name)),
+        grasp_mode=env.grasp_mode,
         provider="ai&" if engine.planner.enabled else "Fallback",
         memory="Connected" if app.state.memory.available else "Fallback",
         agent=engine.state,
@@ -63,6 +70,12 @@ def health() -> Health:
 @app.get("/api/system/status")
 def system_status():
     return health().model_dump()
+
+
+@app.get("/api/backends")
+def backends():
+    """Describe the available engines and which one this process selected."""
+    return {"active": app.state.env.name, "backends": available_backends()}
 
 
 @app.get("/api/scene")
@@ -130,7 +143,10 @@ def reconnect_memory():
 @app.get("/api/config/status")
 def config_status():
     engine: ExecutionEngine = app.state.engine
+    env = app.state.env
     return {
+        "simulation_engine": env.name,
+        "simulation_backend_env": os.getenv("SIM_BACKEND", "mujoco"),
         "ai_provider": "ai&" if engine.planner.enabled else "Fallback",
         "ai_model": os.getenv("AI_AND_MODEL", ""),
         "ai_base_url_configured": bool(os.getenv("AI_AND_BASE_URL")),
@@ -157,6 +173,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 image = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
             payload = {
                 "type": "simulation_frame",
+                "engine": app.state.env.name,
+                "grasp_mode": app.state.env.grasp_mode,
                 "state": state,
                 "sim_time": frame.sim_time,
                 "qpos": frame.qpos,
