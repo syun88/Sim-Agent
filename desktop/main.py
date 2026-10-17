@@ -223,7 +223,7 @@ def build_ui() -> None:
                 with dpg.tab_bar():
                     with dpg.tab(label="Simulation"):
                         dpg.add_image("sim_texture", width=960, height=720)
-                        dpg.add_text("Live OpenArm v2 render from MuJoCo. Contact-assisted weld grasp mode.")
+                        dpg.add_text("Live OpenArm v2 render. Physical fingertip-pinch grasp (friction, verified by contact).")
                     with dpg.tab(label="Agent Events"):
                         dpg.add_input_text(tag="events_text", multiline=True, readonly=True, default_value="", height=-1, width=-1)
                     with dpg.tab(label="Graph Memory"):

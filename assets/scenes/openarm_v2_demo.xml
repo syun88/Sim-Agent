@@ -48,11 +48,4 @@
     </body>
   </worldbody>
 
-  <equality>
-    <weld name="grasp_left_red_cube" body1="openarm_left_ee_base_link" body2="red_cube" active="false"/>
-    <weld name="grasp_left_blue_cube" body1="openarm_left_ee_base_link" body2="blue_cube" active="false"/>
-    <weld name="grasp_right_red_cube" body1="openarm_right_ee_base_link" body2="red_cube" active="false"/>
-    <weld name="grasp_right_blue_cube" body1="openarm_right_ee_base_link" body2="blue_cube" active="false"/>
-  </equality>
-
 </mujoco>

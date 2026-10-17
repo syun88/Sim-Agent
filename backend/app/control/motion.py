@@ -7,7 +7,6 @@ import numpy as np
 
 from backend.app.simulation.base import SimulationBackend
 from backend.app.simulation.openarm_v2.definition import (
-    GRASP_OFFSET,
     GRASP_ROTATION,
     GRIPPER_CLOSED,
     GRIPPER_OPEN,
@@ -15,8 +14,6 @@ from backend.app.simulation.openarm_v2.definition import (
 from backend.app.simulation.transform import orientation_error
 
 __all__ = [
-    "GRASP_OFFSET",
-    "GRASP_ROTATION",
     "MotionResult",
     "OpenArmV2Controller",
 ]
@@ -153,9 +150,6 @@ class OpenArmV2Controller:
         start = self.env.arm_qpos(side)
         path = [(1 - a) * start + a * q for a in np.linspace(0, 1, 8)]
         return self.execute_joint_path(side, path, 0.08, progress)
-
-    def grasp_target(self, object_position: np.ndarray) -> np.ndarray:
-        return np.asarray(object_position, float) - GRASP_OFFSET
 
     def set_gripper(self, side: str, closed: bool) -> None:
         self.env.set_gripper(side, GRIPPER_CLOSED[side] if closed else GRIPPER_OPEN[side])
