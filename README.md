@@ -37,7 +37,7 @@ physical result, records experience, and reuses memory on later tasks.
 - Deterministic memory selection that changes the approach offset from an exploratory 55 mm to a
   remembered safe 60 mm after a related successful execution.
 - OpenAI-compatible `ai&` client with deterministic fallback when credentials are missing.
-- **26 automated tests, all passing** (`pytest -q`).
+- **28 automated tests, all passing** (`pytest -q`).
 
 ### Verified demonstration
 
@@ -112,7 +112,7 @@ labelled `kinematic-grasp-hold`, and this project does not claim contact-only ma
 
 ```bash
 uv sync
-uv run pytest -q                          # 26 tests, the engine is required
+uv run pytest -q                          # 28 tests, the engine is required
 uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --reload
 uv run python scripts/record_demo.py      # regenerates outputs/openarm-v2-demo.mp4
 cd frontend && npm install && npm run dev

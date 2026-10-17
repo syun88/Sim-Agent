@@ -79,7 +79,7 @@ that pose.
 ### Genesis World engine: status
 
 Verified by `backend/tests/test_official_model_fidelity.py`, `backend/tests/test_openarm.py` and
-`backend/tests/test_transform.py` (26 tests, `pytest -q`):
+`backend/tests/test_transform.py` (28 tests, `pytest -q`):
 
 - the ground truth for structure is the model description, compiled by MuJoCo and evaluated with its own
   kinematics routines (`mj_kinematics`, `mj_comPos`, `mj_jac`) - pure kinematics, no solver, no stepping;
