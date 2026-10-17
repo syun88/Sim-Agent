@@ -36,7 +36,7 @@ def test_factory_hands_the_gpu_setting_to_the_engine(monkeypatch):
     requested: list[bool] = []
 
     class RecordingEngine:
-        def __init__(self, prefer_gpu: bool = False):
+        def __init__(self, prefer_gpu: bool = False, show_viewer: bool = False):
             requested.append(prefer_gpu)
 
     monkeypatch.setattr(simulation, "GenesisOpenArmV2Environment", RecordingEngine)
