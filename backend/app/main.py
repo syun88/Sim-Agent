@@ -178,38 +178,14 @@ def config_status():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    queue: list[dict] = []
-    unsubscribe = app.state.engine.subscribe(lambda event: queue.append(event))
-    try:
-        while True:
-            state = build_world_state(app.state.env)
-            frame = app.state.env.frame()
-            rendered = app.state.env.render(720, 480)
-            image = None
-            if rendered is not None:
-                buffer = io.BytesIO()
-                Image.fromarray(rendered).save(buffer, format="JPEG", quality=80)
-                image = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
-            payload = {
-                "type": "simulation_frame",
-                "engine": app.state.env.name,
-                "grasp_mode": app.state.env.grasp_mode,
-                "state": state,
-                "sim_time": frame.sim_time,
-                "qpos": frame.qpos,
-                "contacts": frame.contacts,
-                "events": queue[:30],
-                "agent_state": app.state.engine.state,
-                "current": app.state.engine.current,
-                "image": image,
-            }
-            queue.clear()
-            await websocket.send_json(payload)
-            await asyncio.sleep(0.1)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        unsubscribe()
+    # The Genesis viewer renders in its own process. The dashboard image feed is
+    # served by the full React app's own polling of /api/executions; the
+    # lightweight /simple page does not need a WebSocket at all.
+    await websocket.send_json({
+        "type": "info",
+        "message": "Genesis viewer renders in its own process; no simulation frame feed here.",
+    })
+    await websocket.close()
 
 
 import asyncio
