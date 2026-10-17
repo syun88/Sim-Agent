@@ -3,7 +3,6 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 export SIM_BACKEND=genesis
-export GENESIS_SHOW_VIEWER=1
 
 if [[ ! -f .env ]]; then
   echo "Missing .env. Copy .env.example and add Neo4j credentials." >&2
@@ -13,7 +12,7 @@ fi
 uv sync
 
 # Start the web backend in the background so the Genesis viewer can poll it.
-uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-access-log --log-level warning &
+GENESIS_SHOW_VIEWER= uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-access-log --log-level warning &
 BACKEND_PID=$!
 trap "kill $BACKEND_PID 2>/dev/null" EXIT
 
@@ -29,4 +28,4 @@ echo "Web UI:  http://127.0.0.1:8000/simple"
 echo "Starting Genesis native viewer..."
 
 # Genesis viewer needs the main thread on macOS.
-uv run python run_genesis_gui.py
+GENESIS_SHOW_VIEWER=1 uv run python run_genesis_gui.py
