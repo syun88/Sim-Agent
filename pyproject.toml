@@ -1,0 +1,21 @@
+[project]
+name = "sim-agent"
+version = "0.1.0"
+description = "OpenArm v2 embodied AI agent with MuJoCo, AI planning, graph memory, and web dashboard"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.143.3",
+    "httpx>=0.28.1",
+    "imageio>=2.38.1",
+    "imageio-ffmpeg>=0.6.0",
+    "mujoco>=3.16.0",
+    "neo4j>=6.4.1",
+    "numpy>=2.5.4",
+    "openai>=3.33.0",
+    "openarm-mujoco>=2.3.0",
+    "pillow>=13.0.0",
+    "pydantic>=2.14.1",
+    "pytest>=9.1.1",
+    "python-dotenv>=1.2.4",
+    "uvicorn[standard]>=0.54.0",
+]
