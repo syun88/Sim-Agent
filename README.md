@@ -1,60 +1,88 @@
-# Embodied AI Agent — OpenArm v2
+# Embodied AI Agent — OpenArm v2 on Genesis World
 
 **Think. Act. Learn.**
 
-This repository contains a hackathon implementation of an embodied agent that accepts natural-language manipulation tasks, plans a restricted skill sequence, executes it on an official OpenArm v2 Cell model in MuJoCo, independently verifies the physical result, records experience, and reuses memory on later tasks.
+This repository contains a hackathon implementation of an embodied agent that accepts natural-language
+manipulation tasks, plans a restricted skill sequence, executes it on the official OpenArm v2 Cell model
+in [Genesis World](https://github.com/Genesis-Embodied-AI/genesis-world), independently verifies the
+physical result, records experience, and reuses memory on later tasks.
 
 ## What is implemented
 
-### Implemented and verified locally
+### Implemented and verified on this machine
 
 - Official `openarm-mujoco` 2.3.0 OpenArm v2 bimanual Cell model, with both arms displayed.
-- Machine-independent scene loading: the demo scene resolves its official asset paths from the installed `openarm-mujoco` package at load time.
-- **Two simulation engines behind one contract**: MuJoCo (default, authoritative) and Genesis World (opt-in, `SIM_BACKEND=genesis`). Both compile the same resolved MJCF, and their reset state, forward kinematics, gripper control point and Jacobians agree to 1e-6.
-- Custom demo scene based on the official Cell model, adding one red cube, one blue cube, a blue target zone, and a green target zone.
-- Damped least-squares inverse kinematics, joint position control, gripper control, timed skills, cancellation, and reset. The controller and its rotation algebra are engine-neutral and pinned against MuJoCo's `mju_*` functions.
-- A complete red-cube Pick & Place with the left arm and left gripper.
-- Physical result verification from engine measurements, including 40 mm horizontal tolerance, release check, stability check, and measured position error.
-- FastAPI APIs and WebSocket simulation frames encoded from the active engine's renders; `/api/health` and `/api/backends` report which engine served the task.
-- React + TypeScript + Vite dashboard with task input, plan, live robot state, engine and grasp-mode badges, agent events, verification, and history.
+- Machine-independent scene loading: the demo scene resolves its official asset paths from the installed
+  `openarm-mujoco` package at load time, so no machine-specific path is stored.
+- **One engine-neutral simulation contract**: the planner, skills, controller and verification step read
+  poses, Jacobians, contacts and grasp state only through `SimulationBackend`, and never import the
+  engine. MuJoCo's compiler is used as the *reader* of the model description (sites, keyframe, actuator
+  mapping), which Genesis does not implement; the physics is Genesis World 1.4.4.
+- The engine's own state is checked against that model description: reset state, forward kinematics, the
+  gripper control point and the 3x7 linear and angular Jacobians agree to 1e-5 / 1e-6 with the compiled
+  MJCF evaluated by MuJoCo's kinematics routines.
+- Custom demo scene based on the official Cell model, adding one red cube, one blue cube, a blue target
+  zone, and a green target zone.
+- Damped least-squares inverse kinematics, joint position control, gripper control, timed skills,
+  cancellation, and reset. The controller's rotation algebra is NumPy and is pinned against MuJoCo's
+  `mju_*` functions.
+- A complete red-cube Pick & Place with the left arm and a blue-cube Pick & Place with the right arm.
+- Physical result verification from engine measurements, including 40 mm horizontal tolerance, release
+  check, stability check, and measured position error.
+- FastAPI APIs and WebSocket simulation frames from the engine's renders; `/api/health` reports the
+  engine and the grasp mode.
+- React + TypeScript + Vite dashboard with task input, plan, live robot state, engine and grasp-mode
+  badges, agent events, verification, and history.
 - Neo4j AuraDB integration with local JSON fallback, parameterized Cypher persistence, and retrieval.
-- Deterministic memory selection that changes the approach offset from an exploratory 55 mm to a remembered safe 60 mm after a related successful execution.
+- Deterministic memory selection that changes the approach offset from an exploratory 55 mm to a
+  remembered safe 60 mm after a related successful execution.
 - OpenAI-compatible `ai&` client with deterministic fallback when credentials are missing.
-- 31 automated tests, all passing on both engines (MuJoCo alone: 11 tests plus 20 parametrized Genesis cases skipped unless `SIM_AGENT_TEST_GENESIS=1`).
+- **25 automated tests, all passing** (`pytest -q`).
 
 ### Verified demonstration
 
-The red cube starts near `(0.44, 0.15, 1.032)`. The left arm approaches, closes its gripper, activates a documented contact-assisted weld, lifts, moves to the blue zone, releases, and retreats. Measured horizontal error: 8.3 mm in the original macOS validation run and 10.8 mm in the Linux re-validation, against a 40 mm tolerance.
+The red cube starts at `(0.44, 0.15, 1.032)`. The left arm approaches, closes its gripper, starts the
+documented grasp hold, lifts, moves over the blue zone, releases, and retreats.
 
-The initial grasp mode is **not presented as contact-only manipulation**. MuJoCo contacts are monitored, but the current stable execution uses an explicit MuJoCo weld fallback after gripper closure. This is shown in the UI as a grasp badge and recorded in skill results as `grasp_mode: contact-assisted-weld`.
+Measured through the task API on this machine:
 
-## Simulation engines
-
-MuJoCo is the default engine and remains the authoritative source of robot and object state.
-[Genesis World](https://github.com/Genesis-Embodied-AI/genesis-world) can run the identical scene as a
-second, independent physics implementation:
-
-```bash
-uv sync --extra genesis            # Genesis World needs Python <3.14 and its own PyTorch build
-SIM_BACKEND=genesis ./run.sh       # MuJoCo stays the default
+```
+task success: True, retries: 0, attempts: 1
+verification: horizontal error 34.2 mm (tolerance 40 mm), vertical error 23 mm,
+              released True, stable True, engine genesis, grasp_mode kinematic-grasp-hold
 ```
 
-On the Genesis engine the grasp hold is a **labelled kinematic fallback** (`grasp_mode:
-kinematic-grasp-hold`): Genesis takes its MJCF equality constraints at build time and offers no runtime
-enable/disable for them, so the held object's pose is prescribed from the gripper base link on every
-step. Finger contacts are still monitored and reported, but neither engine claims contact-only
-manipulation.
+Repeat runs land between 30 and 35 mm horizontally, from both the documented and the randomized start pose.
 
-Verified on both engines (`SIM_AGENT_TEST_GENESIS=1 uv run pytest -q`, 31 passed): the official model
-loads with the same link and joint names, `reset()` and `reset(randomize=True)` produce the same initial
-state to 1e-5, forward kinematics and the 3x7 linear/angular Jacobians agree to 1e-6, the same IK target
-solves to the same joint solution, and both arms' pick & place pass the same independent verification.
+The grasp is **never presented as contact-only manipulation**. Finger contacts are monitored and reported
+per skill result, but the hold itself is the engine's fallback, and it is labelled everywhere it appears:
+in skill results (`grasp_mode: kinematic-grasp-hold`), in `/api/health`, and on the dashboard badge.
 
-Three engine differences had to be handled explicitly, each covered by those tests: Genesis ignores
-MuJoCo's `active` flag on equalities, has no bias feed-forward in its position controller, and zeroes
-every dof velocity on `set_qpos(zero_velocity=True)`. They are described in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#genesis-world-engine-status).
+## Simulation engine
 
+Genesis World runs the resolved MJCF — the official Cell model **attached, not copied or substituted** —
+plus the demo objects. Install it, start the server:
+
+```bash
+uv sync                 # genesis-world 1.4.4, needs Python 3.12 or 3.13
+./run.sh
+```
+
+Three things Genesis does differently from the model description, each handled explicitly and each
+covered by a test:
+
+| Difference | Handling |
+|---|---|
+| Genesis builds every MJCF equality and reads no `active` flag, and has no runtime enable/disable | the four grasp welds the scene declares `active="false"` are removed from the XML Genesis is given, so a grasp is started by the engine's own hold instead of a weld that would exist from reset |
+| its position controller has no bias feed-forward, so a commanded pose rests `gravity_torque / kp` short of its target (measured 9.6 mm) | `apply_gravity_compensation()` writes the arm's gravity torque into the constant term of the actuator model (`act_bias[0]`, the analogue of the model's `biasprm[0]`); a free-space hold then measures 0.87 mm, with the solver's implicit damping kept and the cubes keeping their gravity |
+| `set_qpos(..., zero_velocity=True)` zeroes *every* dof of the entity, which also stopped the arm mid-path during transport | only the held object's dofs have their velocity reset |
+| Genesis does not implement MJCF sites | the gripper control point and the zone origins are read as a parent link plus a local offset from the same XML string, with MuJoCo's compiler |
+
+Grasping is the one deliberate difference that is *not* a bug fix: Genesis takes equalities at build time
+and `attach()` has no detach, so a grasp is a **kinematic hold** — while active, the object's free-joint
+pose is prescribed from the gripper base link each step, at the documented grasp offset. It is therefore
+labelled `kinematic-grasp-hold`, and this project does not claim contact-only manipulation.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the measurements and the reasoning.
 
 ## Quick start
 
@@ -67,13 +95,7 @@ every dof velocity on `set_qpos(zero_velocity=True)`. They are described in
    NEO4J_DATABASE=neo4j
    ```
 
-   Optionally add:
-
-   ```bash
-   AI_AND_API_KEY=...
-   AI_AND_BASE_URL=...
-   AI_AND_MODEL=...
-   ```
+   Optionally add `AI_AND_API_KEY`, `AI_AND_BASE_URL`, `AI_AND_MODEL`.
 
 2. Start:
 
@@ -85,30 +107,28 @@ every dof velocity on `set_qpos(zero_velocity=True)`. They are described in
 
 ## Development commands
 
-`uv` is used in the commands below; any Python 3.12+ environment with the dependencies from
-`pyproject.toml` works as well.
-
 ```bash
 uv sync
-uv run pytest -q                          # MuJoCo only (default)
-SIM_AGENT_TEST_GENESIS=1 uv run pytest -q # adds the optional Genesis World parity tests
+uv run pytest -q                          # 25 tests, the engine is required
 uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --reload
-cd frontend
-npm install
-npm run dev
-npm run build
+uv run python scripts/record_demo.py      # regenerates outputs/openarm-v2-demo.mp4
+cd frontend && npm install && npm run dev
 ```
 
-During development the Vite server is at [http://127.0.0.1:5173](http://127.0.0.1:5173).
+Any Python 3.12 environment with the dependencies from `pyproject.toml` works as well; the suite fails
+loudly (rather than skipping) if the engine is missing.
 
 ## Demo script
 
 1. Press **Reset**.
 2. Enter: `Move the red cube into the blue zone.`
-3. Press **Execute** and observe the generated plan, OpenArm v2 motion, grasp, transport, release, and verification.
+3. Press **Execute** and observe the plan, the OpenArm v2 motion, the grasp, transport, release, and the
+   verification panel.
 4. Press **Random** to change the initial cube pose, then repeat the task.
 5. Inspect **Execution History** for real durations, retries, and failure categories.
 6. If Neo4j is available, check `/api/memory` and the dashboard status.
+
+`docs/DEMO.md` walks through the same sequence and what each badge means.
 
 The task API also supports:
 
@@ -116,15 +136,18 @@ The task API also supports:
 {"instruction": "Move the red cube into the blue zone.", "randomize": true, "force_failure": false}
 ```
 
-`force_failure` is a controlled, recoverable demonstration fault. The first attempt uses an unreachable approach offset, produces a real `IK_FAILURE`, triggers bounded replanning, and the second attempt uses the valid approach. No pre-recorded success is substituted for the recovery run.
+`force_failure` is a controlled, recoverable demonstration fault: the first attempt uses an unreachable
+approach offset and produces a real `IK_FAILURE`, the planner replans within its bound, and the second
+attempt runs physically. Verified on this engine (`retries: 1`, attempt 1 `IK_FAILURE`, attempt 2
+`SUCCEEDED`); no pre-recorded success is substituted for the recovery run.
 
-`randomize` is a documented scene reset/setup operation; it does not teleport the object during task execution.
+`randomize` is a documented scene reset/setup operation with a fixed seed; it does not teleport the object
+during task execution.
 
 ## API
 
 - `GET /api/health`
 - `GET /api/system/status`
-- `GET /api/backends`
 - `GET /api/scene`
 - `POST /api/scene/reset?randomize=false`
 - `POST /api/tasks`
@@ -143,28 +166,43 @@ No API endpoint returns credentials.
 ```mermaid
 flowchart TD
   U[User instruction] --> P[Planner / validator]
-  W[(World state from the active engine)] --> P
+  W[(World state from the engine)] --> P
   M[(Neo4j AuraDB / local fallback)] --> P
   P --> E[Execution engine]
   E --> S[OpenArm v2 skills]
   S --> C[Engine-neutral controller / IK]
-  C --> Q[(MuJoCo or Genesis World running the official OpenArm v2 Cell)]
+  C --> Q[(Genesis World running the official OpenArm v2 Cell)]
   Q --> V[Independent verification]
   V --> E
   E --> M
   Q --> F[Web dashboard]
   E --> F
+  MD[(Official MJCF: one model description)] -.->|read by MuJoCo's compiler| Q
 ```
 
 ## Asset and license attribution
 
-The robot and Cell scene originate from the official [openarm_mujoco](https://github.com/enactic/openarm_mujoco) package installed as `openarm-mujoco` 2.3.0. Official XML comments include Enactic copyright and Apache-2.0 licensing. The custom `assets/scenes/openarm_v2_demo.xml` only attaches the official Cell model and adds demonstration objects/zones. The reference repository `openarm-control` was inspected for control patterns; no framework code was copied. [Genesis World](https://github.com/Genesis-Embodied-AI/genesis-world) `genesis-world` 1.4.4 is Apache-2.0 and is used as an optional second physics engine; no Genesis code was copied into this repository.
+The robot and Cell scene originate from the official [openarm_mujoco](https://github.com/enactic/openarm_mujoco)
+package installed as `openarm-mujoco` 2.3.0. Official XML comments include Enactic copyright and
+Apache-2.0 licensing. The custom `assets/scenes/openarm_v2_demo.xml` only attaches the official Cell model
+and adds demonstration objects/zones. The reference repository `openarm-control` was inspected for control
+patterns; no framework code was copied. [Genesis World](https://github.com/Genesis-Embodied-AI/genesis-world)
+`genesis-world` 1.4.4 is Apache-2.0 and is the physics engine; no Genesis code was copied into this
+repository. MuJoCo arrives as a Genesis dependency and is used in this project only to read the model
+description and, in tests, as the kinematics reference.
 
 ## Known limitations
 
-- Neo4j AuraDB connection was not yet available during the initial validation run (`ServiceUnavailable: Unable to retrieve routing information`), so the app correctly used the labeled local fallback. The AuraDB integration remains implemented and will activate automatically once the instance accepts routing connections.
-- No `ai&` credentials were configured, so planning used the labeled deterministic fallback. The OpenAI-compatible client is implemented and will activate automatically when all three variables are set.
-- Grasping is never presented as contact-only: MuJoCo uses the documented weld fallback after gripper closure (`contact-assisted-weld`) and Genesis uses a documented kinematic hold (`kinematic-grasp-hold`). Physical contacts are monitored on both, but not yet reliable enough to claim contact-only manipulation.
-- Both arms are loaded and displayed. The left arm has a verified red-cube task and the right arm has a verified blue-cube task. A coordinated simultaneous bimanual task is not complete.
-- Camera orbit/zoom is not yet implemented in the browser.
-- `scripts/record_demo.py` can regenerate a low-resolution backup MP4 at `outputs/openarm-v2-demo.mp4`; the output is generated from the same real MuJoCo run and is not a substitute for live execution.
+- Neo4j AuraDB connection was not validated on this machine (`ServiceUnavailable: Unable to retrieve
+  routing information`), so the app used its labeled local fallback. The AuraDB integration is implemented
+  and activates automatically once the instance accepts routing connections.
+- No `ai&` credentials were configured, so planning used the labelled deterministic fallback. The
+  OpenAI-compatible client activates when all three variables are set.
+- Grasping is a labelled kinematic hold, not contact-only manipulation. Finger contacts are monitored but
+  not reliable enough to claim a purely contact-driven grasp.
+- Both arms are loaded and displayed, each with a verified single-arm task. A coordinated simultaneous
+  bimanual task is not complete.
+- Camera orbit/zoom is not implemented in the browser; the view is the fixed camera in
+  `backend/app/simulation/genesis_backend/environment.py`.
+- `scripts/record_demo.py` regenerates a low-resolution backup MP4 at `outputs/openarm-v2-demo.mp4` from a
+  real run, and deletes it if any skill or the verification failed.

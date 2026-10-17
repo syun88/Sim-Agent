@@ -5,12 +5,10 @@ The agent never talks to a physics engine directly:
 - the planner only reads `build_world_state()`, which serializes `frame()`;
 - the skills and the verification step drive the robot through the operations below.
 
-MuJoCo and Genesis World are two implementations of this contract. MuJoCo stays the
-authoritative source of robot and object state; Genesis is an additional engine used to
-reproduce the same task on a second physics implementation. Each backend declares how it
-implements the parts MuJoCo expresses natively (grasp hold, gravity compensation), so
-nothing engine specific leaks into the agent, and every engine specific behaviour stays
-labelled.
+Genesis World is the implementation of this contract. It declares how it implements the parts the
+model description expresses natively (grasp hold, gravity compensation), so nothing engine specific
+leaks into the agent, and every engine specific behaviour stays labelled - which is what lets a
+replacement engine be added, or this one be swapped, without touching the agent layers.
 """
 
 from __future__ import annotations
@@ -68,7 +66,7 @@ class SimulationBackend(ABC):
 
     @abstractmethod
     def frame(self) -> Frame:
-        """Serialize the authoritative engine state."""
+        """Serialize the engine state for the planner."""
 
     @abstractmethod
     def render(self, width: int = 720, height: int = 480) -> np.ndarray | None:

@@ -23,9 +23,9 @@ class SkillRunner:
     def _set_hold(self, arm: str, obj: str, active: bool) -> None:
         """Start or release the engine's grasp hold for one arm/object pair.
 
-        MuJoCo uses the documented equality weld fallback; another engine may implement a
-        kinematic hold instead. `env.grasp_mode` says which, and it is reported with every
-        grasp result so a non-physical hold is never presented as contact-only manipulation.
+        The engine implements this the way its own constraint system allows, which on Genesis World
+        is a kinematic hold. `env.grasp_mode` says which, and it is reported with every grasp
+        result so a non-physical hold is never presented as contact-only manipulation.
         """
         self.env.set_grasp_hold(arm, obj, active)
 

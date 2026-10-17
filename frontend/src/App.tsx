@@ -9,7 +9,7 @@ const examples = [
 
 export default function App() {
   const [instruction, setInstruction] = useState(examples[0])
-  const [status, setStatus] = useState({ provider: '...', neo4j: '...', agent: '...', engine: 'mujoco', authoritative: true, graspMode: 'contact-assisted-weld' })
+  const [status, setStatus] = useState({ provider: '...', neo4j: '...', agent: '...', engine: 'genesis', description: 'Genesis World', graspMode: 'kinematic-grasp-hold' })
   const [frame, setFrame] = useState<Frame | null>(null)
   const [plan, setPlan] = useState<Plan | null>(null)
   const [history, setHistory] = useState<Execution[]>([])
@@ -33,7 +33,7 @@ export default function App() {
     const health = await (await fetch('/api/health')).json()
     const executions = await (await fetch('/api/executions')).json()
     const memory = await (await fetch('/api/memory')).json()
-    setStatus({ provider: health.provider, neo4j: health.memory, agent: health.agent, engine: health.simulation_engine, authoritative: health.simulation_authoritative, graspMode: health.grasp_mode })
+    setStatus({ provider: health.provider, neo4j: health.memory, agent: health.agent, engine: health.simulation_engine, description: health.simulation_description, graspMode: health.grasp_mode })
     setHistory(executions.slice().reverse())
     setMemory(memory)
   }
@@ -68,11 +68,11 @@ export default function App() {
       <header className="flex items-center justify-between px-6 py-4 border-b border-white/10">
         <div>
           <h1 className="text-xl font-semibold">Embodied AI Agent</h1>
-          <p className="text-xs text-slate-400">OpenArm v2 · {(frame?.engine ?? status.engine) === 'genesis' ? 'Genesis World' : 'MuJoCo'} · Think. Act. Learn.</p>
+          <p className="text-xs text-slate-400">OpenArm v2 · {status.description} · Think. Act. Learn.</p>
         </div>
         <div className="flex gap-2 text-xs">
-          <Badge label={(frame?.engine ?? status.engine) === 'genesis' ? 'Genesis' : 'MuJoCo'} value={status.authoritative ? 'Authoritative' : 'Alternative'} tone={status.authoritative ? 'green' : 'amber'} />
-          <Badge label="Grasp" value={frame?.grasp_mode ?? status.graspMode} tone={(frame?.grasp_mode ?? status.graspMode) === 'contact-assisted-weld' ? 'green' : 'amber'} />
+          <Badge label="Engine" value={frame?.engine ?? status.engine} tone="blue" />
+          <Badge label="Grasp" value={frame?.grasp_mode ?? status.graspMode} tone="amber" />
           <Badge label="Robot" value="OpenArm v2" tone="blue" />
           <Badge label="AI" value={status.provider} tone={status.provider === 'ai&' ? 'green' : 'amber'} />
           <Badge label="Neo4j" value={status.neo4j} tone={status.neo4j === 'Connected' ? 'green' : 'amber'} />
@@ -110,7 +110,7 @@ export default function App() {
         <section className="col-span-6">
           <Panel title="OpenArm v2 Physical Simulation">
             {frame?.image ? <img src={frame.image} alt="OpenArm v2 simulation" className="w-full rounded-lg border border-white/10" /> : <div className="h-[480px] rounded-lg bg-white/5" />}
-            <div className="mt-3 text-xs text-slate-400">Sim time {frame?.sim_time.toFixed(2)}s · Grasp hold: {frame?.grasp_mode ?? status.graspMode}</div>
+            <div className="mt-3 text-xs text-slate-400">Sim time {frame?.sim_time.toFixed(2)}s · Grasp hold: {frame?.grasp_mode ?? status.graspMode} (kinematic, not contact)</div>
           </Panel>
         </section>
 

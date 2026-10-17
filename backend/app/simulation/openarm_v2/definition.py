@@ -1,8 +1,8 @@
 """Names and grasp geometry of the official OpenArm v2 bimanual Cell model.
 
-Every name here exists in the official `openarm-mujoco` model, so both engines address the
-same robot. The values are the ones the verified MuJoCo demonstration uses; the alternative
-backend reuses them unchanged so one plan means the same thing on either engine.
+Every name here exists in the official `openarm-mujoco` model, so any engine addresses the same robot.
+The engine backend reuses them unchanged, so the agent, the skills and the verification step name the
+same robot whatever engine runs it.
 """
 
 from __future__ import annotations

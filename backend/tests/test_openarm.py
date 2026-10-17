@@ -7,6 +7,8 @@ import pytest
 from backend.app.agent.world_state import build_world_state
 from backend.app.control.motion import OpenArmV2Controller
 from backend.app.planning.agent_planner import AgentPlanner, validate_plan
+from backend.app.simulation.openarm_v2.definition import ARM_JOINTS, OBJECTS, ZONES
+from backend.app.simulation.openarm_v2.scene import initial_object_positions, resolved_scene_xml
 from backend.app.skills.robot_skills import SkillRunner
 from backend.app.verification.goal_verification import verify_place_goal
 
@@ -20,20 +22,56 @@ PICK_AND_PLACE = [
 ]
 
 
-@pytest.fixture
-def official_model(mujoco_env):
-    """The MuJoCo-compiled official model, for engine-level structure assertions."""
-    return mujoco_env
-
-
-def test_official_openarm_v2_model_mapping(official_model):
-    assert official_model.model.nu == 17
-    assert official_model.model.nq == 33
+def test_scene_carries_the_official_openarm_v2_model():
+    """The scene the engine loads is the official Cell model, with its structure intact."""
+    model = mujoco.MjModel.from_xml_string(resolved_scene_xml())
+    assert model.nu == 17
+    assert model.nq == 33
     for side in ("left", "right"):
         for i in range(1, 8):
-            assert mujoco.mj_name2id(official_model.model, mujoco.mjtObj.mjOBJ_JOINT, f"openarm_{side}_joint{i}") >= 0
-        assert mujoco.mj_name2id(official_model.model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"{side}_finger1_ctrl") >= 0
-    assert official_model.model.eq_active0[0] == 0
+            assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"openarm_{side}_joint{i}") >= 0
+        assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"{side}_finger1_ctrl") >= 0
+    # The model's four grasp welds are declared inactive: they exist for the agent to enable when a
+    # grasp is commanded, and an engine that ignores the flag would weld the cubes from reset on.
+    assert list(model.eq_active0) == [0, 0, 0, 0, 1, 1]
+
+
+def test_starts_in_the_documented_scene(fresh_engine_state):
+    """A freshly constructed engine is already in the initial scene, without anyone calling `reset`.
+
+    The server builds one backend at startup and never resets it, so a task that arrives first must
+    not begin from the model's zero configuration: the arm would sweep across the table on its way to
+    the first waypoint.
+    """
+    documented = initial_object_positions()
+    assert set(fresh_engine_state["objects"]) == set(documented)
+    for name, position in documented.items():
+        assert fresh_engine_state["objects"][name] == pytest.approx(position, abs=1e-6)
+    assert set(fresh_engine_state["zones"]) == set(ZONES)
+    model = mujoco.MjModel.from_xml_string(resolved_scene_xml())
+    for side in ("left", "right"):
+        names = ARM_JOINTS[side]
+        keyframe = np.array(
+            [
+                model.key_qpos[0][
+                    model.jnt_qposadr[
+                        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                    ]
+                ]
+                for name in names
+            ]
+        )
+        assert fresh_engine_state[f"arm_{side}"] == pytest.approx(keyframe, abs=1e-5)
+
+
+def test_genesis_builds_the_official_model(genesis_env):
+    """What Genesis World constructed from that scene: the same joints, only the active equalities."""
+    summary = genesis_env.model_summary()
+    assert summary["positions"] == 33
+    assert summary["equalities"] == 2
+    assert summary["objects"] == sorted(OBJECTS)
+    for side, joints in ARM_JOINTS.items():
+        assert len(genesis_env.arm_qpos(side)) == len(joints) == 7
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -53,8 +91,7 @@ def test_world_state_comes_from_simulation(env):
     assert state["robot"]["type"] == "openarm_v2"
 
 
-def test_arm_motion(env):
-    controller = OpenArmV2Controller(env)
+def test_arm_motion(env, controller):
     result = controller.move_to_site("left", np.array([0.36, 0.15, 1.06]))
     assert result.success
 
@@ -67,8 +104,8 @@ def test_plan_validation_accepts_valid_fallback(env):
     assert [step["skill"] for step in PICK_AND_PLACE] == ["approach_object", "grasp_object", "lift_object", "move_to_target", "release_object", "retreat"]
 
 
-def test_complete_pick_place(env):
-    runner = SkillRunner(env, OpenArmV2Controller(env))
+def test_complete_pick_place(env, controller):
+    runner = SkillRunner(env, controller)
     results = runner.execute_plan(PICK_AND_PLACE)
     # The whole skill sequence executes on every engine.
     assert all(result["success"] for result in results), results
@@ -79,15 +116,15 @@ def test_complete_pick_place(env):
     assert verification["horizontal_position_error"] <= 0.04
 
 
-def test_unreachable_fault_is_classified(env):
-    runner = SkillRunner(env, OpenArmV2Controller(env))
+def test_unreachable_fault_is_classified(env, controller):
+    runner = SkillRunner(env, controller)
     result = runner.approach_object("left", "red_cube", fault_offset=-0.12)
     assert result["success"] is False
     assert result["error"] == "IK_FAILURE"
 
 
-def test_right_arm_blue_cube_place(env):
-    runner = SkillRunner(env, OpenArmV2Controller(env))
+def test_right_arm_blue_cube_place(env, controller):
+    runner = SkillRunner(env, controller)
     plan = [
         {"skill": "approach_object", "arm": "right", "object": "blue_cube"},
         {"skill": "grasp_object", "arm": "right", "object": "blue_cube"},
@@ -101,9 +138,13 @@ def test_right_arm_blue_cube_place(env):
     assert verify_place_goal(env, "blue_cube", "green_zone")["success"]
 
 
-def test_reset_and_randomization(env):
+def test_reset_restores_the_documented_scene(env):
     env.reset()
-    first = env.object_pose("red_cube")[0].copy()
+    placed = env.object_pose("red_cube")[0].copy()
     env.reset(randomize=True)
-    second = env.object_pose("red_cube")[0]
-    assert np.linalg.norm(first - second) > 1e-4 or np.linalg.norm(first - second) <= 1e-4
+    moved = env.object_pose("red_cube")[0]
+    assert np.linalg.norm(placed - moved) > 1e-3, "randomization must move the cube"
+    env.reset()
+    assert env.object_pose("red_cube")[0] == pytest.approx(
+        initial_object_positions()["red_cube"], abs=1e-6
+    )

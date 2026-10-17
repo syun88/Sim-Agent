@@ -1,56 +1,63 @@
 """Shared fixtures.
 
-The MuJoCo backend is the default and runs everywhere. The Genesis backend is optional: its
-tests run only with `SIM_AGENT_TEST_GENESIS=1` because starting it compiles Genesis kernels and
-builds the scene (tens of seconds on CPU).
+Genesis World is the engine this project runs, so the suite requires it: a machine without
+`genesis-world` gets a collection error telling it how to install it rather than a silently green
+run. Building the scene is the expensive part (tens of seconds on CPU, it compiles kernels), so one
+scene is built for the session and every test resets it to the documented initial state.
 """
 
 from __future__ import annotations
 
-import os
+from typing import Any
 
 import pytest
 
+from backend.app.simulation import create_backend
 from backend.app.simulation.genesis_backend.environment import genesis_available
 
-GENESIS_FLAG = "SIM_AGENT_TEST_GENESIS"
-ENGINES = ("mujoco", "genesis")
+INSTALL_HINT = (
+    "genesis-world is not installed. Genesis World is this project's simulation engine; "
+    "install it with `uv sync` (or `pip install genesis-world`) in a Python 3.12 environment."
+)
 
 
-def genesis_testing_enabled() -> bool:
-    return os.getenv(GENESIS_FLAG) == "1"
-
-
-def require_genesis() -> None:
-    if not genesis_testing_enabled():
-        pytest.skip(f"set {GENESIS_FLAG}=1 to test the optional Genesis World engine")
-    if not genesis_available():
-        pytest.skip("genesis-world is not installed in this environment")
+#: State observed on the engine the moment it was constructed, before any test could touch it.
+#: Read through the `fresh_engine_state` fixture, not imported: pytest loads this file as its own
+#: module, so a direct import from a test would see a second, empty copy of this dict.
+_FRESH_STATE: dict[str, Any] = {}
 
 
 @pytest.fixture(scope="session")
 def genesis_env():
-    """One Genesis scene for the whole session: building it is the expensive part."""
-    require_genesis()
-    from backend.app.simulation.genesis_backend.environment import GenesisOpenArmV2Environment
-
-    env = GenesisOpenArmV2Environment()
+    if not genesis_available():
+        pytest.exit(INSTALL_HINT, returncode=1)
+    env = create_backend()
+    # Capture now: the only moment the engine is untouched. The server builds one backend at startup
+    # and never resets it, so a fresh engine has to already be in the documented scene.
+    _FRESH_STATE.update(
+        arm_left=env.arm_qpos("left").copy(),
+        arm_right=env.arm_qpos("right").copy(),
+        objects={name: env.object_pose(name)[0].copy() for name in ("red_cube", "blue_cube")},
+        zones={name: env.zone_position(name).copy() for name in ("blue_zone", "green_zone")},
+    )
     yield env
+
+
+@pytest.fixture(scope="session")
+def fresh_engine_state(genesis_env) -> dict[str, Any]:
+    """The engine's state the moment it was constructed, before any test touched it."""
+    return _FRESH_STATE
 
 
 @pytest.fixture
-def mujoco_env():
-    from backend.app.simulation.openarm_v2.environment import OpenArmV2Environment
+def env(genesis_env):
+    """The engine, reset to the documented initial scene before each test."""
+    genesis_env.reset()
+    return genesis_env
 
-    env = OpenArmV2Environment()
-    yield env
 
+@pytest.fixture
+def controller(env):
+    from backend.app.control.motion import OpenArmV2Controller
 
-@pytest.fixture(params=ENGINES)
-def env(request, mujoco_env, genesis_env):
-    """Every engine, reset to the same initial scene before each test."""
-    if request.param == "genesis":
-        genesis_env.reset()
-        return genesis_env
-    mujoco_env.reset()
-    return mujoco_env
+    return OpenArmV2Controller(env)

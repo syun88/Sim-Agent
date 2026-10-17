@@ -18,7 +18,7 @@ from backend.app.agent.world_state import build_world_state
 from backend.app.execution.engine import ExecutionEngine
 from backend.app.memory.graph_memory import MemoryStore
 from backend.app.models.schemas import TaskRequest, TaskResponse
-from backend.app.simulation import available_backends, create_backend
+from backend.app.simulation import ENGINE_DESCRIPTION, create_backend
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
@@ -43,7 +43,7 @@ class Health(BaseModel):
     robot: str
     simulation: str
     simulation_engine: str
-    simulation_authoritative: bool
+    simulation_description: str
     grasp_mode: str
     provider: str
     memory: str
@@ -59,7 +59,7 @@ def health() -> Health:
         robot="OpenArm v2",
         simulation="Connected",
         simulation_engine=env.name,
-        simulation_authoritative=bool(next(item["authoritative"] for item in available_backends() if item["name"] == env.name)),
+        simulation_description=ENGINE_DESCRIPTION,
         grasp_mode=env.grasp_mode,
         provider="ai&" if engine.planner.enabled else "Fallback",
         memory="Connected" if app.state.memory.available else "Fallback",
@@ -70,12 +70,6 @@ def health() -> Health:
 @app.get("/api/system/status")
 def system_status():
     return health().model_dump()
-
-
-@app.get("/api/backends")
-def backends():
-    """Describe the available engines and which one this process selected."""
-    return {"active": app.state.env.name, "backends": available_backends()}
 
 
 @app.get("/api/scene")
@@ -146,7 +140,6 @@ def config_status():
     env = app.state.env
     return {
         "simulation_engine": env.name,
-        "simulation_backend_env": os.getenv("SIM_BACKEND", "mujoco"),
         "ai_provider": "ai&" if engine.planner.enabled else "Fallback",
         "ai_model": os.getenv("AI_AND_MODEL", ""),
         "ai_base_url_configured": bool(os.getenv("AI_AND_BASE_URL")),

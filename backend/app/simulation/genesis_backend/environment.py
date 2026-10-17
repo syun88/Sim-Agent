@@ -1,29 +1,25 @@
-"""Genesis World backend for the same official OpenArm v2 Cell scene.
+"""Genesis World running the official OpenArm v2 Cell scene.
 
-Genesis World is a second, independent physics engine for the identical task: it loads the
-same resolved MJCF string (official `openarm-mujoco` v2 Cell plus the demo objects), addresses
-the same joint and link names, uses the same grasp geometry and the same controller, and
-exposes its state through `SimulationBackend`, so `build_world_state()` and the verification
-step do not know which engine produced a sample.
+The engine loads the resolved MJCF string (official `openarm-mujoco` v2 Cell plus the demo
+objects), addresses the same joint and link names, uses the same grasp geometry and the same
+controller, and exposes its state through `SimulationBackend`, so `build_world_state()` and the
+verification step never see engine specifics.
 
-MuJoCo remains the authoritative engine. What this backend deliberately does differently is
-listed here so nothing is silently implied:
+Three things Genesis does differently from the model description, each handled explicitly here so
+that nothing is silently implied:
 
-- **Grasp hold.** Genesis takes the MJCF equality constraints at build time and exposes no
-  runtime enable/disable for them, and `RigidEntity.attach()` is a one-way structural change
-  with no detach. A grasp is therefore a *kinematic grasp hold*: while the hold is active the
-  object's free-joint pose is prescribed from the gripper base link on every step. Real finger
-  contacts are still monitored and reported, but this backend does not claim contact-only
-  manipulation either.
-- **Gravity compensation.** The MuJoCo controller adds the arm bias forces (`qfrc_bias`)
-  during a joint path. Genesis holds the arm with the model's own PD gains, so
-  `apply_gravity_compensation()` is a no-op here.
-- **Sites.** Genesis does not model MJCF sites, so the gripper control point and the zone
+- **Grasp hold.** Genesis takes MJCF equality constraints at build time and exposes no runtime
+  enable/disable for them, and `RigidEntity.attach()` is a one-way structural change with no
+  detach. A grasp is therefore a *kinematic grasp hold* (`grasp_mode`, reported in every grasp
+  result, in `/api/health` and on the dashboard): while the hold is active the object's free-joint
+  pose is prescribed from the gripper base link on every step. Finger contacts are still monitored
+  and reported, but this engine does not claim contact-only manipulation.
+- **Gravity compensation.** `apply_gravity_compensation()` feeds the arm's gravity torque into the
+  constant term of the actuator model, the analogue of the bias force the model description
+  provides, so the arm holds a commanded pose instead of sagging by `gravity_torque / kp`.
+- **Sites.** Genesis does not implement MJCF sites, so the gripper control point and the zone
   origins are resolved as a parent link plus a local offset, read from the same XML string with
-  MuJoCo's compiler (`_OfficialModelMetadata`). The model description has one source; Genesis
-  supplies only the physics.
-
-Install it with `pip install "sim-agent[genesis]"`. The MuJoCo path never imports it.
+  MuJoCo's compiler (`_OfficialModelMetadata`). The model description has one source.
 """
 
 from __future__ import annotations
@@ -52,11 +48,12 @@ from backend.app.simulation.transform import (
     quat_to_mat,
 )
 
-#: Camera of the dashboard preview, mirroring the MuJoCo free camera.
-CAMERA_LOOKAT = (0.48, 0.0, 1.08)
-CAMERA_DISTANCE = 1.15
-CAMERA_AZIMUTH = 135.0
-CAMERA_ELEVATION = 18.0
+#: Camera of the dashboard preview and of the recorded demo, aimed at the middle of the table from
+#: above so the cubes, both zones and the working arm are all in frame.
+CAMERA_LOOKAT = (0.44, 0.0, 1.04)
+CAMERA_DISTANCE = 1.05
+CAMERA_AZIMUTH = 140.0
+CAMERA_ELEVATION = 38.0
 CAMERA_FOV = 45.0
 CAMERA_RESOLUTION = (720, 480)
 #: Steps between two gravity-torque refreshes of the feed-forward (see `apply_gravity_compensation`).
@@ -233,8 +230,29 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         )
         self._scene.build()
         self._index()
+        # A constructed engine is already in the documented initial scene. The server builds exactly
+        # one backend at startup, so without this the first task would begin from the model's zero
+        # configuration instead of its keyframe, and the arm would sweep across the table.
+        self.reset()
 
     # -- model indexing ----------------------------------------------------------
+
+    def model_summary(self) -> dict:
+        """What Genesis World built from the official MJCF.
+
+        Genesis does not implement MJCF sites and reads no `active` flag, so it is worth being able
+        to assert what it actually constructed instead of trusting the file that was handed to it.
+        """
+        entity = self._entity
+        return {
+            "engine": self.name,
+            "links": len(entity.links),
+            "joints": len(entity.joints),
+            "degrees_of_freedom": int(entity.n_dofs),
+            "positions": int(entity.n_qs),
+            "equalities": int(self._scene.rigid_solver.n_equalities),
+            "objects": sorted(self._object_qs),
+        }
 
     def _index(self) -> None:
         entity = self._entity
@@ -455,10 +473,10 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         )
 
     def apply_gravity_compensation(self, side: str) -> None:
-        """Feed the arm's gravity torque forward, the way the MuJoCo path feeds `qfrc_bias`.
+        """Feed the arm's gravity torque forward, the way the model description does.
 
-        The constant bias term of Genesis's actuator model (`act_bias[0]`, the analogue of MuJoCo's
-        `biasprm[0]`) is added to the position controller's force, so the arm holds a commanded pose
+        The constant bias term of Genesis's actuator model (`act_bias[0]`, the analogue of the
+        model's `biasprm[0]`) is added to the position controller's force, so the arm holds a commanded pose
         to a few millimetres instead of `gravity_torque / kp` short of it, while the damping stays
         implicit in the solver. Only the arm's dofs are compensated: the cubes keep their gravity.
         """
@@ -499,7 +517,7 @@ class GenesisOpenArmV2Environment(SimulationBackend):
     def set_grasp_hold(self, arm: str, object_name: str, active: bool) -> None:
         """Hold the object at the documented grasp offset from the gripper base link.
 
-        The offset rule is the MuJoCo weld's: `GRASP_OFFSET` in world axes frozen into the link frame
+        The offset is the documented grasp rule: `GRASP_OFFSET` in world axes frozen into the link frame
         at grasp time, with the object's orientation relative to the link taken from the current
         poses. Both engines therefore hold the object in the same nominal place, and the difference
         left between them is the arm's own trajectory difference rather than a second grasp rule.

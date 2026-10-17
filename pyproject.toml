@@ -1,14 +1,16 @@
 [project]
 name = "sim-agent"
 version = "0.1.0"
-description = "OpenArm v2 embodied AI agent with MuJoCo, AI planning, graph memory, and web dashboard"
-requires-python = ">=3.12"
+description = "OpenArm v2 embodied AI agent on Genesis World, with AI planning, graph memory, and a web dashboard"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "fastapi>=0.143.3",
+    # The physics engine. It brings MuJoCo along as a dependency and parses the official MJCF with
+    # it; this project reads the model's sites, keyframe and actuator mapping the same way.
+    "genesis-world>=1.4.4",
     "httpx>=0.28.1",
     "imageio>=2.38.1",
     "imageio-ffmpeg>=0.6.0",
-    "mujoco>=3.16.0",
     "neo4j>=6.4.1",
     "numpy>=2.5.4",
     "openai>=3.33.0",
@@ -20,14 +22,6 @@ dependencies = [
     "uvicorn[standard]>=0.54.0",
 ]
 
-# Optional second physics engine. Install with `uv sync --extra genesis`; the MuJoCo path never
-# imports it, and Genesis needs Python <3.14 and its own PyTorch build.
-[project.optional-dependencies]
-genesis = ["genesis-world>=1.4.4"]
-
 [tool.pytest.ini_options]
-markers = [
-    "genesis: requires the optional Genesis World engine (started with SIM_AGENT_TEST_GENESIS=1)",
-]
 testpaths = ["backend/tests", "tests"]
 
