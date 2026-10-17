@@ -33,13 +33,14 @@ def main() -> None:
     print("Press Ctrl+C to exit.")
 
     while True:
+        time.sleep(0.5)
         instruction = _poll_next_command()
         if instruction is None:
             continue
         if len(instruction) < 3:
             continue
 
-        print(f"\nReceived: {instruction}")
+        print(f"\nReceived: {instruction}", flush=True)
 
         state = build_world_state(env)
         plan = planner.plan(instruction, state, [])
@@ -49,16 +50,16 @@ def main() -> None:
             _report_result(instruction, False)
             continue
 
-        print(f"Plan ({plan.provider}):")
+        print(f"Plan ({plan.provider}):", flush=True)
         for i, step in enumerate(plan.steps, 1):
-            print(f"  {i}. {step.skill} {step.object or step.target or ''}")
+            print(f"  {i}. {step.skill} {step.object or step.target or ''}", flush=True)
 
         results = skills.execute_plan(plan.model_dump()["steps"])
         success = all(r.get("success") for r in results)
         if success:
-            print("Task completed successfully.")
+            print("Task completed successfully.", flush=True)
         else:
-            print("Task failed.")
+            print("Task failed.", flush=True)
         _report_result(instruction, success)
 
     print("Closing Genesis viewer...")
