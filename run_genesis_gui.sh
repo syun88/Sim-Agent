@@ -12,7 +12,7 @@ fi
 uv sync
 
 # Start the web backend in the background so the Genesis viewer can poll it.
-GENESIS_SHOW_VIEWER= uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-access-log --log-level warning &
+GENESIS_SHOW_VIEWER= nohup uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-access-log --log-level warning > /tmp/sim-agent-backend.log 2>&1 &
 BACKEND_PID=$!
 trap "kill $BACKEND_PID 2>/dev/null" EXIT
 

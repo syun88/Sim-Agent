@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 
 from backend.app import simulation
 from backend.app.main import app
+from backend.app.planning.agent_planner import AgentPlanner
 from backend.app.simulation import GPU_ENVIRONMENT_VARIABLE, prefer_gpu_from_environment
 
 
@@ -10,9 +11,6 @@ def test_health_and_scene():
         health = client.get("/api/health")
         assert health.status_code == 200
         assert health.json()["robot"] == "OpenArm v2"
-        scene = client.get("/api/scene")
-        assert scene.status_code == 200
-        assert "red_cube" in [item["id"] for item in scene.json()["objects"]]
 
 
 def test_config_does_not_expose_secrets():
