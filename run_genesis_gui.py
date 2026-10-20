@@ -33,7 +33,8 @@ def main() -> None:
     print("Press Ctrl+C to exit.")
 
     while True:
-        time.sleep(0.5)
+        time.sleep(0.05)
+        env.refresh_viewer()
         try:
             response = httpx.get(f"{BACKEND_URL}/api/genesis/next", timeout=1.0)
             response.raise_for_status()

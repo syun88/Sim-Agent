@@ -63,3 +63,32 @@ def test_japanese_pick_and_place_target_is_parsed():
 def test_unknown_object_fails_loudly_when_local_planner_is_off():
     with pytest.raises(PlannerProviderError):
         AgentPlanner().plan("Move the invisible cube.", WORLD_STATE)
+
+
+def test_both_cubes_can_be_selected_by_plural_instruction():
+    plan = _plan_and_validate("pick red and blue cube")
+    assert plan.goal["type"] == "direct_command"
+    assert plan.goal["action"] == "multi_pick"
+    assert plan.goal["objects"] == ["red_cube", "blue_cube"]
+    assert [step.skill for step in plan.steps] == [
+        "approach_object", "grasp_object", "lift_object",
+        "approach_object", "grasp_object", "lift_object",
+    ]
+
+
+def test_count_only_instruction_selects_every_cube():
+    plan = _plan_and_validate("pick two cube")
+    assert plan.goal["action"] == "multi_pick"
+    assert plan.goal["objects"] == ["red_cube", "blue_cube"]
+
+
+def test_repeated_place_goal_is_not_reexecuted_when_already_satisfied():
+    state = {
+        "objects": [{"id": "red_cube", "position": [0.40, 0.00, 1.03]}],
+        "targets": [{"id": "blue_zone", "position": [0.41, 0.00, 1.02]}],
+    }
+    plan = AgentPlanner().plan("Move the red cube into the blue zone.", state)
+    valid, errors = validate_plan(plan, state)
+    assert valid, errors
+    assert plan.goal["type"] == "already_at_target"
+    assert [step.skill for step in plan.steps] == ["return_home"]

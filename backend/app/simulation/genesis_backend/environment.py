@@ -384,6 +384,16 @@ class GenesisOpenArmV2Environment(SimulationBackend):
             self._scene.step()
             self._sim_step += 1
 
+    def refresh_viewer(self) -> None:
+        """Keep the macOS main-thread viewer responsive while no task is stepping physics."""
+        try:
+            viewer = self._scene.viewer
+            if viewer is not None and viewer.is_alive():
+                viewer.update(auto_refresh=True, force=False)
+        except Exception:
+            # A closed viewer should not prevent the command broker from reporting results.
+            pass
+
     # -- observation -------------------------------------------------------------
 
     def frame(self) -> Frame:

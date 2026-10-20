@@ -102,14 +102,15 @@ class AgentPlanner:
     def plan(self, instruction: str, state: dict, memory: list[dict] | None = None) -> AgentPlan:
         started = time.perf_counter()
         memory = memory or []
-        obj = self._find_object(instruction, state)
+        objects = self._find_objects(instruction, state)
+        obj = objects[0] if objects else None
         target = self._find_target(instruction, state, obj)
         arm = self._arm_for(instruction, obj)
         raw = None
         deterministic_payload = None
         deterministic_error = None
         try:
-            deterministic_payload = self._deterministic_plan(instruction, state, obj, target, arm)
+            deterministic_payload = self._deterministic_plan(instruction, state, obj, target, arm, objects)
         except PlannerProviderError as exc:
             deterministic_error = exc
         if any(item.get("success") for item in memory):
@@ -148,21 +149,34 @@ class AgentPlanner:
 
     @staticmethod
     def _find_object(instruction: str, state: dict) -> str | None:
+        objects = AgentPlanner._find_objects(instruction, state)
+        return objects[0] if objects else None
+
+    @staticmethod
+    def _find_objects(instruction: str, state: dict) -> list[str]:
         lowered = instruction.lower()
         aliases = {
-            "red_cube": ("red cube", "red", "赤", "あか"),
-            "blue_cube": ("blue cube", "blue", "青", "あお"),
+            "red_cube": (r"\bred cube\b", r"\bred\b(?!\s+(?:zone|target))", r"赤(?!い?ゾーン)"),
+            "blue_cube": (r"\bblue cube\b", r"\bblue\b(?!\s+(?:zone|target))", r"青(?!い?ゾーン)"),
         }
         object_ids = {item["id"] for item in state["objects"]}
         candidates = []
         for name, values in aliases.items():
             if name not in object_ids:
                 continue
-            for value in values:
-                index = lowered.find(value)
-                if index >= 0:
-                    candidates.append((index, len(value), name))
-        return min(candidates)[2] if candidates else None
+            for pattern in values:
+                match = re.search(pattern, lowered)
+                if match:
+                    candidates.append((match.start(), match.end(), name))
+        ranked = sorted(candidates)
+        return list(dict.fromkeys(item[2] for item in ranked))
+
+    @staticmethod
+    def _plural_requested(instruction: str) -> bool:
+        return bool(re.search(
+            r"\bboth\b|\ball\b|\b(?:1|2|two|three)\b|すべて|両方|2つ|3つ",
+            instruction.lower(),
+        ))
 
     @staticmethod
     def _find_target(instruction: str, state: dict, obj: str | None) -> str | None:
@@ -225,9 +239,18 @@ class AgentPlanner:
         return value
 
     def _deterministic_plan(
-        self, instruction: str, state: dict, obj: str | None, target: str | None, arm: str
+        self,
+        instruction: str,
+        state: dict,
+        obj: str | None,
+        target: str | None,
+        arm: str,
+        objects: list[str] | None = None,
     ) -> dict[str, Any]:
         lowered = instruction.lower()
+        objects = objects or ([obj] if obj else [])
+        if self._plural_requested(lowered) and not objects:
+            objects = [item["id"] for item in state["objects"]]
         has_gripper = bool(re.search(r"グリッパー|ハンド|手|gripper|hand", lowered))
         if has_gripper and re.search(r"開|open", lowered):
             return self._direct_plan(arm, "open_gripper")
@@ -261,6 +284,34 @@ class AgentPlanner:
                 "arm": arm,
                 "steps": [{"skill": "move_relative", "arm": arm, "direction": direction, "distance_cm": distance}],
             }
+        if len(objects) > 1:
+            steps = []
+            for object_id in objects:
+                object_arm = self._arm_for("", object_id)
+                steps.extend([
+                    {"skill": "approach_object", "arm": object_arm, "object": object_id},
+                    {"skill": "grasp_object", "arm": object_arm, "object": object_id},
+                    {"skill": "lift_object", "arm": object_arm, "object": object_id},
+                ])
+                if target:
+                    steps.extend([
+                        {"skill": "move_to_target", "arm": object_arm, "target": target},
+                        {"skill": "release_object", "arm": object_arm, "object": object_id},
+                        {"skill": "retreat", "arm": object_arm},
+                    ])
+            action = "multi_place" if target else "multi_pick"
+            goal: dict[str, Any] = {"type": "direct_command", "action": action, "objects": objects}
+            if target:
+                goal["target"] = target
+            return {"goal": goal, "arm": arm, "steps": steps}
+        if obj and target and self._already_at_target(state, obj, target):
+            return {
+                "goal": {
+                    "type": "already_at_target", "object": obj, "target": target, "arm": arm,
+                },
+                "arm": arm,
+                "steps": [{"skill": "return_home", "arm": arm}],
+            }
         if obj and re.search(r"近づ|アプローチ|approach", lowered):
             return {
                 "goal": {"type": "direct_command", "action": "approach", "object": obj, "arm": arm},
@@ -293,6 +344,16 @@ class AgentPlanner:
                 {"skill": "retreat", "arm": arm},
             ],
         }
+
+    @staticmethod
+    def _already_at_target(state: dict, obj: str, target: str) -> bool:
+        object_position = next((item.get("position") for item in state.get("objects", []) if item.get("id") == obj), None)
+        target_position = next((item.get("position") for item in state.get("targets", []) if item.get("id") == target), None)
+        if not object_position or not target_position:
+            return False
+        horizontal = sum((float(object_position[axis]) - float(target_position[axis])) ** 2 for axis in (0, 1)) ** 0.5
+        vertical = abs(float(object_position[2]) - float(target_position[2]))
+        return horizontal <= 0.04 and vertical <= 0.05
 
     @staticmethod
     def _direct_plan(arm: str, action: str) -> dict[str, Any]:
