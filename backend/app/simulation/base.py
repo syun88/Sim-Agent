@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 
@@ -35,6 +36,14 @@ class Frame:
     ee: dict[str, list[float]]
     grippers: dict[str, float]
     contacts: list[str]
+
+
+class ArmKinematics(Protocol):
+    """Private joint-state snapshot for IK; evaluating candidates never changes the scene."""
+
+    def evaluate(self, joints: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return position, rotation, linear Jacobian and angular Jacobian at the EE."""
+        ...
 
 
 class SimulationBackend(ABC):
@@ -112,8 +121,12 @@ class SimulationBackend(ABC):
         """Current joint positions of one arm."""
 
     @abstractmethod
+    def arm_kinematics(self, side: str) -> ArmKinematics:
+        """Snapshot the current configuration for read-only, isolated IK evaluation."""
+
+    @abstractmethod
     def set_arm_qpos(self, side: str, targets: np.ndarray) -> None:
-        """Write joint positions directly, for kinematics evaluation during IK."""
+        """Write joint positions directly for scene setup/model-fidelity checks, never IK."""
 
     @abstractmethod
     def arm_limits(self, side: str) -> np.ndarray:

@@ -10,6 +10,7 @@ from backend.app.simulation.openarm_v2.definition import (
     GRASP_ROTATION,
     GRIPPER_CLOSED,
     GRIPPER_OPEN,
+    SPAWN_ARM_QPOS,
 )
 from backend.app.simulation.transform import orientation_error
 
@@ -25,19 +26,27 @@ class MotionResult:
     error: str | None = None
     final_position: list[float] | None = None
     position_error: float | None = None
+    rotation_error: float | None = None
 
 
 class OpenArmV2Controller:
     """Damped least-squares joint-space controller, independent of the physics engine.
 
-    The controller reads poses and Jacobians through `SimulationBackend`, so the same
-    inverse kinematics and the same joint path execute on every backend, and an engine
-    difference shows up as a physical difference rather than as a different controller.
+    IK evaluates a private kinematic snapshot through `SimulationBackend`. Candidate
+    poses never enter the live scene or its viewer; only motor commands execute there.
+    Endpoint verification always reads the actual physics state.
     """
 
     def __init__(self, env: SimulationBackend):
         self.env = env
         self.cancelled = False
+        self.should_stop: Callable[[], bool] | None = None
+        self.target_rotations: dict[str, np.ndarray] = {}
+
+    def stop_requested(self) -> bool:
+        if self.should_stop and self.should_stop():
+            self.cancelled = True
+        return self.cancelled
 
     @property
     def timestep(self) -> float:
@@ -61,14 +70,11 @@ class OpenArmV2Controller:
             q = np.clip(np.asarray(q_init, float), limits[:, 0], limits[:, 1])
         if target_rotation is None:
             target_rotation = self.env.ee_pose(side)[1]
-        qpos_backup = self.env.arm_qpos(side)
+        kinematics = self.env.arm_kinematics(side)
         best_q = q.copy()
         best_error = np.inf
         for _ in range(max_iterations):
-            self.env.set_arm_qpos(side, q)
-            self.env.kinematics()
-            position, rotation = self.env.ee_pose(side)
-            linear_jacobian, angular_jacobian = self.env.ee_jacobian(side)
+            position, rotation, linear_jacobian, angular_jacobian = kinematics.evaluate(q)
             perr = np.asarray(target_position, float) - position
             oerr = orientation_error(rotation, target_rotation)
             error = float(np.linalg.norm(perr) + np.linalg.norm(oerr) * 0.2)
@@ -102,9 +108,11 @@ class OpenArmV2Controller:
                     scale = max(0.0, (upper_dist / braking_distance) ** 2)
                     dq[j] *= scale
             q = np.clip(q + dq, limits[:, 0], limits[:, 1])
-        self.env.set_arm_qpos(side, qpos_backup)
-        self.env.refresh()
         if best_error > 0.02:
+            if q_init is None:
+                # A successful handover leaves a very different redundant-arm posture.
+                # Retry the official spawn posture before calling a reachable goal impossible.
+                return self.solve_ik(side, target_position, target_rotation, q_init=SPAWN_ARM_QPOS, max_iterations=max_iterations)
             return None, best_error, float(best_error)
         return best_q, best_error, float(best_error)
 
@@ -117,7 +125,7 @@ class OpenArmV2Controller:
     ) -> MotionResult:
         steps_per = max(1, int(seconds_per_segment / self.timestep))
         for i, target in enumerate(path):
-            if self.cancelled:
+            if self.stop_requested():
                 return MotionResult(False, "STOPPED")
             if progress and i % 8 == 0:
                 progress(f"joint_path_{i}/{len(path)}")
@@ -127,7 +135,7 @@ class OpenArmV2Controller:
                 self.env.set_arm(side, qcmd)
                 self.env.apply_gravity_compensation(side)
                 self.env.step(1)
-                if self.cancelled:
+                if self.stop_requested():
                     return MotionResult(False, "STOPPED")
             self.env.set_arm(side, target)
             self.env.apply_gravity_compensation(side)
@@ -141,15 +149,37 @@ class OpenArmV2Controller:
         position: np.ndarray,
         rotation: np.ndarray | None = None,
         progress: Callable[[str], None] | None = None,
+        q_init: np.ndarray | None = None,
     ) -> MotionResult:
         if rotation is None:
             rotation = GRASP_ROTATION.copy()
-        q, pos_err, _ = self.solve_ik(side, position, rotation)
+        q, pos_err, _ = self.solve_ik(side, position, rotation, q_init=q_init)
         if q is None:
             return MotionResult(False, "IK_FAILURE", position.tolist(), pos_err)
+        self.target_rotations[side] = rotation.copy()
         start = self.env.arm_qpos(side)
         path = [(1 - a) * start + a * q for a in np.linspace(0, 1, 8)]
-        return self.execute_joint_path(side, path, 0.08, progress)
+        result = self.execute_joint_path(side, path, 0.08, progress)
+        if not result.success:
+            return result
+        actual, actual_rotation = self.env.ee_pose(side)
+        residual = float(np.linalg.norm(actual - position))
+        rotation_residual = float(np.linalg.norm(orientation_error(actual_rotation, rotation)))
+        # Read a settled endpoint. The official wrist's damping can leave a short
+        # orientation transient after a large handover rotation or lateral carry.
+        for _ in range(15):
+            if residual <= .004 and rotation_residual <= .06:
+                break
+            if self.stop_requested():
+                return MotionResult(False, "STOPPED")
+            self.env.step(20)
+            actual, actual_rotation = self.env.ee_pose(side)
+            residual = float(np.linalg.norm(actual - position))
+            rotation_residual = float(np.linalg.norm(orientation_error(actual_rotation, rotation)))
+        # Solving IK is not evidence that the motors reached it: a collision can block them.
+        return MotionResult(residual <= 0.012 and rotation_residual <= 0.15,
+                            None if residual <= 0.012 and rotation_residual <= 0.15 else "MOTION_BLOCKED",
+                            actual.tolist(), residual, rotation_residual)
 
     def set_gripper(self, side: str, closed: bool) -> None:
         self.env.set_gripper(side, GRIPPER_CLOSED[side] if closed else GRIPPER_OPEN[side])

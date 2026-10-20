@@ -1,183 +1,134 @@
-# Architecture
+# Language tasks on the official OpenArm v2 / Genesis scene
 
-The backend is the authority for state. The planner sees only serialized simulation state and can choose from a fixed skill library. It cannot generate executable code. Each skill returns measured timing, error categories, and endpoint poses.
+The native viewer owns the only live simulation. FastAPI is a command, progress, and result broker;
+it does not instantiate an environment. The same `TaskExecutor` is used by the native owner,
+headless verification scripts, and the asynchronous execution wrapper.
 
-## Simulation engine
+## Language and grounding
 
-One engine runs the task: Genesis World, on the official OpenArm v2 Cell model.
+`planning/agent_planner.py` asks a configured provider for a `TaskProgram`, not motor commands.
+The bounded Pydantic schema in `planning/task_program.py` has eight operations: pick, handover,
+place, approach, move, open, close, home. Each action can name an object, acting arm, receiving
+arm, semantic destination, or a 1–30cm relative motion. Extra fields and arbitrary code are rejected.
+There are at most 24 intentions and 144 compiled skills.
 
-```mermaid
-flowchart TD
-  A[Agent / planner / skills / verification] -->|SimulationBackend| B[Genesis World backend]
-  D[(Official openarm-mujoco v2 Cell MJCF)] --> B
-  D -.->|sites, keyframe, actuator mapping| C[MuJoCo compiler as the model reader]
-  C --> B
-```
+The provider sees current object positions, the contact-derived occupancy of both hands, and a
+compact discourse context. The compiler resolves `it`, held:left/right, and spatial references
+against this snapshot. It simulates occupancy over the complete program before execution.
+A second pick by another hand becomes a handover. A place automatically acquires an unheld
+object, while an already held object is transported without opening the gripper again.
 
-The agent layers never import an engine. `backend/app/simulation/base.py` declares the contract
-(`SimulationBackend`) that the engine implements, and `backend/app/simulation/__init__.py` is the one
-place an engine is constructed. `backend/app/control/motion.py`, `backend/app/skills/robot_skills.py` and
-`backend/app/verification/goal_verification.py` read poses, Jacobians, contacts and grasp state only
-through that contract. The seam exists so an engine can be replaced or added without touching the agent,
-and so every engine difference is declared where the agent can see it (`grasp_mode`) rather than hidden in
-a controller branch.
+A hand cannot hold two objects or receive an object while occupied. A low-level lift must follow
+a grasp, a release must name the held object, and transport requires a hold. Unsupported objects
+and targets, invalid distances, and unresolved references fail before motion.
 
-### Model description
+Japanese/English clauses covered by `planning/language_fallback.py` provide an explicit fallback.
+When the entire request has an exact parse, the model cannot silently change its ordered object,
+arm, receiver, or destination trace. Invalid provider programs receive one bounded repair attempt.
+Provider failures contain categories rather than exception strings that could reveal credentials.
+Free paraphrases require a functioning language model; the fallback does not guess the first task.
 
-`assets/scenes/openarm_v2_demo.xml` is authored with two path tokens and no machine-specific paths. They
-are resolved at load time from the installed `openarm-mujoco` 2.3.0 package
-(`backend/app/simulation/openarm_v2/scene.py`), so the same XML string is compiled on any machine. The
-official model is attached through MuJoCo's `<model>`/`<attach>` mechanism and is never copied or
-substituted. `backend/app/simulation/openarm_v2/definition.py` holds the joint, link, site, object, zone
-and grasp-geometry names the agent uses.
+## Local model adaptation without training
 
-The description has one reader. Genesis does not implement the MJCF site abstraction, so the gripper
-control point and the zone origins are read from the *same XML string* by MuJoCo's compiler
-(`_OfficialModelMetadata`) as a parent link plus a local offset. Genesis supplies the physics; the
-naming, the keyframe, the actuator mapping and the grasp geometry all come from the official asset.
+The existing local `qwen3-vl:4b` was inspected through Ollama's `/api/show`. This installation has
+architecture `qwen3vl` but template `{{ .Prompt }}`. Normal `/api/chat` calls spent the entire output
+budget in the `thinking` field even with `think=false`, leaving no JSON result.
 
-### The physical grasp
+For precisely this positively identified case, the adapter supplies Qwen role delimiters and an
+already closed thinking prefix through `/api/generate` with `raw=true`. The output is constrained
+by the same JSON schema. Other Ollama templates use `/api/chat`. No model files, weights, global
+Ollama templates, or credentials are modified. This is inference-time formatting and validation.
 
-The grasp is the official hand's own mechanism, measured from the official model:
+## Physical skills
 
-- **Fingertip midpoint.** Each finger body's `*_collision_00` geom is the fingertip pad (the hand's
-  foremost, pad-facing segment, `condim=4` so torsional friction keeps a pinched object from
-  spinning). The midpoint of the two pads' centroids at the closed configuration, in the gripper
-  control point frame, is `(-0.0066, 0, -0.1634)` for both hands (`FINGERTIP_MIDPOINT`);
-  `scripts/measure_grasp_geometry.py` re-measures it from the installed model and the fidelity
-  test fails if the constant drifts.
-- **Gripper travel.** The official keyframe holds both hands fully open (`key_ctrl` `+/-0.7854`, the
-  open range end); 0 closes the pads onto the symmetry plane. The project commands open `0.7854` /
-  `-0.7854` and closes to `0.02` / `-0.02` (the pads stop short of touching each other; on an object the
-  position actuators press into it from there, and the official finger mimic equality keeps the two
-  fingers symmetric).
-- **Approach orientation.** Fingers forward (+x world) so the pads close across the object's `+-y`
-  side faces, tilted 10 deg nose-down: at the pinch alignment the palm's lowest point sits 14.5 mm
-  above the cell table at 10 deg versus 1.7 mm at 0 deg (measured), so the tilt is what keeps the
-  official palm geometry off the table while the fingertips stay on the object's centre.
-- **Approach path.** The arm first rises to a 1.24 m staging altitude above its current pose (the
-  highest the official arm reaches with the horizontal orientation; measured 1.0 mm IK residual at
-  1.24, 12.7 mm at 1.26), because a joint-interpolated swing toward a lateral target otherwise yaws
-  the extended hand through the workspace and can sweep an object off its place. It then swings
-  above the object, drops onto the approach axis 6 cm behind the pinch point, and slides straight in.
-  The skill measures how much the approach displaced the object and fails (`APPROACH_COLLISION`)
-  beyond 5 mm.
-- **Grasp verification.** After closing, both the inner and the outer finger must contact the
-  object (`GRASP_FAILED` otherwise), and a 3 cm verification lift must carry the object with the
-  gripper, with contact maintained (`GRASP_LOST` otherwise). Nothing writes the object's pose:
-  the only pose writes are scene reset and setup.
+The controller snapshots the actual Genesis joint configuration by official joint name, including
+the lifter and fingers. `simulation/openarm_v2/kinematics.py` evaluates IK candidates on a private
+data copy of the already compiled official model, using only forward kinematics and Jacobians.
+It never changes the live scene. This distinction matters: Genesis immediately redraws a direct
+joint-position write and clears the contact solver's state, even without stepping physics. Trial
+poses followed by restoring the start pose would visibly replay the motion before execution.
 
-### What the engine does differently
+Joint-limited damped least-squares IK drives the same position actuators and joint paths. If a
+redundant arm posture left by a handover is a poor IK starting point, it tries the official spawn
+posture as a calculation seed. Only motor commands execute candidates in Genesis; endpoint
+verification reads the actual physics state. Direct joint-position writes are reserved for scene
+setup and model-fidelity checks.
 
-| | Genesis World |
-|---|---|
-| Scene | the resolved official MJCF string, Genesis physics and rasterizer |
-| Grasp | **physical friction pinch**: the position-controlled fingertip pads press the object's side faces; the official finger mimic equality keeps the two fingers symmetric; friction holds the object: `physical-friction-pinch` |
-| Grasp alignment | the hand's `FINGERTIP_MIDPOINT`, measured from the official fingertip pad geoms, is IK-aligned to the object centre |
-| Bias torque during a joint path | `apply_gravity_compensation()` writes the gravity torque into the constant term of the actuator model |
-| Camera | one fixed dashboard camera aimed at the middle of the table |
+A motion result measures its settled Cartesian position and orientation. A valid IK solution
+that physical collision prevents the motors from reaching returns `MOTION_BLOCKED`. Both arms
+receive gravity compensation while either arm moves, so the stationary donor continues holding.
+A commanded orientation is retained across carry segments rather than accumulating each new
+measurement's tracking error as a new desired orientation.
 
-`env.grasp_mode` is reported with every grasp result, in `/api/health`, and in the dashboard badge.
-The skills verify the pinch from the finger-object contacts and from the object following a short
-verification lift, and the goal verification requires the object to be untouched by any finger before
-declaring it released.
+The fingertip midpoint and gripper limits come from the official hand meshes and keyframe.
+`scripts/measure_grasp_geometry.py --check` re-derives the midpoint and checks the constants against
+the installed model. Table grasps open, stage above the workspace, enter along the approach axis,
+close the official fingers, require both finger links, and perform a 30mm follow test.
 
-### Spawn pose
+For a planned handover, the table pick uses a 15mm rearward tangential bias on the cube face,
+leaving room for the other hand. This changes which portion of a face is pinched; it does not
+change the mesh or write the cube pose. The grasp still requires contacts and physical follow.
 
-The request "spawn the joints at 90 degrees" has two readings.  The elbow (joint 4) already spawns at
-90 degrees in the official model keyframe.  Setting *all seven* arm joints to 90 degrees makes the two
-arms interpenetrate, so the project keeps the official keyframe as the single documented spawn pose.
-`SPAWN_ARM_QPOS` in `backend/app/simulation/openarm_v2/definition.py` names that decision, and
-`GenesisOpenArmV2Environment.reset()` builds the full qpos from it.
+## Direct handover
 
-Measured on the compiled MJCF with `mj_kinematics` + `mj_collision` (both arms at the same pose):
+`simulation/openarm_v2/handover.py` reads the attached MJCF and solves both seven-joint arms and
+the cube orientation together. It uses the *measured* donor-to-cube transform, official joint
+limits with a margin, and collision meshes. The receiving pads approach the opposite portion
+of the same side faces. Candidate poses reject arm-arm and hand-table penetration.
+MuJoCo is a model/geometry reader here: no `mj_step` and no second dynamic simulation exist.
+Genesis validates every candidate by actually moving, touching, carrying, and releasing.
 
-| Pose | Joint values (deg) | left ee (m) | right ee (m) | height above table (m) | collision-free | worst penetration |
-|---|---|---|---|---|---|---|
-| official keyframe | [0, 0, 0, 90, 0, 0, 0] | (0.401, 0.153, 1.120) | (0.401, -0.153, 1.120) | 0.120 | **yes** | — |
-| only joint4 = 90° | [0, 0, 0, 90, 0, 0, 0] | (0.401, 0.153, 1.120) | (0.401, -0.153, 1.120) | 0.120 | **yes** | — |
-| all seven joints = 90° | [90, 90, 90, 90, 90, 90, 90] | (0.401, -0.067, 1.340) | (-0.031, -0.373, 1.340) | 0.340 | **no** | arm-arm -0.072 m |
-| joints 2 and 4 = 90° | [0, 90, 0, 90, 0, 0, 0] | (0.401, -0.067, 1.340) | (0.401, -0.374, 1.340) | 0.340 | **no** | arm-arm -0.072 m |
-| joint2 = 45°, joint4 = 90° | [0, 45, 0, 90, 0, 0, 0] | (0.401, -0.002, 1.184) | (0.401, -0.309, 1.184) | 0.184 | **no** | arm-arm -0.018 m |
-| joint2 = -45°, joint4 = 90° | [0, -45, 0, 90, 0, 0, 0] | (0.401, 0.309, 1.184) | (0.401, 0.002, 1.184) | 0.184 | **no** | arm-arm -0.018 m |
+The runtime protocol is:
 
-Only the official keyframe (which is also "only joint4 = 90°") is collision-free.  The all-90° pose
-produces 19 arm-arm contacts, the deepest being `openarm_lifter_link | openarm_left_link3` at -0.072 m
-and `openarm_left_link3 | openarm_right_base_link` at -0.064 m.  No arm-cube or arm-table contacts
-appear in any candidate.  `test_spawn_pose_is_the_official_model_keyframe` asserts the project constant
-matches the model, and `test_starts_in_the_documented_scene` asserts a freshly constructed engine is in
-that pose.
+1. Keep the donor's real pinch while moving it to the coupled pose and settling.
+2. Open the receiving hand. Move to a 120mm standoff outside the held object.
+3. Insert along a Cartesian line in 10mm increments, checking the donor's hold throughout.
+4. Reject an approach that displaces the cube by over 6mm. Close the receiver and require both fingers.
+5. Open the donor and withdraw 80mm along its approach axis. Require no donor-object contacts.
+6. Require the receiving pinch, lift the object another 30mm with that arm alone, and measure follow.
 
-### Genesis World engine: status
+A joint interpolation straight from home to the receiving pose was observed to sweep an open
+finger through the cube, producing spurious intermediate contacts and losing the grasp. The
+standoff and straight insertion were necessary; endpoint IK and a two-finger contact list alone
+did not establish a successful handover.
 
-Verified by `backend/tests/test_official_model_fidelity.py`, `backend/tests/test_openarm.py` and
-`backend/tests/test_transform.py`, `tests/test_memory_serialization.py` (34 tests, `pytest -q`):
+For placement, the received grasp returns to the table attitude by interpolating rotation while
+keeping the cube centre high. Carrying uses Cartesian segments of at most 25mm, followed by
+measured object-position correction. This avoids a joint-space arc dipping through the other
+cube. Placement refuses an occupied target rather than accidentally stacking objects.
 
-- the ground truth for structure is the model description, compiled by MuJoCo and evaluated with its own
-  kinematics routines (`mj_kinematics`, `mj_comPos`, `mj_jac`) - pure kinematics, no solver, no stepping;
-- the initial scene after construction *and* after `reset()` is the model's own keyframe plus the shared
-  object placement, to 1e-5 (the server builds one backend at startup and never resets it, so a task that
-  arrives first must not begin from the model's zero configuration);
-- forward kinematics, the gripper control point pose and the 3x7 linear and angular Jacobians the
-  controller consumes match the official model's own routines to 1e-5 and 1e-6, at the home pose and at an
-  arbitrary configuration;
-- an inverse kinematics solution is checked by the official model's forward kinematics, so a wrong
-  convention cannot pass by agreeing with itself;
-- the complete approach/grasp/lift/place/release/retreat sequence executes for both arms, reports its
-  labelled grasp mode, asserts the both-finger pinch and the verification lift on every grasp, and
-  passes independent verification.
+## Execution, recovery, and verification
 
-Three engine differences had to be handled explicitly, and each is covered by a test:
+`execution/task_executor.py` observes before and after each skill and records the evidence with
+its action index. A failed table approach or empty pinch can be reacquired once from the current
+measured state. A lost transport or a failed handover is reported, not replayed from a scene reset.
+The initial `randomize` option and an explicit reset are setup operations; retries do not reset.
 
-1. **Equalities.** Genesis builds every equality it parses and reads no `active` flag, and it has no
-   runtime enable/disable. The scene therefore declares no inactive equalities at all: a grasp is the
-   fingers' physical pinch, so no constraint that could move an object is expressed.
-   `genesis_scene_xml()` remains as a guard, dropping any inactive equality a future scene edit
-   introduces before the XML reaches Genesis.
-   `test_genesis_builds_the_official_model` asserts Genesis built exactly the official two finger
-   mimics.
-2. **Bias feed-forward.** A Genesis position controller holds a commanded pose `gravity_torque / kp` short
-   of its target. Measured on this machine with the same commanded pose and the same control path: 10.16 mm
-   of sag without compensation, 0.41 mm with it. `apply_gravity_compensation()` writes the arm's gravity
-   torque into the constant term of Genesis's actuator model (`act_bias[0]`, the analogue of the model's
-   `biasprm[0]`), which keeps the damping implicit in the solver and leaves the cubes their own gravity. An
-   earlier attempt to feed the same torque through `control_dofs_force` diverged on long joint paths,
-   because FORCE mode skips the implicit damping the solver folds into the mass matrix for POSITION mode.
-3. **Sites.** Genesis has no MJCF site, so the gripper control point and the zone origins come from the
-   model description as a parent link plus a local offset (above).
+The discourse context stores only the last object, hand, and released target. It advances from
+successful execution steps and is cleared with a scene reset. It is a reference aid, not evidence
+of ownership; hand occupancy is always observed from Genesis contacts.
 
-Measured placement error of the red-cube task through the task API, with the physical friction pinch:
-7.6 mm horizontally and 23.0 mm vertically against a 40 mm / 50 mm tolerance (right-arm blue-cube task:
-5.4 mm). The residual is where the released object comes to rest after its 4 cm release drop onto the
-zone, not a grasp defect: the transport holds the object between the fingertip pads the whole way.
+`verification/goal_verification.py` checks every final object predicate, including objects placed
+earlier in the task. Holding requires both fingers and an elevated object. Placement requires
+horizontal error <=40mm, vertical error <=50mm, no finger contact, linear speed <20mm/s, and
+less than 2mm displacement over a 100ms observation window. Unmentioned objects must stay within
+6mm of their initial positions. The displayed result includes measured errors and tolerances.
+A truncated plan or an unfinished skill cannot become a success just because some final position
+happens to match.
 
-`scripts/verify_pick_place_genesis.py` runs the same physical pick & place from nine initial object
-positions (six left-arm, three right-arm); all nine passed on this machine with 0.0 mm approach
-displacement, a both-finger pinch, the object following the verification lift, and 5.3-18.5 mm final
-horizontal error (`outputs/pick_place_positions.json`).
+## Broker and UI
 
-## OpenArm v2
+`run_genesis_gui.py` registers an owner before constructing Genesis, preventing duplicate native
+viewers. The broker accepts snapshots and results only from its registered owner; the destructive
+queue-read endpoint also checks the owner ID. Planning runs in a worker on an immutable scene
+snapshot, keeping native macOS rendering on the main thread. Only that main thread drives Genesis.
+A stop during planning can be reported without allowing a late language response to move motors.
 
-- Model: `openarm-mujoco` 2.3.0, v2 Cell, attached bimanual robot.
-- Actuator mapping: 1 lifter, 7 left arm, 1 left gripper, 7 right arm, 1 right gripper.
-- Active task arm: left.
-- Controller: damped least-squares inverse kinematics on the gripper control point, executed as an
-  interpolated joint path. The rotation algebra is NumPy (`backend/app/simulation/transform.py`) and is
-  pinned against MuJoCo's `mju_*` functions by `backend/tests/test_transform.py`.
+The operator page at `/` and `/simple` shows the entire interpreted program, assumptions, current
+step, actual provider, measured hand occupancy, verification, and failures. Queued resets and stop
+requests remain pending until acknowledged by execution. `/api/scene` serves the viewer's latest
+snapshot and returns 503 while none exists; the backend never invents a scene.
 
-## Execution
-
-- Pydantic plan validation rejects unknown skills, objects, targets, unsupported arms, empty or oversized plans.
-- The executor serializes simulation control through one engine/task.
-- Failure verification is independent of the AI plan.
-- `reset(randomize=True)` uses one shared placement function for both engines, whose seed is documented
-  in `backend/app/simulation/openarm_v2/scene.py`.
-
-## Memory
-
-- AuraDB uses parameterized Cypher and constraints.
-- Experience is keyed by task, execution, object, skill, outcome, and failure.
-- If AuraDB is unavailable, records go to `outputs/memory-fallback.json` and the UI reports `Fallback`.
-- Retrieved experience is stored back into plans only as a compact summary (instruction, outcome, retry
-  count, skills). Embedding whole records nested the entire history inside one record and grew the
-  fallback file to 4.2 GB (one record: 345 MB); the summaries keep it flat.
+The native viewer also supports `--headless` and `--once` for testing the same broker path without
+a window. `scripts/verify_language_tasks.py` exercises the actual planner and executor and writes
+inspectable JSON. Existing official-model fidelity and position-grid tests remain applicable.

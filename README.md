@@ -1,240 +1,150 @@
-# Embodied AI Agent — OpenArm v2 on Genesis World
+# OpenArm v2 — 言葉で作業する Genesis エージェント
 
-**Think. Act. Learn.**
+公式の OpenArm v2 Cell と Genesis World に限定した、ファインチューニング不要の操作エージェントです。
+日本語・英語・混在する指示を、物体と左右の手を区別した作業列に変換します。Web は指示入力と計測結果の表示、
+実際のシミュレーションは独立した Genesis ネイティブビューアーが担当します。
 
-This repository contains a hackathon implementation of an embodied agent that accepts natural-language
-manipulation tasks, plans a restricted skill sequence, executes it on the official OpenArm v2 Cell model
-in [Genesis World](https://github.com/Genesis-Embodied-AI/genesis-world), independently verifies the
-physical result, records experience, and reuses memory on later tasks.
-
-## What is implemented
-
-### Implemented and verified on this machine
-
-- Official `openarm-mujoco` 2.3.0 OpenArm v2 bimanual Cell model, with both arms displayed.
-- Machine-independent scene loading: the demo scene resolves its official asset paths from the installed
-  `openarm-mujoco` package at load time, so no machine-specific path is stored.
-- **One engine-neutral simulation contract**: the planner, skills, controller and verification step read
-  poses, Jacobians, contacts and grasp state only through `SimulationBackend`, and never import the
-  engine. MuJoCo's compiler is used as the *reader* of the model description (sites, keyframe, actuator
-  mapping), which Genesis does not implement; the physics is Genesis World 1.4.4.
-- The engine's own state is checked against that model description: reset state, forward kinematics, the
-  gripper control point and the 3x7 linear and angular Jacobians agree to 1e-5 / 1e-6 with the compiled
-  MJCF evaluated by MuJoCo's kinematics routines.
-- Custom demo scene based on the official Cell model, adding one red cube, one blue cube, a blue target
-  zone, and a green target zone.
-- Damped least-squares inverse kinematics, joint position control, gripper control, timed skills,
-  cancellation, and reset. The controller's rotation algebra is NumPy and is pinned against MuJoCo's
-  `mju_*` functions.
-- A complete red-cube Pick & Place with the left arm and a blue-cube Pick & Place with the right arm.
-- **Physical grasping**: the gripper opens, the IK aligns the hand's fingertip midpoint (measured
-  from the official model's fingertip pads, `FINGERTIP_MIDPOINT`) to the object centre, the fingers
-  close as a position-controlled friction pinch, and the grasp is verified from the finger-object
-  contacts plus a short verification lift the object must follow. Nothing writes an object's pose
-  during an execution; a failed pinch is reported as `GRASP_FAILED` / `GRASP_LOST`, never as success.
-- Physical result verification from engine measurements, including 40 mm horizontal tolerance, release
-  check (no finger touches the object), stability check, and measured position error.
-- FastAPI APIs and WebSocket simulation frames from the engine's renders; `/api/health` reports the
-  engine and the grasp mode.
-- React + TypeScript + Vite dashboard with task input, plan, live robot state, engine and grasp-mode
-  badges, agent events, verification, and history.
-- Neo4j AuraDB integration with local JSON fallback, parameterized Cypher persistence, and retrieval.
-  Retrieved experience is stored back only as a compact summary, so records cannot nest the whole
-  history inside one another.
-- Memory retrieval that feeds prior executions to the planner as compact summaries (a whole record
-  is never embedded in another, which historically grew one record to 345 MB).
-- OpenAI-compatible `ai&` client with deterministic fallback when credentials are missing.
-- Broader command surface for OpenArm v2: pick/place, approach, grasp-and-hold, direct gripper
-  open/close, home, and guarded relative EE moves. Japanese and English direct commands are
-  handled by the deterministic parser; an optional local Ollama planner can interpret other prompts.
-- **34 automated tests, all passing** (`pytest -q`).
-
-### Verified demonstration
-
-The red cube starts at `(0.44, 0.15, 1.032)`. The left arm opens its gripper, aligns the fingertip
-midpoint to the cube centre, closes the fingers into a friction pinch, verifies both fingers contact
-the cube and the cube follows a verification lift, lifts, moves over the blue zone, releases, and
-retreats.
-
-Measured through the task API on this machine, with the physical friction pinch:
-
-```
-task success: True, retries: 0, attempts: 1
-verification: horizontal error 7.6 mm (tolerance 40 mm), vertical error 23.0 mm,
-              released True, stable True, engine genesis, grasp_mode physical-friction-pinch
-right-arm blue-cube task: the same, horizontal error 5.4 mm
+```text
+右手がBlue Cubeを取って左手に渡した後に置いて、
+その左手にあるRED CUBEを掴んで右手がそれを取って右手のところに置く
 ```
 
-`scripts/verify_pick_place_genesis.py` runs the whole physical pick & place from **nine initial
-object positions** (six left-arm, three right-arm, spread across each arm's workspace). All nine
-passed on this machine: every run reports 0.0 mm approach displacement, a both-finger pinch, the
-object following the verification lift, and 5.3-18.5 mm final horizontal error; the evidence is in
-`outputs/pick_place_positions.json` (regenerated by the script). The grasp mode is reported with
-every grasp result (`grasp_mode: physical-friction-pinch`), in `/api/health`, and on the dashboard
-badge.
+この指示は「青を右で取る → 左に渡す → 左側に置く → 赤を左で取る → 右に渡す → 右側に置く」に分解されます。
+左右の手が同じキューブを接触で保持し、受け手の把持を確認してから渡し手を開く、直接の受け渡しです。
 
-## Simulation engine
+## 起動
 
-Genesis World runs the resolved MJCF — the official Cell model **attached, not copied or substituted** —
-plus the demo objects. Install it, start the server:
-
-```bash
-uv sync                 # genesis-world 1.4.4, needs Python 3.12 or 3.13
-./run.sh
-```
-
-Two things Genesis does differently from the model description, each handled explicitly and each
-covered by a test:
-
-| Difference | Handling |
-|---|---|
-| Genesis builds every MJCF equality and reads no `active` flag, and has no runtime enable/disable | the scene declares no inactive equalities at all (a grasp is the fingers' physical pinch, so no constraint that could move an object is expressed); a guard still strips any inactive equality a future scene edit introduces, because Genesis would build it as a permanent constraint |
-| its position controller has no bias feed-forward, so a commanded pose rests `gravity_torque / kp` short of its target (measured 9.6 mm) | `apply_gravity_compensation()` writes the arm's gravity torque into the constant term of the actuator model (`act_bias[0]`, the analogue of the model's `biasprm[0]`); a free-space hold then measures 0.87 mm, with the solver's implicit damping kept and the cubes keeping their gravity |
-| Genesis does not implement MJCF sites | the gripper control point and the zone origins are read as a parent link plus a local offset from the same XML string, with MuJoCo's compiler |
-
-Grasping is the same physics as the model description: the position-controlled fingertip pads pinch
-the object's side faces, the official finger mimic equality keeps the two fingers symmetric, the
-contact solver produces the finger-object contacts, and friction holds the object through lift and
-transport. There is no engine-side grasp state to leave on and no mechanism that moves an object on
-its own. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the measurements and the reasoning.
-
-## Quick start
-
-1. Put Neo4j credentials in `.env`:
-
-   ```bash
-   NEO4J_URI=neo4j+s://...
-   NEO4J_USERNAME=neo4j
-   NEO4J_PASSWORD=...
-   NEO4J_DATABASE=neo4j
-   ```
-
-   Optionally add `AI_AND_API_KEY`, `AI_AND_BASE_URL`, `AI_AND_MODEL`.
-
-2. Start:
-
-   ```bash
-   ./run.sh
-   ```
-
-   Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
-   For a command-only page, open [http://127.0.0.1:8000/simple](http://127.0.0.1:8000/simple).
-
-## Development commands
+Python 3.12 または 3.13 と `uv` を使用します。プロジェクトのルートで実行してください。
 
 ```bash
 uv sync
-uv run pytest -q                          # 28 tests, the engine is required
-uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --reload
-uv run python scripts/record_demo.py      # regenerates outputs/openarm-v2-demo.mp4
-cd frontend && npm install && npm run dev
+./run_genesis_gui.sh
 ```
 
-Any Python 3.12 environment with the dependencies from `pyproject.toml` works as well; the suite fails
-loudly (rather than skipping) if the engine is missing.
+[http://127.0.0.1:8000/simple](http://127.0.0.1:8000/simple) を開いて指示を送ります。
+`/` でも同じ入力画面を表示します。Genesis のウィンドウで実際の動作を確認できます。
 
-## Demo script
+ローカルの Ollama に `qwen3-vl:4b` がインストール済みであれば、ランチャーが自動選択します。
+既存の `AI_AND_API_KEY`、`AI_AND_BASE_URL`、`AI_AND_MODEL` がすべて設定されていれば、OpenAI 互換のプロバイダーを使います。
+設定は `.env` に置き、Git に追加しないでください。モデルを再学習したり、重みを変更したりする処理はありません。
 
-1. Press **Reset**.
-2. Enter: `Move the red cube into the blue zone.`
-3. Press **Execute** and observe the plan, the OpenArm v2 motion, the grasp, transport, release, and the
-   verification panel.
-4. Press **Random** to change the initial cube pose, then repeat the task.
-5. Inspect **Execution History** for real durations, retries, and failure categories.
-6. If Neo4j is available, check `/api/memory` and the dashboard status.
+```bash
+# ローカルモデルを明示して起動する場合
+OPENARM_LOCAL_PLANNER=1 OPENARM_OLLAMA_MODEL=qwen3-vl:4b ./run_genesis_gui.sh
 
-`docs/DEMO.md` walks through the same sequence and what each badge means.
-
-The task API also supports:
-
-```json
-{"instruction": "Move the red cube into the blue zone.", "randomize": true, "force_failure": false}
+# 言語モデルを使わず、対応する定型文だけで操作する場合
+OPENARM_LOCAL_PLANNER=0 ./run_genesis_gui.sh
 ```
 
-The command parser also accepts shorter OpenArm v2 instructions such as:
+モデルを利用できない場合は `deterministic_fallback` と表示します。理解できない指示を、勝手な赤キューブの移動に置き換えることはありません。
+インポートされた Qwen3-VL の Ollama テンプレートが `{{ .Prompt }}` だけの場合は、モデルのアーキテクチャを確認してから
+会話の区切りと非推論の出力開始形式を補います。ほかのモデルのテンプレートや、Ollama に保存されたモデル自体は変更しません。
+
+## 指示の例
 
 ```text
+右手で青いキューブを掴んで
+それを左手に渡して左側に置く
+
+青いやつを右で拾って、空いてるほうの手にパスして、そっちの端に置いといて。
+そのあと赤い方を左でつまんで右に受け取ってもらって右側に置いといて
+
+Pick the blue cube with the right hand, then pass it to the left hand,
+then place it on the left side.
+
+赤を青いゾーンに置いて、青を緑のゾーンに置いて
+右アームを右に10cm動かして
 グリッパーを開いてください
-Close the left hand.
-右アームを右に10cm動かしてください
-赤いキューブを右に5cm動かしてください
-赤いキューブを緑のゾーンに入れてください
 ```
 
-Relative motion is guarded to 1-30 cm. A command that moves an object first performs the same
-physical approach and pinch as a verified pick-and-place; it does not write the object pose.
-The optional local planner is enabled by `run_genesis_gui.sh` only when `qwen3-vl:4b` is already
-installed. Its provider is reported separately, and a provider failure still falls back to the
-deterministic OpenArm v2 planner.
+「取る」だけなら保持します。「置く」まで指定した場合は解放と安定を確認します。
+手を省略した場合は現在持っている手、または実測位置に近い手を選びます。
+置く場所を省略した場合は保持している手の側に置き、その解釈を画面に表示します。
+「それ」は指示内の直前の物体、続く指示では直前に扱った物体を参照します。
+シーンの初期化で参照履歴も初期化します。
 
-`force_failure` is a controlled, recoverable demonstration fault: the first attempt uses an unreachable
-grasp-alignment offset and produces a real `IK_FAILURE`, the planner replans within its bound, and the second
-attempt runs physically. Verified on this engine (`retries: 1`, attempt 1 `IK_FAILURE`, attempt 2
-`SUCCEEDED`); no pre-recorded success is substituted for the recovery run.
+画面には解釈した全工程、実行中の工程、プロバイダー、手が持っている物体、失敗理由、最終状態の判定が表示されます。
+停止はキュー待ちの指示を取り除き、実行中はコントローラーまで伝わります。途中の物体をリセットして成功を作る処理はありません。
 
-`randomize` is a documented scene reset/setup operation with a fixed seed; it does not teleport the object
-during task execution.
-
-## API
-
-- `GET /api/health`
-- `GET /api/system/status`
-- `GET /api/scene`
-- `POST /api/scene/reset?randomize=false`
-- `POST /api/tasks`
-- `GET /api/tasks/{task_id}`
-- `POST /api/tasks/{task_id}/stop`
-- `GET /api/executions`
-- `GET /api/memory`
-- `POST /api/memory/reconnect`
-- `GET /api/config/status`
-- `WS /ws`
-
-No API endpoint returns credentials.
-
-## Architecture
+## 構成
 
 ```mermaid
 flowchart TD
-  U[User instruction] --> P[Planner / validator]
-  W[(World state from the engine)] --> P
-  M[(Neo4j AuraDB / local fallback)] --> P
-  P --> E[Execution engine]
-  E --> S[OpenArm v2 skills]
-  S --> C[Engine-neutral controller / IK]
-  C --> Q[(Genesis World running the official OpenArm v2 Cell)]
-  Q --> V[Independent verification]
-  V --> E
-  E --> M
-  Q --> F[Web dashboard]
-  E --> F
-  MD[(Official MJCF: one model description)] -.->|read by MuJoCo's compiler| Q
+    Input[Web の言語指示] --> Language[LLM / 明示した定型文フォールバック]
+    Language --> Program[型付き TaskProgram]
+    Scene[Genesis の実測状態と参照履歴] --> Grounding[物体参照・左右・手の占有を解決]
+    Program --> Grounding
+    Grounding --> Validator[全工程の前提条件を事前検証]
+    Validator --> Executor[状態を再観測しながら実行]
+    Executor --> Skills[把持・運搬・直接受け渡し・配置]
+    Model[公式 OpenArm v2 モデルと衝突メッシュ] --> Skills
+    Skills --> IK[IK とモーター位置制御]
+    IK --> Genesis[唯一の Genesis シミュレーション]
+    Genesis --> Scene
+    Genesis --> Check[接触・追従・解放・安定・全物体の最終目標]
+    Check --> Executor
+    Check --> Results[Web の計測結果]
 ```
 
-## Asset and license attribution
+言語モデルの仕事は意図の分解です。関節角、自由な Python、物体の座標書き換えを生成させません。
+1つの手が2つのキューブを持つ計画、受け手が塞がった受け渡し、未知の物体、範囲外の相対移動は事前に拒否します。
+無効なモデル回答は検証理由を添えて1回修正し、それでも無効なら理解できた定型文へ戻るか、理由を示して失敗します。
 
-The robot and Cell scene originate from the official [openarm_mujoco](https://github.com/enactic/openarm_mujoco)
-package installed as `openarm-mujoco` 2.3.0. Official XML comments include Enactic copyright and
-Apache-2.0 licensing. The custom `assets/scenes/openarm_v2_demo.xml` only attaches the official Cell model
-and adds demonstration objects/zones. The reference repository `openarm-control` was inspected for control
-patterns; no framework code was copied. [Genesis World](https://github.com/Genesis-Embodied-AI/genesis-world)
-`genesis-world` 1.4.4 is Apache-2.0 and is the physics engine; no Genesis code was copied into this
-repository. MuJoCo arrives as a Genesis dependency and is used in this project only to read the model
-description and, in tests, as the kinematics reference.
+受け渡しでは、公式メッシュに基づいて両腕とキューブの姿勢を一緒に解きます。受け手は物体の外側から直線で接近し、
+両指の接触を確認してから渡し手を開いて後退します。その後、受け手だけで3cm持ち上げ、物体の追従と接触を確認します。
+運搬も短い直線経路に分けます。IK が解けただけで動作を成功扱いせず、実際の到達位置と姿勢を測ります。
 
-## Known limitations
+詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) を参照してください。
 
-- Neo4j AuraDB connection was not validated on this machine (`ServiceUnavailable: Unable to retrieve
-  routing information`), so the app used its labeled local fallback. The AuraDB integration is implemented
-  and activates automatically once the instance accepts routing connections.
-- No `ai&` credentials were configured, so planning used the labelled deterministic fallback. The
-  OpenAI-compatible client activates when all three variables are set.
-- Grasping is a physical friction pinch between the official fingertip pads. Both-finger contact,
-  the verification lift, and a no-finger-contact release check are asserted on every run; an object
-  is never moved by writing its pose.
-- Both arms are loaded and displayed, each with a verified single-arm task. A coordinated simultaneous
-  bimanual task is not complete.
-- Camera orbit/zoom is not implemented in the browser; the view is the fixed camera in
-  `backend/app/simulation/genesis_backend/environment.py`.
-- `scripts/record_demo.py` regenerates a low-resolution backup MP4 at `outputs/openarm-v2-demo.mp4` from a
-  real run, and deletes it if any skill or the verification failed.
+## 検証の再実行
+
+```bash
+uv run pytest -q
+uv run python scripts/measure_grasp_geometry.py --check
+
+# ユーザーの例を、定型文コンパイラーから実際の物理実行まで検証
+uv run python scripts/verify_language_tasks.py --case example
+
+# 同じ例の初期位置を変更
+uv run python scripts/verify_language_tasks.py --case example --randomize
+
+# ローカルモデルで日英・言い換え・複数指示を実際に実行
+uv run python scripts/verify_language_tasks.py --case all --provider local
+
+# 既存の、初期位置9通りの把持・配置チェック
+uv run python scripts/verify_pick_place_genesis.py
+```
+
+`outputs/language_tasks_local.json`、`outputs/language_tasks_fallback.json` などに、
+解釈した作業列、各動作の計測値、両指の接触、受け渡し後の持ち上げ、最終配置の誤差を保存します。
+これらの JSON は Git 管理外です。検証スクリプトは、要求された数の実際の受け渡しと全目標の確認が揃った場合だけ終了コード0を返します。
+
+## このマシンでの検証結果（2026-10-20）
+
+- `uv run pytest -q`: 68件成功。IKが実際のシーンへ候補姿勢を書き込まないこと、左右の腕とリフターの運動学が一致することも確認。
+- ローカルモデル有効時の言語タスク: 7シナリオ・8指示がすべて成功。直接受け渡し9回を含みます。
+- 上記8指示のうち、7指示は `local_ollama`、単純な「掴んで」の1指示は明示された定型文コンパイラーです。
+- 初期位置を変更した、ユーザーの2回受け渡しの例も成功。
+- 既存の初期位置9通りの把持・配置も9/9成功し、水平誤差は2.4–2.8mm。
+- IKを計算用データへ分離した後も、Webからネイティブビューアーへ送った同じ長い例が成功。全14工程を各1回、再試行0回で完了し、最終配置の水平誤差は青3.55mm、赤3.57mm、実行は約119秒でした。
+
+これらはこのシーンで実行した具体的なケースの結果です。任意の指示全般の成功率を示すものではありません。
+生成された `outputs/validation_summary.json`、`outputs/motion_replay_fix_validation.json` と各実行JSONに、判定と計測値を保存しています。
+検証時の [ネイティブ画面](outputs/motion-replay-fix-native.png) と [Webの完了表示](outputs/motion-replay-fix-ui.png) も保存しています。
+
+## 対応範囲
+
+- 現在の公式 OpenArm v2 Cell、2つの剛体キューブ、青・緑のゾーンと左右・中央の配置場所が対象です。
+- 言語モデルを利用すれば言い換えを扱えますが、任意の日本語・英語を常に正しく解釈する保証はありません。
+- このシーンの操作スキルの組み合わせに限定しています。未知の物体、柔軟物、積み重ね、同時に別々の物体を交換する動作は実装対象に含みません。
+- 受け手の手が塞がっている場合は、先に置く指示が必要です。目標に別のキューブがある場合も、意図せず積み重ねることを避けて停止します。
+- 物理の失敗は現在の状態を残して報告します。限定したテーブル上の把持の再試行は行いますが、シーンを途中で初期化する回復は行いません。
+- 配置判定は水平40mm以内、垂直50mm以内、指からの解放、低速かつ100msの安定を要求します。実際の誤差も別途表示します。
+
+## 公式モデルとライセンス
+
+[OpenArm の公式モデル](https://github.com/enactic/openarm_mujoco)を、インストール済み `openarm-mujoco` から参照して添付します。
+ロボットをコピーして別モデルに置き換えることはありません。
+[Genesis World](https://github.com/Genesis-Embodied-AI/genesis-world) が物理状態の唯一の正です。
+MuJoCo のコンパイラーと運動学関数は公式 MJCF の名前、関節範囲、形状、候補姿勢の読み取りに使い、物理実行は行いません。
+各プロジェクトの Apache-2.0 ライセンスに従います。

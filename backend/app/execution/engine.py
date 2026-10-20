@@ -1,26 +1,23 @@
 from __future__ import annotations
 
 import asyncio
-import time
 import uuid
-from typing import Awaitable, Callable
+from typing import Callable
 
-from backend.app.agent.world_state import build_world_state
-from backend.app.control.motion import OpenArmV2Controller
+from backend.app.execution.task_executor import TaskExecutor
 from backend.app.memory.graph_memory import MemoryStore
-from backend.app.models.schemas import AgentPlan, TaskRequest
-from backend.app.planning.agent_planner import AgentPlanner, validate_plan
+from backend.app.models.schemas import TaskRequest
+from backend.app.planning.agent_planner import AgentPlanner
 from backend.app.simulation.base import SimulationBackend
-from backend.app.skills.robot_skills import SkillRunner
-from backend.app.verification.goal_verification import verify_place_goal
 
 
 class ExecutionEngine:
     def __init__(self, env: SimulationBackend, memory: MemoryStore):
         self.env = env
         self.memory = memory
-        self.controller = OpenArmV2Controller(env)
-        self.skills = SkillRunner(env, self.controller)
+        self.executor = TaskExecutor(env)
+        self.controller = self.executor.controller
+        self.skills = self.executor.skills
         self.planner = AgentPlanner()
         self.events: list[dict] = []
         self.executions: list[dict] = []
@@ -60,6 +57,7 @@ class ExecutionEngine:
         self.state = "PLANNING"
         if request.randomize:
             self.env.reset(randomize=True)
+            self.executor.reset_context()
         self._task = asyncio.create_task(self._run(request))
         return task_id
 
@@ -71,98 +69,31 @@ class ExecutionEngine:
 
     async def _run(self, request: TaskRequest):
         assert self.current
-        started = time.perf_counter()
         self.emit("task_started", task_id=self.current["task_id"], instruction=request.instruction)
+        executor = self.executor
         try:
-            attempts = []
-            success = False
-            for attempt in range(3):
-                self.current["attempt"] = attempt + 1
-                state = build_world_state(self.env)
-                self.current["initial_world_state"] = state
-                self.state = "PLANNING"
-                self.emit("memory_retrieval_started")
-                obj = state["objects"][0]["id"]
-                memory = self.memory.retrieve("place_in_zone", obj)
-                self.emit("memory_retrieved", count=len(memory), memories=memory[-3:])
-                plan = self.planner.plan(request.instruction, state, memory)
-                if attempt == 0 and request.force_failure and plan.steps:
-                    plan.steps[0].fault_offset = -0.12
-                    self.emit("controlled_fault_injected", detail="First attempt uses an unreachable approach offset")
-                self.state = "VALIDATING"
-                self.emit("plan_generated", plan=plan.model_dump())
-                valid, errors = validate_plan(plan, state)
-                self.emit("plan_validated", valid=valid, errors=errors)
-                if not valid:
-                    attempts.append({"attempt": attempt + 1, "status": "FAILED", "error": "INVALID_PLAN", "details": errors})
-                    break
-                self.state = "EXECUTING"
-                loop = asyncio.get_running_loop()
-                progress = lambda phase: self.emit("skill_progress", phase=phase, attempt=attempt + 1)
-                results = await loop.run_in_executor(None, lambda: self.skills.execute_plan(plan.model_dump()["steps"], progress))
-                self.emit("skills_completed", results=results)
-                failed_skill = next((r for r in results if not r.get("success", False)), None)
-                goal = plan.goal
-                obj_id = goal.get("object") or (state["objects"][0]["id"])
-                target_id = goal.get("target") or "blue_zone"
-                self.state = "VERIFYING"
-                verification = verify_place_goal(self.env, obj_id, target_id)
-                all_skills_success = all(result.get("success", False) for result in results)
-                goal_type = plan.goal.get("type", "place_in_zone")
-                if goal_type == "place_in_zone":
-                    verification = verify_place_goal(self.env, obj_id, target_id)
-                    success = verification["success"] and all_skills_success and not (
-                        request.force_failure and attempt == 0
-                    )
-                else:
-                    verification = {
-                        "success": bool(all_skills_success),
-                        "goal_type": goal_type,
-                        "method": "completed_skill_execution",
-                        "engine": self.env.name,
-                        "grasp_mode": self.env.grasp_mode,
-                        "failure_category": None if all_skills_success else "SKILL_FAILED",
-                    }
-                    success = all_skills_success
-                self.emit("verification_completed", verification=verification, ai_claimed_success=success)
-                attempts.append({
-                    "attempt": attempt + 1,
-                    "plan": plan.model_dump(),
-                    "skills": results,
-                    "verification": verification,
-                    "status": "SUCCEEDED" if success else "FAILED",
-                })
-                if success:
-                    break
-                if attempt < 2 and goal_type != "place_in_zone":
-                    break
-                if attempt < 2:
-                    self.state = "REPLANNING"
-                    self.emit("replanning", failed_skill=failed_skill, verification=verification)
-                    self.controller.cancelled = False
-                    self.env.reset(randomize=attempt == 1)
-            self.state = "SUCCEEDED" if success else "FAILED"
-            final_state = build_world_state(self.env)
-            record = {
-                "task_id": self.current["task_id"],
-                "execution_id": self.current["execution_id"],
-                "instruction": request.instruction,
-                    "goal_type": goal_type,
-                "object_ids": [o["id"] for o in final_state["objects"]],
-                "skills": [r.get("skill") for a in attempts for r in a.get("skills", [])],
-                "success": success,
-                "failure_category": None if success else attempts[-1].get("verification", {}).get("failure_category", "SIMULATION_ERROR"),
-                "attempts": attempts,
-                "retry_count": len(attempts) - 1,
-                "total_duration": time.perf_counter() - started,
-                "final_world_state": final_state,
-                "planner_provider": self.planner.provider if hasattr(self.planner, "provider") else None,
-            }
+            state = executor.world_state()
+            loop = asyncio.get_running_loop()
+            plan = await loop.run_in_executor(None, lambda: self.planner.plan(request.instruction, state, []))
+            self.state = "VALIDATING"
+            self.emit("plan_generated", plan=plan.model_dump())
+            self.state = "EXECUTING"
+            def emit(kind, **payload):
+                if kind == "verifying":
+                    self.state = "VERIFYING"
+                self.emit(kind, **payload)
+            result = await loop.run_in_executor(None, lambda: executor.run(plan, emit=emit, should_stop=lambda: self.state == "STOPPED", force_failure=request.force_failure))
+            self.state = result["status"]
+            record = {**self.current, **result, "goal_type": plan.goal["type"],
+                      "object_ids": [o["id"] for o in result["final_world_state"]["objects"]],
+                      "failure_category": result["verification"]["failure_category"],
+                      "attempts": [{"plan": result["plan"], "skills": result["skills"], "verification": result["verification"], "status": result["status"]}],
+                      "skills": [s["skill"] for s in result["skills"]], "planner_provider": plan.provider}
             self.executions.append(record)
             self.memory.save_execution(record)
             self.emit("task_finished", status=self.state, record=record)
         except Exception as exc:
             self.state = "FAILED"
-            self.emit("task_error", error=f"{type(exc).__name__}: {str(exc).splitlines()[0]}")
+            self.emit("task_error", error=f"Execution stopped: {type(exc).__name__}")
         finally:
             self.controller.cancelled = False

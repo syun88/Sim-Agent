@@ -3,10 +3,26 @@ from __future__ import annotations
 import numpy as np
 
 from backend.app.simulation.base import SimulationBackend
+from backend.app.planning.task_program import TABLE_TARGETS
+
+
+def physical_holds(env: SimulationBackend) -> dict[str, str | None]:
+    """Contact-derived occupancy, never a planner's remembered ownership."""
+    holds = {}
+    objects = env.frame().objects
+    for side in ("left", "right"):
+        pinched = []
+        for obj in objects:
+            contacts = env.object_contacts(obj, side)
+            if any("inner" in c for c in contacts) and any("outer" in c for c in contacts):
+                pinched.append(obj)
+        holds[side] = pinched[0] if len(pinched) == 1 else None
+    return holds
 
 
 def build_world_state(env: SimulationBackend) -> dict:
     frame = env.frame()
+    holds = physical_holds(env)
     objects = []
     for name, position in frame.objects.items():
         color = name.split("_")[0]
@@ -16,10 +32,12 @@ def build_world_state(env: SimulationBackend) -> dict:
             "color": color,
             "position": position,
             "graspable": True,
+            "held_by": [side for side, obj in holds.items() if obj == name],
         })
     targets = []
     for name, position in frame.zones.items():
         targets.append({"id": name, "color": name.split("_")[0], "position": position})
+    targets.extend({"id": name, "position": list(position), "type": "table_region"} for name, position in TABLE_TARGETS.items())
     relations = []
     for obj in objects:
         obj_pos = np.asarray(obj["position"])
@@ -39,9 +57,9 @@ def build_world_state(env: SimulationBackend) -> dict:
     return {
         "robot": {
             "type": "openarm_v2",
-            "active_arm": "left",
-            "left_arm": {"ee": frame.ee["left"], "gripper": frame.grippers["left"]},
-            "right_arm": {"ee": frame.ee["right"], "gripper": frame.grippers["right"]},
+            "active_arm": next((side for side, obj in holds.items() if obj), None),
+            "left_arm": {"ee": frame.ee["left"], "gripper": frame.grippers["left"], "held_object": holds["left"]},
+            "right_arm": {"ee": frame.ee["right"], "gripper": frame.grippers["right"], "held_object": holds["right"]},
         },
         "objects": objects,
         "targets": targets,

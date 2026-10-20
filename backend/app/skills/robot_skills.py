@@ -110,6 +110,13 @@ class SkillRunner:
         outer = any("outer" in finger for finger in fingers)
         return inner and outer
 
+    def held_object(self, arm: str) -> str | None:
+        return next((obj for obj in self.env.frame().objects if self._pinch_established(obj, arm)), None)
+
+    def _require_hold(self, arm: str, obj: str) -> None:
+        if not self._pinch_established(obj, arm):
+            raise SkillError("GRASP_LOST", f"{arm} no longer has both finger contacts with {obj}")
+
     def _skill(self, name: str, run: Callable[[], dict], started: float) -> dict:
         try:
             result = run()
@@ -119,17 +126,22 @@ class SkillRunner:
 
     # -- skills ------------------------------------------------------------------
 
-    def approach_object(self, arm: str, obj: str, progress=None, fault_offset: float | None = None) -> dict:
+    def approach_object(self, arm: str, obj: str, progress=None, fault_offset: float | None = None, grasp_offset_x: float = 0.) -> dict:
         started = time.perf_counter()
         return self._skill(
             "approach_object",
-            lambda: self._approach(arm, obj, progress, fault_offset),
+            lambda: self._approach(arm, obj, progress, fault_offset, grasp_offset_x),
             started,
         )
 
-    def _approach(self, arm: str, obj: str, progress=None, fault_offset: float | None = None) -> dict:
+    def _approach(self, arm: str, obj: str, progress=None, fault_offset: float | None = None, grasp_offset_x: float = 0.) -> dict:
+        if self.held_object(arm):
+            raise SkillError("HAND_OCCUPIED", f"Place the object held by {arm} before approaching another cube")
+        other = "right" if arm == "left" else "left"
+        if self._pinch_established(obj, other):
+            raise SkillError("HANDOVER_REQUIRED", f"{obj} is held by {other}; use a handover")
         obj_pos, _ = self.env.object_pose(obj)
-        pinch = self._pinch_site_target(arm, obj_pos, fault_offset)
+        pinch = self._pinch_site_target(arm, obj_pos + [grasp_offset_x, 0., 0.], fault_offset)
         finger_direction = GRASP_ROTATION @ np.array([0.0, 0.0, -1.0])
         standoff = pinch - APPROACH_STANDOFF * finger_direction
         high = standoff + np.array([0.0, 0.0, APPROACH_OVERFLY])
@@ -162,6 +174,7 @@ class SkillRunner:
             "final": result.final_position,
             "fingertip_midpoint_error": midpoint_error,
             "object_displacement": disturbance,
+            "grasp_offset_x": grasp_offset_x,
         }
 
     def grasp_object(self, arm: str, obj: str) -> dict:
@@ -217,20 +230,33 @@ class SkillRunner:
         transport paths never come close to.
         """
         started = time.perf_counter()
-        return self._skill("lift_object", lambda: self._move_relative(arm, [0, 0, height]), started)
+        def run():
+            self._require_hold(arm, obj)
+            result = self._move_relative(arm, [0, 0, height])
+            self._require_hold(arm, obj)
+            return result
+        return self._skill("lift_object", run, started)
 
     def open_gripper(self, arm: str) -> dict:
         started = time.perf_counter()
         def run():
             self.controller.wait_gripper(arm, False, 0.45)
-            return {"closed": False}
+            measured = self.env.frame().grippers[arm]
+            from backend.app.simulation.openarm_v2.definition import GRIPPER_OPEN
+            if abs(measured - GRIPPER_OPEN[arm]) > .08:
+                raise SkillError("GRIPPER_BLOCKED", "The gripper did not physically open")
+            return {"closed": False, "measured_joint": measured}
         return self._skill("open_gripper", run, started)
 
     def close_gripper(self, arm: str) -> dict:
         started = time.perf_counter()
         def run():
             self.controller.wait_gripper(arm, True, 0.65)
-            return {"closed": True}
+            from backend.app.simulation.openarm_v2.definition import GRIPPER_CLOSED
+            measured = self.env.frame().grippers[arm]
+            if abs(measured - GRIPPER_CLOSED[arm]) > .08 and self.held_object(arm) is None:
+                raise SkillError("GRIPPER_BLOCKED", "The empty gripper could not close")
+            return {"closed": True, "measured_joint": measured}
         return self._skill("close_gripper", run, started)
 
     def move_relative(self, arm: str, direction: str, distance_cm: float) -> dict:
@@ -248,14 +274,140 @@ class SkillRunner:
         return self._skill("move_to_target", lambda: self._move_to_zone(arm, target), started)
 
     def _move_to_zone(self, arm: str, target: str) -> dict:
+        obj = self.held_object(arm)
+        if obj is None:
+            raise SkillError("GRASP_LOST", f"{arm} has no physical pinch to transport")
         zone = self.env.zone_position(target)
+        for other, position in self.env.frame().objects.items():
+            if other != obj and np.linalg.norm(np.asarray(position)[:2] - zone[:2]) < .075 and abs(position[2] - zone[2]) < .06:
+                raise SkillError("TARGET_OCCUPIED", f"{other} occupies {target}; refusing to stack cubes accidentally")
         desired_object = zone.copy()
         desired_object[2] = RELEASE_HEIGHT
-        site_target = self._pinch_site_target(arm, desired_object)
-        result = self.controller.move_to_site(arm, site_target)
+        _, rotation = self.env.ee_pose(arm)
+        if np.linalg.norm(rotation - GRASP_ROTATION) > .1:
+            # The handover attitude fits the shared centre workspace. Return to the
+            # calibrated table attitude while the cube is still high and clear.
+            ee, rotation = self.env.ee_pose(arm)
+            center = self.env.object_pose(obj)[0]
+            offset = rotation.T @ (center - ee)
+            from scipy.spatial.transform import Rotation, Slerp
+            arc = Slerp([0., 1.], Rotation.from_matrix(np.stack([rotation, GRASP_ROTATION])))
+            for alpha in np.linspace(0., 1., 9)[1:]:
+                desired_rotation = arc(alpha).as_matrix()
+                result = self.controller.move_to_site(arm, center - desired_rotation @ offset, desired_rotation)
+                if not result.success:
+                    raise SkillError(result.error or "IK_FAILURE", "Cannot reorient the physical grasp for table placement")
+                self._require_hold(arm, obj)
+        current = self.env.object_pose(obj)[0]
+        travel = desired_object.copy()
+        # The handover lift is deliberately higher than ordinary transport. A fixed
+        # clearance altitude avoids exceeding the horizontal grasp workspace ceiling
+        # when the receiving pinch sits farther along the cube face.
+        travel[2] = 1.14
+        self._carry_to(arm, obj, travel)
+        return self._carry_to(arm, obj, desired_object)
+
+    def _carry_to(self, arm: str, obj: str, desired: np.ndarray) -> dict:
+        self._require_hold(arm, obj)
+        ee, rotation = self.env.ee_pose(arm)
+        start = self.env.object_pose(obj)[0].copy()
+        offset = rotation.T @ (start - ee)
+        commanded_rotation = self.controller.target_rotations.get(arm, rotation)
+        target = np.asarray(desired) - commanded_rotation @ offset
+        # Keep the carried cube on a Cartesian clearance path. A joint interpolation
+        # between two high endpoints can still dip the palm through a table object.
+        count = max(1, int(np.ceil(np.linalg.norm(np.asarray(desired) - start) / .025)))
+        for alpha in np.linspace(0., 1., count + 1)[1:-1]:
+            waypoint = (1 - alpha) * start + alpha * np.asarray(desired)
+            result = self.controller.move_to_site(arm, waypoint - commanded_rotation @ offset, commanded_rotation)
+            if not result.success:
+                raise SkillError(result.error or "IK_FAILURE", f"Cartesian carry of {obj} was blocked at {np.round(waypoint, 4).tolist()} (position residual {result.position_error}, rotation residual {result.rotation_error})")
+            self._require_hold(arm, obj)
+        for _ in range(3):
+            result = self.controller.move_to_site(arm, target, commanded_rotation)
+            if not result.success:
+                raise SkillError(result.error or "IK_FAILURE", f"Cannot carry {obj} to {np.round(desired, 4).tolist()} (EE {np.round(target, 4).tolist()}, position residual {result.position_error}, rotation residual {result.rotation_error})")
+            self._require_hold(arm, obj)
+            actual = self.env.object_pose(obj)[0]
+            error = float(np.linalg.norm(actual - desired))
+            if error <= .008:
+                return {"object": obj, "target": np.asarray(desired).tolist(), "position": actual.tolist(), "position_error": error}
+            target += np.asarray(desired) - actual
+        raise SkillError("GRASP_SLIP", f"{obj} deviated from carry target by {error * 1000:.1f} mm")
+
+    def handover_object(self, arm: str, obj: str, receiver: str) -> dict:
+        return self._skill("handover_object", lambda: self._handover(arm, obj, receiver), time.perf_counter())
+
+    def _handover(self, arm: str, obj: str, receiver: str) -> dict:
+        if receiver not in {"left", "right"} or receiver == arm:
+            raise SkillError("INVALID_PLAN", "Handover requires different giver and receiver arms")
+        self._require_hold(arm, obj)
+        if self.held_object(receiver):
+            raise SkillError("HAND_OCCUPIED", f"The receiving {receiver} hand is occupied")
+        from backend.app.simulation.openarm_v2.handover import plan_handover_geometry
+        # A rearward table pinch leaves the other part of the face available to the receiver.
+        # For a previously held cube, adapt the receiving depth to the measured grasp instead.
+        ee, rotation = self.env.ee_pose(arm)
+        cube, cube_rotation = self.env.object_pose(obj)
+        pad_bias = float((cube_rotation.T @ (ee + rotation @ FINGERTIP_MIDPOINT[arm] - cube))[0])
+        bias = float(np.clip(.03 + pad_bias, .015, .025))
+        try:
+            geometry = plan_handover_geometry(self.env, arm, obj, receiver_bias=bias)
+        except ValueError as exc:
+            raise SkillError("HANDOVER_UNREACHABLE", str(exc)) from None
+        offset = rotation.T @ (cube - ee)
+        donor_site = geometry.position - geometry.donor_rotation @ offset
+        moved = self.controller.move_to_site(arm, donor_site, geometry.donor_rotation, q_init=geometry.donor_seed)
+        if not moved.success:
+            raise SkillError(moved.error or "IK_FAILURE", "Donor could not reach the coupled handover pose")
+        self.env.step(600)
+        self._require_hold(arm, obj)
+        self.controller.wait_gripper(receiver, False, .5)
+        cube, cube_rotation = self.env.object_pose(obj)
+        receiving_rotation = cube_rotation @ geometry.receiver_relative_rotation
+        site = cube + receiving_rotation @ np.array([0., 0., bias]) - receiving_rotation @ FINGERTIP_MIDPOINT[receiver]
+        pregrasp = site + receiving_rotation[:, 2] * .12
+        # A joint interpolation straight to the cube sweeps an open finger through it.
+        # First stay outside the donor, then insert along a measured Cartesian line.
+        result = self.controller.move_to_site(receiver, pregrasp, receiving_rotation, q_init=geometry.receiver_seed)
         if not result.success:
-            raise SkillError(result.error or "IK_FAILURE", "Unable to reach target")
-        return {"target": site_target.tolist(), "final": result.final_position}
+            raise SkillError(result.error or "IK_FAILURE", "Receiver could not reach the handover standoff")
+        self.env.step(200)
+        self._require_hold(arm, obj)
+        for alpha in np.linspace(0., 1., 13)[1:]:
+            target = (1 - alpha) * pregrasp + alpha * site
+            result = self.controller.move_to_site(receiver, target, receiving_rotation)
+            if not result.success:
+                raise SkillError(result.error or "IK_FAILURE", "Receiver was blocked during the straight insertion")
+            self._require_hold(arm, obj)
+        displacement = float(np.linalg.norm(self.env.object_pose(obj)[0] - cube))
+        if displacement > .006:
+            raise SkillError("HANDOVER_APPROACH_COLLISION", f"Receiver displaced the held cube by {displacement * 1000:.1f} mm")
+        self.controller.wait_gripper(receiver, True, .65)
+        receiving_contacts = sorted(self._contact_fingers(obj, receiver))
+        if not self._pinch_established(obj, receiver):
+            raise SkillError("HANDOVER_NO_RECEIVER_PINCH", f"No two-finger pinch by {receiver}: {receiving_contacts}")
+        donor_contacts = sorted(self._contact_fingers(obj, arm))
+        self.controller.wait_gripper(arm, False, .4)
+        donor_ee, donor_rotation = self.env.ee_pose(arm)
+        result = self.controller.move_to_site(arm, donor_ee + donor_rotation[:, 2] * .08, donor_rotation)
+        if not result.success:
+            raise SkillError(result.error or "MOTION_BLOCKED", "Donor failed to withdraw after releasing")
+        if self.env.object_contacts(obj, arm):
+            raise SkillError("HANDOVER_DONOR_CONTACT", "Donor still touches the transferred cube")
+        self._require_hold(receiver, obj)
+        before = self.env.object_pose(obj)[0].copy()
+        self._carry_to(receiver, obj, before + [0., 0., VERIFICATION_LIFT])
+        after = self.env.object_pose(obj)[0]
+        rose = float(after[2] - before[2])
+        if rose < VERIFICATION_LIFT * VERIFICATION_FOLLOW_RATIO:
+            raise SkillError("HANDOVER_LOST", "Cube did not follow the receiver after donor released")
+        return {"object": obj, "giver": arm, "receiver": receiver,
+                "giver_contacts_before_release": donor_contacts, "receiver_pinch_contacts": receiving_contacts,
+                "giver_released": True, "receiver_contacts_after_lift": sorted(self._contact_fingers(obj, receiver)),
+                "object_rose": rose, "approach_displacement": displacement,
+                "kinematic_residual": geometry.residual, "receiver_grasp_bias": bias,
+                "grasp_mode": self.env.grasp_mode}
 
     def release_object(self, arm: str, obj: str) -> dict:
         started = time.perf_counter()
@@ -269,14 +421,26 @@ class SkillRunner:
 
     def _move_relative(self, arm: str, delta: list[float]) -> dict:
         pos, rotation = self.env.ee_pose(arm)
+        rotation = self.controller.target_rotations.get(arm, rotation)
+        obj = self.held_object(arm)
+        before = self.env.object_pose(obj)[0].copy() if obj else None
         result = self.controller.move_to_site(arm, pos + np.asarray(delta), rotation)
         if not result.success:
             raise SkillError(result.error or "IK_FAILURE", "Relative move failed")
-        return {"final": result.final_position}
+        actual_delta = self.env.ee_pose(arm)[0] - pos
+        if obj:
+            self._require_hold(arm, obj)
+            follow_error = float(np.linalg.norm((self.env.object_pose(obj)[0] - before) - actual_delta))
+            if follow_error > .018:
+                raise SkillError("GRASP_SLIP", f"{obj} did not follow the {arm} gripper")
+        return {"start": pos.tolist(), "final": result.final_position, "measured_delta": actual_delta.tolist()}
 
     def retreat(self, arm: str) -> dict:
         started = time.perf_counter()
-        return self._skill("retreat", lambda: self._move_relative(arm, [-0.08, 0, 0.10]), started)
+        def run():
+            _, rotation = self.env.ee_pose(arm)
+            return self._move_relative(arm, rotation[:, 2] * .08 + [0., 0., .04])
+        return self._skill("retreat", run, started)
 
     def return_home(self, arm: str) -> dict:
         started = time.perf_counter()
@@ -296,7 +460,7 @@ class SkillRunner:
             if progress:
                 progress(skill)
             if skill == "approach_object":
-                result = self.approach_object(arm, step["object"], progress, step.get("fault_offset"))
+                result = self.approach_object(arm, step["object"], progress, step.get("fault_offset"), step.get("grasp_offset_x", 0.))
             elif skill == "grasp_object":
                 result = self.grasp_object(arm, step["object"])
             elif skill == "lift_object":
@@ -319,6 +483,8 @@ class SkillRunner:
                     step.get("direction") or "",
                     float(step.get("distance_cm") or 0.0),
                 )
+            elif skill == "handover_object":
+                result = self.handover_object(arm, step["object"], step.get("receiver") or "")
             else:
                 result = {"skill": skill, "success": False, "duration": 0.0, "error": "INVALID_PLAN", "detail": "Unknown skill"}
             results.append(result)

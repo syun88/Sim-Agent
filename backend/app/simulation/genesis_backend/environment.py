@@ -41,6 +41,7 @@ from backend.app.simulation.openarm_v2.definition import (
     ZONES,
 )
 from backend.app.simulation.openarm_v2.scene import initial_object_positions, resolved_scene_xml
+from backend.app.simulation.openarm_v2.kinematics import OfficialArmKinematics
 from backend.app.simulation.transform import (
     compose_pose,
     quat_to_mat,
@@ -54,6 +55,9 @@ CAMERA_AZIMUTH = 140.0
 CAMERA_ELEVATION = 38.0
 CAMERA_FOV = 45.0
 CAMERA_RESOLUTION = (720, 480)
+# Inside the cell's front wall and below its roof, looking down onto both hands.
+NATIVE_CAMERA_POSITION = (0.78, 0.0, 1.70)
+NATIVE_CAMERA_LOOKAT = (0.30, 0.0, 1.13)
 #: Steps between two gravity-torque refreshes of the feed-forward (see `apply_gravity_compensation`).
 GRAVITY_TORQUE_REFRESH_STEPS = 5
 
@@ -224,6 +228,12 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         self._scene_xml = genesis_scene_xml(self._xml, self._meta)
         self._scene = self._gs.Scene(
             sim_options=self._gs.options.SimOptions(dt=0.001),
+            # The default viewer looks at the opaque front of the official cell.
+            # Place the camera inside the cell so both hands and cubes stay visible.
+            viewer_options=self._gs.options.ViewerOptions(
+                res=(1100, 760), camera_pos=NATIVE_CAMERA_POSITION,
+                camera_lookat=NATIVE_CAMERA_LOOKAT, camera_fov=65.,
+            ),
             rigid_options=self._gs.options.RigidOptions(
                 friction_cone=self._gs.friction_cone.elliptic,
                 enable_torsional_friction=True,
@@ -272,6 +282,21 @@ class GenesisOpenArmV2Environment(SimulationBackend):
 
     def _index(self) -> None:
         entity = self._entity
+        # Map by official joint names, rather than assuming the two loaders use the
+        # same qpos ordering. Include the lifter and both fingers in every snapshot.
+        official_indices, genesis_indices = [], []
+        mujoco, model = self._meta._mujoco, self._meta.model
+        for index in range(model.njnt):
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, index)
+            # The scene's cube free joints are unnamed and do not belong to the
+            # robot's kinematic chain. Their scratch poses are never evaluated.
+            if name is None:
+                continue
+            joint = entity.get_joint(name)
+            official_indices.extend(int(model.jnt_qposadr[index]) + np.arange(joint.n_qs))
+            genesis_indices.extend(joint.qs_idx_local)
+        self._kinematic_qpos_indices = np.asarray(official_indices, dtype=int)
+        self._genesis_qpos_indices = np.asarray(genesis_indices, dtype=int)
         self._links = {
             name: entity.get_link(name)
             for name in (*OBJECTS, *EE_LINKS.values(), *self._site_parents())
@@ -381,6 +406,10 @@ class GenesisOpenArmV2Environment(SimulationBackend):
 
     def step(self, steps: int = 1) -> None:
         for _ in range(steps):
+            if self._sim_step % GRAVITY_TORQUE_REFRESH_STEPS == 0:
+                # A receiving arm must not let the donor sag while only it is moving.
+                for side in ARM_JOINTS:
+                    self.apply_gravity_compensation(side)
             self._scene.step()
             self._sim_step += 1
 
@@ -427,6 +456,9 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         return self._link_pose(name)
 
     def zone_position(self, name: str) -> np.ndarray:
+        from backend.app.planning.task_program import TABLE_TARGETS
+        if name in TABLE_TARGETS:
+            return np.asarray(TABLE_TARGETS[name], float)
         return self._site_pose(f"{name}_site")[0]
 
     def object_linear_speed(self, name: str) -> float:
@@ -472,6 +504,12 @@ class GenesisOpenArmV2Environment(SimulationBackend):
 
     def arm_qpos(self, side: str) -> np.ndarray:
         return self._entity.get_dofs_position(self._dofs[side]).numpy().astype(float)
+
+    def arm_kinematics(self, side: str) -> OfficialArmKinematics:
+        qpos = self._meta.keyframe_qpos
+        observed = self._entity.get_qpos().numpy()
+        qpos[self._kinematic_qpos_indices] = observed[self._genesis_qpos_indices]
+        return OfficialArmKinematics(self._meta.model, qpos, side)
 
     def set_arm_qpos(self, side: str, targets: np.ndarray) -> None:
         limits = self.arm_limits(side)

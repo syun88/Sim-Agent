@@ -1,166 +1,56 @@
 <!doctype html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>OpenArm v2 — Simple Commands</title>
-  <style>
-    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
-    body { margin: 0; background: #050910; color: #e5eef8; min-height: 100vh; }
-    main { max-width: 680px; margin: auto; padding: 32px 20px; }
-    h1 { font-size: 22px; margin: 0; }
-    p.sub { color: #93a4bb; font-size: 13px; margin: 6px 0 24px; }
-    .panel { background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.10); border-radius: 12px; padding: 18px; }
-    textarea { width: 100%; box-sizing: border-box; min-height: 90px; resize: vertical; border-radius: 8px; border: 1px solid rgba(255,255,255,.15); background: rgba(255,255,255,.07); color: inherit; padding: 12px; font-size: 15px; }
-    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
-    button { border: 0; border-radius: 8px; padding: 10px 16px; font-size: 14px; cursor: pointer; }
-    button:disabled { opacity: .5; cursor: not-allowed; }
-    .primary { background: #2563eb; color: white; }
-    .danger { background: #e11d48; color: white; }
-    .secondary { background: rgba(255,255,255,.12); color: inherit; }
-    .status { margin-top: 18px; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .ok { color: #34d399; }
-    .bad { color: #fb7185; }
-  </style>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenArm — 言葉でタスクを実行</title>
+<style>
+:root{color-scheme:dark;font:15px/1.6 system-ui,sans-serif;color:#e7edf5;background:#0a101b}body{margin:0}main{max-width:860px;margin:auto;padding:32px 22px}h1{font-size:25px;margin:0}h2{font-size:16px;margin:0 0 12px}.muted{color:#9aaec7;font-size:13px}.panel{background:#121d2e;border:1px solid #273750;border-radius:14px;padding:22px;margin:18px 0}textarea{font:inherit;box-sizing:border-box;width:100%;min-height:124px;resize:vertical;background:#0b1422;border:1px solid #3d5372;border-radius:9px;padding:13px;color:inherit}button{font:inherit;border:0;border-radius:8px;padding:9px 15px;background:#273b57;color:inherit;cursor:pointer}button:disabled{opacity:.4;cursor:default}.primary{background:#387af5}.danger{background:#9c304d}.row{display:flex;gap:9px;flex-wrap:wrap;margin-top:13px}.examples button{font-size:12px;padding:5px 10px}.status{white-space:pre-wrap;overflow-wrap:anywhere}.ok{color:#62e7b8}.bad{color:#ff93a5}ol{padding-left:25px}li{padding:4px 6px}li.active{background:#263e65;border-radius:5px;color:#b9d4ff}li.done{color:#62e7b8}#world{display:flex;gap:24px;flex-wrap:wrap}#world span{display:block}pre{font:12px/1.7 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}details{margin-top:12px}a{color:#a6c9ff}
+</style>
 </head>
-<body>
-<main>
-  <h1>OpenArm v2 指令入力</h1>
-  <p class="sub">Genesis / MuJoCo バックエンドに同じAPIで指令を送ります。</p>
-
-  <section class="panel">
-    <label for="instruction">自然言語指令</label>
-    <textarea id="instruction" maxlength="500">Move the red cube into the blue zone.</textarea>
-    <div class="row">
-      <button id="execute" class="primary">実行</button>
-      <button id="stop" class="danger">停止</button>
-      <button id="reset" class="secondary">Reset</button>
-      <button id="randomize" class="secondary">Random</button>
-    </div>
-    <div id="status" class="status">状態を確認しています…</div>
-  </section>
+<body><main>
+<h1>OpenArm · 言葉でタスクを実行</h1>
+<p class="muted">2本の腕と赤・青のキューブ。作業の順番や、どちらの手で持つかを自由に伝えてください。</p>
+<div id="connection" class="muted">Genesisとの接続を確認しています…</div>
+<section class="panel"><label for="instruction">やってほしいこと</label>
+<textarea id="instruction" maxlength="2000">右手で青いキューブを取って左手に渡して左側に置く。その後、左手で赤いキューブを取って右手に渡して右側に置いて。</textarea>
+<div class="row examples" id="examples"></div>
+<div class="row"><button id="execute" class="primary">実行</button><button id="stop" class="danger" disabled>停止</button><button id="reset">シーンを初期化</button><button id="randomize">配置を変えて初期化</button></div>
+<p id="status" class="status" aria-live="polite">指示を入力して実行できます。</p></section>
+<section class="panel"><h2>腕と物体の状態</h2><div id="world" class="muted">シミュレーションの計測値を待っています。</div></section>
+<section id="planPanel" class="panel" hidden><h2>解釈した作業</h2><div id="provider" class="muted"></div><ol id="actions"></ol><p id="assumptions" class="muted"></p><div id="verification" class="status"></div><details><summary>計測結果と実行ログ</summary><pre id="evidence"></pre></details></section>
 </main>
-
 <script type="module">
-const instruction = document.getElementById('instruction');
-const execute = document.getElementById('execute');
-const stopButton = document.getElementById('stop');
-const status = document.getElementById('status');
-
-let currentTaskId = null;
-let polling = false;
-
-function setStatus(text, tone = '') {
-  status.className = `status ${tone}`;
-  status.textContent = text;
+const $=id=>document.getElementById(id);
+let currentTaskId=null, polling=false, shownPlan='';
+const arm={left:'左手',right:'右手'}, object={red_cube:'赤いキューブ',blue_cube:'青いキューブ'}, target={blue_zone:'青いゾーン',green_zone:'緑のゾーン',left_side:'左側',right_side:'右側',center:'中央'};
+const op={pick:'掴んで持つ',handover:'渡す',place:'置く',approach:'近づく',move:'動かす',open:'開く',close:'閉じる',home:'ホームに戻す'};
+function status(text,tone=''){$('status').className=`status ${tone}`;$('status').textContent=text;}
+function busy(value){$('execute').disabled=value;$('stop').disabled=!value||!currentTaskId;$('reset').disabled=value;$('randomize').disabled=value;}
+async function request(path,options){const r=await fetch(path,options);const data=await r.json();if(!r.ok)throw Error(typeof data.detail==='string'?data.detail:JSON.stringify(data.detail));return data;}
+function drawTask(t){
+ if(t.plan){
+  $('planPanel').hidden=false;const p=t.plan,key=JSON.stringify(p.program);
+  $('provider').textContent=`解釈: ${p.provider==='local_ollama'?'ローカル言語モデル':p.provider==='deterministic_fallback'?'定型文フォールバック':p.provider}${p.provider_error?' / モデルの回答を検証できず、定型文で解釈':''}`;
+  if(key!==shownPlan){shownPlan=key;$('actions').replaceChildren();for(const a of p.program?.actions??[]){const li=document.createElement('li');li.textContent=`${arm[a.arm]??''} · ${object[a.object]??''} ${op[a.op]??a.op}${a.receiver?' → '+arm[a.receiver]:''}${a.target?' → '+(target[a.target]??a.target):''}${a.direction?' / '+a.direction+' '+a.distance_cm+' cm':''}`;$('actions').append(li);}$('assumptions').textContent=(p.assumptions??[]).join('\n');}
+  const index=t.step?.action_index??t.result?.action_index;[...$('actions').children].forEach((li,i)=>{li.className=t.status==='SUCCEEDED'||i<index?'done':i===index?'active':'';});
+ }
+ if(t.verification){const checks=t.verification.checks??[];$('verification').textContent=checks.map(c=>`${object[c.object]??c.object}: ${c.success?'確認済み':'未達成'}${c.target?' / '+(target[c.target]??c.target):''}${Number.isFinite(c.horizontal_position_error)?' / 誤差 '+(c.horizontal_position_error*1000).toFixed(1)+' mm':''}${c.arm?' / '+arm[c.arm]:''}`).join('\n');}
+ $('evidence').textContent=JSON.stringify({verification:t.verification,detail:t.detail,retry_count:t.retry_count,skills:t.skills},null,2);
 }
-
-function setBusy(busy) {
-  execute.disabled = busy;
-  stopButton.disabled = !busy || !currentTaskId;
+async function poll(){
+ if(polling)return;polling=true;
+ try{while(currentTaskId){
+  try{const t=await request(`/api/tasks/${currentTaskId}`);drawTask(t);
+   if(['SUCCEEDED','FAILED','STOPPED'].includes(t.status)){const failure=t.skills?.find(s=>!s.success);status(t.status==='SUCCEEDED'?'作業が完了し、計測値から目標達成を確認しました。':t.status==='STOPPED'?'停止しました。現在の物体の状態を保っています。':`作業を完了できませんでした。\n${failure?.detail??t.detail??t.verification?.failure_category??'目標の状態を確認できませんでした。'}`,t.status==='SUCCEEDED'?'ok':'bad');currentTaskId=null;break;}
+   const labels={QUEUED_FOR_GENESIS_VIEWER:'Genesisの受付を待っています',PLANNING:'指示を解釈しています',VALIDATING:'作業の整合性を確認しています',EXECUTING:'作業を実行しています',VERIFYING:'物体の位置と接触を確認しています',STOP_REQUESTED:'停止を要求しています'};status(`${labels[t.status]??t.status}${t.step?'\n'+(arm[t.step.arm]??'')+' · '+t.step.skill:''}`);
+  }catch(e){status('通信を再試行しています: '+e.message,'bad');}
+  await new Promise(r=>setTimeout(r,400));
+ }}finally{polling=false;busy(false);}
 }
-
-async function refreshHealth() {
-  try {
-    const response = await fetch('/api/health');
-    const health = await response.json();
-    return `${health.simulation_engine.toUpperCase()} / Agent: ${health.agent} / Robot: ${health.robot}`;
-  } catch {
-    return 'Backend offline';
-  }
-}
-
-async function pollTask() {
-  if (!currentTaskId || polling) return;
-  polling = true;
-  try {
-    while (currentTaskId) {
-      const response = await fetch(`/api/tasks/${currentTaskId}`);
-      if (response.status === 404) {
-        await refreshHealth();
-        await new Promise(resolve => setTimeout(resolve, 500));
-        continue;
-      }
-      const task = await response.json();
-      const verification = task.verification;
-      const state = task.status ?? task.state ?? 'RUNNING';
-      if (['SUCCEEDED', 'FAILED', 'STOPPED'].includes(state)) {
-        const result = verification
-          ? `\n判定: ${verification.success ? 'SUCCESS' : 'FAILED'} / 誤差: ${(verification.horizontal_position_error * 1000).toFixed(1)} mm`
-          : '';
-        setStatus(`${state}${result}`, state === 'SUCCEEDED' ? 'ok' : 'bad');
-        currentTaskId = null;
-      } else {
-        setStatus(`${state} を実行中…`);
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-    }
-  } finally {
-    polling = false;
-    setBusy(false);
-  }
-}
-
-async function submit() {
-  const text = instruction.value.trim();
-  if (text.length < 3) {
-    setStatus('指令は3文字以上入力してください。', 'bad');
-    return;
-  }
-  setBusy(true);
-  setStatus('指令を送信しています…');
-  try {
-    const response = await fetch('/api/tasks', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ instruction: text, randomize: false, force_failure: false }),
-    });
-    const result = await response.json();
-    if (!response.ok) {
-      setStatus(`送信失敗: ${result.detail ?? response.status}`, 'bad');
-      setBusy(false);
-      return;
-    }
-    currentTaskId = result.task_id;
-    setStatus(`受付しました: ${currentTaskId}`);
-    pollTask();
-  } catch (error) {
-    setStatus(`送信失敗: ${error}`, 'bad');
-    setBusy(false);
-  }
-}
-
-async function stop() {
-  if (!currentTaskId) return;
-  try {
-    await fetch(`/api/tasks/${currentTaskId}/stop`, { method: 'POST' });
-    setStatus('停止を要求しました。');
-  } catch (error) {
-    setStatus(`停止失敗: ${error}`, 'bad');
-  }
-}
-
-async function reset(randomize) {
-  try {
-    const response = await fetch(`/api/scene/reset?randomize=${randomize}`, { method: 'POST' });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.detail ?? response.status);
-    setStatus(randomize ? 'Random reset 完了。' : 'Reset 完了。', 'ok');
-  } catch (error) {
-    setStatus(`Reset失敗: ${error}`, 'bad');
-  }
-}
-
-execute.addEventListener('click', submit);
-stopButton.addEventListener('click', stop);
-document.getElementById('reset').addEventListener('click', () => reset(false));
-document.getElementById('randomize').addEventListener('click', () => reset(true));
-
-refreshHealth().then(text => {
-  if (!status.textContent.startsWith('指令')) setStatus(text);
-});
-setInterval(refreshHealth, 2000);
-setBusy(false);
-</script>
-</body>
-</html>
+async function submit(){const text=$('instruction').value.trim();if(text.length<3){status('指示を3文字以上で入力してください。','bad');return;}busy(true);shownPlan='';$('planPanel').hidden=true;$('verification').textContent='';status('指示を送信しています…');try{const t=await request('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({instruction:text})});currentTaskId=t.task_id;busy(true);poll();}catch(e){status(e.message,'bad');busy(false);}}
+async function reset(randomize){busy(true);try{const t=await request(`/api/scene/reset?randomize=${randomize}`,{method:'POST'});currentTaskId=t.task_id;status('初期化を受け付けました。Genesisの完了を待っています。');busy(true);poll();}catch(e){status(e.message,'bad');busy(false);}}
+async function refresh(){try{const h=await request('/api/health');$('connection').textContent=`Genesis · OpenArm v2 · ${h.viewer_online?'接続中':'ビューアーの起動を待っています'} · ${h.provider}`;if(h.viewer_online){const w=await request('/api/scene');$('world').replaceChildren();for(const side of ['left','right']){const d=document.createElement('div');d.textContent=`${arm[side]}: ${object[w.robot[side+'_arm'].held_object]??'持っている物体なし'}`;$('world').append(d);}}}catch{$('connection').textContent='サーバーに接続できません。起動を確認しています。';}}
+$('execute').onclick=submit;$('stop').onclick=async()=>{if(currentTaskId){await request(`/api/tasks/${currentTaskId}/stop`,{method:'POST'});status('停止を要求しました。');}};$('reset').onclick=()=>reset(false);$('randomize').onclick=()=>reset(true);
+for(const [label,text] of [['まず掴む','右手で青いキューブを掴んで'],['受け渡して置く','右手で青を取って左手に渡して左側に置く'],['2つを順番に置く','赤を青いゾーンに置いて、青を緑のゾーンに置いて'],['曖昧な指示','青いやつを右で拾って、空いてるほうの手にパスして、そっちの端に置いといて']]){const b=document.createElement('button');b.textContent=label;b.onclick=()=>{$('instruction').value=text;};$('examples').append(b);}
+refresh();setInterval(refresh,1500);
+</script></body></html>

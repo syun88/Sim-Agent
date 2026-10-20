@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 export SIM_BACKEND=genesis
 
 if [[ ! -f .env ]]; then
-  echo "Note: .env not found; Neo4j and ai& provider will use their documented fallbacks." >&2
+  echo "Note: .env not found; using the installed local planner or the labelled deterministic fallback." >&2
 fi
 
 # Prefer the locally installed vision/tool model when the caller has not chosen a planner.
@@ -18,10 +18,35 @@ export OPENARM_OLLAMA_MODEL="${OPENARM_OLLAMA_MODEL:-qwen3-vl:4b}"
 
 uv sync
 
-# Start the web backend in the background so the Genesis viewer can poll it.
-GENESIS_SHOW_VIEWER= nohup uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-access-log --log-level warning > /tmp/sim-agent-backend.log 2>&1 &
-BACKEND_PID=$!
-trap "kill $BACKEND_PID 2>/dev/null" EXIT
+# Reuse this project's running owner instead of starting another Python window.
+EXISTING_SERVICE=$(uv run python - <<'PY'
+import httpx
+try:
+    response = httpx.get('http://127.0.0.1:8000/api/health', timeout=1)
+    response.raise_for_status()
+    data = response.json()
+    if data.get('robot') == 'OpenArm v2':
+        print('viewer' if data.get('viewer_online') or data.get('viewer_starting') else 'broker')
+except (httpx.HTTPError, ValueError):
+    pass
+PY
+)
+if [[ "$EXISTING_SERVICE" == "viewer" ]]; then
+  echo "OpenArm is already running: http://127.0.0.1:8000/simple"
+  exit 0
+fi
+
+BACKEND_PID=""
+if [[ "$EXISTING_SERVICE" != "broker" ]]; then
+  GENESIS_SHOW_VIEWER= nohup uv run uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-access-log --log-level warning > /tmp/sim-agent-backend.log 2>&1 &
+  BACKEND_PID=$!
+fi
+cleanup() {
+  if [[ -n "$BACKEND_PID" ]]; then
+    kill "$BACKEND_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
 
 # Wait briefly for the backend to become ready.
 for _ in $(seq 1 40); do
@@ -35,4 +60,4 @@ echo "Web UI:  http://127.0.0.1:8000/simple"
 echo "Starting Genesis native viewer..."
 
 # Genesis viewer needs the main thread on macOS.
-GENESIS_SHOW_VIEWER=1 uv run python run_genesis_gui.py
+GENESIS_SHOW_VIEWER=1 uv run python run_genesis_gui.py "$@"

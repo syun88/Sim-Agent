@@ -7,6 +7,7 @@ SkillName = Literal[
     "approach_object", "grasp_object", "lift_object", "move_to_target",
     "release_object", "retreat", "return_home", "open_gripper",
     "close_gripper", "move_relative",
+    "handover_object",
 ]
 ArmName = Literal["left", "right"]
 MoveDirection = Literal["up", "down", "left", "right", "forward", "back"]
@@ -24,6 +25,9 @@ class PlanStep(BaseModel):
     fault_offset: float | None = None
     direction: MoveDirection | None = None
     distance_cm: float | None = Field(default=None, gt=0, le=30)
+    receiver: ArmName | None = None
+    action_index: int | None = None
+    grasp_offset_x: float = Field(default=0., ge=-.02, le=.02)
 
 
 class AgentPlan(BaseModel):
@@ -37,10 +41,12 @@ class AgentPlan(BaseModel):
     memory_decision: str | None = None
     planning_latency: float | None = None
     raw_response: str | None = None
+    program: dict[str, Any] | None = None
+    assumptions: list[str] = Field(default_factory=list)
 
 
 class TaskRequest(BaseModel):
-    instruction: str = Field(min_length=3, max_length=500)
+    instruction: str = Field(min_length=3, max_length=2000)
     randomize: bool = False
     force_failure: bool = False
 

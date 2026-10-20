@@ -143,6 +143,47 @@ def test_ik_reaches_the_target_through_the_official_model(env, controller, offic
     assert np.linalg.norm(reached - target) < 5e-4
 
 
+@pytest.mark.parametrize("target", [[0.36, 0.15, 1.18], [3.0, 0.15, 1.18]])
+def test_ik_does_not_write_candidate_poses_into_the_live_scene(env, controller, monkeypatch, target):
+    """A native viewer renders every direct pose write, even without a physics step.
+
+    Both successful IK and the failed solve/spawn-seed retry must be read-only. Restoring
+    qpos afterwards is insufficient: candidates would already have been shown and the
+    setter would already have cleared the contact solver's state.
+    """
+    before = env.frame()
+    velocity = env._entity.get_dofs_velocity().numpy().copy()
+
+    def unexpected_write(*args, **kwargs):
+        pytest.fail("IK wrote a trial pose into the live Genesis scene")
+
+    monkeypatch.setattr(env, "set_arm_qpos", unexpected_write)
+    solution, _, _ = controller.solve_ik("left", np.asarray(target), GRASP_ROTATION)
+    assert (solution is not None) == (target[0] < 1.0)
+    assert env.frame() == before
+    assert np.array_equal(env._entity.get_dofs_velocity().numpy(), velocity)
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_isolated_kinematics_snapshots_the_actual_robot_configuration(env, side):
+    """Snapshot the lifter as well as the arm; later scene changes cannot alter IK."""
+    config = np.array([0.4, -0.3, 0.5, 0.8, -0.2, 0.3, 0.1])
+    config = np.clip(config, *env.arm_limits(side).T)
+    env.set_arm_qpos(side, config)
+    lifter = env._entity.get_joint("openarm_lifter_joint")
+    env._entity.set_dofs_position(np.array([0.02], dtype=np.float32), lifter.dofs_idx_local)
+    snapshot = env.arm_kinematics(side)
+    pose = env.ee_pose(side)
+    jacobian = env.ee_jacobian(side)
+    calculated = snapshot.evaluate(config)
+    for actual, expected in zip(calculated, (*pose, *jacobian)):
+        assert actual == pytest.approx(expected, abs=1e-5)
+
+    env.set_arm_qpos(side, SPAWN_ARM_QPOS)
+    for actual, expected in zip(snapshot.evaluate(config), calculated):
+        assert actual == pytest.approx(expected, abs=1e-12)
+
+
 def test_fingertip_midpoint_comes_from_the_official_model(official):
     """`FINGERTIP_MIDPOINT` is the measurement of the official model, not an independent guess.
 

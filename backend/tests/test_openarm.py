@@ -102,8 +102,18 @@ def test_world_state_comes_from_simulation(env):
 
 
 def test_arm_motion(env, controller):
-    result = controller.move_to_site("left", np.array([0.36, 0.15, 1.06]))
+    # Free-space endpoint; the former low endpoint swept the hand through the cube and
+    # only "passed" because the controller never checked where the motors actually stopped.
+    target = np.array([0.36, 0.15, 1.18])
+    result = controller.move_to_site("left", target)
     assert result.success
+    assert np.linalg.norm(env.ee_pose("left")[0] - target) <= .012
+
+
+def test_blocked_motion_is_not_reported_as_a_completed_ik_move(env, controller):
+    result = controller.move_to_site("left", np.array([0.36, 0.15, 1.06]))
+    assert not result.success
+    assert result.error == "MOTION_BLOCKED"
 
 
 def test_plan_validation_accepts_valid_fallback(env):

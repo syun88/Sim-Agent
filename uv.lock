@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12, <3.14"
 
 [[package]]
@@ -1838,6 +1838,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pytest" },
     { name = "python-dotenv" },
+    { name = "scipy" },
     { name = "torch" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -1857,6 +1858,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.14.1" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "python-dotenv", specifier = ">=1.2.4" },
+    { name = "scipy", specifier = ">=1.18.1" },
     { name = "torch" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.54.0" },
 ]
