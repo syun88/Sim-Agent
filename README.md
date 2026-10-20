@@ -44,6 +44,9 @@ physical result, records experience, and reuses memory on later tasks.
 - Memory retrieval that feeds prior executions to the planner as compact summaries (a whole record
   is never embedded in another, which historically grew one record to 345 MB).
 - OpenAI-compatible `ai&` client with deterministic fallback when credentials are missing.
+- Broader command surface for OpenArm v2: pick/place, approach, grasp-and-hold, direct gripper
+  open/close, home, and guarded relative EE moves. Japanese and English direct commands are
+  handled by the deterministic parser; an optional local Ollama planner can interpret other prompts.
 - **34 automated tests, all passing** (`pytest -q`).
 
 ### Verified demonstration
@@ -147,6 +150,22 @@ The task API also supports:
 ```json
 {"instruction": "Move the red cube into the blue zone.", "randomize": true, "force_failure": false}
 ```
+
+The command parser also accepts shorter OpenArm v2 instructions such as:
+
+```text
+グリッパーを開いてください
+Close the left hand.
+右アームを右に10cm動かしてください
+赤いキューブを右に5cm動かしてください
+赤いキューブを緑のゾーンに入れてください
+```
+
+Relative motion is guarded to 1-30 cm. A command that moves an object first performs the same
+physical approach and pinch as a verified pick-and-place; it does not write the object pose.
+The optional local planner is enabled by `run_genesis_gui.sh` only when `qwen3-vl:4b` is already
+installed. Its provider is reported separately, and a provider failure still falls back to the
+deterministic OpenArm v2 planner.
 
 `force_failure` is a controlled, recoverable demonstration fault: the first attempt uses an unreachable
 grasp-alignment offset and produces a real `IK_FAILURE`, the planner replans within its bound, and the second

@@ -73,7 +73,7 @@ def health() -> Health:
         simulation="Genesis viewer process",
         simulation_engine="genesis",
         simulation_description=ENGINE_DESCRIPTION,
-        grasp_mode="kinematic-grasp-hold",
+        grasp_mode="physical-friction-pinch",
         provider="ai&" if AgentPlanner().enabled else "Fallback",
         memory="Connected" if app.state.memory.available else "Fallback",
         agent="IDLE",
@@ -92,15 +92,22 @@ def scene():
 
 @app.post("/api/scene/reset")
 def reset_scene(randomize: bool = False):
-    # The standalone Genesis viewer performs the reset; the backend just records it.
-    return {"status": "ok", "randomized": randomize}
+    # The standalone Genesis viewer performs the reset; the backend only queues it.
+    genesis_command_queue.append({"action": "reset", "randomize": randomize})
+    return {"status": "queued", "randomized": randomize}
 
 
 @app.post("/api/tasks", response_model=TaskResponse)
 async def create_task(request: TaskRequest):
     import uuid
     task_id = str(uuid.uuid4())
-    genesis_command_queue.append(request.instruction)
+    genesis_command_queue.append({
+        "action": "task",
+        "instruction": request.instruction,
+        "randomize": request.randomize,
+        "force_failure": request.force_failure,
+        "task_id": task_id,
+    })
     app.state.executions.append({
         "task_id": task_id,
         "instruction": request.instruction,
@@ -113,16 +120,27 @@ async def create_task(request: TaskRequest):
 def genesis_next_command():
     """Return the next pending instruction for the standalone Genesis viewer process."""
     if genesis_command_queue:
-        return {"instruction": genesis_command_queue.pop(0)}
-    return {"instruction": None}
+        return genesis_command_queue.pop(0)
+    return {"action": None}
 
 
 @app.post("/api/genesis/result", include_in_schema=False)
 def genesis_result(result: dict[str, Any]):
     """Accept execution results from the standalone Genesis viewer process."""
     for record in reversed(app.state.executions):
-        if record["instruction"] == result.get("instruction") and record["status"] == "QUEUED_FOR_GENESIS_VIEWER":
+        if record.get("task_id") == result.get("task_id") or (
+            record["instruction"] == result.get("instruction")
+            and record["status"] == "QUEUED_FOR_GENESIS_VIEWER"
+        ):
             record["status"] = "SUCCEEDED" if result.get("success") else "FAILED"
+            if result.get("plan") is not None:
+                record["plan"] = result["plan"]
+            if result.get("skills") is not None:
+                record["skills"] = result["skills"]
+            if result.get("verification") is not None:
+                record["verification"] = result["verification"]
+            if result.get("detail"):
+                record["detail"] = result["detail"]
             break
     return {"status": "ok", "received": result}
 
@@ -137,8 +155,12 @@ def get_task(task_id: str):
 
 @app.post("/api/tasks/{task_id}/stop")
 def stop_task(task_id: str):
+    for record in reversed(app.state.executions):
+        if record["task_id"] == task_id and record["status"] in {"QUEUED_FOR_GENESIS_VIEWER", "PLANNING", "EXECUTING", "VERIFYING"}:
+            record["status"] = "STOP_REQUESTED"
+            return {"status": "stop_requested"}
     engine: ExecutionEngine = app.state.engine
-    if engine.current and engine.current.get("task_id") == task_id:
+    if engine is not None and engine.current and engine.current.get("task_id") == task_id:
         engine.stop()
         return {"status": "stopping"}
     raise HTTPException(404, "Active task not found")

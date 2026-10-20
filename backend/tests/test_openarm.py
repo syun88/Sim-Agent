@@ -143,6 +143,18 @@ def test_unreachable_fault_is_classified(env, controller):
     assert result["error"] == "IK_FAILURE"
 
 
+def test_direct_gripper_and_relative_move_skills(env, controller):
+    """Direct commands execute real gripper/EE motion and report measured results."""
+    runner = SkillRunner(env, controller)
+    assert runner.open_gripper("left")["success"]
+    assert runner.close_gripper("left")["success"]
+    before = np.asarray(env.ee_pose("left")[0])
+    moved = runner.move_relative("left", "up", 2.0)
+    assert moved["success"], moved
+    after = np.asarray(env.ee_pose("left")[0])
+    assert after[2] - before[2] == pytest.approx(0.02, abs=0.01)
+
+
 def test_grasp_fails_without_physical_contact(env, controller):
     """A grasp with nothing between the fingers is a failure, not a success.
 

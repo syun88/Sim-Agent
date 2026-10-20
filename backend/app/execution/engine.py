@@ -107,7 +107,23 @@ class ExecutionEngine:
                 target_id = goal.get("target") or "blue_zone"
                 self.state = "VERIFYING"
                 verification = verify_place_goal(self.env, obj_id, target_id)
-                success = verification["success"] and not (request.force_failure and attempt == 0)
+                all_skills_success = all(result.get("success", False) for result in results)
+                goal_type = plan.goal.get("type", "place_in_zone")
+                if goal_type == "place_in_zone":
+                    verification = verify_place_goal(self.env, obj_id, target_id)
+                    success = verification["success"] and all_skills_success and not (
+                        request.force_failure and attempt == 0
+                    )
+                else:
+                    verification = {
+                        "success": bool(all_skills_success),
+                        "goal_type": goal_type,
+                        "method": "completed_skill_execution",
+                        "engine": self.env.name,
+                        "grasp_mode": self.env.grasp_mode,
+                        "failure_category": None if all_skills_success else "SKILL_FAILED",
+                    }
+                    success = all_skills_success
                 self.emit("verification_completed", verification=verification, ai_claimed_success=success)
                 attempts.append({
                     "attempt": attempt + 1,
@@ -117,6 +133,8 @@ class ExecutionEngine:
                     "status": "SUCCEEDED" if success else "FAILED",
                 })
                 if success:
+                    break
+                if attempt < 2 and goal_type != "place_in_zone":
                     break
                 if attempt < 2:
                     self.state = "REPLANNING"
@@ -129,7 +147,7 @@ class ExecutionEngine:
                 "task_id": self.current["task_id"],
                 "execution_id": self.current["execution_id"],
                 "instruction": request.instruction,
-                "goal_type": "place_in_zone",
+                    "goal_type": goal_type,
                 "object_ids": [o["id"] for o in final_state["objects"]],
                 "skills": [r.get("skill") for a in attempts for r in a.get("skills", [])],
                 "success": success,

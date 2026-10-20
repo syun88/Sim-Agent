@@ -61,6 +61,16 @@ MIN_STAGING_RISE = 0.02
 #: The approach may not displace the object by more than this (m); the object is only pinched
 #: after this check, so a shove here would fake nothing anyway, but the plan still fails loudly.
 APPROACH_DISTURBANCE_TOLERANCE = 0.005
+#: World-frame deltas for human "right/left/forward/back" commands. Positive world y is the left
+#: side of the official Cell spawn pose; positive world x is toward the table/front.
+DIRECTION_VECTORS = {
+    "up": np.array([0.0, 0.0, 1.0]),
+    "down": np.array([0.0, 0.0, -1.0]),
+    "right": np.array([0.0, -1.0, 0.0]),
+    "left": np.array([0.0, 1.0, 0.0]),
+    "forward": np.array([1.0, 0.0, 0.0]),
+    "back": np.array([-1.0, 0.0, 0.0]),
+}
 
 
 class SkillRunner:
@@ -209,6 +219,30 @@ class SkillRunner:
         started = time.perf_counter()
         return self._skill("lift_object", lambda: self._move_relative(arm, [0, 0, height]), started)
 
+    def open_gripper(self, arm: str) -> dict:
+        started = time.perf_counter()
+        def run():
+            self.controller.wait_gripper(arm, False, 0.45)
+            return {"closed": False}
+        return self._skill("open_gripper", run, started)
+
+    def close_gripper(self, arm: str) -> dict:
+        started = time.perf_counter()
+        def run():
+            self.controller.wait_gripper(arm, True, 0.65)
+            return {"closed": True}
+        return self._skill("close_gripper", run, started)
+
+    def move_relative(self, arm: str, direction: str, distance_cm: float) -> dict:
+        started = time.perf_counter()
+        def run():
+            if direction not in DIRECTION_VECTORS:
+                raise SkillError("INVALID_PLAN", f"Unknown move direction: {direction}")
+            if not 1.0 <= distance_cm <= 30.0:
+                raise SkillError("INVALID_PLAN", "Relative move must be between 1 and 30 cm")
+            return self._move_relative(arm, DIRECTION_VECTORS[direction] * distance_cm / 100.0)
+        return self._skill("move_relative", run, started)
+
     def move_to_target(self, arm: str, target: str) -> dict:
         started = time.perf_counter()
         return self._skill("move_to_target", lambda: self._move_to_zone(arm, target), started)
@@ -275,6 +309,16 @@ class SkillRunner:
                 result = self.retreat(arm)
             elif skill == "return_home":
                 result = self.return_home(arm)
+            elif skill == "open_gripper":
+                result = self.open_gripper(arm)
+            elif skill == "close_gripper":
+                result = self.close_gripper(arm)
+            elif skill == "move_relative":
+                result = self.move_relative(
+                    arm,
+                    step.get("direction") or "",
+                    float(step.get("distance_cm") or 0.0),
+                )
             else:
                 result = {"skill": skill, "success": False, "duration": 0.0, "error": "INVALID_PLAN", "detail": "Unknown skill"}
             results.append(result)

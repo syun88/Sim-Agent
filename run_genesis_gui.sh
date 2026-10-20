@@ -5,9 +5,16 @@ cd "$(dirname "$0")"
 export SIM_BACKEND=genesis
 
 if [[ ! -f .env ]]; then
-  echo "Missing .env. Copy .env.example and add Neo4j credentials." >&2
-  exit 1
+  echo "Note: .env not found; Neo4j and ai& provider will use their documented fallbacks." >&2
 fi
+
+# Prefer the locally installed vision/tool model when the caller has not chosen a planner.
+if [[ -z "${OPENARM_LOCAL_PLANNER:-}" ]]; then
+  if command -v ollama >/dev/null 2>&1 && ollama list 2>/dev/null | awk '{print $1}' | grep -qx 'qwen3-vl:4b'; then
+    export OPENARM_LOCAL_PLANNER=1
+  fi
+fi
+export OPENARM_OLLAMA_MODEL="${OPENARM_OLLAMA_MODEL:-qwen3-vl:4b}"
 
 uv sync
 

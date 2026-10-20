@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 SkillName = Literal[
     "approach_object", "grasp_object", "lift_object", "move_to_target",
-    "release_object", "retreat", "return_home",
+    "release_object", "retreat", "return_home", "open_gripper",
+    "close_gripper", "move_relative",
 ]
 ArmName = Literal["left", "right"]
+MoveDirection = Literal["up", "down", "left", "right", "forward", "back"]
 ExecutionState = Literal[
     "IDLE", "PLANNING", "VALIDATING", "EXECUTING", "VERIFYING",
     "SUCCEEDED", "FAILED", "REPLANNING", "STOPPED",
@@ -20,10 +22,12 @@ class PlanStep(BaseModel):
     object: str | None = None
     target: str | None = None
     fault_offset: float | None = None
+    direction: MoveDirection | None = None
+    distance_cm: float | None = Field(default=None, gt=0, le=30)
 
 
 class AgentPlan(BaseModel):
-    goal: dict[str, str]
+    goal: dict[str, Any]
     arm: ArmName = "left"
     steps: list[PlanStep]
     provider: str = "deterministic_fallback"
