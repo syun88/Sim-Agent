@@ -12,8 +12,37 @@ EXAMPLE = "右手がBlue Cubeを取って左手に渡した後に置いて、そ
 
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch):
-    for key in ("AI_AND_API_KEY", "AI_AND_BASE_URL", "AI_AND_MODEL", "OPENARM_LOCAL_PLANNER"):
+    for key in ("AI_AND_API_KEY", "AI_AND_BASE_URL", "AI_AND_MODEL", "OPENARM_LOCAL_PLANNER", "OPENARM_FAST_LANGUAGE"):
         monkeypatch.delenv(key, raising=False)
+
+
+def test_complete_exact_request_can_skip_model_without_losing_a_handover(monkeypatch):
+    monkeypatch.setenv("OPENARM_FAST_LANGUAGE", "1")
+    monkeypatch.setenv("OPENARM_LOCAL_PLANNER", "1")
+    planner = AgentPlanner()
+    def unexpected_model_call(*args):
+        pytest.fail("A fully grounded request should not wait for a language model")
+    monkeypatch.setattr(planner, "_ai_plan", unexpected_model_call)
+    plan = planner.plan(EXAMPLE, WORLD)
+    assert len(plan.program["actions"]) == 6
+    assert sum(s.skill == "handover_object" for s in plan.steps) == 2
+    assert plan.provider == "deterministic_fallback" and plan.provider_error is None
+    assert plan.model is None
+
+
+def test_exact_fast_path_still_uses_model_for_free_paraphrases(monkeypatch):
+    monkeypatch.setenv("OPENARM_FAST_LANGUAGE", "1")
+    monkeypatch.setenv("OPENARM_LOCAL_PLANNER", "1")
+    planner = AgentPlanner()
+    calls = []
+    def model(*args):
+        calls.append(args[0])
+        return {"payload": {"actions": [{"op": "pick", "object": "blue_cube", "arm": "right"}]},
+                "raw": "validated model response"}
+    monkeypatch.setattr(planner, "_ai_plan", model)
+    plan = planner.plan("take the azure one please", WORLD)
+    assert calls == ["take the azure one please"]
+    assert plan.provider == "local_ollama" and plan.goal["object"] == "blue_cube"
 
 
 def test_full_user_example_preserves_both_handovers_and_both_final_goals():

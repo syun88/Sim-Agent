@@ -38,6 +38,7 @@ class SkillError(Exception):
     def __init__(self, category: str, message: str):
         super().__init__(message)
         self.category = category
+        self.evidence: dict = {}
 
 
 #: Height of the in-grasp verification lift (m). The object must rise at least
@@ -122,7 +123,8 @@ class SkillRunner:
             result = run()
             return {"skill": name, "success": True, "duration": time.perf_counter() - started, **result}
         except SkillError as exc:
-            return {"skill": name, "success": False, "duration": time.perf_counter() - started, "error": exc.category, "detail": str(exc)}
+            return {"skill": name, "success": False, "duration": time.perf_counter() - started, "error": exc.category,
+                    "detail": str(exc), **({"evidence": exc.evidence} if exc.evidence else {})}
 
     # -- skills ------------------------------------------------------------------
 
@@ -146,6 +148,11 @@ class SkillRunner:
         standoff = pinch - APPROACH_STANDOFF * finger_direction
         high = standoff + np.array([0.0, 0.0, APPROACH_OVERFLY])
         before = obj_pos.copy()
+        # Reject an unreachable pinch before starting the approach. Faster
+        # staging must not turn an invalid target into a later contact failure.
+        pinch_q, _, _ = self.controller.solve_ik(arm, pinch, GRASP_ROTATION)
+        if pinch_q is None:
+            raise SkillError("IK_FAILURE", "The requested fingertip pinch pose is unreachable")
         # 1) open the gripper
         self.controller.wait_gripper(arm, False, 0.35)
         # 2) rise to the staging altitude above the current pose, so the lateral swing that
@@ -153,14 +160,24 @@ class SkillRunner:
         ee_position, _ = self.env.ee_pose(arm)
         rise = STAGING_ALTITUDE - ee_position[2]
         waypoints: list[tuple[str, np.ndarray]] = []
-        if rise > MIN_STAGING_RISE:
+        if obj == "wine_bottle":
+            # The tall neck intersects a cube-style overflight. Pull the open
+            # fingers behind the body before the lateral swing instead. These
+            # clearances were checked against the official finger collision mesh.
+            back = np.array([min(standoff[0] - .01, .23), ee_position[1], 1.16])
+            waypoints += (("bottle_backoff", back), ("pregrasp", standoff), ("pinch", pinch))
+        elif rise > MIN_STAGING_RISE:
             waypoints.append(("staging", ee_position + np.array([0.0, 0.0, rise])))
         # 3) swing high above the object, drop onto the approach axis, slide straight in
-        waypoints += (("pregrasp_high", high), ("pregrasp", standoff), ("pinch", pinch))
-        for name, target in waypoints:
-            result = self.controller.move_to_site(arm, target, progress=progress)
+        if obj != "wine_bottle":
+            waypoints += (("pregrasp_high", high), ("pregrasp", standoff), ("pinch", pinch))
+        destinations = waypoints if self.controller.motion_speed == 1. else [waypoints[-1]]
+        for name, target in destinations:
+            via = [point for _, point in waypoints[:-1]] if self.controller.motion_speed != 1. else None
+            result = self.controller.move_to_site(arm, target, progress=progress, via=via)
             if not result.success:
-                raise SkillError(result.error or "IK_FAILURE", f"Unable to reach the {name} pose")
+                raise SkillError(result.error or "IK_FAILURE", f"Unable to reach the {name} pose "
+                                 f"(position error={result.position_error}, rotation error={result.rotation_error})")
         after = self.env.object_pose(obj)[0]
         disturbance = float(np.linalg.norm(after - before))
         if disturbance > APPROACH_DISTURBANCE_TOLERANCE:
@@ -198,7 +215,8 @@ class SkillRunner:
             )
         # 5) verify the hold physically: a short lift must carry the object with the gripper
         ee_position = self.env.ee_pose(arm)[0]
-        lift = self.controller.move_to_site(arm, ee_position + np.array([0.0, 0.0, VERIFICATION_LIFT]))
+        lift = self.controller.move_to_site(arm, ee_position + np.array([0.0, 0.0, VERIFICATION_LIFT]),
+                                            duration=.8 if obj == "wine_bottle" else None)
         if not lift.success:
             raise SkillError(lift.error or "IK_FAILURE", "The hold-verification lift failed")
         after = self.env.object_pose(obj)[0]
@@ -292,9 +310,13 @@ class SkillRunner:
             offset = rotation.T @ (center - ee)
             from scipy.spatial.transform import Rotation, Slerp
             arc = Slerp([0., 1.], Rotation.from_matrix(np.stack([rotation, GRASP_ROTATION])))
-            for alpha in np.linspace(0., 1., 9)[1:]:
-                desired_rotation = arc(alpha).as_matrix()
-                result = self.controller.move_to_site(arm, center - desired_rotation @ offset, desired_rotation)
+            orientations = [arc(alpha).as_matrix() for alpha in np.linspace(0., 1., 9)[1:]]
+            positions = [center - attitude @ offset for attitude in orientations]
+            for index in range(len(positions)) if self.controller.motion_speed == 1. else [len(positions) - 1]:
+                result = self.controller.move_to_site(arm, positions[index], orientations[index],
+                    via=positions[:-1] if self.controller.motion_speed != 1. else None,
+                    via_rotations=orientations[:-1] if self.controller.motion_speed != 1. else None,
+                    on_sample=lambda: self._require_hold(arm, obj))
                 if not result.success:
                     raise SkillError(result.error or "IK_FAILURE", "Cannot reorient the physical grasp for table placement")
                 self._require_hold(arm, obj)
@@ -317,14 +339,18 @@ class SkillRunner:
         # Keep the carried cube on a Cartesian clearance path. A joint interpolation
         # between two high endpoints can still dip the palm through a table object.
         count = max(1, int(np.ceil(np.linalg.norm(np.asarray(desired) - start) / .025)))
-        for alpha in np.linspace(0., 1., count + 1)[1:-1]:
-            waypoint = (1 - alpha) * start + alpha * np.asarray(desired)
-            result = self.controller.move_to_site(arm, waypoint - commanded_rotation @ offset, commanded_rotation)
-            if not result.success:
-                raise SkillError(result.error or "IK_FAILURE", f"Cartesian carry of {obj} was blocked at {np.round(waypoint, 4).tolist()} (position residual {result.position_error}, rotation residual {result.rotation_error})")
-            self._require_hold(arm, obj)
-        for _ in range(3):
-            result = self.controller.move_to_site(arm, target, commanded_rotation)
+        via = [(1 - alpha) * start + alpha * np.asarray(desired) - commanded_rotation @ offset
+               for alpha in np.linspace(0., 1., count + 1)[1:-1]]
+        if self.controller.motion_speed == 1.:
+            for waypoint in via:
+                result = self.controller.move_to_site(arm, waypoint, commanded_rotation)
+                if not result.success:
+                    raise SkillError(result.error or "IK_FAILURE", "Cartesian carry was blocked")
+                self._require_hold(arm, obj)
+            via = []
+        for attempt in range(3):
+            result = self.controller.move_to_site(arm, target, commanded_rotation,
+                via=via if attempt == 0 else None, on_sample=lambda: self._require_hold(arm, obj))
             if not result.success:
                 raise SkillError(result.error or "IK_FAILURE", f"Cannot carry {obj} to {np.round(desired, 4).tolist()} (EE {np.round(target, 4).tolist()}, position residual {result.position_error}, rotation residual {result.rotation_error})")
             self._require_hold(arm, obj)
@@ -357,10 +383,23 @@ class SkillRunner:
             raise SkillError("HANDOVER_UNREACHABLE", str(exc)) from None
         offset = rotation.T @ (cube - ee)
         donor_site = geometry.position - geometry.donor_rotation @ offset
-        moved = self.controller.move_to_site(arm, donor_site, geometry.donor_rotation, q_init=geometry.donor_seed)
+        donor_positions, donor_rotations = [], []
+        if self.controller.motion_speed != 1.:
+            from scipy.spatial.transform import Rotation, Slerp
+            arc = Slerp([0., 1.], Rotation.from_matrix(np.stack([rotation, geometry.donor_rotation])))
+            angle = Rotation.from_matrix(geometry.donor_rotation @ rotation.T).magnitude()
+            count = max(2, int(np.ceil(max(angle / .25, np.linalg.norm(geometry.position - cube) / .025))))
+            for alpha in np.linspace(0., 1., count + 1)[1:-1]:
+                attitude = arc(alpha).as_matrix()
+                center = (1. - alpha) * cube + alpha * geometry.position
+                donor_positions.append(center - attitude @ offset)
+                donor_rotations.append(attitude)
+        moved = self.controller.move_to_site(arm, donor_site, geometry.donor_rotation,
+            q_init=geometry.donor_seed, via=donor_positions, via_rotations=donor_rotations,
+            on_sample=lambda: self._require_hold(arm, obj))
         if not moved.success:
             raise SkillError(moved.error or "IK_FAILURE", "Donor could not reach the coupled handover pose")
-        self.env.step(600)
+        self.env.step(max(1, round(600 / self.controller.motion_speed)))
         self._require_hold(arm, obj)
         self.controller.wait_gripper(receiver, False, .5)
         cube, cube_rotation = self.env.object_pose(obj)
@@ -372,11 +411,14 @@ class SkillRunner:
         result = self.controller.move_to_site(receiver, pregrasp, receiving_rotation, q_init=geometry.receiver_seed)
         if not result.success:
             raise SkillError(result.error or "IK_FAILURE", "Receiver could not reach the handover standoff")
-        self.env.step(200)
+        self.env.step(max(1, round(200 / self.controller.motion_speed)))
         self._require_hold(arm, obj)
-        for alpha in np.linspace(0., 1., 13)[1:]:
-            target = (1 - alpha) * pregrasp + alpha * site
-            result = self.controller.move_to_site(receiver, target, receiving_rotation)
+        insertion = [(1 - alpha) * pregrasp + alpha * site for alpha in np.linspace(0., 1., 13)[1:]]
+        destinations = insertion if self.controller.motion_speed == 1. else [site]
+        for target in destinations:
+            result = self.controller.move_to_site(receiver, target, receiving_rotation,
+                via=insertion[:-1] if self.controller.motion_speed != 1. else None,
+                on_sample=lambda: self._require_hold(arm, obj))
             if not result.success:
                 raise SkillError(result.error or "IK_FAILURE", "Receiver was blocked during the straight insertion")
             self._require_hold(arm, obj)
@@ -452,6 +494,14 @@ class SkillRunner:
             return {"final": result.final_position}
         return self._skill("return_home", run, started)
 
+    def throw_object(self, arm: str, obj: str, height_cm: float = 3.) -> dict:
+        from backend.app.skills.dynamic_skills import throw_up
+        return self._skill("throw_object", lambda: throw_up(self, arm, obj, height_cm), time.perf_counter())
+
+    def pour_liquid(self, arm: str, obj: str, target: str, volume_ml: float) -> dict:
+        from backend.app.skills.pouring import pour_wine
+        return self._skill("pour_liquid", lambda: pour_wine(self, arm, obj, target, volume_ml), time.perf_counter())
+
     def execute_plan(self, plan: list[dict], progress=None) -> list[dict]:
         results = []
         for step in plan:
@@ -485,6 +535,10 @@ class SkillRunner:
                 )
             elif skill == "handover_object":
                 result = self.handover_object(arm, step["object"], step.get("receiver") or "")
+            elif skill == "throw_object":
+                result = self.throw_object(arm, step["object"], float(step.get("height_cm") or 3.))
+            elif skill == "pour_liquid":
+                result = self.pour_liquid(arm, step["object"], step.get("target") or "wine_glass", float(step.get("volume_ml") or 20.))
             else:
                 result = {"skill": skill, "success": False, "duration": 0.0, "error": "INVALID_PLAN", "detail": "Unknown skill"}
             results.append(result)

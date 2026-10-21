@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Callable
 
 import numpy as np
@@ -13,6 +14,10 @@ from backend.app.simulation.openarm_v2.definition import (
     SPAWN_ARM_QPOS,
 )
 from backend.app.simulation.transform import orientation_error
+
+# Motor targets need not cross the Python/engine boundary at the 1 kHz physics
+# rate. The solver still integrates every step; a target is held for at most 4 ms.
+MOTOR_COMMAND_PERIOD = .004
 
 __all__ = [
     "MotionResult",
@@ -27,6 +32,9 @@ class MotionResult:
     final_position: list[float] | None = None
     position_error: float | None = None
     rotation_error: float | None = None
+    nominal_duration: float | None = None
+    trajectory_duration: float | None = None
+    settling_duration: float | None = None
 
 
 class OpenArmV2Controller:
@@ -37,8 +45,13 @@ class OpenArmV2Controller:
     Endpoint verification always reads the actual physics state.
     """
 
-    def __init__(self, env: SimulationBackend):
+    def __init__(self, env: SimulationBackend, *, motion_speed: float | None = None):
         self.env = env
+        self.motion_speed = float(os.getenv("OPENARM_MOTION_SPEED", "6")) if motion_speed is None else float(motion_speed)
+        if not np.isfinite(self.motion_speed) or self.motion_speed <= 0:
+            raise ValueError("OPENARM_MOTION_SPEED must be a finite positive number")
+        self.env.motion_speed = self.motion_speed
+        self.env.configure_motion_response(self.motion_speed)
         self.cancelled = False
         self.should_stop: Callable[[], bool] | None = None
         self.target_rotations: dict[str, np.ndarray] = {}
@@ -124,17 +137,25 @@ class OpenArmV2Controller:
         progress: Callable[[str], None] | None = None,
     ) -> MotionResult:
         steps_per = max(1, int(seconds_per_segment / self.timestep))
+        command_steps = max(1, int(round(MOTOR_COMMAND_PERIOD / self.timestep)))
         for i, target in enumerate(path):
             if self.stop_requested():
                 return MotionResult(False, "STOPPED")
             if progress and i % 8 == 0:
                 progress(f"joint_path_{i}/{len(path)}")
             q_start = self.env.arm_qpos(side)
-            for alpha in np.linspace(0, 1, max(2, int(np.linalg.norm(target - q_start) / 0.005))):
+            distance = float(np.linalg.norm(target - q_start))
+            if distance < 1e-9:
+                # The first old waypoint was exactly the observed start pose,
+                # but still added an 80 ms dwell to every move, even a 1 cm one.
+                continue
+            interpolation_steps = max(2, int(distance / .005))
+            for index in range(0, interpolation_steps, command_steps):
+                alpha = index / (interpolation_steps - 1)
                 qcmd = (1 - alpha) * q_start + alpha * target
                 self.env.set_arm(side, qcmd)
                 self.env.apply_gravity_compensation(side)
-                self.env.step(1)
+                self.env.step(min(command_steps, interpolation_steps - index))
                 if self.stop_requested():
                     return MotionResult(False, "STOPPED")
             self.env.set_arm(side, target)
@@ -150,16 +171,74 @@ class OpenArmV2Controller:
         rotation: np.ndarray | None = None,
         progress: Callable[[str], None] | None = None,
         q_init: np.ndarray | None = None,
+        duration: float | None = None,
+        scale_speed: bool = True,
+        via: list[np.ndarray] | None = None,
+        via_rotations: list[np.ndarray] | None = None,
+        on_sample: Callable[[], None] | None = None,
     ) -> MotionResult:
         if rotation is None:
             rotation = GRASP_ROTATION.copy()
-        q, pos_err, _ = self.solve_ik(side, position, rotation, q_init=q_init)
+        self.env.configure_motion_response(self.motion_speed if scale_speed else 1.)
+        joint_waypoints = [self.env.arm_qpos(side)]
+        q, pos_err = None, float("inf")
+        rotations = via_rotations if via_rotations is not None else [rotation] * len(via or [])
+        if len(rotations) != len(via or []):
+            raise ValueError("Each via position needs one via rotation")
+        for waypoint, attitude in zip([*(via or []), position], [*rotations, rotation]):
+            seed = joint_waypoints[-1] if via else q_init
+            q, pos_err, _ = self.solve_ik(side, waypoint, attitude, q_init=seed)
+            if q is None:
+                break
+            joint_waypoints.append(q)
         if q is None:
             return MotionResult(False, "IK_FAILURE", position.tolist(), pos_err)
         self.target_rotations[side] = rotation.copy()
         start = self.env.arm_qpos(side)
-        path = [(1 - a) * start + a * q for a in np.linspace(0, 1, 8)]
-        result = self.execute_joint_path(side, path, 0.08, progress)
+        nominal_duration = duration
+        trajectory_duration = None
+        if duration is None and self.motion_speed == 1. and not via:
+            path = [(1 - a) * start + a * q for a in np.linspace(0, 1, 8)]
+            result = self.execute_joint_path(side, path, .08, progress)
+        else:
+            if nominal_duration is None:
+                # The previous path spent 80ms at each of seven waypoints plus
+                # its interpolation time. Schedule one continuous trajectory.
+                nominal_duration = sum(.56 + max(14, int(np.linalg.norm(b - a) / .005)) * self.timestep
+                                       for a, b in zip(joint_waypoints, joint_waypoints[1:]))
+            trajectory_duration = nominal_duration / (self.motion_speed if scale_speed else 1.)
+            result = MotionResult(True)
+            steps = max(2, int(np.ceil(trajectory_duration / self.timestep)))
+            trajectory_duration = steps * self.timestep
+            curve = derivative = None
+            if via:
+                from scipy.interpolate import PchipInterpolator
+                knots = np.linspace(0., 1., len(joint_waypoints))
+                # Shape preservation prevents a high-clearance approach from
+                # overshooting the last insertion segment into the workpiece.
+                curve = PchipInterpolator(knots, joint_waypoints, axis=0)
+                derivative = curve.derivative()
+            command_steps = max(1, int(round(MOTOR_COMMAND_PERIOD / self.timestep))) if scale_speed else 1
+            indices = range(0, steps, command_steps) if scale_speed else range(1, steps + 1)
+            completed = False
+            try:
+                for index in indices:
+                    if self.stop_requested():
+                        return MotionResult(False, "STOPPED")
+                    fraction = index / steps
+                    alpha = fraction ** 3 * (10. - 15. * fraction + 6. * fraction ** 2)
+                    alpha_dot = 30. * fraction ** 2 * (1. - fraction) ** 2 / trajectory_duration
+                    reference = start + (q - start) * alpha if curve is None else curve(alpha)
+                    velocity = ((q - start) if curve is None else derivative(alpha)) * alpha_dot if scale_speed else None
+                    self.env.set_arm(side, reference, velocities=velocity)
+                    self.env.step(min(command_steps, steps - index) if scale_speed else 1)
+                    if on_sample is not None and index % max(command_steps, round(.02 / self.timestep)) == 0:
+                        on_sample()
+                completed = True
+            finally:
+                # A stop/error must also clear the velocity reference; otherwise
+                # the still-running scene would continue driving the stopped arm.
+                self.env.set_arm(side, q if completed else self.env.arm_qpos(side))
         if not result.success:
             return result
         actual, actual_rotation = self.env.ee_pose(side)
@@ -167,24 +246,68 @@ class OpenArmV2Controller:
         rotation_residual = float(np.linalg.norm(orientation_error(actual_rotation, rotation)))
         # Read a settled endpoint. The official wrist's damping can leave a short
         # orientation transient after a large handover rotation or lateral carry.
-        for _ in range(15):
-            if residual <= .004 and rotation_residual <= .06:
+        settling_steps = 0
+        previous_position, previous_rotation = actual.copy(), actual_rotation.copy()
+        stable_steps = 0
+        settle_quantum = 10 if scale_speed else 20
+        require_stable = scale_speed and self.motion_speed != 1.
+        for _ in range(300 // settle_quantum):
+            if not require_stable and residual <= .004 and rotation_residual <= .06:
                 break
             if self.stop_requested():
                 return MotionResult(False, "STOPPED")
-            self.env.step(20)
+            self.env.step(settle_quantum)
+            settling_steps += settle_quantum
+            if on_sample is not None:
+                on_sample()
             actual, actual_rotation = self.env.ee_pose(side)
             residual = float(np.linalg.norm(actual - position))
             rotation_residual = float(np.linalg.norm(orientation_error(actual_rotation, rotation)))
+            if (residual <= .012 and rotation_residual <= .15
+                    and np.linalg.norm(actual - previous_position) < .0001
+                    and np.linalg.norm(orientation_error(previous_rotation, actual_rotation)) < .001):
+                stable_steps += settle_quantum
+            else:
+                stable_steps = 0
+            previous_position, previous_rotation = actual.copy(), actual_rotation.copy()
+            if require_stable and stable_steps * self.timestep >= .03:
+                break
         # Solving IK is not evidence that the motors reached it: a collision can block them.
         return MotionResult(residual <= 0.012 and rotation_residual <= 0.15,
                             None if residual <= 0.012 and rotation_residual <= 0.15 else "MOTION_BLOCKED",
-                            actual.tolist(), residual, rotation_residual)
+                            actual.tolist(), residual, rotation_residual,
+                            nominal_duration, trajectory_duration, settling_steps * self.timestep)
 
     def set_gripper(self, side: str, closed: bool) -> None:
         self.env.set_gripper(side, GRIPPER_CLOSED[side] if closed else GRIPPER_OPEN[side])
 
     def wait_gripper(self, side: str, closed: bool, seconds: float = 0.45) -> MotionResult:
         self.set_gripper(side, closed)
-        self.env.step(max(1, int(seconds / self.timestep)))
+        budget = max(1, int(seconds / self.timestep))
+        if self.motion_speed == 1.:
+            self.env.step(budget)
+            return MotionResult(True)
+        # Closure speed is produced by the official finger motors. Finish once
+        # their measured response settles, rather than always idling for 650ms.
+        quantum = max(1, int(round(.01 / self.timestep)))
+        previous = self.env.gripper_position(side)
+        stable_steps = elapsed = 0
+        completed = False
+        try:
+            while elapsed < budget:
+                if self.stop_requested():
+                    return MotionResult(False, "STOPPED")
+                count = min(quantum, budget - elapsed)
+                self.env.step(count)
+                elapsed += count
+                measured = self.env.gripper_position(side)
+                near_goal = closed or abs(measured - GRIPPER_OPEN[side]) < .03
+                stable_steps = stable_steps + count if near_goal and abs(measured - previous) < .005 else 0
+                previous = measured
+                if elapsed * self.timestep >= (.18 if closed else .04) and stable_steps * self.timestep >= .03:
+                    break
+            completed = True
+        finally:
+            if not completed:
+                self.env.set_gripper(side, self.env.gripper_position(side))
         return MotionResult(True)

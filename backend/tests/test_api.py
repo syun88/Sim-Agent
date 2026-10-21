@@ -31,13 +31,15 @@ def test_documented_gpu_setting_is_read(monkeypatch):
 
 def test_factory_hands_the_gpu_setting_to_the_engine(monkeypatch):
     """The setting has to reach the engine, not just be parsed."""
-    requested: list[bool] = []
+    requested: list[tuple[bool, str]] = []
 
     class RecordingEngine:
-        def __init__(self, prefer_gpu: bool = False, show_viewer: bool = False):
-            requested.append(prefer_gpu)
+        def __init__(self, prefer_gpu: bool = False, show_viewer: bool = False, scene_profile: str = "cubes"):
+            requested.append((prefer_gpu, scene_profile))
 
     monkeypatch.setattr(simulation, "GenesisOpenArmV2Environment", RecordingEngine)
     monkeypatch.setenv(GPU_ENVIRONMENT_VARIABLE, "1")
     simulation.create_backend()
-    assert requested == [True]
+    assert requested == [(True, "cubes")]
+    simulation.create_backend("wine")
+    assert requested[-1] == (True, "wine")

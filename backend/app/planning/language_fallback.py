@@ -11,7 +11,9 @@ import unicodedata
 from backend.app.planning.task_program import GroundingError, TaskAction, TaskProgram
 
 VERBS = re.compile(
-    r"(?P<handover>受け渡(?:して|す)|渡(?:した|して|す|せ)|手渡(?:して|す)|\bhandover\b|\bhand[ -]over\b|\bpass(?:es)?\b|\bhand(?=\s+(?:it|the|that)))"
+    r"(?P<throw>投げ(?:て|る|ろ)|放り(?:投げて|投げる)|上[にへ](?:軽く|ぽんと|そっと|少し|ちょっと|\s)*放(?:って|つ)|\bthrow\b|\btoss\b)"
+    r"|(?P<pour>注(?:いで|ぐ|げ)|そそ(?:いで|ぐ)|\bpour\b)"
+    r"|(?P<handover>受け渡(?:して|す)|渡(?:した|して|す|せ)|手渡(?:して|す)|\bhandover\b|\bhand[ -]over\b|\bpass(?:es)?\b|\bhand(?=\s+(?:it|the|that)))"
     r"|(?P<place>置(?:いた|いて|く|け)|入(?:れて|れる)|運(?:んで|ぶ)|\bplace\b|\bput(?:s)?\b|\bset\s+down\b|\bleave\b)"
     r"|(?P<pick>掴(?:んで|む|め)|つか(?:んで|む)|持ち上げ(?:て|る)|握(?:って|る)|取(?:って|る)|と(?:って|る)|\bpick(?:s)?(?:\s+up)?\b|\bgrab\b|\bgrasp\b|\btake(?:s)?\b|\blift\b)"
     r"|(?P<approach>近づ(?:いて|けて|く)|アプローチ|\bapproach\b)"
@@ -26,7 +28,9 @@ ARMS = {"left": r"左(?:手|腕|アーム|ハンド)?|\bleft(?:\s+(?:hand|arm))?
 def named_objects(text: str, state: dict) -> list[str]:
     available = {x["id"] for x in state["objects"]}
     matches = []
-    for name, pattern in {"red_cube": r"(?<![a-z0-9_])red(?:[ _-]*cube)?(?![a-z0-9_])|赤(?:い|の)?(?:キューブ|ブロック|箱)?|あか", "blue_cube": r"(?<![a-z0-9_])blue(?:[ _-]*cube)?(?![a-z0-9_])|青(?:い|の)?(?:キューブ|ブロック|箱)?|あお"}.items():
+    for name, pattern in {"red_cube": r"(?<![a-z0-9_])red(?![ _-]*wine)(?:[ _-]*cube)?(?![a-z0-9_])|赤(?!ワイン)(?:い|の)?(?:キューブ|ブロック|箱)?|あか", "blue_cube": r"(?<![a-z0-9_])blue(?:[ _-]*cube)?(?![a-z0-9_])|青(?:い|の)?(?:キューブ|ブロック|箱)?|あお",
+                          "wine_bottle": r"ワイン(?:ボトル|の?瓶)?|ボトル|瓶|\bwine(?:[ _-]*bottle)?\b|\bbottle\b",
+                          "wine_glass": r"グラス|ワイングラス|\b(?:wine[ _-]*)?glass\b"}.items():
         if name in available:
             for match in re.finditer(pattern, text, re.I):
                 tail = text[match.end():]
@@ -42,6 +46,8 @@ def arm_mentions(text: str) -> list[str]:
 
 
 def target_in(text: str) -> str | None:
+    if re.search(r"グラス|\bglass\b", text, re.I):
+        return "wine_glass"
     if re.search(r"そこに|同じ場所|\bthere\b|\bsame (?:place|target)\b", text):
         return "there"
     for target, pattern in {
@@ -71,6 +77,20 @@ def parse_fallback(instruction: str, state: dict) -> TaskProgram:
     text = unicodedata.normalize("NFKC", instruction).lower().strip()
     if re.search(r"\b(?:yellow|purple|orange|black|white)\b|黄色|紫色|白い|黒い|緑(?:の|色の)?(?:キューブ|cube)|green\s+cube|\b(?:ball|sphere|cylinder)\b", text):
         raise GroundingError("This scene has only a red cube and a blue cube")
+    # Bounded noun-only requests: the omitted predicate is unambiguously pour.
+    # Full matching prevents an unknown trailing task from being silently dropped.
+    number = r"\d+(?:\.\d+)?"
+    noun_pour = re.fullmatch(
+        rf"(?:赤)?ワイン(?:を)?\s*(?:(?P<before>{number})\s*ml(?:くらい|ほど)?[、,\s]*)?"
+        rf"(?:そこの|その|あの|ここの)?グラス[にへ]\s*"
+        rf"(?:(?P<after>{number})\s*ml(?:くらい|ほど)?|少しだけ|少し|ちょっと)?\s*お願い(?:します)?[。.!！\s]*"
+        r"(?:(?:終わったら|その後|あとで)?[、,\s]*ボトル(?:も|を)"
+        r"(?:(?:元の(?:場所|ところ)|元)[にへ])?戻して(?:おいて|ね)?[。.!！\s]*)?", text)
+    if noun_pour:
+        amount = noun_pour.group("before") or noun_pour.group("after")
+        return TaskProgram(actions=[TaskAction(op="pour", object="wine_bottle", target="wine_glass",
+                                               volume_ml=float(amount) if amount else 20.)],
+                           assumptions=[] if amount else ["Unspecified small pour means 20 mL"])
     # A colour or ID by itself is a useful informal pick request; prose without a verb isn't.
     if re.fullmatch(r"(?:red|blue)(?:[ _-]*cube)?|[赤青](?:い|の)?(?:キューブ|ブロック|箱)?", text):
         return TaskProgram(actions=[TaskAction(op="pick", object=named_objects(text, state)[0])])
@@ -85,7 +105,7 @@ def parse_fallback(instruction: str, state: dict) -> TaskProgram:
     # connectors first so that 'right hand picks ...' retains its explicit subject.
     segments: list[tuple[str, str]] = []
     if english:
-        clauses = re.split(r"[,;.]+|\b(?:and then|then|after that|next|afterwards)\b|\band\s+(?=(?:pick|grab|pass|hand|put|place|move|open|close|take|lift)\b)", text)
+        clauses = re.split(r"[,;.]+|\b(?:and then|then|after that|next|afterwards)\b|\band\s+(?=(?:pick|grab|pass|hand|put|place|move|open|close|take|lift|throw|toss|pour)\b)", text)
         for clause in clauses:
             found = list(VERBS.finditer(clause))
             if len(found) > 1:
@@ -105,6 +125,12 @@ def parse_fallback(instruction: str, state: dict) -> TaskProgram:
             raise GroundingError(f"Unrecognised instruction suffix: {remainder}")
     for op, segment in segments:
         names = named_objects(segment, state)
+        if (op == "place" and "wine_bottle" in names and "wine_glass" in names
+                and re.search(r"ワイン|\bwine\b", segment)
+                and not re.search(r"(?:ワイン)?(?:ボトル|瓶)を|(?:put|place)\s+(?:the\s+)?(?:wine\s+)?bottle\b", segment)):
+            op = "pour"
+        if op == "pour":
+            names = [n for n in names if n != "wine_glass"]
         arms = arm_mentions(segment)
         reference = bool(re.search(r"\bit\b|\bthat\b|それ|さっきの|その(?:物|キューブ|箱)", segment))
         obj = names[0] if names else ("it" if reference else None)
@@ -115,7 +141,7 @@ def parse_fallback(instruction: str, state: dict) -> TaskProgram:
         target = target_in(segment)
         if op == "move" and target and not re.search(r"\d", segment):
             op = "place"
-        if op in {"pick", "place", "handover", "approach"}:
+        if op in {"pick", "place", "handover", "approach", "throw", "pour"}:
             if len(names) > 1 or (op == "pick" and re.search(r"\bboth\b|\ball\b|\btwo\b|2つ|両方|すべて", segment)):
                 if op != "pick" and op != "place":
                     raise GroundingError("Specify one object for each handover")
@@ -155,6 +181,15 @@ def parse_fallback(instruction: str, state: dict) -> TaskProgram:
             if match and match.group(2) in {"m", "メートル"}: distance *= 100
         action = TaskAction(op=op, object=obj, arm=arm, receiver=receiver, target=target,
                             direction=direction, distance_cm=distance)
+        if op == "throw":
+            action.direction = direction_in(segment) or "up"
+            match = re.search(r"(\d+(?:\.\d+)?)\s*(?:cm|センチ)", segment)
+            action.height_cm = float(match.group(1)) if match else 3.
+        if op == "pour":
+            action.object = obj or ("wine_bottle" if "wine_bottle" in {o["id"] for o in state["objects"]} else None)
+            action.target = "wine_glass"
+            match = re.search(r"(\d+(?:\.\d+)?)\s*(?:ml|ミリリットル)", segment, re.I)
+            action.volume_ml = float(match.group(1)) if match else 20.
         actions.append(action)
         if names:
             last_object = names[0]

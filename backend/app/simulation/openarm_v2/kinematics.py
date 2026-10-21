@@ -35,3 +35,37 @@ class OfficialArmKinematics:
         return (self._data.site_xpos[self._site].copy(),
                 self._data.site_xmat[self._site].reshape(3, 3).copy(),
                 self._linear[:, self._dofs].copy(), self._angular[:, self._dofs].copy())
+
+
+class OfficialGravityKinematics:
+    """Gravity lever arms from the official model; no dynamics solver is stepped.
+
+    This avoids querying every live link Jacobian on both CPU and GPU. Input is
+    always the actual Genesis configuration; only the known robot's own mass is
+    compensated, so payloads and fluid still exert their real forces in Genesis.
+    """
+    def __init__(self, model):
+        import mujoco
+        self._mj, self._model = mujoco, model
+        self._data = mujoco.MjData(model)
+        self._jac = np.zeros((3, model.nv))
+        self._dofs = {}
+        self._bodies = {}
+        for side in ARM_JOINTS:
+            joints = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name) for name in ARM_JOINTS[side]]
+            self._dofs[side] = model.jnt_dofadr[joints]
+            self._bodies[side] = [i for i in range(model.nbody)
+                                  if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i) or "").startswith(f"openarm_{side}_")]
+
+    def evaluate(self, qpos: np.ndarray, gravity: np.ndarray) -> dict[str, np.ndarray]:
+        self._data.qpos[:] = qpos
+        self._mj.mj_kinematics(self._model, self._data)
+        self._mj.mj_comPos(self._model, self._data)
+        torques = {}
+        for side, bodies in self._bodies.items():
+            torque = np.zeros(7)
+            for body in bodies:
+                self._mj.mj_jacBodyCom(self._model, self._data, self._jac, None, body)
+                torque -= self._jac[:, self._dofs[side]].T @ (self._model.body_mass[body] * gravity)
+            torques[side] = torque
+        return torques

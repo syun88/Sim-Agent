@@ -8,11 +8,12 @@ SkillName = Literal[
     "release_object", "retreat", "return_home", "open_gripper",
     "close_gripper", "move_relative",
     "handover_object",
+    "throw_object", "pour_liquid",
 ]
 ArmName = Literal["left", "right"]
 MoveDirection = Literal["up", "down", "left", "right", "forward", "back"]
 ExecutionState = Literal[
-    "IDLE", "PLANNING", "VALIDATING", "EXECUTING", "VERIFYING",
+    "IDLE", "PLANNING", "PREPARING_SCENE", "VALIDATING", "EXECUTING", "VERIFYING",
     "SUCCEEDED", "FAILED", "REPLANNING", "STOPPED",
 ]
 
@@ -28,6 +29,8 @@ class PlanStep(BaseModel):
     receiver: ArmName | None = None
     action_index: int | None = None
     grasp_offset_x: float = Field(default=0., ge=-.02, le=.02)
+    height_cm: float | None = Field(default=None, ge=1, le=10)
+    volume_ml: float | None = Field(default=None, ge=5, le=35)
 
 
 class AgentPlan(BaseModel):

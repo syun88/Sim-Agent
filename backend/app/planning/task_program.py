@@ -21,13 +21,15 @@ TABLE_TARGETS = {
 
 class TaskAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    op: Literal["pick", "handover", "place", "approach", "move", "open", "close", "home"]
+    op: Literal["pick", "handover", "place", "approach", "move", "open", "close", "home", "throw", "pour"]
     object: str | None = None
     arm: Literal["left", "right"] | None = None
     receiver: Literal["left", "right"] | None = None
     target: str | None = None
     direction: Literal["up", "down", "left", "right", "forward", "back"] | None = None
     distance_cm: float | None = Field(default=None, ge=1, le=30)
+    height_cm: float | None = Field(default=None, ge=1, le=10)
+    volume_ml: float | None = Field(default=None, ge=5, le=35)
 
 
 class TaskProgram(BaseModel):
@@ -65,6 +67,7 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
     checks: dict[str, dict] = {obj: {"type": "holding", "object": obj, "arm": side} for side, obj in held.items() if obj}
     canonical: list[TaskAction] = []
     assumptions = list(program.assumptions)
+    remaining_wine = state.get("fluid", {}).get("bottle_ml") if state.get("fluid") else None
 
     def emit(skill: str, arm: str, index: int, **kwargs):
         steps.append(PlanStep(skill=skill, arm=arm, action_index=index, **kwargs))
@@ -80,22 +83,30 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
         return ("left" if position[1] >= 0 else "right") if position else ("right" if obj == "blue_cube" else "left")
 
     def acquire(obj: str, arm: str, index: int):
+        if not objects[obj].get("graspable", True):
+            raise GroundingError(f"{obj} is a fixed receiving vessel and cannot be grasped")
         if held[arm] and held[arm] != obj:
             raise GroundingError(f"{arm} hand already holds {held[arm]}; place it before picking {obj}")
         source = owner(obj)
         if source == arm:
             return
         if source:
+            if obj == "wine_bottle":
+                raise GroundingError("Bottle handover is not supported; use the current holder")
             emit("handover_object", source, index, object=obj, receiver=arm)
             held[source] = None
         else:
             handover_next = program.actions[index].op == "handover" or any((a.op == "handover" and a.object in {obj, "it", "それ", None}) or (a.op == "pick" and a.arm and a.arm != arm and a.object in {obj, "it", "それ"}) for a in program.actions[index + 1:])
-            for skill in ("approach_object", "grasp_object", "lift_object"):
+            for skill in (("approach_object", "grasp_object") if obj == "wine_bottle" else ("approach_object", "grasp_object", "lift_object")):
                 emit(skill, arm, index, object=obj, grasp_offset_x=-.015 if skill == "approach_object" and handover_next else 0.)
         held[arm] = obj
 
     for index, original in enumerate(program.actions):
         action = original.model_copy(deep=True)
+        if action.op != "handover":
+            # Small models sometimes fill an irrelevant recipient on a pour.
+            # It must not change discourse ownership after a completed action.
+            action.receiver = None
         obj = action.object
         if obj in {"it", "that", "それ", "そのキューブ", "same"}:
             obj = last_object
@@ -105,13 +116,13 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             side = obj.split("_")[0]
             candidates = [v for v in objects.values() if "position" in v]
             obj = (max if side == "left" else min)(candidates, key=lambda x: x["position"][1])["id"] if candidates else None
-        needs_object = action.op in {"pick", "handover", "place", "approach"}
+        needs_object = action.op in {"pick", "handover", "place", "approach", "throw", "pour"}
         if obj is None and needs_object:
             obj = held.get(action.arm) if action.arm else None
             unique_held = list({item for item in held.values() if item})
             obj = obj or last_object or (unique_held[0] if len(unique_held) == 1 else None)
         if needs_object and obj not in objects:
-            raise GroundingError(f"Action {index + 1}: specify a known cube (red_cube or blue_cube); reference {obj!r} is ambiguous")
+            raise GroundingError(f"Action {index + 1}: specify a known object ({', '.join(objects)}); reference {obj!r} is ambiguous")
         if obj is not None and obj not in objects:
             raise GroundingError(f"Unknown object: {obj}")
         arm = action.arm or ((owner(obj) or auto_arm(obj)) if obj else last_arm)
@@ -126,6 +137,8 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
                 last_arm = arm
             checks[obj] = {"type": "holding", "object": obj, "arm": arm}
         elif action.op == "handover":
+            if obj == "wine_bottle":
+                raise GroundingError("Bottle handover is not supported; pour with the current holder")
             receiver = action.receiver
             if receiver not in SIDES or receiver == arm:
                 raise GroundingError(f"Action {index + 1}: handover needs two different hands")
@@ -137,6 +150,15 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             checks[obj] = {"type": "holding", "object": obj, "arm": receiver}
             last_arm = receiver
         elif action.op == "place":
+            if obj == "wine_bottle":
+                if (action.target is None and canonical and canonical[-1].op == "pour"
+                        and canonical[-1].object == obj):
+                    # Pour is an atomic serve-and-return skill. A following
+                    # unspecified 'put the bottle back' is already fulfilled.
+                    assumptions.append(f"Action {index + 1}: bottle return is included in the preceding pour")
+                    canonical.append(action)
+                    continue
+                raise GroundingError("Use pour for the bottle; it includes returning it upright to its starting place")
             target = action.target or f"{arm}_side"
             if target in {"there", "そこ", "same_target"}:
                 target = discourse.get("last_target")
@@ -155,6 +177,34 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
                 raise GroundingError(f"{arm} hand must be empty before approach")
             emit("approach_object", arm, index, object=obj)
             checks[f"approach:{arm}"] = {"type": "approach", "object": obj, "arm": arm}
+        elif action.op == "pour":
+            if obj != "wine_bottle" or action.target not in {None, "wine_glass"} or "wine_glass" not in objects:
+                raise GroundingError("Pour requires the wine bottle and receiving glass")
+            action.target = "wine_glass"
+            action.volume_ml = action.volume_ml or 20.
+            if remaining_wine is not None and action.volume_ml + 2. > remaining_wine:
+                raise GroundingError("The requested amount exceeds the bottle's available wine")
+            if remaining_wine is not None:
+                remaining_wine -= action.volume_ml
+            acquire(obj, arm, index)
+            emit("pour_liquid", arm, index, object=obj, target="wine_glass", volume_ml=action.volume_ml)
+            held[arm] = None
+            checks.pop(obj, None)
+            checks.pop("wine_glass", None)
+            checks[f"pour:{index}"] = {"type": "pour", "object": obj, "target": "wine_glass", "volume_ml": action.volume_ml, "action_index": index}
+        elif action.op == "throw":
+            if objects[obj].get("type") != "cube":
+                raise GroundingError("Only a cube can be thrown in this scene")
+            if action.direction not in {None, "up"}:
+                raise GroundingError("Only upward throws are supported")
+            acquire(obj, arm, index)
+            action.direction = "up"
+            action.height_cm = action.height_cm or 3.
+            emit("throw_object", arm, index, object=obj, height_cm=action.height_cm)
+            held[arm] = None
+            checks.pop(obj, None)
+            checks[f"throw:{index}"] = {"type": "throw", "object": obj, "arm": arm,
+                                       "min_height": action.height_cm / 100., "action_index": index}
         elif action.op == "move":
             if not action.direction or action.distance_cm is None:
                 raise GroundingError("Relative motion requires a direction and distance (1–30 cm)")
@@ -186,7 +236,8 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             goal.update(type="place_in_zone", object=first.object, target=first.target)
         else:
             labels = {"pick": "grasp", "approach": "approach", "move": "grasp_and_move" if first.object else "move_relative",
-                      "open": "open_gripper", "close": "close_gripper", "home": "return_home", "handover": "handover"}
+                      "open": "open_gripper", "close": "close_gripper", "home": "return_home", "handover": "handover",
+                      "throw": "throw", "pour": "pour"}
             goal.update(type="direct_command", action=labels[first.op], arm=first.arm)
             if first.object:
                 goal["object"] = first.object

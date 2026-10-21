@@ -26,6 +26,7 @@ scene reset and setup in `reset`.
 from __future__ import annotations
 
 import importlib.util
+import os
 import threading
 
 import numpy as np
@@ -41,7 +42,7 @@ from backend.app.simulation.openarm_v2.definition import (
     ZONES,
 )
 from backend.app.simulation.openarm_v2.scene import initial_object_positions, resolved_scene_xml
-from backend.app.simulation.openarm_v2.kinematics import OfficialArmKinematics
+from backend.app.simulation.openarm_v2.kinematics import OfficialArmKinematics, OfficialGravityKinematics
 from backend.app.simulation.transform import (
     compose_pose,
     quat_to_mat,
@@ -61,6 +62,14 @@ NATIVE_CAMERA_LOOKAT = (0.30, 0.0, 1.13)
 #: Steps between two gravity-torque refreshes of the feed-forward (see `apply_gravity_compensation`).
 GRAVITY_TORQUE_REFRESH_STEPS = 5
 
+
+def simulation_speed_from_environment() -> float:
+    """Wall-clock pacing only; physics dt and motor/skill timing stay in SI seconds."""
+    speed = float(os.getenv("OPENARM_SIM_SPEED", "1"))
+    if not np.isfinite(speed) or speed <= 0:
+        raise ValueError("OPENARM_SIM_SPEED must be a finite positive number")
+    return speed
+
 _INIT_LOCK = threading.Lock()
 _INITIALISED = False
 
@@ -76,6 +85,13 @@ def _ensure_genesis_init(prefer_gpu: bool):
 
     global _INITIALISED
     with _INIT_LOCK:
+        if _INITIALISED and not gs._initialized:
+            _INITIALISED = False
+        if _INITIALISED and (gs.backend == gs.cpu) != (not prefer_gpu):
+            # The owner closes its previous scene before changing profiles/devices.
+            # Genesis supports destroy/init in one process; never run two live scenes.
+            gs.destroy()
+            _INITIALISED = False
         if not _INITIALISED:
             gs.init(backend=gs.gpu if prefer_gpu else gs.cpu, precision="32", logging_level="error")
             _INITIALISED = True
@@ -217,24 +233,58 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         prefer_gpu: bool = False,
         camera_resolution: tuple[int, int] = CAMERA_RESOLUTION,
         show_viewer: bool = False,
+        scene_profile: str = "cubes",
     ):
+        self.simulation_speed = simulation_speed_from_environment()
         if not genesis_available():
             raise RuntimeError(
                 "genesis-world is not installed; install the 'genesis' extra to use this engine"
             )
         self._gs = _ensure_genesis_init(prefer_gpu)
+        self.compute_backend = self._gs.backend.name
+        if scene_profile not in {"cubes", "wine"}:
+            raise ValueError("Unknown scene profile")
+        self.scene_profile = scene_profile
+        self._wine = None
         self._xml = resolved_scene_xml()
+        self._cube_names = tuple(OBJECTS) if scene_profile == "cubes" else ()
+        if scene_profile == "wine":
+            # Keep the official robot/cell attachment intact. Each task profile
+            # carries only its workpieces, rather than unused free cube joints.
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(self._xml)
+            world = root.find("worldbody")
+            for body in list(world.findall("body")):
+                if body.get("name") in OBJECTS:
+                    world.remove(body)
+            self._xml = ET.tostring(root, encoding="unicode")
         self._meta = _OfficialModelMetadata(self._xml)
         self._scene_xml = genesis_scene_xml(self._xml, self._meta)
+        fluid_options = {}
+        if scene_profile == "wine":
+            from backend.app.simulation.genesis_backend.wine import (
+                PARTICLE_SIZE, LIQUID_MU, WINE_DT, WINE_SUBSTEPS, PRESSURE_SOLVER, HASH_GRID_SIZE, validate_fluid_timestep,
+            )
+            validate_fluid_timestep(PARTICLE_SIZE, LIQUID_MU, WINE_DT / WINE_SUBSTEPS)
+            fluid_options["sph_options"] = self._gs.options.SPHOptions(
+                particle_size=PARTICLE_SIZE, pressure_solver=PRESSURE_SOLVER, hash_grid_res=HASH_GRID_SIZE,
+                lower_bound=(.05, -.55, .80), upper_bound=(.9, .55, 1.75))
         self._scene = self._gs.Scene(
-            sim_options=self._gs.options.SimOptions(dt=0.001),
+            sim_options=self._gs.options.SimOptions(dt=WINE_DT if scene_profile == "wine" else .001,
+                                                  substeps=WINE_SUBSTEPS if scene_profile == "wine" else 1),
             # The default viewer looks at the opaque front of the official cell.
             # Place the camera inside the cell so both hands and cubes stay visible.
             viewer_options=self._gs.options.ViewerOptions(
-                res=(1100, 760), camera_pos=NATIVE_CAMERA_POSITION,
-                camera_lookat=NATIVE_CAMERA_LOOKAT, camera_fov=65.,
+                res=(1100, 760),
+                realtime_factor=self.simulation_speed,
+                camera_pos=(.78, 0., 1.75) if scene_profile == "wine" else NATIVE_CAMERA_POSITION,
+                camera_lookat=(.40, .07, 1.13) if scene_profile == "wine" else NATIVE_CAMERA_LOOKAT,
+                camera_fov=72. if scene_profile == "wine" else 65.,
             ),
             rigid_options=self._gs.options.RigidOptions(
+                constraint_solver=self._gs.constraint_solver.Newton,
+                contact_resolution=self._gs.contact_resolution.convex if scene_profile == "wine" else None,
+                impratio=10. if scene_profile == "wine" else None,
                 friction_cone=self._gs.friction_cone.elliptic,
                 enable_torsional_friction=True,
                 enable_rolling_friction=True,
@@ -245,8 +295,17 @@ class GenesisOpenArmV2Environment(SimulationBackend):
                 enable_adjacent_collision=True,
             ),
             show_viewer=show_viewer,
+            **fluid_options,
         )
-        self._entity = self._scene.add_entity(self._gs.morphs.MJCF(file=self._scene_xml))
+        material = self._gs.materials.Rigid(needs_coup=False) if scene_profile == "wine" else None
+        self._entity = self._scene.add_entity(self._gs.morphs.MJCF(file=self._scene_xml), material=material)
+        if scene_profile == "wine":
+            from backend.app.simulation.genesis_backend.wine import WineWorld
+            # Same tabletop height, also a collision boundary for spilled particles.
+            self._scene.add_entity(self._gs.morphs.MJCF(file='''<mujoco><worldbody>
+                <geom type="plane" size="1 1 .01" pos="0 0 1.006" contype="1073741824" conaffinity="0"/>
+                </worldbody></mujoco>''', visualization=False))
+            self._wine = WineWorld(self._scene, self._gs, async_surface=show_viewer)
         self._camera = self._scene.add_camera(
             res=camera_resolution,
             pos=free_camera_position(),
@@ -256,6 +315,8 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         )
         self._scene.build()
         self._index()
+        if self._wine:
+            self._wine.capture_setup()
         # A constructed engine is already in the documented initial scene. The server builds exactly
         # one backend at startup, so without this the first task would begin from the model's zero
         # configuration instead of its keyframe, and the arm would sweep across the table.
@@ -299,18 +360,32 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         self._genesis_qpos_indices = np.asarray(genesis_indices, dtype=int)
         self._links = {
             name: entity.get_link(name)
-            for name in (*OBJECTS, *EE_LINKS.values(), *self._site_parents())
+            for name in (*self._cube_names, *EE_LINKS.values(), *self._site_parents())
         }
+        self._objects = self._cube_names
+        if self._wine:
+            self._links.update({"wine_bottle": self._wine.bottle.get_link("wine_bottle"),
+                                "wine_glass": self._wine.glass.get_link("wine_glass")})
+            self._objects += ("wine_bottle", "wine_glass")
         self._dofs = {
             side: np.array([entity.get_joint(name).dofs_idx_local[0] for name in ARM_JOINTS[side]])
             for side in ARM_JOINTS
         }
+        # Joint limits and the PD position/velocity coefficients are model
+        # constants. Reading them back for every motor command launches kernels.
+        self._arm_limits = {}
+        for side, dofs in self._dofs.items():
+            lower, upper = entity.get_dofs_limit(dofs)
+            self._arm_limits[side] = np.stack([lower.cpu().numpy(), upper.cpu().numpy()], axis=1).astype(float)
         self._gripper_dofs = {
             side: int(entity.get_joint(name).dofs_idx_local[0])
             for side, name in GRIPPER_JOINTS.items()
         }
-        self._object_qs = {name: int(entity.get_joint(name).qs_idx_local[0]) for name in OBJECTS}
+        self._object_qs = {name: int(entity.get_joint(name).qs_idx_local[0]) for name in self._cube_names}
         self._link_names_by_index = {link.idx: link.name for link in entity.links}
+        if self._wine:
+            for item in (self._wine.bottle, self._wine.glass):
+                self._link_names_by_index.update({link.idx: link.name for link in item.links})
         self._arm_links = {side: self._arm_descendants(side) for side in ARM_JOINTS}
         self._arm_link_indices = {
             side: np.array([link.idx_local for link in links])
@@ -318,14 +393,22 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         }
         self._act_biases = {
             side: tuple(
-                tensor.numpy().astype(float) for tensor in entity.get_dofs_act_bias(self._dofs[side])[1:]
+                tensor.cpu().numpy().astype(float) for tensor in entity.get_dofs_act_bias(self._dofs[side])[1:]
             )
             for side in ARM_JOINTS
         }
-        self._gravity = np.asarray(self._scene.rigid_solver.get_gravity(), dtype=float).reshape(3)
+        self._act_gains = {side: entity.get_dofs_act_gain(dofs).cpu().numpy().astype(float)
+                           for side, dofs in self._dofs.items()}
+        self._gravity_dofs = np.concatenate(list(self._dofs.values()))
+        self._gravity_bias1 = np.concatenate([self._act_biases[side][0] for side in ARM_JOINTS])
+        self._gravity_bias2 = np.concatenate([self._act_biases[side][1] for side in ARM_JOINTS])
+        self._gravity = self._scene.rigid_solver.get_gravity().cpu().numpy().astype(float).reshape(3)
+        self._gravity_kinematics = OfficialGravityKinematics(self._meta.model)
         self._sim_step = 0
-        self._gravity_torque_at_step = -1
+        self._gravity_torque_at_step = -GRAVITY_TORQUE_REFRESH_STEPS
         self._gravity_torque_values = {side: np.zeros(7) for side in ARM_JOINTS}
+        self._gravity_bias_at_step = -GRAVITY_TORQUE_REFRESH_STEPS
+        self._motion_response_speed = 1.
 
     def _arm_descendants(self, side: str) -> list:
         """Every link carried by one arm, including the gripper, in link order."""
@@ -353,7 +436,7 @@ class GenesisOpenArmV2Environment(SimulationBackend):
 
     def _link_pose(self, name: str) -> tuple[np.ndarray, np.ndarray]:
         link = self._links[name]
-        return link.get_pos().numpy().astype(float), quat_to_mat(link.get_quat().numpy().astype(float))
+        return link.get_pos().cpu().numpy().astype(float), quat_to_mat(link.get_quat().cpu().numpy().astype(float))
 
     def _site_pose(self, site_name: str) -> tuple[np.ndarray, np.ndarray]:
         parent, local_position, local_quat = self._meta.site_frame(site_name)
@@ -387,13 +470,14 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         never write an object pose.
         """
         self._sim_step = 0
-        self._gravity_torque_at_step = -1
+        self._gravity_torque_at_step = -GRAVITY_TORQUE_REFRESH_STEPS
+        self._gravity_bias_at_step = -GRAVITY_TORQUE_REFRESH_STEPS
         entity = self._entity
         entity.set_qpos(self._spawn_qpos()[: entity.n_qs].astype(np.float32), zero_velocity=True)
         for joint_name, value in self._meta.keyframe_ctrl.items():
             dof = int(entity.get_joint(joint_name).dofs_idx_local[0])
             entity.control_dofs_position(np.array([value], dtype=np.float32), np.array([dof]))
-        placements = initial_object_positions(randomize)
+        placements = initial_object_positions(randomize) if self._cube_names else {}
         if object_positions:
             placements = {
                 **placements,
@@ -402,6 +486,8 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         for name, position in placements.items():
             qpos = np.array([*position, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
             entity.set_qpos(qpos, self._object_qs[name] + np.arange(7), zero_velocity=True)
+        if self._wine:
+            self._wine.reset()
         self.refresh()
 
     def step(self, steps: int = 1) -> None:
@@ -412,6 +498,8 @@ class GenesisOpenArmV2Environment(SimulationBackend):
                     self.apply_gravity_compensation(side)
             self._scene.step()
             self._sim_step += 1
+            if self.step_observer is not None:
+                self.step_observer()
 
     def refresh_viewer(self) -> None:
         """Keep the macOS main-thread viewer responsive while no task is stepping physics."""
@@ -429,15 +517,17 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         entity = self._entity
         return Frame(
             sim_time=float(self._scene.sim.cur_t),
-            qpos=entity.get_qpos().numpy().astype(float).tolist(),
-            objects={name: self._link_pose(name)[0].tolist() for name in OBJECTS},
-            zones={name: self.zone_position(name).tolist() for name in ZONES},
+            qpos=entity.get_qpos().cpu().numpy().astype(float).tolist(),
+            objects={name: self._link_pose(name)[0].tolist() for name in self._objects},
+            zones={name: self.zone_position(name).tolist() for name in (*ZONES, *(("wine_glass",) if self._wine else ()))},
             ee={side: self.ee_pose(side)[0].tolist() for side in EE_LINKS},
             grippers={
-                side: float(entity.get_dofs_position(np.array([dof])).numpy()[0])
+                side: float(entity.get_dofs_position(np.array([dof])).cpu().numpy()[0])
                 for side, dof in self._gripper_dofs.items()
             },
             contacts=self.contact_names(),
+            fluid=self._wine.measure() if self._wine else None,
+            scene_profile=self.scene_profile,
         )
 
     def render(self, width: int = 720, height: int = 480) -> np.ndarray | None:
@@ -456,13 +546,38 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         return self._link_pose(name)
 
     def zone_position(self, name: str) -> np.ndarray:
+        if name == "wine_glass" and self._wine:
+            return self._wine.pose(self._wine.glass)[0] + [0., 0., .143]
         from backend.app.planning.task_program import TABLE_TARGETS
         if name in TABLE_TARGETS:
             return np.asarray(TABLE_TARGETS[name], float)
         return self._site_pose(f"{name}_site")[0]
 
+    def fluid_state(self) -> dict:
+        if self._wine is None:
+            raise ValueError("Wine scene is required")
+        return self._wine.measure()
+
+    def close(self) -> None:
+        if self._wine:
+            self._wine.surface_renderer.close()
+        self._scene.destroy()
+
     def object_linear_speed(self, name: str) -> float:
-        return float(np.linalg.norm(self._links[name].get_vel().numpy()))
+        return float(np.linalg.norm(self.object_velocity(name)))
+
+    def object_velocity(self, name: str) -> np.ndarray:
+        return self._links[name].get_vel().cpu().numpy().astype(float)
+
+    def object_contact_links(self, name: str) -> list[str]:
+        others = []
+        for a, b in self._contact_link_pairs():
+            left, right = self._link_names_by_index.get(a, ""), self._link_names_by_index.get(b, "")
+            if name == left:
+                others.append(right)
+            elif name == right:
+                others.append(left)
+        return sorted(set(others))
 
     def contact_names(self) -> list[str]:
         return [
@@ -494,22 +609,60 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         link_a, link_b = contacts.get("link_a"), contacts.get("link_b")
         if link_a is None or link_b is None or len(link_a) == 0:
             return []
-        return list(zip(link_a.numpy().astype(int).tolist(), link_b.numpy().astype(int).tolist()))
+        return list(zip(link_a.cpu().numpy().astype(int).tolist(), link_b.cpu().numpy().astype(int).tolist()))
 
     # -- actuation ---------------------------------------------------------------
 
-    def set_arm(self, side: str, targets: list[float] | np.ndarray) -> None:
+    def configure_motion_response(self, speed: float) -> None:
+        if speed == self._motion_response_speed:
+            return
+        # Shortening the trajectory alone leaves ~300ms of endpoint settling.
+        # Increase arm tracking stiffness and critically damp it from Genesis's
+        # articulated inertia. Finger gains and every actuator force limit stay.
+        inertia = np.diag(self._entity.get_mass_mat().cpu().numpy())
+        damping, position_bias, gains = [], [], []
+        for side, dofs in self._dofs.items():
+            bias1, bias2 = self._act_biases[side]
+            values = -bias2.copy()
+            # Modest stiffness with inertia-based damping tracks faster without
+            # demanding speed**2 torque and saturating the model's motors.
+            stiffness_scale = max(1., speed)
+            if speed != 1.:
+                critical = 2.2 * np.sqrt(np.maximum(0., -bias1 * stiffness_scale * inertia[dofs]))
+                values = np.maximum(values, critical)
+            gains.append(self._act_gains[side] * stiffness_scale)
+            position_bias.append(bias1 * stiffness_scale)
+            damping.append(-values)
+        self._gravity_bias1 = np.concatenate(position_bias)
+        self._gravity_bias2 = np.concatenate(damping)
+        self._entity.set_dofs_act_gain(np.concatenate(gains), self._gravity_dofs)
+        self._gravity_bias_at_step = -GRAVITY_TORQUE_REFRESH_STEPS
+        self._motion_response_speed = speed
+        self.apply_gravity_compensation("left")
+
+    def set_arm(self, side: str, targets: list[float] | np.ndarray,
+                velocities: np.ndarray | None = None) -> None:
         values = np.clip(np.asarray(targets, dtype=float), *self.arm_limits(side).T)
-        self._entity.control_dofs_position(values.astype(np.float32), self._dofs[side])
+        if velocities is None:
+            self._entity.control_dofs_position(values.astype(np.float32), self._dofs[side])
+        else:
+            # Genesis's position+velocity PD follows a moving reference instead
+            # of damping it toward rest at every interpolation sample. Model
+            # position limits and actuator force limits remain.
+            self._entity.control_dofs_position_velocity(
+                values.astype(np.float32), np.asarray(velocities, dtype=np.float32), self._dofs[side])
 
     def arm_qpos(self, side: str) -> np.ndarray:
-        return self._entity.get_dofs_position(self._dofs[side]).numpy().astype(float)
+        return self._entity.get_dofs_position(self._dofs[side]).cpu().numpy().astype(float)
 
     def arm_kinematics(self, side: str) -> OfficialArmKinematics:
+        return OfficialArmKinematics(self._meta.model, self._observed_model_qpos(), side)
+
+    def _observed_model_qpos(self) -> np.ndarray:
         qpos = self._meta.keyframe_qpos
-        observed = self._entity.get_qpos().numpy()
+        observed = self._entity.get_qpos().cpu().numpy()
         qpos[self._kinematic_qpos_indices] = observed[self._genesis_qpos_indices]
-        return OfficialArmKinematics(self._meta.model, qpos, side)
+        return qpos
 
     def set_arm_qpos(self, side: str, targets: np.ndarray) -> None:
         limits = self.arm_limits(side)
@@ -519,8 +672,7 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         )
 
     def arm_limits(self, side: str) -> np.ndarray:
-        lower, upper = self._entity.get_dofs_limit(self._dofs[side])
-        return np.stack([lower.numpy(), upper.numpy()], axis=1).astype(float)
+        return self._arm_limits[side].copy()
 
     def kinematics(self) -> None:
         """No-op: Genesis refreshes forward kinematics inside `set_arm_qpos`."""
@@ -536,7 +688,7 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         jacobian = self._entity.get_jacobian(
             self._links[parent], local_point=local_position.astype(np.float32)
         )
-        jacobian = jacobian.numpy().astype(float)
+        jacobian = jacobian.cpu().numpy().astype(float)
         dofs = self._dofs[side]
         return jacobian[:3][:, dofs], jacobian[3:][:, dofs]
 
@@ -548,6 +700,9 @@ class GenesisOpenArmV2Environment(SimulationBackend):
             np.array([dof]),
         )
 
+    def gripper_position(self, side: str) -> float:
+        return float(self._entity.get_dofs_position(np.array([self._gripper_dofs[side]])).cpu().item())
+
     def apply_gravity_compensation(self, side: str) -> None:
         """Feed the arm's gravity torque forward, the way the model description does.
 
@@ -556,34 +711,27 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         to a few millimetres instead of `gravity_torque / kp` short of it, while the damping stays
         implicit in the solver. Only the arm's dofs are compensated: the cubes keep their gravity.
         """
-        dofs = self._dofs[side]
-        bias1, bias2 = self._act_biases[side]
-        self._entity.set_dofs_act_bias(self._gravity_torque(side), bias1, bias2, dofs)
+        if self._gravity_bias_at_step + GRAVITY_TORQUE_REFRESH_STEPS > self._sim_step:
+            return
+        self._gravity_torque(side)
+        # Both arms are compensated together, once per refresh interval. A moving
+        # receiver must keep the donor supported, without duplicate bias writes.
+        torques = np.concatenate([self._gravity_torque_values[arm] for arm in ARM_JOINTS])
+        self._entity.set_dofs_act_bias(torques, self._gravity_bias1, self._gravity_bias2, self._gravity_dofs)
+        self._gravity_bias_at_step = self._gravity_torque_at_step
 
     def _gravity_torque(self, side: str) -> np.ndarray:
         """Torque holding one arm's links against gravity.
 
         Recomputed every `GRAVITY_TORQUE_REFRESH_STEPS` steps: the load changes slowly compared to
-        the PD response that absorbs the residual, and the Jacobian reads are the expensive part.
+        the PD response that absorbs the residual. Use the actual measured configuration.
         """
         if self._gravity_torque_at_step + GRAVITY_TORQUE_REFRESH_STEPS <= self._sim_step:
             self._refresh_gravity_torque()
         return self._gravity_torque_values[side]
 
     def _refresh_gravity_torque(self) -> None:
-        entity = self._entity
-        for side, dofs in self._dofs.items():
-            indices = self._arm_link_indices[side]
-            masses = entity.get_links_mass(indices).numpy().astype(float)
-            coms = entity.get_links_COM(indices).numpy().astype(float)
-            torque = np.zeros(len(dofs))
-            for link, mass, com in zip(self._arm_links[side], masses, coms):
-                if mass <= 0.0:
-                    continue
-                jacobian = entity.get_jacobian(
-                    link, local_point=com.astype(np.float32)
-                ).numpy().astype(float)
-                # Hold the link: the actuator torque cancels the gravity torque the link applies.
-                torque -= jacobian[:3][:, dofs].T @ (mass * self._gravity)
-            self._gravity_torque_values[side] = torque
+        # The official mass/COM geometry is identical on CPU and GPU. One actual
+        # qpos snapshot replaces ~20 individual Genesis Jacobian kernel launches.
+        self._gravity_torque_values = self._gravity_kinematics.evaluate(self._observed_model_qpos(), self._gravity)
         self._gravity_torque_at_step = self._sim_step

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 
 import numpy as np
 
@@ -36,6 +36,8 @@ class Frame:
     ee: dict[str, list[float]]
     grippers: dict[str, float]
     contacts: list[str]
+    fluid: dict | None = None
+    scene_profile: str = "cubes"
 
 
 class ArmKinematics(Protocol):
@@ -60,6 +62,9 @@ class SimulationBackend(ABC):
     grasp_mode: str = "unknown"
     #: Whether the grasp is physical contact between the fingers and the object.
     grasp_is_physical_contact: bool = False
+    # Called between completed physics steps, on the simulation owner's thread.
+    # The native broker uses it for heartbeats and interruption of long waits.
+    step_observer: Callable[[], None] | None = None
 
     # -- lifecycle ---------------------------------------------------------------
 
@@ -79,6 +84,9 @@ class SimulationBackend(ABC):
     @abstractmethod
     def step(self, steps: int = 1) -> None:
         """Advance the simulation."""
+
+    def configure_motion_response(self, speed: float) -> None:
+        """Select actuator response for transport, retaining model force/position limits."""
 
     # -- observation -------------------------------------------------------------
 
@@ -103,6 +111,14 @@ class SimulationBackend(ABC):
         """Linear speed of an object in m/s, used by the stability check."""
 
     @abstractmethod
+    def object_velocity(self, name: str) -> np.ndarray:
+        """World linear velocity (m/s), measured by the physics engine."""
+
+    @abstractmethod
+    def object_contact_links(self, name: str) -> list[str]:
+        """All links touching this object, including the table, palm and fingers."""
+
+    @abstractmethod
     def contact_names(self) -> list[str]:
         """Human-readable names of the active contacts."""
 
@@ -113,8 +129,9 @@ class SimulationBackend(ABC):
     # -- actuation ---------------------------------------------------------------
 
     @abstractmethod
-    def set_arm(self, side: str, targets: list[float] | np.ndarray) -> None:
-        """Command the seven joint positions of one arm."""
+    def set_arm(self, side: str, targets: list[float] | np.ndarray,
+                velocities: np.ndarray | None = None) -> None:
+        """Command joint position and optional desired velocity through the motors."""
 
     @abstractmethod
     def arm_qpos(self, side: str) -> np.ndarray:
@@ -151,6 +168,10 @@ class SimulationBackend(ABC):
     @abstractmethod
     def set_gripper(self, side: str, value: float) -> None:
         """Command one gripper position."""
+
+    def gripper_position(self, side: str) -> float:
+        """Measured driven finger joint, for checking the motor response."""
+        return float(self.frame().grippers[side])
 
     @abstractmethod
     def apply_gravity_compensation(self, side: str) -> None:

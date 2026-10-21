@@ -28,10 +28,10 @@ def build_world_state(env: SimulationBackend) -> dict:
         color = name.split("_")[0]
         objects.append({
             "id": name,
-            "type": "cube",
+            "type": {"wine_bottle": "bottle", "wine_glass": "glass"}.get(name, "cube"),
             "color": color,
             "position": position,
-            "graspable": True,
+            "graspable": name != "wine_glass",
             "held_by": [side for side, obj in holds.items() if obj == name],
         })
     targets = []
@@ -65,4 +65,9 @@ def build_world_state(env: SimulationBackend) -> dict:
         "targets": targets,
         "spatial_relations": relations,
         "sim_time": frame.sim_time,
+        "scene_profile": frame.scene_profile,
+        "fluid": frame.fluid,
+        "compute_backend": getattr(env, "compute_backend", "cpu"),
+        "requested_realtime_factor": getattr(env, "simulation_speed", 1.),
+        "requested_motion_speed": getattr(env, "motion_speed", 1.),
     }

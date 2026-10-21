@@ -1,0 +1,46 @@
+[
+  {
+    "name": "bottle",
+    "source": "https://www.innerscene.com/tools/library/3d-parts/wine-bottle-original-drink-vessel-dff39232",
+    "license": "CC0-1.0",
+    "original_sha256": "dc1a5eaaa98fc6c23aed4f5a92be09072620e3a0891ae9c8b5775e08ee256e50",
+    "scale": 0.7,
+    "origin_z_offset_m": 0.085,
+    "collision_volume_m3": 6.222214819824167e-05,
+    "collision_bounds_m": [
+      [
+        -0.02625,
+        -0.02625,
+        -0.085
+      ],
+      [
+        0.02625,
+        0.02625,
+        0.12499999999999999
+      ]
+    ],
+    "visual_representation": "single outward skin; back faces culled"
+  },
+  {
+    "name": "glass",
+    "source": "https://www.innerscene.com/tools/library/3d-parts/wine-glass-original-drink-vessel-98bf1e17",
+    "license": "CC0-1.0",
+    "original_sha256": "85df13d7e2f3323315fea4b8174bc5fe7cc9b3b2a6f9da384b214ca434c4606e",
+    "scale": 0.65,
+    "origin_z_offset_m": 0.0,
+    "collision_volume_m3": 2.138537221892838e-05,
+    "collision_bounds_m": [
+      [
+        -0.0273,
+        -0.0273,
+        0.0
+      ],
+      [
+        0.0273,
+        0.0273,
+        0.14300000000000002
+      ]
+    ],
+    "visual_representation": "single outward skin; back faces culled"
+  }
+]

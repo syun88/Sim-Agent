@@ -7,8 +7,8 @@ headless verification scripts, and the asynchronous execution wrapper.
 ## Language and grounding
 
 `planning/agent_planner.py` asks a configured provider for a `TaskProgram`, not motor commands.
-The bounded Pydantic schema in `planning/task_program.py` has eight operations: pick, handover,
-place, approach, move, open, close, home. Each action can name an object, acting arm, receiving
+The bounded Pydantic schema in `planning/task_program.py` has ten operations: pick, handover,
+place, approach, move, open, close, home, throw, pour. Each action can name an object, acting arm, receiving
 arm, semantic destination, or a 1–30cm relative motion. Extra fields and arbitrary code are rejected.
 There are at most 24 intentions and 144 compiled skills.
 
@@ -27,6 +27,13 @@ When the entire request has an exact parse, the model cannot silently change its
 arm, receiver, or destination trace. Invalid provider programs receive one bounded repair attempt.
 Provider failures contain categories rather than exception strings that could reveal credentials.
 Free paraphrases require a functioning language model; the fallback does not guess the first task.
+The native entry point defaults `OPENARM_FAST_LANGUAGE` to `1` after loading
+`.env`. When the entire instruction already compiles against the observed world,
+it returns that exact program immediately as `deterministic_fallback`, with no
+model name or round trip. Unrecognised wording still uses the model. Setting this
+flag to `0` retains model confirmation for multi-action exact requests; the same
+signature/quantity/object checks apply. This cuts avoidable planning latency,
+independently of the native physics/motion speed improvements below.
 
 ## Local model adaptation without training
 
@@ -57,6 +64,37 @@ setup and model-fidelity checks.
 A motion result measures its settled Cartesian position and orientation. A valid IK solution
 that physical collision prevents the motors from reaching returns `MOTION_BLOCKED`. Both arms
 receive gravity compensation while either arm moves, so the stationary donor continues holding.
+The CPU and GPU paths both read one actual Genesis qpos snapshot and compute the
+gravity lever arms with the official mass/COM geometry. Independent tests compare
+these torques against Genesis's live link Jacobians. One batched actuator-bias
+write supports both arms per five physics steps; redundant controller calls reuse
+that update. Joint limits are immutable model data read once at construction.
+
+Native viewer pacing targets 1x wall-clock real time by default, configurable with
+`OPENARM_SIM_SPEED`. It is a throughput target, bounded by computation, not a
+physics dt multiplier. It does not rescale gravity, force limits or the physical
+clock. Actual arm travel uses a separate `OPENARM_MOTION_SPEED` (default 6).
+Free transit and carry waypoints form a shape-preserving joint spline with
+quintic time scaling; position and velocity references are sent through Genesis's
+native combined PD control at up to 4ms intervals. Arm stiffness and inertia-based
+damping improve tracking without changing force caps or finger motors. Endpoints
+are measured from physics, and contact checks continue during loaded transport.
+The controller clears velocity references on completion and interruption.
+Large loaded reorientations interpolate the object center and hand attitude
+together using the observed pinch offset, rather than swinging a held object
+through a single short joint stroke. Receiver insertion and table reorientation
+also use continuous waypoints while checking the donor/receiver pinch.
+
+Gripper waits observe actual joint settling, while preserving the two-finger and
+lift-follow grasp checks. Calibrated pour-angle/mouth adjustments and the ballistic
+launch restore the original actuator response and simulation durations. Upright
+bottle transport and throw wind-up use fast transit. Every intervening physics
+step still executes; stop checks remain between steps. `scripts/verify_arm_motion.py`
+compares measured simulation seconds for approach, grasp and loaded A-to-B travel,
+independently of playback. Wine mode retains the production fluid and samples
+spillage and airborne volume during the move. `scripts/verify_execution_speed.py`
+measures actual native task wall time independently from initial compilation and
+language inference, while requiring the physical grasp/place postconditions.
 A commanded orientation is retained across carry segments rather than accumulating each new
 measurement's tracking error as a new desired orientation.
 
@@ -132,3 +170,127 @@ snapshot and returns 503 while none exists; the backend never invents a scene.
 The native viewer also supports `--headless` and `--once` for testing the same broker path without
 a window. `scripts/verify_language_tasks.py` exercises the actual planner and executor and writes
 inspectable JSON. Existing official-model fidelity and position-grid tests remain applicable.
+
+## Dynamic manipulation and liquid scene
+
+The task schema also contains `throw` and `pour`. A cube throw acquires the cube,
+commands an accelerating upward joint stroke, and opens the actual fingers. It does
+not set the cube velocity. Verification independently searches the recorded Genesis
+contacts/positions/velocities for an upward contact-free interval, a measured apex,
+and gravitational acceleration. A dropped cube or a contact-supported lift fails.
+The default requested rise is 30mm measured after release.
+
+Wine work uses a separate scene profile with the same attached official robot/cell,
+a free bottle, a fixed receiving glass, and red SPH particles. The bottle and glass
+are Innerscene CC0 assets; unchanged GLBs, source hashes, and reproducible open-vessel
+mesh derivatives are included in `assets/wine`. Hollow material shells couple to
+SPH through SDFs; wall friction is 0.2 on the bottle and 0.8 on the glass to
+approximate a dissipative wet boundary at this coarse resolution. Convex body/neck proxies on the same physical bottle provide rigid
+gripper/support contacts without filling the liquid cavity. No attachment or pose
+tracking constraint holds the bottle. Bottle acquisition retracts behind the body
+before moving sideways, since a cube-style overflight hits the tall neck.
+
+`scene_selection.py` selects the workpiece profile before language grounding. The
+native owner closes its previous scene and creates the new one on its main thread;
+it never creates a second runtime. Switching requires empty hands and clears the
+reference context. `PREPARING_SCENE` and the owner's startup lease cover compilation.
+The wine profile uses an available GPU by default (Metal on this Mac), unless
+`GENESIS_USE_GPU` explicitly selects a device. Robot gravity geometry is evaluated
+from the actual observed joint snapshot to avoid per-link GPU transfers; this is
+forward geometry only, with Genesis retaining every dynamic state and payload force.
+
+Wine measurement counts active particles inside the transformed vessel cavities and
+reports reference volume in mL from the actual Genesis SPH reference particle volume (0.8 times spacing cubed,
+3,600 particles, 45mL initially, with 2.5mm spacing). It separately
+reports particles in the bottle, glass, flight, and on the table. These are coarse
+SPH volume estimates, not a calibrated real-wine material model. Liquid moves only
+through gravity, pressure, and rigid/SPH coupling. Particle/vessel setters are
+restricted to scene setup/reset. `scripts/verify_dynamic_tasks.py` runs language,
+compilation, physical skills, and independent event/volume verification together.
+Containment uses distance to the rotational cavity profile with a particle-radius
+margin, including the sloped floor. Padding only the interpolated radius wrongly
+classified near-floor particles as spills. Bottle/glass/flight/spill sets remain
+disjoint and all active particles are counted. Spill checks include acquisition
+and transport and allow at most 0.1mL in the entire task.
+
+Vessel MJCF collision geoms use group 3, outside Genesis's visual groups 0–2.
+Alpha zero alone does not keep a collision geom out of the imported visual set.
+The transparent visual meshes contain a single outward-facing skin with back-face
+culling: the native rasterizer sorts objects rather than the faces of a hollow
+transparent shell, so overlapping inner/outer walls otherwise produce triangular
+blending artifacts. The watertight collision/SDF shells retain their complete
+cavities and are unchanged by this display preparation. This is rasterized
+transparency, without optical refraction. Base, stem, and bowl are separate visual
+geoms so that the rasterizer can order their transparent draw calls. The wine
+camera includes the entire glass.
+
+SPH uses `vis_mode="recon"` with a smooth splashsurf surface of the observed render
+particles, not a separate fluid simulation. `LiquidSurfaceRenderer` adapts this
+scene's Genesis 1.4.4 SPH mesh upload. A clean CPU forkserver preloads imports;
+each reconstruction job exits after returning the mesh, bounding its native heap.
+Only one job may be outstanding; frame sequence checks and explicit reset discard
+stale results. Native updates are asynchronous; offscreen validation waits for
+the current surface. No installed Genesis code or global renderer functions are
+modified. Reconstructed geometry never affects particle positions or measured mL.
+
+Wine stepping uses 2ms simulation steps with 32 substeps and WCSPH. The rigid
+solver uses Newton with convex contact resolution and `impratio=10`; the default
+elliptic signorini combination produced invalid forces on Metal when the initial
+glass interfered with the open fingers. The glass is now outside the spawn sweep.
+The default cube profile retains its existing 1ms solver configuration.
+The viscosity coefficient is 0.003 and surface-tension coefficient is 1.5e-4 for
+resolved water-like flow at this scale; these are not calibrated wine properties.
+The scene validates Genesis 1.4.4's explicit-viscosity bound
+`substep_dt <= 0.01 * support_radius**2 / mu` before opening a viewer. Changing
+spacing alone from 4.5mm to 2.5mm with the former mu=0.003 and 0.5ms substep
+violated that bound and produced the rejected exploding configuration. Hollow
+SDF walls use 0.4mm cells (128–512 resolution) to resolve the thin vessel material.
+The SPH neighbor hash uses 32 cubed buckets (`hash_grid_res=(0.16, 0.16, 0.16)`
+with 5mm cells), instead of the default 150 cubed. The simulation bounds remain
+unchanged. Genesis filters bucket candidates by actual distance, including across
+hash wraps, so this reduces empty-bucket work without clipping escaped liquid or
+changing the support radius. CPU/Metal timings are diagnostics, not a promise of
+real-time fluid simulation.
+
+Pour control observes the bottle-to-wrist transform and corrects the measured
+mouth position, holds the angle once flow begins, and meters liquid at 20ms
+intervals before increasing tilt. Explicit motion durations include interpolation
+time. Closing keeps the mouth over the bowl until the opening points upward; only
+then does the bottle move away. Final checks require measured glass volume,
+bounded total spill, zero airborne liquid, particle conservation, release, and a
+stable upright bottle at its starting position. Existing spills remain in the
+reported total; incremental spill is recorded separately. Nonzero volumes are
+shown to four decimal places, with a nonzero lower-bound label below that scale.
+Measured vessel clearance must be nonnegative as well as having safe planned
+clearance. These are motion-endpoint measurements; the rigid solver handles
+contact during interpolation.
+Vessel motion uses quintic time interpolation with zero endpoint velocity and
+acceleration. Near flow onset the tilt increments are 2 degrees; the mouth is
+aimed over the receiving opening, 18mm above the rim. The neck and bowl must keep
+at least 1mm of planned clearance, checked against samples of the actual glass
+shell and the bottle's physical contact proxies. A previous fixed-vessel fixture
+put the neck through the bowl wall; its low-spill result is invalid and is not
+robot-task evidence. Actual clearance is also recorded after each bottle motion.
+Closing anticipates the measured outflow during the motor's stopping interval.
+Flow holds last up to two seconds before increasing the tilt again. Closure first
+raises the opening to 85 degrees, then returns upright in stages, keeping the last
+liquid above the receiving opening.
+
+Implementation references: [Genesis SPH setup](https://genesis-world.readthedocs.io/en/latest/user_guide/physics/beyond_rigid_bodies.html),
+[SPH materials](https://genesis-world.readthedocs.io/en/latest/api_reference/engine/material/sph.html),
+[rigid/particle coupling](https://genesis-world.readthedocs.io/en/latest/user_guide/theory/coupling/index.html),
+and [the exact v1.4.4 SPH solver](https://github.com/Genesis-Embodied-AI/genesis-world/blob/v1.4.4/genesis/engine/solvers/sph_solver.py).
+
+Informal Japanese upward-release phrases and bounded noun-only wine requests also
+have labelled deterministic parses. Unknown trailing tasks still fail. For model
+programs, an unspecified wine hand is selected from observed ownership/geometry,
+not a model's arbitrary default. A redundant unspecified bottle placement directly
+after a pour is merged with that skill's measured return. Model assumptions that
+claim success are discarded; only the physical verifier can establish completion.
+
+The native owner installs a step observer after scene construction. Between every
+completed physics step it checks the cached stop request and publishes the usual
+heartbeat. Long SPH gripper/settling waits therefore do not starve the broker or
+delay cancellation until the entire simulated wait finishes. An interrupted
+transit clears its velocity reference and holds the observed joint position.
+The measured object/particle state is retained; cancellation never resets it.

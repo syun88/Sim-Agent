@@ -115,7 +115,7 @@ def register_viewer(body: dict):
     lease_live = _online() or time.monotonic() < app.state.viewer.get('starting_until', 0)
     if lease_live and app.state.viewer.get('viewer_id') != viewer_id:
         raise HTTPException(409, 'A Genesis viewer already owns this scene')
-    app.state.viewer = {'viewer_id': viewer_id, 'last_seen': time.monotonic(), 'starting_until': time.monotonic() + 60,
+    app.state.viewer = {'viewer_id': viewer_id, 'last_seen': time.monotonic(), 'starting_until': time.monotonic() + 300,
                         'provider': body.get('provider', 'deterministic_fallback')}
     app.state.world_state = None
     return {'status': 'registered'}

@@ -17,6 +17,7 @@ dependencies = [
     "openai>=3.33.0",
     "openarm-mujoco>=2.3.0",
     "pillow>=11.0.0,<12.0.0",
+    "pysplashsurf>=0.14.1.0",
     "pydantic>=2.14.1",
     "pytest>=9.1.1",
     "python-dotenv>=1.2.4",

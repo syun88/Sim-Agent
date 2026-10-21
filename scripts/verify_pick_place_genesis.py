@@ -110,6 +110,8 @@ def run_task(env, skills, task, xy) -> dict:
         "engine": verification["engine"],
         "grasp_mode": verification["grasp_mode"],
         "duration_s": round(elapsed, 1),
+        "wall_duration_s": elapsed,
+        "simulation_duration_s": env._sim_step * env.timestep - .2,
     }
 
 

@@ -75,11 +75,49 @@ def verify_task_goal(env: SimulationBackend, plan, results: list[dict], initial_
             position, rotation = env.ee_pose(check["arm"])
             error = float(np.linalg.norm(env.object_pose(obj)[0] - (position + rotation @ FINGERTIP_MIDPOINT[check["arm"]])))
             evidence = {"success": error < .012, "fingertip_midpoint_error": error}
+        elif check["type"] == "throw":
+            from backend.app.skills.dynamic_skills import evaluate_throw
+            event = next((r for r in results if r.get("skill") == "throw_object" and
+                          r.get("action_index") == check["action_index"] and r.get("object") == obj), {})
+            evidence = evaluate_throw(event.get("trajectory", []), check["min_height"])
+        elif check["type"] == "pour":
+            event = next((r for r in results if r.get("skill") == "pour_liquid" and
+                          r.get("action_index") == check["action_index"]), {})
+            final = env.fluid_state()
+            initial = event.get("initial_liquid") or event.get("evidence", {}).get("initial_liquid", {})
+            pours = [c for c in checks if c["type"] == "pour"]
+            endpoint = event.get("final_liquid", final) if len(pours) > 1 else final
+            poured = endpoint["glass_ml"] - initial.get("glass_ml", endpoint["glass_ml"])
+            baseline = (initial_state or {}).get("fluid") or initial
+            spilled = final["spilled_ml"]
+            tolerance = max(3., check["volume_ml"] * .25)
+            released = not env.object_contacts(obj)
+            from backend.app.simulation.genesis_backend.wine import BOTTLE_START, MAX_SPILL_ML
+            bp, br = env.object_pose(obj)
+            returned = (np.linalg.norm(bp - BOTTLE_START) < .012 and br[2, 2] > np.cos(.12)
+                        and env.object_linear_speed(obj) < .02)
+            total_requested = sum(c["volume_ml"] for c in pours)
+            total_poured = final["glass_ml"] - baseline.get("glass_ml", final["glass_ml"])
+            trace = event.get("fluid_trace") or event.get("evidence", {}).get("fluid_trace", [])
+            clearances = [row["vessel_clearance_mm"] for row in trace if "vessel_clearance_mm" in row]
+            vessels_clear = bool(clearances) and min(clearances) >= 0.
+            success = (bool(initial) and final["finite"] and abs(poured - check["volume_ml"]) <= tolerance
+                       and abs(total_poured - total_requested) <= max(3., total_requested * .25)
+                       and final["spilled_ml"] <= MAX_SPILL_ML and released and returned
+                       and final["in_flight_ml"] == 0.
+                       and final["particle_count"] == initial.get("particle_count") and vessels_clear)
+            evidence = {"success": bool(success), "poured_ml": poured, "spilled_ml": spilled,
+                        "additional_spilled_ml": spilled - baseline.get("spilled_ml", 0.),
+                        "vessels_clear": vessels_clear,
+                        "minimum_vessel_clearance_mm": min(clearances) if clearances else None,
+                        "tolerance_ml": tolerance, "liquid": final, "bottle_released": released,
+                        "bottle_returned": bool(returned)}
         else:
             evidence = {"success": False, "failure_category": "UNSUPPORTED_GOAL"}
         measured.append({**check, **evidence})
     if initial_state:
         touched = {s.object for s in plan.steps if s.object}
+        touched.update(s.target for s in plan.steps if s.skill == "pour_liquid" and s.target)
         for item in initial_state["objects"]:
             if item["id"] not in touched:
                 displacement = float(np.linalg.norm(env.object_pose(item["id"])[0] - item["position"]))

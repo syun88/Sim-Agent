@@ -76,7 +76,7 @@ RELEASE_HEIGHT = 1.07
 #: (+x world) so the pads close across the object's +-y side faces, tilted `GRASP_TILT_DEG`
 #: nose-down. The tilt is what keeps the official palm geometry off the cell table at the pinch
 #: alignment: with the fingertip midpoint at a resting cube's centre, the palm's lowest point sits
-#: 2.2 cm above the table top at 10 degrees, versus 0.7 mm at 0 degrees (measured on the compiled
+#: 14.5 mm above the table top at 10 degrees, versus 1.7 mm at 0 degrees (measured on the compiled
 #: MJCF; see docs/ARCHITECTURE.md).
 GRASP_TILT_DEG = 10.0
 _TILT = np.deg2rad(GRASP_TILT_DEG)
