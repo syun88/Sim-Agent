@@ -5,7 +5,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 
-def move_held_vessel(runner, arm, obj, target, origin, rotation, phase, duration=.40, *, transport=False):
+def move_held_vessel(runner, arm, obj, target, origin, rotation, phase, duration=.40, *, transport=False, path=None):
     """Move the physically pinched vessel; also used to verify upright A-to-B transport."""
     from backend.app.skills.robot_skills import SkillError
     from backend.app.simulation.genesis_backend.wine import BOTTLE_MOUTH, vessel_clearance
@@ -17,8 +17,34 @@ def move_held_vessel(runner, arm, obj, target, origin, rotation, phase, duration
     ee, er = env.ee_pose(arm)
     relative_position = r.T @ (ee - p)
     relative_rotation = r.T @ er
+    if transport:
+        # A partially filled bottle can slip during a 0.1s, 18cm return even
+        # when its upright outward carry succeeded. Bound physical acceleration
+        # and peak speed rather than scaling every explicit transit by six.
+        distance = float(np.linalg.norm(np.asarray(origin) - p))
+        minimum_time = max(np.sqrt(5.774 * distance / 4.), 1.875 * distance / .65)
+        duration = max(duration, minimum_time * control.motion_speed)
+    waypoints = path or []
+    minimum_clearance = float("inf")
+    samples = []
+
+    def observe():
+        nonlocal minimum_clearance
+        runner._require_hold(arm, obj)
+        bp, br = env.object_pose(obj)
+        gp, gr = env.object_pose(target)
+        clearance = vessel_clearance(bp, br, gp, gr)
+        minimum_clearance = min(minimum_clearance, clearance)
+        samples.append({"sim_time": env._sim_step * env.timestep, "position": bp.tolist(),
+                        "rotation": br.tolist()})
+        if clearance < 0.:
+            raise SkillError("VESSEL_COLLISION", f"Bottle/glass contact during {phase}")
+
     moved = control.move_to_site(arm, np.asarray(origin) + rotation @ relative_position,
-                                 rotation @ relative_rotation, duration=duration, scale_speed=transport)
+        rotation @ relative_rotation, duration=duration, scale_speed=transport,
+        via=[np.asarray(point) + attitude @ relative_position for point, attitude in waypoints] or None,
+        via_rotations=[attitude @ relative_rotation for _, attitude in waypoints] or None,
+        on_sample=observe if waypoints else None)
     if not moved.success:
         raise SkillError(moved.error or "POUR_MOTION_FAILED", f"Bottle motion blocked during {phase} "
                          f"(position error={moved.position_error}, rotation error={moved.rotation_error})")
@@ -32,7 +58,7 @@ def move_held_vessel(runner, arm, obj, target, origin, rotation, phase, duration
             break
         ep, er = env.ee_pose(arm)
         corrected = control.move_to_site(arm, ep + mouth_error, rotation @ br.T @ er,
-                                         duration=.12, scale_speed=transport)
+                                         duration=.12, scale_speed=False)
         if not corrected.success:
             raise SkillError(corrected.error or "POUR_MOTION_FAILED", f"Mouth correction blocked during {phase}")
         corrections += 1
@@ -44,6 +70,9 @@ def move_held_vessel(runner, arm, obj, target, origin, rotation, phase, duration
                 "motion_sim_duration": finished - started,
                 "mouth_corrections": corrections,
                 "vessel_clearance_mm": vessel_clearance(bp, br, gp, gr) * 1000., **env.fluid_state()}
+    if waypoints:
+        measured.update(continuous_waypoints=len(waypoints) + 1, motion_samples=samples,
+                        minimum_path_clearance_mm=minimum_clearance * 1000.)
     if measured["vessel_clearance_mm"] < 0.:
         raise SkillError("VESSEL_COLLISION", f"Measured bottle/glass interference during {phase}")
     return measured
@@ -80,11 +109,13 @@ def _pour_wine(runner, arm: str, obj: str, target: str, volume_ml: float, contex
     glass_rim = env.zone_position(target)
     direction = 1. if arm == "left" else -1.
 
-    def move_bottle(origin, rotation, phase, duration=.40, *, transport=False):
-        trace.append(move_held_vessel(runner, arm, obj, target, origin, rotation, phase, duration, transport=transport))
-        logging.getLogger(__name__).info("%s: %s", phase, trace[-1])
+    def move_bottle(origin, rotation, phase, duration=.40, *, transport=False, path=None):
+        context['active_phase'] = phase
+        trace.append(move_held_vessel(runner, arm, obj, target, origin, rotation, phase, duration, transport=transport, path=path))
+        logging.getLogger(__name__).info('%s: glass=%.4fmL spill=%.4fmL sim=%.3fs', phase,
+            trace[-1]['glass_ml'], trace[-1]['spilled_ml'], trace[-1]['sim_time'])
 
-    def at_angle(angle, *, closing=False, side_clearance=0., duration=.40):
+    def angle_pose(angle, *, closing=False, side_clearance=0.):
         radians = np.deg2rad(angle)
         rotation = Rotation.from_rotvec(np.array([direction * radians, 0., 0.])).as_matrix() @ original_rotation
         # Approach the glass from the holder's side. The mouth arrives above it
@@ -101,6 +132,10 @@ def _pour_wine(runner, arm: str, obj: str, target: str, volume_ml: float, contex
         clearance = vessel_clearance(origin, rotation, gp, gr)
         if clearance < .001:
             raise SkillError("VESSEL_COLLISION", f"Bottle/glass clearance is only {clearance * 1000:.2f}mm")
+        return origin, rotation
+
+    def at_angle(angle, *, closing=False, side_clearance=0., duration=.40):
+        origin, rotation = angle_pose(angle, closing=closing, side_clearance=side_clearance)
         move_bottle(origin, rotation, f"{'close' if closing else 'tilt'}_{angle:g}", duration)
 
     # First move forward while remaining on the bottle's side of the table,
@@ -122,7 +157,13 @@ def _pour_wine(runner, arm: str, obj: str, target: str, volume_ml: float, contex
         return arriving_volume(measured) >= volume_ml - reserve
     target_reached = False
     final_angle = 0.
-    for angle in (0., 20., 40., 60., 75., 80., 85., 90., *np.arange(92., 119., 2.)):
+    # Approach the flow angle along one continuously timed path. The former
+    # 20-degree moves each stopped, settled and corrected the mouth separately.
+    # Retain the fine volume feedback once liquid can reach the lip.
+    at_angle(0., duration=.4)
+    poses = [angle_pose(angle) for angle in np.arange(2., 107., 2.)]
+    move_bottle(*poses[-1], "tilt_continuous_106", 3.4, path=poses[:-1])
+    for angle in np.arange(108., 119., 2.):
         at_angle(angle, duration=.4 if angle <= 75 else .10)
         final_angle = angle
         measured = env.fluid_state()

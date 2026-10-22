@@ -85,6 +85,8 @@ def _ensure_genesis_init(prefer_gpu: bool):
 
     global _INITIALISED
     with _INIT_LOCK:
+        from backend.app.simulation.runtime_owner import acquire_genesis_owner
+        acquire_genesis_owner()
         if _INITIALISED and not gs._initialized:
             _INITIALISED = False
         if _INITIALISED and (gs.backend == gs.cpu) != (not prefer_gpu):
@@ -483,6 +485,11 @@ class GenesisOpenArmV2Environment(SimulationBackend):
                 **placements,
                 **{name: np.asarray(position, float) for name, position in object_positions.items()},
             }
+        from backend.app.simulation.openarm_v2.spawn import validate_spawn_positions
+        self.spawn_validation = validate_spawn_positions(self, placements)
+        if self._wine:
+            from backend.app.simulation.genesis_backend.wine import BOTTLE_START
+            self.spawn_validation['objects'].update(validate_spawn_positions(self, {'wine_bottle': BOTTLE_START})['objects'])
         for name, position in placements.items():
             qpos = np.array([*position, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
             entity.set_qpos(qpos, self._object_qs[name] + np.arange(7), zero_velocity=True)
@@ -544,6 +551,9 @@ class GenesisOpenArmV2Environment(SimulationBackend):
 
     def object_pose(self, name: str) -> tuple[np.ndarray, np.ndarray]:
         return self._link_pose(name)
+
+    def object_bounds(self, name: str) -> np.ndarray:
+        return self._links[name].get_AABB().cpu().numpy().astype(float).reshape(2, 3)
 
     def zone_position(self, name: str) -> np.ndarray:
         if name == "wine_glass" and self._wine:

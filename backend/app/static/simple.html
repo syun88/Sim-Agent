@@ -2,17 +2,26 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OpenArm — 言葉でタスクを実行</title>
+<title>Sim-Agent — 言葉でタスクを実行</title>
 <style>
 :root{color-scheme:dark;font:15px/1.6 system-ui,sans-serif;color:#e7edf5;background:#0a101b}body{margin:0}main{max-width:860px;margin:auto;padding:32px 22px}h1{font-size:25px;margin:0}h2{font-size:16px;margin:0 0 12px}.muted{color:#9aaec7;font-size:13px}.panel{background:#121d2e;border:1px solid #273750;border-radius:14px;padding:22px;margin:18px 0}textarea{font:inherit;box-sizing:border-box;width:100%;min-height:124px;resize:vertical;background:#0b1422;border:1px solid #3d5372;border-radius:9px;padding:13px;color:inherit}button{font:inherit;border:0;border-radius:8px;padding:9px 15px;background:#273b57;color:inherit;cursor:pointer}button:disabled{opacity:.4;cursor:default}.primary{background:#387af5}.danger{background:#9c304d}.row{display:flex;gap:9px;flex-wrap:wrap;margin-top:13px}.examples button{font-size:12px;padding:5px 10px}.status{white-space:pre-wrap;overflow-wrap:anywhere}.ok{color:#62e7b8}.bad{color:#ff93a5}ol{padding-left:25px}li{padding:4px 6px}li.active{background:#263e65;border-radius:5px;color:#b9d4ff}li.done{color:#62e7b8}#world{display:flex;gap:24px;flex-wrap:wrap}#world span{display:block}pre{font:12px/1.7 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}details{margin-top:12px}a{color:#a6c9ff}
+[hidden]{display:none!important}select,input{font:inherit;background:#0b1422;color:inherit;border:1px solid #3d5372;border-radius:6px;padding:6px}
 </style>
 </head>
 <body><main>
-<h1>OpenArm · 言葉でタスクを実行</h1>
+<h1>Sim-Agent · 言葉でタスクを実行</h1>
 <p class="muted">キューブの把持・受け渡し・投げ上げ、ワインをグラスへ注ぐ作業。言葉で順番や量を伝えてください。</p>
 <div id="connection" class="muted">Genesisとの接続を確認しています…</div>
+<section class="panel"><h2>ROBOT</h2>
+<div class="row"><select id="robotSelect" aria-label="ロボット選択"></select><button id="switchRobot">切り替える</button></div>
+<p id="robotInfo" class="muted">OpenArm v2 が標準です。</p>
+<details><summary>URDFフォルダーからロボットを追加</summary>
+<div class="row"><input id="urdfFolder" aria-label="URDFフォルダー" placeholder="URDFフォルダー、または .urdf の絶対パス" style="flex:1;min-width:260px"><button id="importRobot">解析して追加</button></div>
+<p class="muted">元のメッシュを参照し、机のシーン・関節構成・IK設定を生成します。</p></details>
+<div id="jointControls" class="row" hidden><select id="jointSelect" aria-label="関節"></select><input id="jointAngle" type="number" value="5" step="1" aria-label="目標角度" style="width:75px">度 <button id="moveJoint">関節を動かす</button></div>
+</section>
 <section class="panel"><label for="instruction">やってほしいこと</label>
-<textarea id="instruction" maxlength="2000">右手で青いキューブを取って左手に渡して左側に置く。その後、左手で赤いキューブを取って右手に渡して右側に置いて。</textarea>
+<textarea id="instruction" maxlength="2000">右手で青いキューブを取って左手に渡して左側の赤いキューブの上に乗せて</textarea>
 <div class="row examples" id="examples"></div>
 <div class="row"><button id="execute" class="primary">実行</button><button id="stop" class="danger" disabled>停止</button><button id="reset">シーンを初期化</button><button id="randomize">配置を変えて初期化</button></div>
 <p id="status" class="status" aria-live="polite">指示を入力して実行できます。</p></section>
@@ -21,21 +30,22 @@
 </main>
 <script type="module">
 const $=id=>document.getElementById(id);
-let currentTaskId=null, polling=false, shownPlan='';
+let currentTaskId=null, polling=false, shownPlan='', robotCatalog=[], activeRobot='openarm_v2', isBusy=false;
 const arm={left:'左手',right:'右手'}, object={red_cube:'赤いキューブ',blue_cube:'青いキューブ',wine_bottle:'ワインボトル',wine_glass:'グラス'}, target={blue_zone:'青いゾーン',green_zone:'緑のゾーン',left_side:'左側',right_side:'右側',center:'中央',wine_glass:'グラス'};
-const op={pick:'掴んで持つ',handover:'渡す',place:'置く',approach:'近づく',move:'動かす',open:'開く',close:'閉じる',home:'ホームに戻す',throw:'上に投げる',pour:'注ぐ'};
+const op={pick:'掴んで持つ',handover:'渡す',place:'置く',approach:'近づく',move:'動かす',open:'開く',close:'閉じる',home:'ホームに戻す',throw:'上に投げる',pour:'注ぐ',joint:'関節を動かす'};
+const relation={on:'上に重ねる',left_of:'左隣に置く',right_of:'右隣に置く',front_of:'手前に置く',behind:'奥に置く',near:'そばに置く'};
 function volume(value){if(!Number.isFinite(value))return '不明';if(value===0)return '0';if(value>0&&value<0.0001)return '0.0001未満';return String(Number(value.toFixed(4)));}
 function status(text,tone=''){$('status').className=`status ${tone}`;$('status').textContent=text;}
-function busy(value){$('execute').disabled=value;$('stop').disabled=!value||!currentTaskId;$('reset').disabled=value;$('randomize').disabled=value;}
+function busy(value){isBusy=value;for(const id of ['execute','reset','randomize','robotSelect','switchRobot','urdfFolder','importRobot','jointSelect','jointAngle','moveJoint'])$(id).disabled=value;$('moveJoint').disabled=value||$('robotSelect').value!==activeRobot||!$('jointSelect').options.length;$('stop').disabled=!value||!currentTaskId;}
 async function request(path,options){const r=await fetch(path,options);const data=await r.json();if(!r.ok)throw Error(typeof data.detail==='string'?data.detail:JSON.stringify(data.detail));return data;}
 function drawTask(t){
  if(t.plan){
   $('planPanel').hidden=false;const p=t.plan,key=JSON.stringify(p.program);
   $('provider').textContent=`解釈: ${p.provider==='local_ollama'?'ローカル言語モデル':p.provider==='deterministic_fallback'?'定型文フォールバック':p.provider}${p.provider_error?' / モデルの回答を検証できず、定型文で解釈':''}`;
-  if(key!==shownPlan){shownPlan=key;$('actions').replaceChildren();for(const a of p.program?.actions??[]){const li=document.createElement('li');li.textContent=`${arm[a.arm]??''} · ${object[a.object]??''} ${op[a.op]??a.op}${a.receiver?' → '+arm[a.receiver]:''}${a.target?' → '+(target[a.target]??a.target):''}${a.volume_ml?' / '+a.volume_ml+' mL':''}${a.height_cm?' / 自由飛行で'+a.height_cm+' cm以上':''}${a.direction&&a.distance_cm?' / '+a.direction+' '+a.distance_cm+' cm':''}`;$('actions').append(li);}$('assumptions').textContent=(p.assumptions??[]).join('\n');}
+  if(key!==shownPlan){shownPlan=key;$('actions').replaceChildren();for(const a of p.program?.actions??[]){const li=document.createElement('li');li.textContent=`${arm[a.arm]??''} · ${object[a.object]??''} ${relation[a.relation]??op[a.op]??a.op}${a.receiver?' → '+arm[a.receiver]:''}${a.target?' → '+(object[a.target]??target[a.target]??a.target):''}${a.joint?' / '+a.joint+' → '+a.position_deg+'度':''}${a.volume_ml?' / '+a.volume_ml+' mL':''}${a.height_cm?' / 自由飛行で'+a.height_cm+' cm以上':''}${a.direction&&a.distance_cm?' / '+a.direction+' '+a.distance_cm+' cm':''}`;$('actions').append(li);}$('assumptions').textContent=(p.assumptions??[]).join('\n');}
   const index=t.step?.action_index??t.result?.action_index;[...$('actions').children].forEach((li,i)=>{li.className=t.status==='SUCCEEDED'||i<index?'done':i===index?'active':'';});
  }
- if(t.verification){const checks=t.verification.checks??[];$('verification').textContent=checks.map(c=>`${object[c.object]??c.object}: ${c.success?'確認済み':'未達成'}${c.target?' / '+(target[c.target]??c.target):''}${Number.isFinite(c.horizontal_position_error)?' / 誤差 '+(c.horizontal_position_error*1000).toFixed(1)+' mm':''}${Number.isFinite(c.poured_ml)?' / 注いだ量 '+volume(c.poured_ml)+' mL / こぼれ合計 '+volume(c.spilled_ml)+' mL / 空中 '+volume(c.liquid?.in_flight_ml)+' mL':''}${Number.isFinite(c.free_flight_rise)?' / 自由飛行の上昇 '+(c.free_flight_rise*100).toFixed(1)+' cm':''}${c.arm?' / '+arm[c.arm]:''}`).join('\n');}
+ if(t.verification){const checks=t.verification.checks??[];$('verification').textContent=checks.map(c=>`${object[c.object]??c.object}: ${c.success?'確認済み':'未達成'}${c.target?' / '+(object[c.target]??target[c.target]??c.target):''}${Number.isFinite(c.horizontal_position_error)?' / 誤差 '+(c.horizontal_position_error*1000).toFixed(1)+' mm':''}${Number.isFinite(c.poured_ml)?' / 注いだ量 '+volume(c.poured_ml)+' mL / こぼれ合計 '+volume(c.spilled_ml)+' mL / 空中 '+volume(c.liquid?.in_flight_ml)+' mL':''}${Number.isFinite(c.free_flight_rise)?' / 自由飛行の上昇 '+(c.free_flight_rise*100).toFixed(1)+' cm':''}${c.arm?' / '+arm[c.arm]:''}`).join('\n');}
  $('evidence').textContent=JSON.stringify({verification:t.verification,detail:t.detail,retry_count:t.retry_count,skills:t.skills},null,2);
 }
 async function poll(){
@@ -46,12 +56,26 @@ async function poll(){
    const labels={QUEUED_FOR_GENESIS_VIEWER:'Genesisの受付を待っています',PREPARING_SCENE:'作業用のシーンを準備しています',PLANNING:'指示を解釈しています',VALIDATING:'作業の整合性を確認しています',EXECUTING:'作業を実行しています',VERIFYING:'物体の位置と接触を確認しています',STOP_REQUESTED:'停止を要求しています'};status(`${labels[t.status]??t.status}${t.step?'\n'+(arm[t.step.arm]??'')+' · '+t.step.skill:''}`);
   }catch(e){status('通信を再試行しています: '+e.message,'bad');}
   await new Promise(r=>setTimeout(r,400));
- }}finally{polling=false;busy(false);}
+ }}finally{polling=false;busy(false);loadRobots();}
 }
 async function submit(){const text=$('instruction').value.trim();if(text.length<3){status('指示を3文字以上で入力してください。','bad');return;}busy(true);shownPlan='';$('planPanel').hidden=true;$('verification').textContent='';status('指示を送信しています…');try{const t=await request('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({instruction:text})});currentTaskId=t.task_id;busy(true);poll();}catch(e){status(e.message,'bad');busy(false);}}
 async function reset(randomize){busy(true);try{const t=await request(`/api/scene/reset?randomize=${randomize}`,{method:'POST'});currentTaskId=t.task_id;status('初期化を受け付けました。Genesisの完了を待っています。');busy(true);poll();}catch(e){status(e.message,'bad');busy(false);}}
-async function refresh(){try{const h=await request('/api/health');$('connection').textContent=`Genesis · OpenArm v2 · ${h.viewer_online?'接続中':h.viewer_starting?'シーンを準備中':'ビューアーの起動を待っています'} · ${h.provider}`;if(h.viewer_online){const w=await request('/api/scene');$('world').replaceChildren();for(const side of ['left','right']){const d=document.createElement('div');d.textContent=`${arm[side]}: ${object[w.robot[side+'_arm'].held_object]??'持っている物体なし'}`;$('world').append(d);}if(w.fluid){const d=document.createElement('div');d.textContent=`ワイン: ボトル ${volume(w.fluid.bottle_ml)} mL / グラス ${volume(w.fluid.glass_ml)} mL / 空中 ${volume(w.fluid.in_flight_ml)} mL / こぼれ合計 ${volume(w.fluid.spilled_ml)} mL`;$('world').append(d);}}}catch{$('connection').textContent='サーバーに接続できません。起動を確認しています。';}}
+async function refresh(){try{const h=await request('/api/health');$('connection').textContent=`Genesis · ${h.robot} · ${h.viewer_online?'接続中':h.viewer_starting?'シーンを準備中':'ビューアーの起動を待っています'} · ${h.provider}`;if(h.viewer_online){const w=await request('/api/scene');$('world').replaceChildren();for(const side of ['left','right']){const d=document.createElement('div');d.textContent=`${arm[side]}: ${object[w.robot[side+'_arm'].held_object]??'持っている物体なし'}`;$('world').append(d);}if(w.fluid){const d=document.createElement('div');d.textContent=`ワイン: ボトル ${volume(w.fluid.bottle_ml)} mL / グラス ${volume(w.fluid.glass_ml)} mL / 空中 ${volume(w.fluid.in_flight_ml)} mL / こぼれ合計 ${volume(w.fluid.spilled_ml)} mL`;$('world').append(d);}}}catch{$('connection').textContent='サーバーに接続できません。起動を確認しています。';}}
+function showRobot(){
+ const r=robotCatalog.find(item=>item.id===$('robotSelect').value);if(!r)return;
+ $('robotInfo').replaceChildren();const text=document.createElement('span');
+ text.textContent=r.builtin?'OpenArm v2 · 物理把持・受け渡し・積み重ね・ワイン':`${r.name} · ${r.links}リンク / ${r.joints.length}関節 · 机のシーン / ${Object.keys(r.grippers||{}).length ? `指を自動検出・Cube ${Math.round(r.cube_size*1000)} mm・${r.grasp_calibrated ? "把持を物理検証済み" : "接触と持ち上げを実行時に確認"}` : "手先IK・関節操作。対向する指を検出できませんでした。"}`;
+ $('robotInfo').append(text);$('jointControls').hidden=!!r.builtin;
+ $('jointSelect').replaceChildren();for(const joint of (r.joints??[]).filter(j=>j.type!=='prismatic')){const o=document.createElement('option');o.value=joint.name;o.textContent=joint.name;$('jointSelect').append(o);}
+ $('moveJoint').disabled=isBusy||r.id!==activeRobot||!$('jointSelect').options.length;
+ if(!r.builtin){const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent='生成したロボット設定と検証記録';details.append(summary);for(const file of ['gripper_analysis.json','gripper_runtime.json','profile.json','scene.json','ik_seeds.json','ik_validation.json','spawn_validation.json','solve_ik.py']){const a=document.createElement('a');a.href=`/api/robots/${encodeURIComponent(r.id)}/files/${file}`;a.textContent=' '+file;a.style.marginLeft='10px';details.append(a);}$('robotInfo').append(details);}
+}
+async function loadRobots(preferred){try{const data=await request('/api/robots');robotCatalog=data.robots;activeRobot=data.selected;$('robotSelect').replaceChildren();for(const r of robotCatalog){const o=document.createElement('option');o.value=r.id;o.textContent=r.name+(r.builtin?' (標準)':'');$('robotSelect').append(o);}$('robotSelect').value=preferred??data.selected;showRobot();}catch(e){status(e.message,'bad');}}
+$('robotSelect').onchange=showRobot;
+$('importRobot').onclick=async()=>{const folder=$('urdfFolder').value.trim();if(!folder)return;busy(true);status('URDFの関節・メッシュ・IKを解析しています…');try{const r=await request('/api/robots/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({folder})});await loadRobots(r.id);status('追加しました。「切り替える」でこのロボットと机のシーンを起動できます。','ok');}catch(e){status(e.message,'bad');}finally{busy(false);}};
+$('switchRobot').onclick=async()=>{busy(true);status('ロボットと作業シーンを切り替えています…');try{const r=await request('/api/robots/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({robot_id:$('robotSelect').value})});currentTaskId=r.task_id;busy(true);poll();}catch(e){status(e.message,'bad');busy(false);}};
+$('moveJoint').onclick=()=>{$('instruction').value=`${$('jointSelect').value} を ${$('jointAngle').value} 度にして`;submit();};
 $('execute').onclick=submit;$('stop').onclick=async()=>{if(currentTaskId){await request(`/api/tasks/${currentTaskId}/stop`,{method:'POST'});status('停止を要求しました。');}};$('reset').onclick=()=>reset(false);$('randomize').onclick=()=>reset(true);
-for(const [label,text] of [['上に投げる','右手で青いキューブを上に投げて'],['ワインを注ぐ','ワインをグラスに20ml注いで'],['まず掴む','右手で青いキューブを掴んで'],['受け渡して置く','右手で青を取って左手に渡して左側に置く'],['2つを順番に置く','赤を青いゾーンに置いて、青を緑のゾーンに置いて'],['曖昧な指示','青いやつを右で拾って、空いてるほうの手にパスして、そっちの端に置いといて']]){const b=document.createElement('button');b.textContent=label;b.onclick=()=>{$('instruction').value=text;};$('examples').append(b);}
-refresh();setInterval(refresh,1500);
+for(const [label,text] of [['赤の上に重ねる','右手で青いキューブを取って左手に渡して左側の赤いキューブの上に乗せて'],['上に投げる','右手で青いキューブを上に投げて'],['ワインを注ぐ','ワインをグラスに20ml注いで'],['まず掴む','右手で青いキューブを掴んで'],['受け渡して置く','右手で青を取って左手に渡して左側に置く'],['2つを順番に置く','赤を青いゾーンに置いて、青を緑のゾーンに置いて'],['曖昧な指示','青いやつを右で拾って、空いてるほうの手にパスして、そっちの端に置いといて']]){const b=document.createElement('button');b.textContent=label;b.onclick=()=>{$('instruction').value=text;};$('examples').append(b);}
+loadRobots();refresh();setInterval(refresh,1500);
 </script></body></html>

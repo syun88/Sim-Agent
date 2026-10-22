@@ -56,24 +56,28 @@ def verify_task_goal(env: SimulationBackend, plan, results: list[dict], initial_
         checks = [{"type": "placement", "object": plan.goal["object"], "target": plan.goal["target"]}]
     measured = []
     # Allow release to settle under the same physics; no pose correction or scene reset.
-    if any(c["type"] in {"placement", "released"} for c in checks):
+    if any(c["type"] in {"placement", "relative_placement", "released"} for c in checks):
         env.step(200)
     for check in checks:
         obj = check["object"]
         if check["type"] == "placement":
             evidence = verify_place_goal(env, obj, check["target"])
+        elif check["type"] == "relative_placement":
+            from backend.app.skills.spatial_placement import verify_relative_goal
+            evidence = verify_relative_goal(env, obj, check["target"], check["relation"],
+                                            check.get("arm", "left"), check.get("distance_cm"))
         elif check["type"] == "holding":
             contacts = env.object_contacts(obj, check["arm"])
-            both = any("inner" in c for c in contacts) and any("outer" in c for c in contacts)
+            both = env.pinch_established(obj, check["arm"])
             position = env.object_pose(obj)[0]
-            evidence = {"success": bool(both and position[2] > 1.045), "contacts": contacts, "position": position.tolist()}
+            evidence = {"success": bool(both and env.object_bounds(obj)[0, 2] > env.table_height + .008), "contacts": contacts, "position": position.tolist()}
         elif check["type"] == "released":
             contacts = env.object_contacts(obj)
             evidence = {"success": not contacts, "contacts": contacts}
         elif check["type"] == "approach":
             from backend.app.simulation.openarm_v2.definition import FINGERTIP_MIDPOINT
             position, rotation = env.ee_pose(check["arm"])
-            error = float(np.linalg.norm(env.object_pose(obj)[0] - (position + rotation @ FINGERTIP_MIDPOINT[check["arm"]])))
+            error = float(np.linalg.norm(env.object_pose(obj)[0] - (position + rotation @ (np.zeros(3) if getattr(env, "robot_id", "openarm_v2") != "openarm_v2" else FINGERTIP_MIDPOINT[check["arm"]]))))
             evidence = {"success": error < .012, "fingertip_midpoint_error": error}
         elif check["type"] == "throw":
             from backend.app.skills.dynamic_skills import evaluate_throw

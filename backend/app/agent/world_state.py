@@ -14,7 +14,7 @@ def physical_holds(env: SimulationBackend) -> dict[str, str | None]:
         pinched = []
         for obj in objects:
             contacts = env.object_contacts(obj, side)
-            if any("inner" in c for c in contacts) and any("outer" in c for c in contacts):
+            if env.pinch_established(obj, side):
                 pinched.append(obj)
         holds[side] = pinched[0] if len(pinched) == 1 else None
     return holds
@@ -31,13 +31,16 @@ def build_world_state(env: SimulationBackend) -> dict:
             "type": {"wine_bottle": "bottle", "wine_glass": "glass"}.get(name, "cube"),
             "color": color,
             "position": position,
-            "graspable": name != "wine_glass",
+            "graspable": name != "wine_glass" and getattr(env, 'grasp_is_physical_contact', True),
             "held_by": [side for side, obj in holds.items() if obj == name],
+            **({"bounds": env.object_bounds(name).tolist()} if name.endswith("_cube") else {}),
         })
     targets = []
     for name, position in frame.zones.items():
         targets.append({"id": name, "color": name.split("_")[0], "position": position})
-    targets.extend({"id": name, "position": list(position), "type": "table_region"} for name, position in TABLE_TARGETS.items())
+    imported = getattr(env, "robot_id", "openarm_v2") != "openarm_v2"
+    targets.extend({"id": name, "position": env.zone_position(name).tolist() if imported else list(position),
+                    "type": "table_region"} for name, position in TABLE_TARGETS.items())
     relations = []
     for obj in objects:
         obj_pos = np.asarray(obj["position"])
@@ -56,7 +59,13 @@ def build_world_state(env: SimulationBackend) -> dict:
                 relations.append({"subject": obj["id"], "relation": "right_of" if obj_pos[1] < other_pos[1] else "left_of", "object": other["id"], "distance": float(abs(obj_pos[1] - other_pos[1]))})
     return {
         "robot": {
-            "type": "openarm_v2",
+            "type": getattr(env, "robot_id", "openarm_v2"),
+            "name": getattr(env, "robot_name", "OpenArm v2"),
+            "available_arms": getattr(env, "available_arms", ["left", "right"]),
+            **({"chains": env.profile["chains"],
+                "model_summary": env.model_summary(),
+                "joints": [{key: joint[key] for key in ("name", "type", "lower", "upper", "effort", "velocity")}
+                           for joint in env.profile["joints"]], "grasp_calibrated": env.profile.get("grasp_calibrated", False), "grippers": {side: {k: g[k] for k in ("joint", "type", "status", "cube_size")} for side, g in env.profile.get("grippers", {}).items()}} if imported else {}),
             "active_arm": next((side for side, obj in holds.items() if obj), None),
             "left_arm": {"ee": frame.ee["left"], "gripper": frame.grippers["left"], "held_object": holds["left"]},
             "right_arm": {"ee": frame.ee["right"], "gripper": frame.grippers["right"], "held_object": holds["right"]},
@@ -64,6 +73,15 @@ def build_world_state(env: SimulationBackend) -> dict:
         "objects": objects,
         "targets": targets,
         "spatial_relations": relations,
+        "capabilities": {"relative_placement": ["on", "left_of", "right_of", "front_of", "behind", "near"],
+                         "skills": ["move_relative", "return_home", "move_joint"] if imported and not env.profile.get("grippers") else
+                         ["approach_object", "grasp_object", "lift_object", "move_to_target", "move_to_object",
+                          "release_object", "retreat", "return_home", "open_gripper", "close_gripper",
+                          "move_relative", "handover_object", *([] if imported else ["throw_object", "pour_liquid"]),
+                          *(["move_joint"] if imported else [])],
+                         "geometry_source": "Genesis collision bounds", "grasp": env.grasp_mode},
+        "grasp_mode": env.grasp_mode,
+        "spawn_validation": getattr(env, "spawn_validation", None),
         "sim_time": frame.sim_time,
         "scene_profile": frame.scene_profile,
         "fluid": frame.fluid,

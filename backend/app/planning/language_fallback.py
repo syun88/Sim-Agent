@@ -9,12 +9,14 @@ import re
 import unicodedata
 
 from backend.app.planning.task_program import GroundingError, TaskAction, TaskProgram
+from backend.app.planning.references import named_objects
+from backend.app.planning.spatial_language import placement_references, strip_preservation
 
 VERBS = re.compile(
     r"(?P<throw>投げ(?:て|る|ろ)|放り(?:投げて|投げる)|上[にへ](?:軽く|ぽんと|そっと|少し|ちょっと|\s)*放(?:って|つ)|\bthrow\b|\btoss\b)"
     r"|(?P<pour>注(?:いで|ぐ|げ)|そそ(?:いで|ぐ)|\bpour\b)"
     r"|(?P<handover>受け渡(?:して|す)|渡(?:した|して|す|せ)|手渡(?:して|す)|\bhandover\b|\bhand[ -]over\b|\bpass(?:es)?\b|\bhand(?=\s+(?:it|the|that)))"
-    r"|(?P<place>置(?:いた|いて|く|け)|入(?:れて|れる)|運(?:んで|ぶ)|\bplace\b|\bput(?:s)?\b|\bset\s+down\b|\bleave\b)"
+    r"|(?P<place>置(?:いた|いて|く|け)|(?:乗|載)せ(?:て|る)|重ね(?:て|る)|積(?:んで|む)|入(?:れて|れる)|運(?:んで|ぶ)|\bplace\b|\bput(?:s)?\b|\bstack\b|\bset\s+down\b|\bleave\b)"
     r"|(?P<pick>掴(?:んで|む|め)|つか(?:んで|む)|持ち上げ(?:て|る)|握(?:って|る)|取(?:って|る)|と(?:って|る)|\bpick(?:s)?(?:\s+up)?\b|\bgrab\b|\bgrasp\b|\btake(?:s)?\b|\blift\b)"
     r"|(?P<approach>近づ(?:いて|けて|く)|アプローチ|\bapproach\b)"
     r"|(?P<open>開(?:いて|けて|く|け)|\bopen\b)"
@@ -23,21 +25,6 @@ VERBS = re.compile(
     r"|(?P<move>動か(?:して|す)|移動(?:して|する)?|\bmove\b)", re.I,
 )
 ARMS = {"left": r"左(?:手|腕|アーム|ハンド)?|\bleft(?:\s+(?:hand|arm))?\b", "right": r"右(?:手|腕|アーム|ハンド)?|\bright(?:\s+(?:hand|arm))?\b"}
-
-
-def named_objects(text: str, state: dict) -> list[str]:
-    available = {x["id"] for x in state["objects"]}
-    matches = []
-    for name, pattern in {"red_cube": r"(?<![a-z0-9_])red(?![ _-]*wine)(?:[ _-]*cube)?(?![a-z0-9_])|赤(?!ワイン)(?:い|の)?(?:キューブ|ブロック|箱)?|あか", "blue_cube": r"(?<![a-z0-9_])blue(?:[ _-]*cube)?(?![a-z0-9_])|青(?:い|の)?(?:キューブ|ブロック|箱)?|あお",
-                          "wine_bottle": r"ワイン(?:ボトル|の?瓶)?|ボトル|瓶|\bwine(?:[ _-]*bottle)?\b|\bbottle\b",
-                          "wine_glass": r"グラス|ワイングラス|\b(?:wine[ _-]*)?glass\b"}.items():
-        if name in available:
-            for match in re.finditer(pattern, text, re.I):
-                tail = text[match.end():]
-                if re.match(r"(?:い|の|[\s_-])*(?:ゾーン|エリア|zone|target)", tail, re.I):
-                    continue
-                matches.append((match.start(), name))
-    return list(dict.fromkeys(name for _, name in sorted(matches)))
 
 
 def arm_mentions(text: str) -> list[str]:
@@ -75,6 +62,13 @@ def direction_in(text: str) -> str | None:
 
 def parse_fallback(instruction: str, state: dict) -> TaskProgram:
     text = unicodedata.normalize("NFKC", instruction).lower().strip()
+    joints = state.get("robot", {}).get("joints", [])
+    for joint in joints:
+        name = joint["name"]
+        matched = re.fullmatch(r"(?:set\s+)?" + re.escape(name.lower()) +
+            r"\s*(?:を|to|=)?\s*(-?\d+(?:\.\d+)?)\s*(?:度|degrees?|deg|°)\s*(?:にして|に動かして|にする|へ|に|please)?[。.!\s]*", text)
+        if matched:
+            return TaskProgram(actions=[TaskAction(op="joint", joint=name, position_deg=float(matched.group(1)))])
     if re.search(r"\b(?:yellow|purple|orange|black|white)\b|黄色|紫色|白い|黒い|緑(?:の|色の)?(?:キューブ|cube)|green\s+cube|\b(?:ball|sphere|cylinder)\b", text):
         raise GroundingError("This scene has only a red cube and a blue cube")
     # Bounded noun-only requests: the omitted predicate is unambiguously pour.
@@ -94,6 +88,7 @@ def parse_fallback(instruction: str, state: dict) -> TaskProgram:
     # A colour or ID by itself is a useful informal pick request; prose without a verb isn't.
     if re.fullmatch(r"(?:red|blue)(?:[ _-]*cube)?|[赤青](?:い|の)?(?:キューブ|ブロック|箱)?", text):
         return TaskProgram(actions=[TaskAction(op="pick", object=named_objects(text, state)[0])])
+    text = strip_preservation(text, state)
     verbs = list(VERBS.finditer(text))
     if not verbs:
         raise GroundingError("No supported action understood; describe which cube, hand and destination")
@@ -105,8 +100,10 @@ def parse_fallback(instruction: str, state: dict) -> TaskProgram:
     # connectors first so that 'right hand picks ...' retains its explicit subject.
     segments: list[tuple[str, str]] = []
     if english:
-        clauses = re.split(r"[,;.]+|\b(?:and then|then|after that|next|afterwards)\b|\band\s+(?=(?:pick|grab|pass|hand|put|place|move|open|close|take|lift|throw|toss|pour)\b)", text)
+        clauses = re.split(r"[,;.]+|\b(?:and then|then|after that|next(?!\s+to\b)|afterwards)\b|\band\s+(?=(?:pick|grab|pass|hand|put|place|move|open|close|take|lift|throw|toss|pour)\b)", text)
         for clause in clauses:
+            if re.search(r"\b(?:do\s+not|don't|never)\b", clause, re.I):
+                continue
             found = list(VERBS.finditer(clause))
             if len(found) > 1:
                 raise GroundingError("Fallback cannot resolve this compound clause; use the language model or separate with 'then'")
@@ -125,6 +122,15 @@ def parse_fallback(instruction: str, state: dict) -> TaskProgram:
             raise GroundingError(f"Unrecognised instruction suffix: {remainder}")
     for op, segment in segments:
         names = named_objects(segment, state)
+        relative = placement_references(segment, state) if op == "place" else []
+        if len(relative) > 1:
+            raise GroundingError("Resolve compound spatial references with the language model")
+        relation = relative[0]["relation"] if relative else None
+        if relative:
+            # The last noun can be the support/reference, while the moved cube
+            # is the held/discourse object from the preceding clause.
+            anchor = relative[0]["target"]
+            names = [name for name in names if name != anchor]
         if (op == "place" and "wine_bottle" in names and "wine_glass" in names
                 and re.search(r"ワイン|\bwine\b", segment)
                 and not re.search(r"(?:ワイン)?(?:ボトル|瓶)を|(?:put|place)\s+(?:the\s+)?(?:wine\s+)?bottle\b", segment)):
@@ -138,7 +144,7 @@ def parse_fallback(instruction: str, state: dict) -> TaskProgram:
             if re.search(r"左(?:側)?の(?:キューブ|箱)|\bleft(?:most)?\s+cube", segment): obj = "left_cube"
             if re.search(r"右(?:側)?の(?:キューブ|箱)|\bright(?:most)?\s+cube", segment): obj = "right_cube"
         arm = arms[0] if arms else None
-        target = target_in(segment)
+        target = relative[0]["target"] if relative else target_in(segment)
         if op == "move" and target and not re.search(r"\d", segment):
             op = "place"
         if op in {"pick", "place", "handover", "approach", "throw", "pour"}:
@@ -180,7 +186,7 @@ def parse_fallback(instruction: str, state: dict) -> TaskProgram:
             if match and match.group(2) in {"mm", "ミリ"}: distance /= 10
             if match and match.group(2) in {"m", "メートル"}: distance *= 100
         action = TaskAction(op=op, object=obj, arm=arm, receiver=receiver, target=target,
-                            direction=direction, distance_cm=distance)
+                            direction=direction, distance_cm=distance, relation=relation)
         if op == "throw":
             action.direction = direction_in(segment) or "up"
             match = re.search(r"(\d+(?:\.\d+)?)\s*(?:cm|センチ)", segment)

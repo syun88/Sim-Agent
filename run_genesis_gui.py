@@ -17,17 +17,28 @@ from backend.app.execution.task_executor import TaskExecutor
 from backend.app.planning.agent_planner import AgentPlanner, PlannerProviderError
 from backend.app.planning.scene_selection import scene_for_instruction
 from backend.app.simulation import create_backend
+from backend.app.robots.registry import get_profile, selected_robot, remember_selection
 
 BACKEND_URL = 'http://127.0.0.1:8000'
 
 
+def make_executor(env):
+    if getattr(env, 'robot_id', 'openarm_v2') == 'openarm_v2':
+        return TaskExecutor(env)
+    from backend.app.robots.executor import ImportedRobotExecutor
+    return ImportedRobotExecutor(env)
+
+
 def main() -> None:
+    from backend.app.simulation.runtime_owner import acquire_genesis_owner
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--headless', action='store_true', help='Same real physics/executor without a native window')
     parser.add_argument('--once', action='store_true', help='Exit after executing one command (integration verification)')
     parser.add_argument('--backend-url', default=BACKEND_URL)
     parser.add_argument('--scene', choices=['cubes', 'wine'], default='cubes', help='Initial Genesis scene')
+    parser.add_argument('--robot', help='Imported robot ID; default is the saved selection or OpenArm')
     args = parser.parse_args()
+    acquire_genesis_owner()
     load_dotenv(Path(__file__).resolve().parent / '.env')
     # Fully grounded requests need no model round trip; unfamiliar language still
     # uses the configured model. An explicit shell/.env value takes precedence.
@@ -39,10 +50,11 @@ def main() -> None:
     response = client.post('/api/genesis/register', json={'viewer_id': viewer_id, 'provider': planner.configured_provider})
     response.raise_for_status()
     os.environ['GENESIS_SHOW_VIEWER'] = '0' if args.headless else '1'
-    print('Building the official OpenArm v2 scene on Genesis...', flush=True)
-    env = create_backend(args.scene)
+    robot_id = get_profile(args.robot or selected_robot())['id']
+    print(f'Building {robot_id} on Genesis...', flush=True)
+    env = create_backend(args.scene if robot_id == 'openarm_v2' else 'cubes', robot_id=robot_id)
     env.step(200)
-    executor = TaskExecutor(env)
+    executor = make_executor(env)
     active_id = None
     last_publish = 0.0
     last_control = 0.0
@@ -107,14 +119,45 @@ def main() -> None:
             gs.destroy()
             env = create_backend('cubes')
             env.step_observer = observe_step
-            executor = TaskExecutor(env)
+            executor = make_executor(env)
             publish(force=True)
             raise
-        executor = TaskExecutor(env)
+        executor = make_executor(env)
         env.step_observer = observe_step
         env.step(200)
         last_publish = 0.
         publish('scene_ready', force=True, status='PLANNING', detail=None)
+
+    def prepare_robot(robot_id):
+        nonlocal env, executor, last_publish
+        current_id = getattr(env, 'robot_id', 'openarm_v2')
+        profile = get_profile(robot_id)
+        robot_id = profile['id']
+        if current_id == robot_id and (profile.get('builtin') or
+                profile.get('configuration_sha256') == getattr(env, 'profile', {}).get('configuration_sha256')):
+            return
+        if any(executor.world_state()['robot'][side + '_arm']['held_object'] for side in ('left', 'right')):
+            raise PlannerProviderError('SCENE_BUSY', 'Release the held object or reset before switching robots')
+        publish('robot_preparing', force=True, status='PREPARING_SCENE', detail='Loading ' + robot_id)
+        client.post('/api/genesis/register', json={'viewer_id': viewer_id, 'provider': planner.configured_provider}).raise_for_status()
+        previous_scene = env.scene_profile
+        env.close()
+        try:
+            env = create_backend('cubes', robot_id=robot_id)
+        except Exception:
+            import genesis as gs
+            gs.destroy()
+            env = create_backend(previous_scene, robot_id=current_id)
+            executor = make_executor(env)
+            env.step_observer = observe_step
+            publish(force=True)
+            raise
+        executor = make_executor(env)
+        env.step_observer = observe_step
+        env.step(200)
+        remember_selection(robot_id)
+        last_publish = 0.
+        publish('robot_ready', force=True, status='EXECUTING', detail=None)
 
     print(f'Ready: {planner.configured_provider}; arm motion {executor.controller.motion_speed:g}x; '
           f'target pacing {env.simulation_speed:g}x '
@@ -145,8 +188,13 @@ def main() -> None:
                     executor.reset_context()
                     env.step(200)
                     body.update(success=True, verification={'success': True, 'goal_type': 'scene_reset'}, final_world_state=build_world_state(env))
+                elif command['action'] == 'select_robot':
+                    prepare_robot(command['robot_id'])
+                    body.update(success=True, verification={'success': True, 'goal_type': 'robot_selection', 'robot_id': command['robot_id']},
+                                final_world_state=build_world_state(env))
                 else:
-                    prepare_scene(scene_for_instruction(command['instruction'], env.scene_profile))
+                    if getattr(env, 'robot_id', 'openarm_v2') == 'openarm_v2':
+                        prepare_scene(scene_for_instruction(command['instruction'], env.scene_profile))
                     if command.get('randomize'):
                         env.reset(randomize=True)
                         executor.reset_context()

@@ -29,10 +29,15 @@ def prefer_gpu_from_environment() -> bool:
     return os.getenv(GPU_ENVIRONMENT_VARIABLE, "0").strip() == "1"
 
 
-def create_backend(scene_profile: str | None = None) -> SimulationBackend:
+def create_backend(scene_profile: str | None = None, *, robot_id: str = "openarm_v2") -> SimulationBackend:
     """Create the simulation backend."""
     profile = scene_profile or os.getenv("OPENARM_SCENE", "cubes")
     gpu = prefer_gpu_from_environment()
+    if robot_id != "openarm_v2":
+        if profile == "wine":
+            raise ValueError("Wine manipulation needs a calibrated physical gripper profile")
+        from backend.app.simulation.genesis_backend.generic_environment import GenericURDFEnvironment
+        return GenericURDFEnvironment(robot_id, show_viewer=os.getenv("GENESIS_SHOW_VIEWER", "") == "1", prefer_gpu=gpu)
     if profile == "wine" and GPU_ENVIRONMENT_VARIABLE not in os.environ:
         import torch
         gpu = torch.backends.mps.is_available() or torch.cuda.is_available()

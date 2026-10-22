@@ -106,10 +106,7 @@ class SkillRunner:
 
     def _pinch_established(self, obj: str, arm: str) -> bool:
         """A pinch needs both the inner and the outer finger on the object."""
-        fingers = self._contact_fingers(obj, arm)
-        inner = any("inner" in finger for finger in fingers)
-        outer = any("outer" in finger for finger in fingers)
-        return inner and outer
+        return self.env.pinch_established(obj, arm)
 
     def held_object(self, arm: str) -> str | None:
         return next((obj for obj in self.env.frame().objects if self._pinch_established(obj, arm)), None)
@@ -261,7 +258,7 @@ class SkillRunner:
             self.controller.wait_gripper(arm, False, 0.45)
             measured = self.env.frame().grippers[arm]
             from backend.app.simulation.openarm_v2.definition import GRIPPER_OPEN
-            if abs(measured - GRIPPER_OPEN[arm]) > .08:
+            if abs(measured - self.env.gripper_target(arm, False)) > .08:
                 raise SkillError("GRIPPER_BLOCKED", "The gripper did not physically open")
             return {"closed": False, "measured_joint": measured}
         return self._skill("open_gripper", run, started)
@@ -272,7 +269,7 @@ class SkillRunner:
             self.controller.wait_gripper(arm, True, 0.65)
             from backend.app.simulation.openarm_v2.definition import GRIPPER_CLOSED
             measured = self.env.frame().grippers[arm]
-            if abs(measured - GRIPPER_CLOSED[arm]) > .08 and self.held_object(arm) is None:
+            if abs(measured - self.env.gripper_target(arm, True)) > .08 and self.held_object(arm) is None:
                 raise SkillError("GRIPPER_BLOCKED", "The empty gripper could not close")
             return {"closed": True, "measured_joint": measured}
         return self._skill("close_gripper", run, started)
@@ -301,6 +298,13 @@ class SkillRunner:
                 raise SkillError("TARGET_OCCUPIED", f"{other} occupies {target}; refusing to stack cubes accidentally")
         desired_object = zone.copy()
         desired_object[2] = RELEASE_HEIGHT
+        self._align_for_placement(arm, obj)
+        travel = desired_object.copy()
+        travel[2] = 1.14
+        self._carry_to(arm, obj, travel)
+        return self._carry_to(arm, obj, desired_object)
+
+    def _align_for_placement(self, arm: str, obj: str) -> None:
         _, rotation = self.env.ee_pose(arm)
         if np.linalg.norm(rotation - GRASP_ROTATION) > .1:
             # The handover attitude fits the shared centre workspace. Return to the
@@ -320,14 +324,24 @@ class SkillRunner:
                 if not result.success:
                     raise SkillError(result.error or "IK_FAILURE", "Cannot reorient the physical grasp for table placement")
                 self._require_hold(arm, obj)
-        current = self.env.object_pose(obj)[0]
-        travel = desired_object.copy()
-        # The handover lift is deliberately higher than ordinary transport. A fixed
-        # clearance altitude avoids exceeding the horizontal grasp workspace ceiling
-        # when the receiving pinch sits farther along the cube face.
-        travel[2] = 1.14
-        self._carry_to(arm, obj, travel)
-        return self._carry_to(arm, obj, desired_object)
+
+    def move_to_object(self, arm, obj, target, relation, distance_cm=None):
+        def run():
+            from backend.app.skills.spatial_placement import relative_destination
+            self._require_hold(arm, obj)
+            if target == obj or target not in self.env.frame().objects:
+                raise SkillError("INVALID_TARGET", "Choose another observed cube as the reference")
+            if self.env.object_contacts(target) or self.env.object_linear_speed(target) > .02:
+                raise SkillError("REFERENCE_MOVING", "The placement reference must be resting on the table")
+            self._align_for_placement(arm, obj)
+            desired = relative_destination(self.env, obj, target, relation, arm, distance_cm)
+            travel = desired.copy()
+            travel[2] = max(1.14, desired[2] + .035)
+            self._carry_to(arm, obj, travel)
+            placed = self._carry_to(arm, obj, desired)
+            return {**placed, "reference_object": target, "relation": relation,
+                    "support_bounds": self.env.object_bounds(target).tolist()}
+        return self._skill("move_to_object", run, time.perf_counter())
 
     def _carry_to(self, arm: str, obj: str, desired: np.ndarray) -> dict:
         self._require_hold(arm, obj)
@@ -517,6 +531,8 @@ class SkillRunner:
                 result = self.lift_object(arm, step["object"])
             elif skill == "move_to_target":
                 result = self.move_to_target(arm, step["target"])
+            elif skill == "move_to_object":
+                result = self.move_to_object(arm, step["object"], step["target"], step["relation"], step.get("distance_cm"))
             elif skill == "release_object":
                 result = self.release_object(arm, step["object"])
             elif skill == "retreat":

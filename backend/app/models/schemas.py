@@ -8,7 +8,7 @@ SkillName = Literal[
     "release_object", "retreat", "return_home", "open_gripper",
     "close_gripper", "move_relative",
     "handover_object",
-    "throw_object", "pour_liquid",
+    "throw_object", "pour_liquid", "move_to_object", "move_joint",
 ]
 ArmName = Literal["left", "right"]
 MoveDirection = Literal["up", "down", "left", "right", "forward", "back"]
@@ -23,6 +23,7 @@ class PlanStep(BaseModel):
     arm: ArmName = "left"
     object: str | None = None
     target: str | None = None
+    relation: Literal["on", "left_of", "right_of", "front_of", "behind", "near"] | None = None
     fault_offset: float | None = None
     direction: MoveDirection | None = None
     distance_cm: float | None = Field(default=None, gt=0, le=30)
@@ -31,6 +32,8 @@ class PlanStep(BaseModel):
     grasp_offset_x: float = Field(default=0., ge=-.02, le=.02)
     height_cm: float | None = Field(default=None, ge=1, le=10)
     volume_ml: float | None = Field(default=None, ge=5, le=35)
+    joint: str | None = None
+    position_deg: float | None = Field(default=None, allow_inf_nan=False)
 
 
 class AgentPlan(BaseModel):

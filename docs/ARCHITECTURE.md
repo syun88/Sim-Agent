@@ -1,4 +1,4 @@
-# Language tasks on the official OpenArm v2 / Genesis scene
+# Language tasks and selectable robots in Genesis
 
 The native viewer owns the only live simulation. FastAPI is a command, progress, and result broker;
 it does not instantiate an environment. The same `TaskExecutor` is used by the native owner,
@@ -7,8 +7,8 @@ headless verification scripts, and the asynchronous execution wrapper.
 ## Language and grounding
 
 `planning/agent_planner.py` asks a configured provider for a `TaskProgram`, not motor commands.
-The bounded Pydantic schema in `planning/task_program.py` has ten operations: pick, handover,
-place, approach, move, open, close, home, throw, pour. Each action can name an object, acting arm, receiving
+The bounded Pydantic schema in `planning/task_program.py` has eleven operations: pick, handover,
+place, approach, move, open, close, home, throw, pour, joint. Each action can name an object, acting arm, receiving
 arm, semantic destination, or a 1–30cm relative motion. Extra fields and arbitrary code are rejected.
 There are at most 24 intentions and 144 compiled skills.
 
@@ -34,6 +34,84 @@ model name or round trip. Unrecognised wording still uses the model. Setting thi
 flag to `0` retains model confirmation for multi-action exact requests; the same
 signature/quantity/object checks apply. This cuts avoidable planning latency,
 independently of the native physics/motion speed improvements below.
+
+Object-relative placement retains both a reference object and a typed relation (`on`, `left_of`,
+`right_of`, `front_of`, `behind`, `near`), rather than reducing a noun phrase to a table region.
+`references.py` and `spatial_language.py` identify literal support/anchor and preservation phrases
+independently of model generation. The provider receives these source constraints and the full
+JSON schema in its prompt as well as its structured-output decoder. The final intentions must
+preserve each anchor/relation and cannot manipulate a noun that is only a reference or explicitly
+left in place. Negated actions are constraints, not affirmative clauses. One rejected model
+program can be repaired; a fully understood deterministic alternative is explicitly labelled.
+There is no single multi-action few-shot example to copy into an unrelated instruction.
+
+`skills/spatial_placement.py` uses observed Genesis collision bounds for placement height and
+separation. A stack releases the held cube above the support's top surface. Verification requires
+actual support contact, at least 65% horizontal support overlap, a support gap below 4mm,
+horizontal alignment within 12mm, upright attitude, stable speed and no finger hold. The support
+must remain undisturbed. IK success alone never establishes a stack.
+
+## URDF registration, scene selection and reachable setup
+
+The built-in default is the attached official OpenArm v2. `/api/robots/import` inspects a local
+URDF folder without constructing Genesis. `robots/registry.py` resolves mesh references in a
+generated URDF, retains source joint types/limits/effort/velocity, selects up to two longest distinct
+actuated leaf chains, and saves all candidate chains and warnings. The original files are unchanged.
+Generated local bundles live in gitignored `outputs/robots/<id>/`. The source hash is checked
+before loading an existing profile. Continuous joints retain unbounded angular limits.
+
+`robots/urdf.py` evaluates the URDF tree, spatial Jacobians and bounded private IK. The generated
+`solve_ik.py` exports an IK solution without moving the live scene. This is kinematic evidence;
+`scripts/verify_imported_robot.py` separately compares FK against Genesis and drives actual motors.
+URDF masses/forces are used as supplied and are not assumed to be hardware-calibrated.
+
+`POST /api/robots/select` queues a command for the existing native owner. It closes the previous
+world, creates the selected robot's world and executor, then persists the successful selection.
+A held object must first be released or reset. On load failure the owner reconstructs its previous
+profile. Only one world/viewer is live. `GenericURDFEnvironment` creates a ground plane, desk and
+selected fixed-base URDF, without the OpenArm Cell or any OpenArm robot entity.
+
+`robots/spawn.py` projects each chain's initial tool position onto the desk and searches separated
+candidate locations. Admission checks full-pose IK at the settled cube center and at 4cm and 8cm
+above it, including robot/desk collision clearance. Detected jaws also require five closure samples
+with aperture-centering compensation and a 3cm verification-lift pose. The live approach separately
+checks the full 49-sample closure and its interpolation; admission alone is not physical evidence.
+`spawn_validation.json` records the actual solutions and residuals. Random resets sample
+new candidates and repeat the checks; explicit unreachable or colliding coordinates fail. A robot that cannot
+reach the desk gets no unreachable props. Generic tool origins are not certified pinch frames.
+For OpenArm, `simulation/openarm_v2/spawn.py` instead checks the official fingertip offset,
+calibrated grasp orientation and actual approach waypoints on private official-model data.
+The same checks run on documented defaults, random layouts and explicit setup positions.
+
+Imported profiles expose motor-driven relative motion, home and rotary joint angle commands.
+`ImportedRobotExecutor` respects source velocity/effort limits and checks actual final errors.
+URDF collision surfaces and private aperture sweeps infer opposed jaws, motor directions, open/closed commands and a desk-clear grasp frame. Scorpion has seven arm joints and one rotary jaw driver per side. The common cube size is selected from both jaw apertures and finger dimensions; visual/collision size, mass, spawn height and full-pose approach IK share that size. Geometry inference enables a physical attempt. Each grasp requires loaded contacts on opposed distal pads, contact points consistent with authored surfaces, bounded penetration, motor-driven lift-follow and 300ms of unsupported holding. The desk world enables adjacent-link collisions, the Newton solver, elliptic friction cone, torsional friction and rolling friction. Source torque/velocity limits remain in force, including a rate limit on jaw motor references. No object pose is written during manipulation. Profiles without an opposed actuated mechanism retain motion controls only. The configuration hash includes the URDF and all referenced mesh content; changed assets regenerate the profile and invalidate old physical evidence. Old robot IDs resolve to the regenerated profile so an existing selection survives source repairs.
+
+The imported controller plans back from the closed aperture and its verification lift to an
+open-aperture pose, then to the insertion corridor. Both jaw and arm coordinates enter private
+collision checks. Small collision corrections use pose equality constraints so avoiding a root
+contact does not sacrifice tool height next to the desk. The closure interpolation is checked for
+collisions and Cartesian pose error. During execution the observed jaw coordinate selects its
+arm seed; closure pauses when the motors have not centred the aperture. A bounded native motor
+torque preload maintains contact after the initial position target would otherwise unload.
+Lift preflight also covers apertures near 95–105% of object thickness. A fully-closed aperture can
+be liftable while the wider loaded aperture meets a root casing. Spawn admission uses the same
+loaded-aperture check, and approach seed caches are keyed by object position.
+Semantic table regions admit a whole loaded route, including descent, before motion. The controller
+executes those checked joint waypoints without solving a different IK branch during transport.
+Transit tests multiple clearance heights. Relative moves also trace Cartesian samples rather than
+requesting a single endpoint IK jump. The default imported transport lift adds only the missing
+clearance above the scaled cube; it does not inherit OpenArm's additional 6cm motion. Retreat height
+comes from measured finger bounds and nearby object tops, avoiding an unreachable fixed high pose.
+Opening withdraws the moving jaw while holding the arm. Retreat first separates from the fixed
+pad along its inferred normal and lifts vertically on a checked Cartesian path; it rejects more
+than 2mm of object displacement. A direct joint shortcut previously swept through a released
+cube despite its clear endpoint. Final release requires absent finger contacts, desk support,
+stability and placement accuracy after retreat. Imported spline knots are allocated by source
+joint travel time; an exact derivative bound enforces source velocity limits between knots.
+The optional `default_armature=None` retains authored inertia without adding Genesis's default rotor
+inertia to small fingers. `simulation/runtime_owner.py` gives native runs, tests and standalone
+Genesis validators the same process lease; the broker still owns no physics world.
 
 ## Local model adaptation without training
 
@@ -262,8 +340,8 @@ stable upright bottle at its starting position. Existing spills remain in the
 reported total; incremental spill is recorded separately. Nonzero volumes are
 shown to four decimal places, with a nonzero lower-bound label below that scale.
 Measured vessel clearance must be nonnegative as well as having safe planned
-clearance. These are motion-endpoint measurements; the rigid solver handles
-contact during interpolation.
+clearance. Held-vessel paths additionally sample actual finger contacts and measured shell
+clearance every 20ms during interpolation, preserving the strict abort on intersection.
 Vessel motion uses quintic time interpolation with zero endpoint velocity and
 acceleration. Near flow onset the tilt increments are 2 degrees; the mouth is
 aimed over the receiving opening, 18mm above the rim. The neck and bowl must keep
@@ -275,6 +353,18 @@ Closing anticipates the measured outflow during the motor's stopping interval.
 Flow holds last up to two seconds before increasing the tilt again. Closure first
 raises the opening to 85 degrees, then returns upright in stages, keeping the last
 liquid above the receiving opening.
+
+The opening sweep from 2 to 106 degrees is now one 3.4-second joint trajectory through 53
+body-pose waypoints. A measured body-to-control-point transform maps the moving mouth path
+to wrist position and orientation. PCHIP joint interpolation avoids the former stop and settle
+at every tilt angle. Endpoint mouth correction and metered 108–118 degree flow control remain.
+Closing uses the calibrated separate waypoints: an attempted combined closing path was rejected
+by the actual clearance gate and is not used. Fluid parameters and physical time are unchanged.
+Upright vessel transit also bounds the quintic body's planned peak speed to 0.65m/s and peak
+acceleration to 4m/s², independently of the general arm speed multiplier. A measured failure
+showed that a 0.6-second return divided by six lost finger contact with the partially filled bottle.
+Mouth corrections retain a 0.12-second physical duration. These limits concern the commanded
+body path; final contact and object-follow verification still reads actual Genesis physics.
 
 Implementation references: [Genesis SPH setup](https://genesis-world.readthedocs.io/en/latest/user_guide/physics/beyond_rigid_bodies.html),
 [SPH materials](https://genesis-world.readthedocs.io/en/latest/api_reference/engine/material/sph.html),

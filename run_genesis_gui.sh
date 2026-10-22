@@ -25,7 +25,7 @@ try:
     response = httpx.get('http://127.0.0.1:8000/api/health', timeout=1)
     response.raise_for_status()
     data = response.json()
-    if data.get('robot') == 'OpenArm v2':
+    if data.get('service') == 'sim-agent' or data.get('robot') == 'OpenArm v2':
         print('viewer' if data.get('viewer_online') or data.get('viewer_starting') else 'broker')
 except (httpx.HTTPError, ValueError):
     pass

@@ -19,6 +19,32 @@ from backend.app.simulation.transform import orientation_error
 # rate. The solver still integrates every step; a target is held for at most 4 ms.
 MOTOR_COMMAND_PERIOD = .004
 
+
+def maximum_spline_slope(curve) -> np.ndarray:
+    """Exact per-joint derivative bound for a piecewise cubic spline."""
+    # q'(t) = 3*a*t**2 + 2*b*t + c on each local interval.
+    a, b, c = curve.c[:3]
+    widths = np.diff(curve.x)[:, None]
+    at_end = 3. * a * widths**2 + 2. * b * widths + c
+    vertex = np.divide(-b, 3. * a, out=np.zeros_like(a), where=abs(a) > 1e-15)
+    inside = (vertex > 0.) & (vertex < widths)
+    at_vertex = np.where(inside, 3.*a*vertex**2 + 2.*b*vertex + c, 0.)
+    return np.max(np.maximum(np.maximum(abs(c), abs(at_end)), abs(at_vertex)), axis=0)
+
+
+def joint_spline(waypoints, velocity_limits=None):
+    from scipy.interpolate import PchipInterpolator
+    points = np.asarray(waypoints,float)
+    if velocity_limits is None:
+        knots = np.linspace(0.,1.,len(points))
+    else:
+        # Allocate progress by joint travel time. Uniform knots make one large
+        # posture correction slow down every tiny Cartesian sample in the path.
+        weights = np.maximum(np.max(abs(np.diff(points,axis=0))/velocity_limits,axis=1),1e-6)
+        knots = np.r_[0.,np.cumsum(weights)]
+        knots /= knots[-1]
+    return PchipInterpolator(knots,points,axis=0)
+
 __all__ = [
     "MotionResult",
     "OpenArmV2Controller",
@@ -45,13 +71,14 @@ class OpenArmV2Controller:
     Endpoint verification always reads the actual physics state.
     """
 
-    def __init__(self, env: SimulationBackend, *, motion_speed: float | None = None):
+    def __init__(self, env: SimulationBackend, *, motion_speed: float | None = None, configure_motors: bool = True):
         self.env = env
         self.motion_speed = float(os.getenv("OPENARM_MOTION_SPEED", "6")) if motion_speed is None else float(motion_speed)
         if not np.isfinite(self.motion_speed) or self.motion_speed <= 0:
             raise ValueError("OPENARM_MOTION_SPEED must be a finite positive number")
-        self.env.motion_speed = self.motion_speed
-        self.env.configure_motion_response(self.motion_speed)
+        if configure_motors:
+            self.env.motion_speed = self.motion_speed
+            self.env.configure_motion_response(self.motion_speed)
         self.cancelled = False
         self.should_stop: Callable[[], bool] | None = None
         self.target_rotations: dict[str, np.ndarray] = {}
@@ -94,7 +121,7 @@ class OpenArmV2Controller:
             if error < best_error:
                 best_error = error
                 best_q = q.copy()
-            if np.linalg.norm(perr) < 0.002 and np.linalg.norm(oerr) < 0.015:
+            if np.linalg.norm(perr) < getattr(self.env, "ik_position_tolerance", .002) and np.linalg.norm(oerr) < getattr(self.env, "ik_rotation_tolerance", .015):
                 break
             J = np.vstack([linear_jacobian, angular_jacobian])
             # Weighted task vector matching the official openarm_control cost ratio
@@ -125,7 +152,7 @@ class OpenArmV2Controller:
             if q_init is None:
                 # A successful handover leaves a very different redundant-arm posture.
                 # Retry the official spawn posture before calling a reachable goal impossible.
-                return self.solve_ik(side, target_position, target_rotation, q_init=SPAWN_ARM_QPOS, max_iterations=max_iterations)
+                return self.solve_ik(side, target_position, target_rotation, q_init=self.env.home_arm_qpos(side), max_iterations=max_iterations)
             return None, best_error, float(best_error)
         return best_q, best_error, float(best_error)
 
@@ -176,6 +203,7 @@ class OpenArmV2Controller:
         via: list[np.ndarray] | None = None,
         via_rotations: list[np.ndarray] | None = None,
         on_sample: Callable[[], None] | None = None,
+        planned_joints: list[np.ndarray] | None = None,
     ) -> MotionResult:
         if rotation is None:
             rotation = GRASP_ROTATION.copy()
@@ -185,19 +213,40 @@ class OpenArmV2Controller:
         rotations = via_rotations if via_rotations is not None else [rotation] * len(via or [])
         if len(rotations) != len(via or []):
             raise ValueError("Each via position needs one via rotation")
-        for waypoint, attitude in zip([*(via or []), position], [*rotations, rotation]):
-            seed = joint_waypoints[-1] if via else q_init
-            q, pos_err, _ = self.solve_ik(side, waypoint, attitude, q_init=seed)
-            if q is None:
-                break
-            joint_waypoints.append(q)
+        if planned_joints is not None:
+            path = np.asarray(planned_joints, float)
+            limits = self.env.arm_limits(side)
+            if (path.ndim != 2 or len(path)<2 or path.shape[1]!=len(joint_waypoints[0])
+                    or not np.isfinite(path).all() or np.max(abs(path[0]-joint_waypoints[0]))>.02
+                    or np.any(path<limits[:,0]) or np.any(path>limits[:,1])):
+                return MotionResult(False,'STALE_MOTION_PLAN')
+            q = path[-1].copy()
+            point, attitude, _, _ = self.env.arm_kinematics(side).evaluate(q)
+            pos_err = float(np.linalg.norm(point-position))
+            if pos_err>.002 or np.linalg.norm(orientation_error(attitude,rotation))>.03:
+                return MotionResult(False,'INVALID_MOTION_PLAN',position.tolist(),pos_err)
+            joint_waypoints.extend(path[1:])
+        else:
+            for waypoint, attitude in zip([*(via or []), position], [*rotations, rotation]):
+                seed = joint_waypoints[-1] if via else q_init
+                q, pos_err, _ = self.solve_ik(side, waypoint, attitude, q_init=seed)
+                if q is None:
+                    break
+                joint_waypoints.append(q)
         if q is None:
             return MotionResult(False, "IK_FAILURE", position.tolist(), pos_err)
+        planner = getattr(self.env, 'plan_joint_waypoints', None)
+        if planner is not None:
+            joint_waypoints = planner(side, joint_waypoints, self.stop_requested)
+            if joint_waypoints is None:
+                return MotionResult(False, "COLLISION_PATH", position.tolist(), pos_err)
+        curved_path = bool(via) or len(joint_waypoints)>2
         self.target_rotations[side] = rotation.copy()
         start = self.env.arm_qpos(side)
         nominal_duration = duration
         trajectory_duration = None
-        if duration is None and self.motion_speed == 1. and not via:
+        velocity_limits = self.env.arm_velocity_limits(side)
+        if duration is None and self.motion_speed == 1. and not curved_path and velocity_limits is None:
             path = [(1 - a) * start + a * q for a in np.linspace(0, 1, 8)]
             result = self.execute_joint_path(side, path, .08, progress)
         else:
@@ -207,17 +256,21 @@ class OpenArmV2Controller:
                 nominal_duration = sum(.56 + max(14, int(np.linalg.norm(b - a) / .005)) * self.timestep
                                        for a, b in zip(joint_waypoints, joint_waypoints[1:]))
             trajectory_duration = nominal_duration / (self.motion_speed if scale_speed else 1.)
+            curve = derivative = None
+            if curved_path:
+                curve = joint_spline(joint_waypoints,velocity_limits)
+                derivative = curve.derivative()
+                check_curve = getattr(self.env, 'joint_curve_is_clear', None)
+                if check_curve is not None and not check_curve(side, curve, joint_waypoints):
+                    return MotionResult(False, 'COLLISION_PATH', position.tolist(), pos_err)
+            if velocity_limits is not None:
+                # Bound the actual spline derivative. Multiplying the largest
+                # segment by 3*N needlessly slowed finely sampled approaches.
+                slopes = maximum_spline_slope(curve) if curve is not None else abs(q-start)
+                trajectory_duration = max(trajectory_duration, float(np.max(1.875 * slopes / velocity_limits)))
             result = MotionResult(True)
             steps = max(2, int(np.ceil(trajectory_duration / self.timestep)))
             trajectory_duration = steps * self.timestep
-            curve = derivative = None
-            if via:
-                from scipy.interpolate import PchipInterpolator
-                knots = np.linspace(0., 1., len(joint_waypoints))
-                # Shape preservation prevents a high-clearance approach from
-                # overshooting the last insertion segment into the workpiece.
-                curve = PchipInterpolator(knots, joint_waypoints, axis=0)
-                derivative = curve.derivative()
             command_steps = max(1, int(round(MOTOR_COMMAND_PERIOD / self.timestep))) if scale_speed else 1
             indices = range(0, steps, command_steps) if scale_speed else range(1, steps + 1)
             completed = False
@@ -246,6 +299,8 @@ class OpenArmV2Controller:
         rotation_residual = float(np.linalg.norm(orientation_error(actual_rotation, rotation)))
         # Read a settled endpoint. The official wrist's damping can leave a short
         # orientation transient after a large handover rotation or lateral carry.
+        position_tolerance = getattr(self.env, "motion_position_tolerance", .012)
+        rotation_tolerance = getattr(self.env, "motion_rotation_tolerance", .15)
         settling_steps = 0
         previous_position, previous_rotation = actual.copy(), actual_rotation.copy()
         stable_steps = 0
@@ -263,7 +318,7 @@ class OpenArmV2Controller:
             actual, actual_rotation = self.env.ee_pose(side)
             residual = float(np.linalg.norm(actual - position))
             rotation_residual = float(np.linalg.norm(orientation_error(actual_rotation, rotation)))
-            if (residual <= .012 and rotation_residual <= .15
+            if (residual <= position_tolerance and rotation_residual <= rotation_tolerance
                     and np.linalg.norm(actual - previous_position) < .0001
                     and np.linalg.norm(orientation_error(previous_rotation, actual_rotation)) < .001):
                 stable_steps += settle_quantum
@@ -273,13 +328,13 @@ class OpenArmV2Controller:
             if require_stable and stable_steps * self.timestep >= .03:
                 break
         # Solving IK is not evidence that the motors reached it: a collision can block them.
-        return MotionResult(residual <= 0.012 and rotation_residual <= 0.15,
-                            None if residual <= 0.012 and rotation_residual <= 0.15 else "MOTION_BLOCKED",
+        return MotionResult(residual <= position_tolerance and rotation_residual <= rotation_tolerance,
+                            None if residual <= position_tolerance and rotation_residual <= rotation_tolerance else "MOTION_BLOCKED",
                             actual.tolist(), residual, rotation_residual,
                             nominal_duration, trajectory_duration, settling_steps * self.timestep)
 
     def set_gripper(self, side: str, closed: bool) -> None:
-        self.env.set_gripper(side, GRIPPER_CLOSED[side] if closed else GRIPPER_OPEN[side])
+        self.env.set_gripper(side, self.env.gripper_target(side, closed))
 
     def wait_gripper(self, side: str, closed: bool, seconds: float = 0.45) -> MotionResult:
         self.set_gripper(side, closed)
@@ -301,7 +356,7 @@ class OpenArmV2Controller:
                 self.env.step(count)
                 elapsed += count
                 measured = self.env.gripper_position(side)
-                near_goal = closed or abs(measured - GRIPPER_OPEN[side]) < .03
+                near_goal = closed or abs(measured - self.env.gripper_target(side, False)) < .03
                 stable_steps = stable_steps + count if near_goal and abs(measured - previous) < .005 else 0
                 previous = measured
                 if elapsed * self.timestep >= (.18 if closed else .04) and stable_steps * self.timestep >= .03:

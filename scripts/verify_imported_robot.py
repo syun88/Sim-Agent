@@ -1,0 +1,94 @@
+"""URDF + desk runtime, private FK/Jacobian agreement and motor-driven IK travel."""
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from backend.app.robots.registry import get_profile, import_robot
+from backend.app.robots.executor import ImportedRobotExecutor
+from backend.app.simulation import create_backend
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('robot', help='Imported ID or an existing URDF folder/file')
+    parser.add_argument('--native', action='store_true')
+    parser.add_argument('--json', type=Path)
+    args = parser.parse_args()
+    profile = import_robot(args.robot) if Path(args.robot).exists() else get_profile(args.robot)
+    output = args.json or Path(profile['directory']) / 'runtime_validation.json'
+    os.environ['GENESIS_SHOW_VIEWER'] = '1' if args.native else '0'
+    env = create_backend(robot_id=profile['id'])
+    executor = ImportedRobotExecutor(env)
+    maximum_velocity_ratio = 0.
+    original_set_arm = env.set_arm
+    def observe_command(side, targets, velocities=None):
+        nonlocal maximum_velocity_ratio
+        if velocities is not None:
+            maximum_velocity_ratio = max(maximum_velocity_ratio,
+                float(np.max(abs(velocities) / env.arm_velocity_limits(side))))
+        return original_set_arm(side, targets, velocities)
+    env.set_arm = observe_command
+    result = {'robot_id': profile['id'], 'robot_links': env._entity.n_links, 'robot_dofs': env._entity.n_dofs,
+              'collision_geoms': env._entity.n_geoms, 'native': args.native, 'phases': [], 'success': False,
+              'openarm_cell': False, 'physics': 'Genesis', 'grasp_calibrated': False}
+    try:
+        env.step(200)
+        from PIL import Image
+        Image.fromarray(env.render()).save(output.with_suffix('.png'))
+        result['spawn_layouts'] = []
+        for randomize in (False, True, True):
+            env.reset(randomize=randomize)
+            env.step(200)
+            layout = {}
+            for name, entry in env.spawn_validation['objects'].items():
+                actual = env.object_pose(name)[0]
+                error = float(np.linalg.norm(actual - entry['position']))
+                if error > .005:
+                    raise RuntimeError(f'{name}: initial object drifted by {error:.6f}m')
+                checked = env._spawn_sampler.validate(actual, entry['arm'])
+                layout[name] = {'actual_position': actual.tolist(), 'setup_settling_error': error,
+                                'arm': entry['arm'], 'maximum_ik_error': max(c['position_error'] for c in checked['checks'])}
+            result['spawn_layouts'].append(layout)
+        for side in env.available_arms:
+            actual, rotation = env.ee_pose(side)
+            predicted = env.arm_kinematics(side).evaluate(env.arm_qpos(side))[0]
+            error = float(np.linalg.norm(actual - predicted))
+            if error > .0001:
+                raise RuntimeError(f'{side}: URDF/Genesis FK differ by {error:.6f}m')
+            print(side, 'FK error', error, flush=True)
+            target = actual + [0., 0., .01]
+            solution, _, _ = executor.controller.solve_ik(side, target, rotation)
+            if solution is None:
+                raise RuntimeError(side + ': IK goal is unreachable')
+            motion = executor.controller.move_to_site(side, target, rotation, duration=1., scale_speed=True)
+            measured = env.ee_pose(side)[0]
+            record = {'arm': side, 'fk_error': error, 'ik_solution_rad': solution.tolist(),
+                      'initial_position': actual.tolist(), 'target_position': target.tolist(), 'actual_position': measured.tolist(),
+                      'actual_position_error': float(np.linalg.norm(measured - target)), 'motion_success': motion.success,
+                      'actual_rise': float(measured[2] - actual[2])}
+            result['phases'].append(record)
+            output.write_text(json.dumps(result, indent=2))
+            print(record, flush=True)
+            if not motion.success or record['actual_position_error'] > .003 or record['actual_rise'] < .007:
+                raise RuntimeError(side + ': physical IK tracking failed')
+        result['maximum_command_velocity_ratio'] = maximum_velocity_ratio
+        if maximum_velocity_ratio > 1.001:
+            raise RuntimeError('A motor reference exceeded its source URDF velocity limit')
+        result['success'] = True
+    except Exception as exc:
+        result['error'] = str(exc)
+        print('FAILED', str(exc), flush=True)
+    finally:
+        output.write_text(json.dumps(result, indent=2))
+        env.close()
+    return 0 if result['success'] else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

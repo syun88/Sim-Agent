@@ -102,6 +102,10 @@ class SimulationBackend(ABC):
     def object_pose(self, name: str) -> tuple[np.ndarray, np.ndarray]:
         """World position and rotation matrix of a manipulated object."""
 
+    def object_bounds(self, name: str) -> np.ndarray:
+        """Observed world collision bounds, [minimum, maximum], in metres."""
+        raise NotImplementedError
+
     @abstractmethod
     def zone_position(self, name: str) -> np.ndarray:
         """World position of a target zone."""
@@ -147,7 +151,15 @@ class SimulationBackend(ABC):
 
     @abstractmethod
     def arm_limits(self, side: str) -> np.ndarray:
-        """Joint limits of one arm as a (7, 2) array."""
+        """Joint limits of one arm as an (N, 2) array."""
+
+    def home_arm_qpos(self, side: str) -> np.ndarray:
+        from backend.app.simulation.openarm_v2.definition import SPAWN_ARM_QPOS
+        return SPAWN_ARM_QPOS.copy()
+
+    def arm_velocity_limits(self, side: str) -> np.ndarray | None:
+        """Optional source velocity caps for a generated URDF motion profile."""
+        return None
 
     @abstractmethod
     def kinematics(self) -> None:
@@ -183,3 +195,13 @@ class SimulationBackend(ABC):
     # verified against: the skills require the object to be touched by both fingers after
     # closing and to follow the gripper through a verification lift, and the goal verification
     # requires the object to be untouched by any finger before declaring it released.
+
+    def gripper_target(self, side: str, closed: bool) -> float:
+        from backend.app.simulation.openarm_v2.definition import GRIPPER_CLOSED, GRIPPER_OPEN
+        return (GRIPPER_CLOSED if closed else GRIPPER_OPEN)[side]
+
+    def pinch_established(self, name: str, side: str) -> bool:
+        contacts = self.object_contacts(name, side)
+        return any('inner' in c for c in contacts) and any('outer' in c for c in contacts)
+
+    table_height: float = 1.006

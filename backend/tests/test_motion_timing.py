@@ -60,3 +60,20 @@ def test_interrupted_trajectory_clears_velocity_reference(env, monkeypatch):
     assert any(velocity is not None and np.linalg.norm(velocity) > 0. for _, velocity in commands)
     assert commands[-1][1] is None
     np.testing.assert_allclose(commands[-1][0], env.arm_qpos("left"))
+
+
+def test_checked_joint_plan_rejects_stale_start_and_drives_motors_without_resolving_ik(env, monkeypatch):
+    controller = OpenArmV2Controller(env)
+    point, rotation = env.ee_pose('left')
+    start = env.arm_qpos('left')
+    target = point + [0.,0.,.01]
+    q, _, _ = controller.solve_ik('left',target,rotation)
+    assert q is not None
+    initial_step = env._sim_step
+    stale = controller.move_to_site('left',target,rotation,planned_joints=[start+.03,q])
+    assert stale.error=='STALE_MOTION_PLAN' and env._sim_step==initial_step
+    def unexpected_ik(*args, **kwargs):raise AssertionError('The checked path must execute unchanged')
+    monkeypatch.setattr(controller,'solve_ik',unexpected_ik)
+    result = controller.move_to_site('left',target,rotation,planned_joints=[start,q])
+    assert result.success
+    assert env.ee_pose('left')[0][2]-point[2]>.007

@@ -14,6 +14,8 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.app.memory.graph_memory import MemoryStore
 from backend.app.models.schemas import TaskRequest, TaskResponse
+from backend.app.robots.registry import available_robots, get_profile, import_robot, selected_robot
+from pydantic import BaseModel
 from backend.app.planning.agent_planner import AgentPlanner
 from backend.app.simulation import ENGINE_DESCRIPTION
 
@@ -34,7 +36,7 @@ async def lifespan(app: FastAPI):
     app.state.memory.close()
 
 
-app = FastAPI(title='OpenArm v2 — Language tasks on Genesis', version='2.0.0', lifespan=lifespan)
+app = FastAPI(title='Sim-Agent — Language tasks on Genesis', version='2.1.0', lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:5173', 'http://127.0.0.1:5173'], allow_methods=['*'], allow_headers=['*'])
 simple_page = Path(__file__).resolve().parent / 'static' / 'simple.html'
 
@@ -63,9 +65,12 @@ def simple_commands():
 @app.get('/api/health')
 def health():
     active = next((r for r in reversed(app.state.executions) if r['status'] not in TERMINAL), None)
-    return {'status': 'ok', 'robot': 'OpenArm v2', 'simulation': 'Genesis viewer process',
-            'simulation_engine': 'genesis', 'simulation_description': ENGINE_DESCRIPTION,
-            'grasp_mode': 'physical-friction-pinch', 'provider': app.state.viewer.get('provider', AgentPlanner().configured_provider),
+    robot = (app.state.world_state or {}).get('robot', {})
+    return {'status': 'ok', 'service': 'sim-agent', 'robot': robot.get('name', 'OpenArm v2'),
+            'robot_id': robot.get('type', 'openarm_v2'), 'simulation': 'Genesis viewer process',
+            'simulation_engine': 'genesis', 'simulation_description': ENGINE_DESCRIPTION if robot.get('type', 'openarm_v2') == 'openarm_v2'
+            else 'Genesis World, imported URDF: ' + robot.get('name', 'robot'),
+            'grasp_mode': (app.state.world_state or {}).get('grasp_mode', 'physical-friction-pinch'), 'provider': app.state.viewer.get('provider', AgentPlanner().configured_provider),
             'memory': 'Connected' if app.state.memory.available else 'Fallback',
             'agent': active['status'] if active else 'IDLE', 'viewer_online': _online(),
             'viewer_starting': app.state.world_state is None and time.monotonic() < app.state.viewer.get('starting_until', 0)}
@@ -105,6 +110,55 @@ def reset_scene(randomize: bool = False):
 async def create_task(request: TaskRequest):
     record = _enqueue({'action': 'task', **request.model_dump()})
     return TaskResponse(task_id=record['task_id'], status='PLANNING', message='Task queued for Genesis viewer')
+
+
+class RobotImport(BaseModel):
+    folder: str
+
+
+class RobotSelection(BaseModel):
+    robot_id: str
+
+
+@app.get('/api/robots')
+def robots():
+    robot_id = (app.state.world_state or {}).get('robot', {}).get('type') or selected_robot()
+    return {'robots': available_robots(), 'selected': robot_id}
+
+
+@app.post('/api/robots/import')
+def import_urdf(request: RobotImport):
+    try:
+        return import_robot(request.folder)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
+@app.post('/api/robots/select')
+def select_robot(request: RobotSelection):
+    if any(record['status'] not in TERMINAL for record in app.state.executions):
+        raise HTTPException(409, 'Finish or stop the current task before switching robots')
+    try:
+        profile = get_profile(request.robot_id)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(400, str(exc)) from None
+    record = _enqueue({'action': 'select_robot', 'robot_id': profile['id'], 'instruction': 'Select robot: ' + profile['id']})
+    return {'task_id': record['task_id'], 'status': 'queued'}
+
+
+@app.get('/api/robots/{robot_id}/files/{filename}')
+def robot_file(robot_id: str, filename: str):
+    if filename not in {'gripper_analysis.json', 'profile.json', 'scene.json', 'ik_seeds.json', 'ik_validation.json', 'spawn_validation.json',
+                        'runtime_validation.json', 'auto_grasp_validation.json', 'gripper_runtime.json', 'solve_ik.py', 'README.md', 'robot.urdf'}:
+        raise HTTPException(404, 'Unknown generated file')
+    try:
+        profile = get_profile(robot_id)
+        path = Path(profile['directory']) / filename
+    except (ValueError, OSError, KeyError):
+        raise HTTPException(404, 'Generated robot profile not found') from None
+    if not path.is_file():
+        raise HTTPException(404, 'Generated file not found')
+    return FileResponse(path, filename=filename)
 
 
 @app.post('/api/genesis/register', include_in_schema=False)

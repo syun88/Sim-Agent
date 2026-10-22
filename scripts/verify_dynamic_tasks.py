@@ -35,6 +35,10 @@ def main():
     args = parser.parse_args()
     if args.verbose:
         logging.basicConfig(level=logging.INFO)
+    else:
+        logger = logging.getLogger('backend.app.skills.pouring')
+        logger.setLevel(logging.INFO)
+        logger.addHandler(logging.StreamHandler())
     os.environ["OPENARM_LOCAL_PLANNER"] = "1" if args.provider == "local" else "0"
     planner = AgentPlanner()
     planner.api_key = planner.base_url = planner.model = ""
