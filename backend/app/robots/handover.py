@@ -28,7 +28,7 @@ class ExchangePlanner:
             raise error
         if self.env.step_observer:self.env.step_observer()
 
-    def receiver(self,donor,receiver,center,cube_rotation,snapshot,completion=None):
+    def receiver(self,donor,receiver,center,cube_rotation,snapshot,completion=None,preferred=None,preferred_only=False):
         env=self.env;c=self.controller;g=env.grippers[receiver]
         names=env.profile['chains'][receiver]['joints']
         # Keep a finite contact patch on the cube while making room for the
@@ -48,7 +48,10 @@ class ExchangePlanner:
                     forward=rotation@local_forward
                     angle=np.linalg.norm(Rotation.from_matrix(rotation@env.ee_pose(receiver)[1].T).as_rotvec())
                     attitudes.append((float(forward@toward)-angle*.08,rotation))
-        for _,rotation in sorted(attitudes,key=lambda item:-item[0]):
+        rotations=[r for score,r in sorted(attitudes,key=lambda item:-item[0])]
+        if preferred:rotations.insert(0,cube_rotation@np.asarray(preferred['object_rotation']))
+        if preferred_only:rotations=rotations[:1]
+        for index,rotation in enumerate(rotations):
             direction=rotation@(np.asarray(g['grasp_rotation']).T@g['approach_axis'])
             pad=g['pad_region']
             height_axis=rotation@np.asarray(pad['height_axis'])
@@ -57,9 +60,13 @@ class ExchangePlanner:
             bite_travel=(pad['depth_max']-pad['depth_min'])/2.+env.cube_size/2.-overlap
             biases=[-cube_rotation.T@direction*bite_travel*depth+cube_rotation.T@height_axis*height_limit*f*sign
                     for depth in (.6,.85,.3,0.) for f in (.55,.8,.3,0.) for sign in (1.,-1.)]
+            if preferred and index==0:biases.insert(0,np.asarray(preferred['bias'],float))
+            if preferred_only:biases=biases[:1]
             for bias in biases:
                 target=center+cube_rotation@bias
-                for seed in (env.arm_qpos(receiver),rng.normal(0.,.5,len(names))):
+                seeds=[env.arm_qpos(receiver),rng.normal(0.,.5,len(names))]
+                if preferred and index==0:seeds.insert(0,np.asarray(preferred['open_arm_q']))
+                for seed in seeds:
                     self.check();self.attempts['receiver_pose']+=1
                     goal=solve_profile_ik(env.profile,receiver,target,rotation,model=env.model,
                         q_init=seed,snapshot=snapshot,joint_limits=env.ik_joint_limits(receiver))
@@ -164,6 +171,30 @@ class ExchangePlanner:
         home_mid=np.mean(homes,axis=0)
         xy=home_mid[:2]
         height=max(env.table_height+2.45*length,home_mid[2]+length*.75)
+        from backend.app.robots.skill_recipes import load_exchange_recipe
+        recipe=load_exchange_recipe(env.profile,donor,receiver)
+        if recipe:
+            center=np.asarray(recipe['center']);final=np.asarray(recipe['donor_rotation'])
+            angle=np.linalg.norm(Rotation.from_matrix(final@rotation.T).as_rotvec())
+            count=max(12,int(np.ceil(np.linalg.norm(center-object_position)/.01)),int(np.ceil(angle/.09)))
+            arc=Slerp([0.,1.],Rotation.from_matrix([rotation,final]));fractions=np.linspace(0.,1.,count+1)[1:]
+            rotations=[arc(t).as_matrix() for t in fractions]
+            path=c.plan_poses(donor,[object_position+(center-object_position)*t-r@offset for t,r in zip(fractions,rotations)],rotations)
+            if path is not None:
+                from backend.app.robots.placement import shorten_loaded_path
+                path=shorten_loaded_path(env,donor,obj,path,c.stop_requested)
+            if path is not None:
+                future={**snapshot,**dict(zip(names,path[-1]))}
+                predicted=final@rotation.T@object_rotation
+                recipient=self.receiver(donor,receiver,center,predicted,future,
+                    lambda p:self.completion(donor,receiver,path[-1],final,future,p),
+                    preferred=recipe['predicted_receiver'],preferred_only=True)
+                if recipient is not None:
+                    self.attempts['recipe_cache_hit']+=1
+                    return {'center':center,'donor_path':path,'donor_rotation':final,'receiver':recipient,
+                        'predicted_cube_rotation':predicted,'observed_receiver_hint':recipe['receiver'],
+                        'planning_attempts':dict(self.attempts)}
+            self.attempts['recipe_cache_rejected']+=1
         if (np.linalg.norm(object_position[:2]-home_mid[:2])<length*1.8
                 and object_position[2]>env.table_height+env.cube_size*2.):
             self.check()
@@ -171,7 +202,8 @@ class ExchangePlanner:
                 lambda p:self.completion(donor,receiver,env.arm_qpos(donor),rotation,snapshot,p))
             if recipient is not None:
                 return {'center':object_position,'donor_path':[env.arm_qpos(donor)]*2,
-                    'donor_rotation':rotation,'receiver':recipient,'planning_attempts':dict(self.attempts)}
+                    'donor_rotation':rotation,'receiver':recipient,'predicted_cube_rotation':object_rotation,
+                    'planning_attempts':dict(self.attempts)}
         for dz in (0.,-.5*length,.5*length,-length,length):
             for dx in (0.,length*.6,-length*.6):
                 center=np.r_[xy+[dx,0.],height+dz]
@@ -187,13 +219,17 @@ class ExchangePlanner:
                     points=[object_position+(center-object_position)*t-r@offset for t,r in zip(fractions,rotations)]
                     path=c.plan_poses(donor,points,rotations)
                     if path is None:continue
+                    from backend.app.robots.placement import shorten_loaded_path
+                    path=shorten_loaded_path(env,donor,obj,path,c.stop_requested)
+                    if path is None:continue
                     self.attempts['donor_clear']+=1
                     future={**snapshot,**dict(zip(names,path[-1]))}
                     recipient=self.receiver(donor,receiver,center,turn@object_rotation,future,
                         lambda plan:self.completion(donor,receiver,path[-1],final,future,plan))
                     if recipient is not None:
                         return {'center':center,'donor_path':path,'donor_rotation':final,
-                                'receiver':recipient,'planning_attempts':dict(self.attempts)}
+                                'receiver':recipient,'predicted_cube_rotation':turn@object_rotation,
+                                'planning_attempts':dict(self.attempts)}
         error=SkillError('HANDOVER_UNREACHABLE','No shared posture passed loaded travel, receiver closure and insertion checks')
         error.evidence={'planning_attempts':dict(self.attempts)}
         raise error

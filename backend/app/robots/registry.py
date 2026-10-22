@@ -8,11 +8,12 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from backend.app.robots.urdf import URDFModel, URDFKinematics, solve_profile_ik, mesh_path, origin, vector
+from backend.app.robots.policy import IMPORTED_ROBOT_POLICY,policy_signature
 
 GENERATED_ROOT = Path(__file__).resolve().parents[3] / "outputs" / "robots"
 OPENARM = {"id": "openarm_v2", "name": "OpenArm v2", "source": "official openarm-mujoco",
            "builtin": True, "capabilities": ["motion", "physical_grasp", "handover", "stack", "pour"]}
-PROFILE_VERSION = 12
+PROFILE_VERSION = 14
 _file_hash_cache = {}
 
 
@@ -60,6 +61,7 @@ def get_profile(robot_id):
     if not source.is_file():
         raise ValueError("The source URDF moved; choose its new location")
     if (profile.get("profile_version", 0) < PROFILE_VERSION
+            or profile.get('control_policy_sha256')!=policy_signature()
             or profile.get('asset_sha256') != asset_signature(source)):
         updated = import_robot(source)
         if updated['id'] != robot_id:
@@ -172,12 +174,14 @@ def import_robot(folder):
                "joints": model.active, "chains": chains, "all_chains": candidates, "home": home,
                "root_transform": root_transform.tolist(), "capabilities": ["motion", "joint_control", "ik"],
                "profile_version": PROFILE_VERSION, "asset_sha256": asset_signature(source),
+               "control_policy_sha256":policy_signature(),"control_policy":IMPORTED_ROBOT_POLICY,
                "grasp_calibrated": False, "warnings": warnings, "mesh_count": len(set(meshes))}
     if actuator_configuration:
         profile['actuator_configuration']=actuator_configuration
         profile['warnings']=["Source masses, geometry and joint frames are preserved. Explicit actuators.json supplies motor effort and no-load speed limits."]
     scene = {"robot_id": robot_id, "openarm_cell": False, "table_top": .76, "table_size": [1.6, 1.4, .05],
-             "robot_root_transform": root_transform.tolist(), "physics_dt": .002,
+             "robot_root_transform": root_transform.tolist(), "physics_dt": IMPORTED_ROBOT_POLICY['physics_dt_max_s'],
+             "physics_substeps":IMPORTED_ROBOT_POLICY['physics_substeps'],
              "robot_gravity_compensation": 1., "self_collision": True, "adjacent_collision": True,
              "default_armature": None,
              "constraint_solver": "Newton", "friction_cone": "elliptic",
@@ -195,6 +199,8 @@ def import_robot(folder):
             profile['capabilities'].append('handover')
     scene['cube_size'] = min((g['cube_size'] for g in profile['grippers'].values()), default=.052)
     scene['cube_mass'] = .05 * (scene['cube_size'] / .052) ** 3
+    scene['physics_dt']=min(IMPORTED_ROBOT_POLICY['physics_dt_max_s'],max(IMPORTED_ROBOT_POLICY['physics_dt_min_s'],
+        scene['cube_size']*IMPORTED_ROBOT_POLICY['physics_dt_per_cube_meter']))
     profile['cube_size'] = scene['cube_size']
     (target / 'gripper_analysis.json').write_text(json.dumps(analysis, indent=2) + '\n')
     seeds = {}
@@ -234,7 +240,7 @@ def import_robot(folder):
         "spawn_validation.json admits desk props only when supported-height grasp/approach IK, robot/desk clearance and sampled jaw closure pass. Full paths and contacts are verified during execution.\n"
         "Opposed jaws and cube size are inferred from collision geometry. Every grasp still requires two contacts and lift-follow in Genesis. Continuous joints have no invented finite limits.\n")
     profile['configuration_sha256'] = hashlib.sha256(json.dumps(
-        {'source': profile['asset_sha256'], 'version': PROFILE_VERSION, 'adjacent_collision': True,
+        {'source': profile['asset_sha256'], 'version': PROFILE_VERSION, 'policy':policy_signature(),'adjacent_collision': True,
          'chains': chains, 'grippers': profile['grippers'], 'cube_size': scene['cube_size'],
          'home': home, 'root': profile['root_transform']}, sort_keys=True).encode()).hexdigest()
     # The catalog sees only complete registrations, after all IK/setup files exist.

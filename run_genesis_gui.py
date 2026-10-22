@@ -58,6 +58,7 @@ def main() -> None:
     active_id = None
     last_publish = 0.0
     last_control = 0.0
+    last_viewer_refresh = 0.0
     stop_cache = False
 
     def publish(event=None, force=False, **payload):
@@ -79,7 +80,12 @@ def main() -> None:
             pass
 
     def should_stop():
-        nonlocal last_control, stop_cache
+        nonlocal last_control, stop_cache, last_viewer_refresh
+        # Private IK/collision searches can run without advancing physics.
+        # Pump the native window on the same main thread while they work.
+        if time.monotonic()-last_viewer_refresh>.05:
+            env.refresh_viewer()
+            last_viewer_refresh=time.monotonic()
         if active_id and time.monotonic() - last_control > .25:
             publish()
             try:

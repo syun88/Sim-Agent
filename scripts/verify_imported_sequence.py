@@ -19,6 +19,7 @@ def main():
     parser.add_argument('--instruction',default='右手で青いキューブを取って左手に渡して左側の赤いキューブの上に乗せて')
     parser.add_argument('--json',type=Path,required=True)
     parser.add_argument('--timeout',type=float,default=600.)
+    parser.add_argument('--image',type=Path,help='Render the measured final stack after execution')
     args=parser.parse_args()
     os.environ['GENESIS_SHOW_VIEWER']='0'
     os.environ.setdefault('OPENARM_FAST_LANGUAGE','1')
@@ -50,6 +51,7 @@ def main():
                 import numpy as np
                 from backend.app.control.motion import joint_spline,maximum_spline_slope
                 path=kw['planned_joints'];curve=joint_spline(path,env.arm_velocity_limits(a[0])) if len(path)>2 else None
+                data['planned_end_joints']=np.asarray(path[-1]).tolist()
                 slope=maximum_spline_slope(curve) if curve is not None else abs(np.asarray(path[-1])-path[0])
                 previous=sum(.56+max(14,int(np.linalg.norm(np.asarray(b)-q)/.005))*env.timestep for q,b in zip(path,path[1:]))
                 data['previous_timing_on_same_path_s']=float(max(previous/6.,max(1.875*slope/2.,default=0.)))
@@ -57,10 +59,18 @@ def main():
             print('MOVE',a[0],result.success,result.trajectory_duration,round(data['wall_s'],3),flush=True)
             return result
         executor.controller.move_to_site=move
+        first_step=env._sim_step;last_checked=first_step
+        observation_stride=max(1,round(.02/env.timestep))
+        report['self_collision_observation_period_s']=observation_stride*env.timestep
+        report['self_collision_observation_count']=0
         def observe():
-            report['observed_steps']+=1
-            if report['observed_steps']%10==0:
+            nonlocal last_checked
+            # Planning also pulses the native step observer for lease/stop
+            # responsiveness. Count only newly advanced Genesis physics steps.
+            report['observed_steps']=env._sim_step-first_step
+            if env._sim_step-last_checked>=observation_stride:
                 report['peak_observed_self_penetration_m']=max(report['peak_observed_self_penetration_m'],env.self_collision_report()['maximum_penetration_m'])
+                report['self_collision_observation_count']+=1;last_checked=env._sim_step
         env.step_observer=observe
         def emit(event,**payload):
             if event=='skill_finished':
@@ -68,6 +78,14 @@ def main():
         deadline=time.monotonic()+args.timeout
         result=executor.run(plan,emit=emit,should_stop=lambda:time.monotonic()>deadline)
         report.update(success=result['success'],status=result['status'],result=result)
+        if args.image:
+            from PIL import Image
+            import numpy as np
+            center=np.mean([env.object_pose(name)[0] for name in env._objects],axis=0)
+            env._camera.set_pose(pos=center+[.20,-.25,.18],lookat=center)
+            args.image.parent.mkdir(parents=True,exist_ok=True)
+            Image.fromarray(env.render()).save(args.image)
+            report['final_image']=str(args.image.resolve())
         save();print('RESULT',result['success'],result['verification'],flush=True)
         return 0 if result['success'] else 1
     except BaseException as error:

@@ -360,8 +360,9 @@ class ImportedRobotSkills(SkillRunner):
         start_ee, start_rotation = self.env.ee_pose(arm)
         relative = start_rotation.T @ (after - start_ee)
         samples = []
+        hold_steps=max(1,int(np.ceil(.02/self.env.timestep)))
         for _ in range(15):
-            self.env.step(max(1, round(.02 / self.env.timestep)))
+            self.env.step(hold_steps)
             ee, attitude = self.env.ee_pose(arm)
             drift = float(np.linalg.norm(attitude.T @ (self.env.object_pose(obj)[0] - ee) - relative))
             pinch = self.env.pinch_evidence(obj, arm)
@@ -378,7 +379,7 @@ class ImportedRobotSkills(SkillRunner):
                     'pinch_contacts': contacts, 'contacts_after_lift': self.env.object_contacts(obj, arm),
                     'object_rose': rise, 'verification_lift': .03, 'cube_size': self.env.cube_size,
                     'position_before': before.tolist(), 'position_after': self.env.object_pose(obj)[0].tolist(),
-                    'hold_duration_s': .3, 'hold_samples': samples, 'pinch': self.env.pinch_evidence(obj, arm),
+                    'hold_duration_s':15*hold_steps*self.env.timestep,'hold_samples': samples, 'pinch': self.env.pinch_evidence(obj, arm),
                     'grip_force_limits': self.env._grip_force_limits[arm],
                     'self_collision': self.env.self_collision_report()}
         self.env.grippers[arm]['status'] = 'physical_grasp_verified'
@@ -629,7 +630,9 @@ class ImportedRobotSkills(SkillRunner):
         if self.held_object(receiver):raise SkillError('HAND_OCCUPIED','The receiving hand is occupied')
         self.controller.wait_gripper(receiver,False,.6)
         planner=ExchangePlanner(self)
+        planning_started=time.perf_counter()
         plan=planner.plan(arm,receiver,obj)
+        initial_planning_s=time.perf_counter()-planning_started
         point,rotation,*_=self.env.arm_kinematics(arm).evaluate(plan['donor_path'][-1])
         self._move(arm,point,rotation,planned_joints=plan['donor_path'],on_sample=lambda:self._require_hold(arm,obj))
         # Reobserve after physical travel: the cube's small compliance/slip is
@@ -637,8 +640,14 @@ class ImportedRobotSkills(SkillRunner):
         center,cube_rotation=self.env.object_pose(obj)
         snapshot=self.env.joint_snapshot();donor_q=self.env.arm_qpos(arm);donor_rotation=self.env.ee_pose(arm)[1]
         planner=ExchangePlanner(self)
+        receiver_hint=plan.get('observed_receiver_hint') or {
+            'object_rotation':(plan['predicted_cube_rotation'].T@plan['receiver']['rotation']).tolist(),
+            'bias':plan['receiver']['bias'].tolist(),'open_arm_q':plan['receiver']['closure'][0]['arm_q'].tolist()}
+        planning_started=time.perf_counter()
         recipient=planner.receiver(arm,receiver,center,cube_rotation,snapshot,
-            lambda p:planner.completion(arm,receiver,donor_q,donor_rotation,snapshot,p))
+            lambda p:planner.completion(arm,receiver,donor_q,donor_rotation,snapshot,p),
+            preferred=receiver_hint)
+        observed_planning_s=time.perf_counter()-planning_started
         if recipient is None:raise SkillError('HANDOVER_UNREACHABLE','The measured exchange pose has no complete receiving path')
         self._move(receiver,recipient['target'],recipient['rotation'],planned_joints=recipient['path'],
                    on_sample=lambda:self._require_hold(arm,obj))
@@ -674,9 +683,10 @@ class ImportedRobotSkills(SkillRunner):
         if rise<.021:raise SkillError('HANDOVER_FAILED',f'The receiver lifted the released cube only {rise:.6f}m')
         ee,attitude=self.env.ee_pose(receiver);relative=attitude.T@(self.env.object_pose(obj)[0]-ee)
         samples=[]
+        hold_steps=max(1,int(np.ceil(.02/self.env.timestep)))
         allowed={name for group in self.env.grippers[receiver]['contact_groups'] for name in group}
         for _ in range(15):
-            self.env.step(max(1,round(.02/self.env.timestep)))
+            self.env.step(hold_steps)
             point,rot=self.env.ee_pose(receiver)
             samples.append({'pinch':self.env.pinch_established(obj,receiver),
                 'relative_drift_m':float(np.linalg.norm(rot.T@(self.env.object_pose(obj)[0]-point)-relative)),
@@ -687,10 +697,20 @@ class ImportedRobotSkills(SkillRunner):
             error.evidence={'hold_samples':samples};raise error
         evidence={'grasp_mode':self.env.grasp_mode,'grasp_is_physical_contact':True,'object':obj,'receiver':receiver,
             'giver_contacts_before_release':donor_contacts,'receiver_pinch_contacts':receiver_contacts,
-            'receiver_lift':rise,'hold_samples':samples,'handover_center':center.tolist(),
+            'receiver_lift':rise,'hold_samples':samples,'hold_duration_s':15*hold_steps*self.env.timestep,'handover_center':center.tolist(),
             'receiver_grasp_bias_m':recipient['bias'].tolist(),'planning_attempts':plan['planning_attempts'],
+            'initial_planning_s':initial_planning_s,'observed_planning_s':observed_planning_s,
+            'observed_planning_attempts':dict(planner.attempts),
             'self_collision':self.env.self_collision_report()}
         self.env.record_grasp_verification(receiver,evidence)
+        from backend.app.robots.skill_recipes import record_exchange_recipe
+        def hint(value,object_rotation):
+            return {'object_rotation':(object_rotation.T@value['rotation']).tolist(),
+                'bias':value['bias'].tolist(),'open_arm_q':value['closure'][0]['arm_q'].tolist()}
+        evidence['recipe_saved']=record_exchange_recipe(self.env.profile,arm,receiver,{
+            'center':plan['center'].tolist(),'donor_rotation':plan['donor_rotation'].tolist(),
+            'predicted_receiver':hint(plan['receiver'],plan['predicted_cube_rotation']),
+            'receiver':hint(recipient,cube_rotation),'verification_lift_m':rise,'hold_duration_s':15*hold_steps*self.env.timestep})
         return evidence
 
     def _joint_trajectory(self, arm, target, duration=1.):

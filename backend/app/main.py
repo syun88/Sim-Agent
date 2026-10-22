@@ -149,7 +149,7 @@ def select_robot(request: RobotSelection):
 @app.get('/api/robots/{robot_id}/files/{filename}')
 def robot_file(robot_id: str, filename: str):
     if filename not in {'gripper_analysis.json', 'profile.json', 'scene.json', 'ik_seeds.json', 'ik_validation.json', 'spawn_validation.json',
-                        'runtime_validation.json', 'auto_grasp_validation.json', 'gripper_runtime.json', 'solve_ik.py', 'README.md', 'robot.urdf'}:
+                        'runtime_validation.json', 'auto_grasp_validation.json', 'gripper_runtime.json', 'handover_skills.json', 'solve_ik.py', 'README.md', 'robot.urdf'}:
         raise HTTPException(404, 'Unknown generated file')
     try:
         profile = get_profile(robot_id)

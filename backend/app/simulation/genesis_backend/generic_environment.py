@@ -6,6 +6,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from backend.app.robots.registry import get_profile
+from backend.app.robots.policy import IMPORTED_ROBOT_POLICY as POLICY
 from backend.app.robots.urdf import URDFModel, URDFKinematics
 from backend.app.robots.spawn import ReachableDeskSpawns
 from backend.app.simulation.base import SimulationBackend, Frame
@@ -21,8 +22,7 @@ class GenericURDFEnvironment(SimulationBackend):
     ik_rotation_tolerance = .004
     motion_position_tolerance = .004
     motion_rotation_tolerance = .025
-    cartesian_motion_limits = {'linear_velocity_m_s':.25,'linear_acceleration_m_s2':1.,
-        'angular_velocity_rad_s':2.5,'angular_acceleration_rad_s2':12.,'minimum_duration_s':.2}
+    cartesian_motion_limits = POLICY['tool_limits']
 
     def __init__(self, robot_id, show_viewer=False, prefer_gpu=False):
         self.profile = get_profile(robot_id)
@@ -42,7 +42,7 @@ class GenericURDFEnvironment(SimulationBackend):
         self._spawn_sampler = ReachableDeskSpawns(self.profile, scene_config)
         self.spawn_validation = self._spawn_sampler.layout()
         self._dt = float(scene_config["physics_dt"])
-        self._scene = gs.Scene(sim_options=gs.options.SimOptions(dt=self._dt, substeps=2),
+        self._scene = gs.Scene(sim_options=gs.options.SimOptions(dt=self._dt, substeps=int(scene_config.get('physics_substeps',2))),
             rigid_options=gs.options.RigidOptions(constraint_solver=gs.constraint_solver.Newton,
                 friction_cone=gs.friction_cone.elliptic, enable_torsional_friction=True, enable_rolling_friction=True,
                 enable_self_collision=True, enable_neutral_collision=True,
@@ -77,7 +77,10 @@ class GenericURDFEnvironment(SimulationBackend):
                                    np.inf if j["upper"] is None else j["upper"]] for j in self.profile["joints"]}
         self._entity.set_dofs_position(np.array([self.profile["home"][name] for name in self._all_names]), self._all_dofs)
         inertia = np.maximum(np.diag(self._entity.get_mass_mat().cpu().numpy())[self._all_dofs], 1e-6)
-        kp = np.clip(inertia * 400., 10., 500.)
+        arm_names={name for chain in self.profile['chains'].values() for name in chain['joints']}
+        response=np.asarray([POLICY['arm_response_rad_s'] if name in arm_names else POLICY['finger_response_rad_s']
+                             for name in self._all_names])
+        kp = np.clip(inertia * response**2,POLICY['kp_min'],POLICY['kp_max'])
         self._entity.set_dofs_kp(kp, self._all_dofs)
         kv = 2. * np.sqrt(kp * inertia)
         self._entity.set_dofs_kv(kv, self._all_dofs)
@@ -89,7 +92,7 @@ class GenericURDFEnvironment(SimulationBackend):
         self._gripper_force_holds = set()
         self._grip_force_limits = {}
         for side, g in self.grippers.items():
-            force = max(.25, self.cube_mass * 9.81 * 4. / (2. * .6))
+            force = max(.25,self.cube_mass*9.81*POLICY['grip_weight_margin']/(2.*POLICY['friction_assumption']))
             effort = force if g['type'] == 'sliding_jaws' else force * g['finger_length']
             cap = min(effort, self.model.by_name[g['joint']]['effort'])
             dofs = list(self._gripper_dofs[side].values())
@@ -102,6 +105,8 @@ class GenericURDFEnvironment(SimulationBackend):
         self._gripper_commands, self._gripper_goals = {}, {}
         self._sim_step = 0
         self._contact_evidence_cache, self._contact_visuals = {}, {}
+        from backend.app.robots.contacts import PinchContactTracker
+        self._pinch_tracker=PinchContactTracker()
         self.reset()
         self._private_collisions = None
 
@@ -158,6 +163,7 @@ class GenericURDFEnvironment(SimulationBackend):
         self.spawn_validation = placements
         self._sim_step = 0
         self._contact_evidence_cache.clear()
+        self._pinch_tracker.reset()
         q = np.array([self.profile["home"][name] for name in self._all_names])
         self._entity.set_dofs_position(q, self._all_dofs)
         self._entity.set_dofs_velocity(np.zeros_like(q), self._all_dofs)
@@ -245,6 +251,7 @@ class GenericURDFEnvironment(SimulationBackend):
         temporary = path.with_suffix('.json.tmp')
         temporary.write_text(json.dumps(recorded, indent=2) + '\n')
         temporary.replace(path)
+        self.grippers[side]['status']='physical_grasp_verified'
         self.profile['grasp_calibrated'] = all(s in recorded['arms'] for s in self.grippers)
 
     def minimum_release_height(self, side, obj, surface):
@@ -329,7 +336,6 @@ class GenericURDFEnvironment(SimulationBackend):
         return self._contact_visuals[link_name]
 
     def pinch_evidence(self, name, side):
-        from backend.app.robots.contacts import evaluate_pinch_contacts
         import trimesh
         key = (self._sim_step, name, side)
         if key in self._contact_evidence_cache:
@@ -357,21 +363,27 @@ class GenericURDFEnvironment(SimulationBackend):
             depth = float(local @ pad['forward'])
             height = float(local @ pad['height_axis'])
             distal = pad['depth_min'] <= depth <= pad['depth_max'] and abs(height - pad['height_center']) <= pad['height_half_extent']
-            surface_error = None
-            if distal:
-                link = self._entity.get_link(link_name)
-                quat = link.get_quat().cpu().numpy()
-                rotation = Rotation.from_quat(quat[[1, 2, 3, 0]]).as_matrix()
-                positions = point + np.array([[-.5], [0.], [.5]]) * normal * penetration
-                points = (positions - link.get_pos().cpu().numpy()) @ rotation
-                surface = self._contact_surface(link_name)
-                if surface is not None:
-                    surface_error = float(trimesh.proximity.closest_point(surface, points)[1].min())
             force = raw['force_b' if object_is_b else 'force_a'][i]
             contacts.append({'robot_link': link_name, 'position': point.tolist(), 'normal': normal.tolist(),
                 'force_on_object_N': force.tolist(), 'normal_force_N': abs(float(force @ normal)),
-                'penetration_m': penetration, 'on_distal_pad': bool(distal), 'surface_error_m': surface_error})
-        result = evaluate_pinch_contacts(contacts, g, self.cube_size, self.cube_mass)
+                'penetration_m': penetration, 'on_distal_pad': bool(distal), 'surface_error_m': None})
+        # Convex pieces can produce many contacts on the same authored pad.
+        # Query its unchanged surface once for all three probes per contact,
+        # rather than repeating pose reads and proximity-tree setup per point.
+        for link_name in {c['robot_link'] for c in contacts if c['on_distal_pad']}:
+            distal=[c for c in contacts if c['robot_link']==link_name and c['on_distal_pad']]
+            surface=self._contact_surface(link_name)
+            if surface is None:continue
+            link=self._entity.get_link(link_name);quat=link.get_quat().cpu().numpy()
+            rotation=Rotation.from_quat(quat[[1,2,3,0]]).as_matrix()
+            points=np.asarray([c['position'] for c in distal])[:,None,:]
+            normals=np.asarray([c['normal'] for c in distal])[:,None,:]
+            depths=np.asarray([c['penetration_m'] for c in distal])[:,None,None]
+            probes=points+np.array([-.5,0.,.5])[None,:,None]*normals*depths
+            local=(probes.reshape(-1,3)-link.get_pos().cpu().numpy())@rotation
+            errors=trimesh.proximity.closest_point(surface,local)[1].reshape(-1,3).min(axis=1)
+            for contact,error in zip(distal,errors):contact['surface_error_m']=float(error)
+        result = self._pinch_tracker.evaluate(side,name,contacts,g,self.cube_size,self.cube_mass)
         # Keep only this step; a reset or another physics step must never reuse old contacts.
         self._contact_evidence_cache = {k: v for k, v in self._contact_evidence_cache.items() if k[0] == self._sim_step}
         self._contact_evidence_cache[key] = result
@@ -443,6 +455,7 @@ class GenericURDFEnvironment(SimulationBackend):
         if g is None:
             raise ValueError('No opposed actuated jaws detected on this arm')
         if value <= 0.:
+            self._pinch_tracker.reset(side)
             self.set_gripper_effort(side, holding=False)
         target = g['open_q'] + np.clip(value, 0., 1.) * (g['closed_q'] - g['open_q'])
         self._gripper_goals[side] = float(target)
@@ -469,8 +482,10 @@ class GenericURDFEnvironment(SimulationBackend):
     def configure_grip_load(self,side,offset_m=0.,mass=None):
         """Budget normal preload for payload weight and an off-centre grip."""
         g=self.grippers[side];mass=self.cube_mass if mass is None else float(mass)
-        radius=max(.0001,min(g['pad_height'],self.cube_size)*.25)
-        force=max(.25,mass*9.81*(4./(2.*.6)+abs(offset_m)/(.6*radius)))
+        radius=max(.0001,min(g['pad_height'],self.cube_size)*POLICY['contact_radius_fraction'])
+        friction=POLICY['friction_assumption']
+        force=max(.25,mass*9.81*POLICY['grip_weight_margin']/(2.*friction),
+            mass*9.81*(POLICY['grip_wrench_weight_margin']/(2.*friction)+abs(offset_m)/(friction*radius)))
         lever=1. if g['type']=='sliding_jaws' else g['finger_length']
         source=self.model.by_name[g['joint']]
         cap=min(force*lever,source['effort'])

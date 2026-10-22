@@ -119,6 +119,11 @@ joint travel time. `control/path_timing.py` applies forward/backward local speed
 motor and tool-space velocity/acceleration limits; a short tight corner does not slow the
 entire path. There is no fixed wait per intermediate IK sample. The official OpenArm path
 retains its existing timing policy.
+Imported numeric policy lives in `robots/policy.py`: tool velocity/acceleration, size-scaled
+physics dt (up to 5ms, two substeps), impedance and contact tolerances enter the configuration
+hash. Loaded transport shortcuts are checked against both mechanism and payload geometry,
+then against the interpolated curve, and selected only when local retiming is faster.
+Settling uses a time budget rather than a fixed step count which grows with dt.
 The optional `default_armature=None` retains authored inertia without adding Genesis's default rotor
 inertia to small fingers. `simulation/runtime_owner.py` gives native runs, tests and standalone
 Genesis validators the same process lease; the broker still owns no physics world.
@@ -129,6 +134,18 @@ independent lift against a combined joint snapshot. A box probe checks that both
 can actually reach the object before a full jaw sweep is attempted. The object is reobserved
 after donor motion; predicted pose is never written into Genesis. Source-limited normal
 preload accounts for payload weight and off-centre contact after donor release.
+Only a physically completed exchange, including independent receiver lift and 300ms hold,
+can write `handover_skills.json`. The configuration-bound recipe stores geometric parameters
+and an IK initial guess, not a motor trajectory. Both predicted and reobserved receiving
+poses, closure, travel and departure are recomputed and checked on reuse. Rejected recipes
+fall back to ordinary search. The executor records cache hits and both planning durations.
+The native runner pumps the viewer on the main thread during private planning checks.
+
+Contact surface distances are queried in batches per authored finger mesh. A Schmitt trigger
+requires strict distal, opposed, loaded contacts to enter; its small surface-distance exit
+band never relaxes normal force, opposition, distal membership or penetration limits. Open,
+reset or contact loss clears it. Lift/follow and unsupported physical hold remain separate
+acceptance gates.
 
 `robots/placement.py` plans with the measured wrist-to-payload transform. Stable cube faces
 and yaw are searched independently of a fixed canonical wrist pose. Robot/desk clearance,

@@ -94,6 +94,43 @@ def cleared_empty_path(env,arm,goal,stop):
     return None
 
 
+def shorten_loaded_path(env,arm,obj,path,stop=lambda:False):
+    """Shortcut a transit only when the robot AND real payload geometry fit.
+
+    A single held cube may change orientation during free transit. Keeping an
+    unnecessary straight Cartesian tool line can produce large redundant wrist
+    excursions and slow down a route which has a short, clear joint path.
+    """
+    query=LoadedBoxQueries(env,arm,obj);snapshot=env.joint_snapshot();names=query.names
+    compact=[np.asarray(path[0])];index=0
+    while index<len(path)-1:
+        if stop():return None
+        end=len(path)-1
+        while end>index and not query.edge_clear(names,path[index],path[end],snapshot):end-=1
+        if end==index:return None
+        compact.append(np.asarray(path[end]));index=end
+    original=joint_spline(path,env.arm_velocity_limits(arm))
+    from backend.app.control.path_timing import PathTiming
+    old_time=PathTiming(query.kinematics,original,path[0],path[-1],env.arm_velocity_limits(arm),env.cartesian_motion_limits).duration
+    for spacing in (.05,.025,.01):
+        dense=[compact[0]]
+        for a,b in zip(compact,compact[1:]):
+            count=max(1,int(np.ceil(np.max(abs(b-a))/spacing)))
+            dense.extend(a+(b-a)*t for t in np.linspace(0.,1.,count+1)[1:])
+        curve=joint_spline(dense,env.arm_velocity_limits(arm))
+        count=max(40,int(np.sum(np.linalg.norm(np.diff(dense,axis=0),axis=1))/.025))
+        if all(query.clear({**snapshot,**dict(zip(names,curve(t)))})
+               for t in np.unique(np.r_[np.linspace(0.,1.,count+1),curve.x])):
+            new_time=PathTiming(query.kinematics,curve,dense[0],dense[-1],env.arm_velocity_limits(arm),env.cartesian_motion_limits).duration
+            if new_time<old_time:return dense
+            break
+    # A failed shortcut must not replace the original validated transit.
+    count=max(40,int(np.sum(np.linalg.norm(np.diff(path,axis=0),axis=1))/.025))
+    if all(query.clear({**snapshot,**dict(zip(names,original(t)))})
+           for t in np.unique(np.r_[np.linspace(0.,1.,count+1),original.x])):return path
+    return None
+
+
 def plan_placement(skills,arm,obj,xy,surface,reference=None,timeout=90.):
     env=skills.env;c=skills.controller;deadline=time.monotonic()+timeout
     loaded=LoadedBoxQueries(env,arm,obj);snapshot=env.joint_snapshot();start=env.arm_qpos(arm)

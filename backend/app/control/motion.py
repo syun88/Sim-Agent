@@ -16,7 +16,7 @@ from backend.app.simulation.openarm_v2.definition import (
 from backend.app.simulation.transform import orientation_error
 
 # Motor targets need not cross the Python/engine boundary at the 1 kHz physics
-# rate. The solver still integrates every step; a target is held for at most 4 ms.
+# rate. The target cadence is 4ms, or one physics step when its dt is larger.
 MOTOR_COMMAND_PERIOD = .004
 
 
@@ -330,8 +330,12 @@ class OpenArmV2Controller:
         previous_position, previous_rotation = actual.copy(), actual_rotation.copy()
         stable_steps = 0
         settle_quantum = 10 if scale_speed else 20
+        settling_iterations=300//settle_quantum
+        if getattr(self.env,'cartesian_motion_limits',None):
+            settle_quantum=max(1,round(.01/self.timestep))
+            settling_iterations=int(np.ceil(.6/(settle_quantum*self.timestep)))
         require_stable = scale_speed and self.motion_speed != 1.
-        for _ in range(300 // settle_quantum):
+        for _ in range(settling_iterations):
             if not require_stable and residual <= .004 and rotation_residual <= .06:
                 break
             if self.stop_requested():
