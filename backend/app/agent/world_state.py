@@ -23,14 +23,21 @@ def physical_holds(env: SimulationBackend) -> dict[str, str | None]:
 def build_world_state(env: SimulationBackend) -> dict:
     frame = env.frame()
     holds = physical_holds(env)
+    contacts = env.contact_names()
+    available = getattr(env,'available_arms',['left','right'])
     objects = []
     for name, position in frame.objects.items():
         color = name.split("_")[0]
+        _, attitude = env.object_pose(name)
         objects.append({
             "id": name,
             "type": {"wine_bottle": "bottle", "wine_glass": "glass"}.get(name, "cube"),
             "color": color,
             "position": position,
+            "rotation": attitude.tolist(),
+            "linear_speed_m_s": env.object_linear_speed(name),
+            "touching": sorted({other for pair in contacts if name in pair.split('|')
+                                for other in pair.split('|') if other != name}),
             "graspable": name != "wine_glass" and getattr(env, 'grasp_is_physical_contact', True),
             "held_by": [side for side, obj in holds.items() if obj == name],
             **({"bounds": env.object_bounds(name).tolist()} if name.endswith("_cube") else {}),
@@ -42,6 +49,9 @@ def build_world_state(env: SimulationBackend) -> dict:
     targets.extend({"id": name, "position": env.zone_position(name).tolist() if imported else list(position),
                     "type": "table_region"} for name, position in TABLE_TARGETS.items())
     relations = []
+    from backend.app.agent.scene_relations import support_relations
+    supports = support_relations(objects,contacts)
+    relations.extend(supports)
     for obj in objects:
         obj_pos = np.asarray(obj["position"])
         for target in targets:
@@ -57,11 +67,20 @@ def build_world_state(env: SimulationBackend) -> dict:
             other_pos = np.asarray(other["position"])
             if abs(obj_pos[2] - other_pos[2]) < 0.08 and abs(obj_pos[0] - other_pos[0]) < 0.18:
                 relations.append({"subject": obj["id"], "relation": "right_of" if obj_pos[1] < other_pos[1] else "left_of", "object": other["id"], "distance": float(abs(obj_pos[1] - other_pos[1]))})
+    if hasattr(env,'joint_snapshot'):
+        joints = env.joint_snapshot()
+    else:
+        from backend.app.simulation.openarm_v2.definition import ARM_JOINTS
+        joints = {name:float(value) for side in available
+                  for name,value in zip(ARM_JOINTS[side],env.arm_qpos(side))}
     return {
         "robot": {
             "type": getattr(env, "robot_id", "openarm_v2"),
             "name": getattr(env, "robot_name", "OpenArm v2"),
             "available_arms": getattr(env, "available_arms", ["left", "right"]),
+            "end_effectors": {side:{'position':frame.ee[side],'rotation':env.ee_pose(side)[1].tolist()}
+                              for side in available},
+            "joint_positions": joints,
             **({"chains": env.profile["chains"],
                 "model_summary": env.model_summary(),
                 "joints": [{key: joint[key] for key in ("name", "type", "lower", "upper", "effort", "velocity")}
@@ -73,6 +92,8 @@ def build_world_state(env: SimulationBackend) -> dict:
         "objects": objects,
         "targets": targets,
         "spatial_relations": relations,
+        "support_relations": supports,
+        "workspace": {"table_height_m":env.table_height,"position_unit":"m","rotation":"world_from_object"},
         "capabilities": {"relative_placement": ["on", "left_of", "right_of", "front_of", "behind", "near"],
                          "skills": ["move_relative", "return_home", "move_joint"] if imported and not env.profile.get("grippers") else
                          ["approach_object", "grasp_object", "lift_object", "move_to_target", "move_to_object",

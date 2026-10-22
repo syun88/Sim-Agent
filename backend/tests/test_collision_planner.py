@@ -16,6 +16,23 @@ def test_parent_child_collision_is_detected_without_mutating_source(tmp_path):
     assert source.read_bytes() == before
 
 
+def test_grasp_box_probe_reports_finger_clearance_without_creating_dynamics_contacts(tmp_path):
+    source=tmp_path/'probe.urdf'
+    source.write_text('''<robot name="probe"><link name="base"/><link name="finger">
+      <collision><geometry><box size=".01 .01 .03"/></geometry></collision></link>
+      <joint name="slide" type="prismatic"><parent link="base"/><child link="finger"/>
+      <origin xyz=".02 0 0"/><axis xyz="1 0 0"/>
+      <limit lower="0" upper=".1" effort="1" velocity="1"/></joint></robot>''')
+    query=PrivateCollisionQueries({'urdf':str(source),'root_transform':np.eye(4).tolist()})
+    assert query.clear({'slide':0.})
+    points=query.box_contact_points({'slide':0.},[0.,0.,0.],np.eye(3),.03,{'finger'})
+    assert points and abs(points[0]['distance_m'])<1e-6
+    assert query.clear({'slide':0.})
+    assert not query.box_contact_points({'slide':.02},[0.,0.,0.],np.eye(3),.03,{'finger'})
+    shifted=query.box_contact_points({'slide':.02},[.02,0.,0.],np.eye(3),.03,{'finger'})
+    assert shifted and abs(shifted[0]['distance_m'])<1e-6
+
+
 def test_path_goes_around_an_obstacle_instead_of_accepting_a_clear_endpoint_only():
     query = object.__new__(PrivateCollisionQueries)
     query.clear = lambda q: not (abs(q['x']) < .22 and abs(q['y']) < .65)
@@ -25,6 +42,23 @@ def test_path_goes_around_an_obstacle_instead_of_accepting_a_clear_endpoint_only
     assert path is not None
     np.testing.assert_allclose(path[0], start);np.testing.assert_allclose(path[-1], goal)
     assert all(query.edge_clear(names, a, b, {}) for a, b in zip(path, path[1:]))
+
+
+def test_adjacent_collision_intervals_bound_ik_without_changing_urdf(tmp_path):
+    source=tmp_path/'blocked_turn.urdf'
+    source.write_text('''<robot name="blocked_turn"><link name="base"><collision>
+      <origin xyz="0 .1 0"/><geometry><sphere radius=".02"/></geometry></collision></link>
+      <link name="tool"><collision><origin xyz=".1 0 0"/>
+      <geometry><sphere radius=".02"/></geometry></collision></link>
+      <joint name="turn" type="continuous"><parent link="base"/><child link="tool"/>
+      <axis xyz="0 0 1"/><limit effort="1" velocity="1"/></joint></robot>''')
+    profile={'urdf':str(source),'root_transform':np.eye(4).tolist()}
+    before=source.read_bytes();query=PrivateCollisionQueries(profile)
+    low,high=query.adjacent_joint_intervals(['turn'],{'turn':0.})[0]
+    assert -2.*np.pi < low < -np.pi and 0. < high < np.pi/2.
+    assert query.edge_clear(['turn'],np.array([low]),np.array([high]),{},minimum_clearance=.0001)
+    assert not query.clear({'turn':high+.01})
+    assert source.read_bytes()==before
 def test_pose_refinement_uses_redundancy_to_avoid_collision_without_changing_tool_goal(tmp_path):
     import numpy as np
     from backend.app.robots.collision_planner import PrivateCollisionQueries

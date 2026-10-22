@@ -67,10 +67,39 @@ class PrivateCollisionQueries:
                 if child['parent'] == link:
                     link_body(child['child'], body, np.asarray(child['origin']), child)
         link_body(self.urdf.root, world, np.asarray(profile['root_transform']))
+        ET.SubElement(world,'geom',name='grasp_probe',type='box',size='.01 .01 .01',contype='0',conaffinity='0')
         self.model = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding='unicode'))
         self.data = mujoco.MjData(self.model)
         self.addresses = {j['name']: self.model.jnt_qposadr[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, j['name'])]
                           for j in self.urdf.joints if j['type'] != 'fixed'}
+
+    def box_contact_points(self,values,center,rotation,size,links,distance=.001):
+        """Geometric grasp preflight only; this never asserts a loaded pinch."""
+        mj,model,data=self.mujoco,self.model,self.data
+        probe=mj.mj_name2id(model,mj.mjtObj.mjOBJ_GEOM,'grasp_probe')
+        model.geom_pos[probe]=center
+        model.geom_quat[probe]=Rotation.from_matrix(rotation).as_quat()[[3,0,1,2]]
+        model.geom_size[probe]=np.broadcast_to(size,(3,))/2.
+        model.geom_rbound[probe]=np.linalg.norm(model.geom_size[probe])
+        for name,address in self.addresses.items():
+            driver,k,offset=self.urdf.joint_driver(name);data.qpos[address]=values.get(driver,0.)*k+offset
+        mj.mj_kinematics(model,data)
+        # MuJoCo caches world-attached geom poses in MjData. Updating the
+        # model's static pose alone leaves a query box at its compile-time pose.
+        data.geom_xpos[probe]=center
+        data.geom_xmat[probe]=np.asarray(rotation).reshape(9)
+        result=[]
+        if not hasattr(self,'_probe_link_names'):
+            self._probe_link_names=[mj.mj_id2name(model,mj.mjtObj.mjOBJ_BODY,int(b)) for b in model.geom_bodyid]
+        candidates=np.array([i for i,name in enumerate(self._probe_link_names) if name in links],int)
+        near=(np.linalg.norm(data.geom_xpos[candidates]-center,axis=1)
+              <=model.geom_rbound[candidates]+model.geom_rbound[probe]+distance)
+        for geom in candidates[near]:
+            name=self._probe_link_names[geom]
+            line=np.zeros(6)
+            gap=mj.mj_geomDistance(model,data,geom,probe,distance,line)
+            if gap<distance:result.append({'link':name,'distance_m':float(gap),'position':((line[:3]+line[3:])/2.).tolist()})
+        return result
 
     def contacts(self, values, tolerance=.0002):
         mj, model, data = self.mujoco, self.model, self.data
@@ -92,6 +121,47 @@ class PrivateCollisionQueries:
 
     def clear(self, values):
         return not self.contacts(values)
+
+    def adjacent_joint_intervals(self,names,reference,minimum_clearance=.0001):
+        """Necessary IK bounds from each adjacent link pair's own geometry.
+
+        Relative placement of a joint's parent/child solids depends only on that
+        joint. Stay in the connected interval containing the setup posture.
+        Sampling supplies optimisation bounds, not a collision certificate:
+        every candidate and its complete path must still pass normal queries.
+        """
+        limits=[]
+        for name in names:
+            joint=self.urdf.by_name[name]
+            low=-np.inf if joint['lower'] is None else joint['lower']
+            high=np.inf if joint['upper'] is None else joint['upper']
+            pair={joint['parent'],joint['child']}
+            if not all(self.urdf.links[link].find('collision') is not None for link in pair):
+                limits.append([low,high]);continue
+            value=float(reference.get(name,0.))
+            def free(q):
+                return not any(set(c['links'])==pair for c in self.contacts(
+                    {**reference,name:q},tolerance=-minimum_clearance))
+            if not free(value):
+                limits.append([low,high]);continue
+            ends=[]
+            for direction,bound in ((-1.,low),(1.,high)):
+                span=min(abs(bound-value),2.*np.pi) if np.isfinite(bound) else 2.*np.pi
+                spacing=.01 if joint['type']=='prismatic' else .05
+                previous=value;end=bound
+                for distance in np.linspace(0.,span,max(2,int(np.ceil(span/spacing))+1))[1:]:
+                    probe=value+direction*distance
+                    if not free(probe):
+                        blocked=probe
+                        for _ in range(12):
+                            middle=(previous+blocked)/2.
+                            if free(middle):previous=middle
+                            else:blocked=middle
+                        end=previous;break
+                    previous=probe
+                ends.append(end)
+            limits.append(ends)
+        return np.asarray(limits,float)
 
     def refine_pose(self, profile, side, position, rotation, q, snapshot, minimum_clearance=0.):
         """Resolve small collisions while retaining the requested tool pose.

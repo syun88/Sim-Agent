@@ -21,6 +21,8 @@ class GenericURDFEnvironment(SimulationBackend):
     ik_rotation_tolerance = .004
     motion_position_tolerance = .004
     motion_rotation_tolerance = .025
+    cartesian_motion_limits = {'linear_velocity_m_s':.25,'linear_acceleration_m_s2':1.,
+        'angular_velocity_rad_s':2.5,'angular_acceleration_rad_s2':12.,'minimum_duration_s':.2}
 
     def __init__(self, robot_id, show_viewer=False, prefer_gpu=False):
         self.profile = get_profile(robot_id)
@@ -112,6 +114,13 @@ class GenericURDFEnvironment(SimulationBackend):
     def joint_snapshot(self):
         return dict(zip(self._all_names, self._entity.get_dofs_position(self._all_dofs).cpu().numpy().astype(float)))
 
+    def ik_joint_limits(self,side):
+        if not hasattr(self,'_geometric_joint_limits'):self._geometric_joint_limits={}
+        if side not in self._geometric_joint_limits:
+            names=self.profile['chains'][side]['joints']
+            self._geometric_joint_limits[side]=self.collision_queries.adjacent_joint_intervals(names,self.profile['home'])
+        return self._geometric_joint_limits[side]
+
     def plan_joint_waypoints(self, side, waypoints, stop=lambda: False):
         names = self.profile['chains'][side]['joints']
         snapshot = self.joint_snapshot()
@@ -123,8 +132,13 @@ class GenericURDFEnvironment(SimulationBackend):
             result.extend(segment[1:])
         return result
 
-    def joint_curve_is_clear(self, side, curve, waypoints):
+    def joint_waypoints_are_clear(self,side,waypoints):
         names = self.profile['chains'][side]['joints'];snapshot = self.joint_snapshot()
+        return all(self.collision_queries.edge_clear(names,a,b,snapshot) for a,b in zip(waypoints,waypoints[1:]))
+
+    def joint_curve_is_clear(self, side, curve, waypoints, *, snapshot=None):
+        names = self.profile['chains'][side]['joints']
+        snapshot = self.joint_snapshot() if snapshot is None else snapshot
         count = max(16, int(np.sum(np.linalg.norm(np.diff(waypoints, axis=0), axis=1))/.035))
         samples = np.unique(np.r_[np.linspace(0.,1.,count+1),curve.x])
         return all(self.collision_queries.clear({**snapshot, **dict(zip(names, curve(t)))}) for t in samples)
@@ -451,6 +465,19 @@ class GenericURDFEnvironment(SimulationBackend):
             hi = transit if not holding or direction<0 else preload
             lower.append(-lo);upper.append(hi);dofs.append(self._gripper_dofs[side][name])
         self._entity.set_dofs_force_range(np.asarray(lower), np.asarray(upper), dofs)
+
+    def configure_grip_load(self,side,offset_m=0.,mass=None):
+        """Budget normal preload for payload weight and an off-centre grip."""
+        g=self.grippers[side];mass=self.cube_mass if mass is None else float(mass)
+        radius=max(.0001,min(g['pad_height'],self.cube_size)*.25)
+        force=max(.25,mass*9.81*(4./(2.*.6)+abs(offset_m)/(.6*radius)))
+        lever=1. if g['type']=='sliding_jaws' else g['finger_length']
+        source=self.model.by_name[g['joint']]
+        cap=min(force*lever,source['effort'])
+        limits=self._grip_force_limits[side]
+        limits.update(normal_force_target_N=force,motor_effort_limit=cap,
+            transit_effort_limit=min(source['effort'],cap+(limits['kv']+limits['damping'])*source['velocity']),
+            load_offset_m=float(offset_m),payload_mass_kg=mass,contact_radius_m=radius)
 
     def command_gripper_joint(self, side, target):
         self._gripper_force_holds.discard(side)

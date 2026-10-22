@@ -63,7 +63,14 @@ before loading an existing profile. Continuous joints retain unbounded angular l
 `robots/urdf.py` evaluates the URDF tree, spatial Jacobians and bounded private IK. The generated
 `solve_ik.py` exports an IK solution without moving the live scene. This is kinematic evidence;
 `scripts/verify_imported_robot.py` separately compares FK against Genesis and drives actual motors.
-URDF masses/forces are used as supplied and are not assumed to be hardware-calibrated.
+URDF masses are preserved. Optional `actuators.json` explicitly replaces export placeholder
+effort/velocity limits using named hardware presets; no hardware is inferred from mesh names.
+The STS3215-C001 7.4V preset records 1.9123Nm peak torque, 5.454rad/s no-load speed and
+0.4903Nm rated torque, with the FEETECH specification URL. Source URDF bytes remain unchanged.
+The metadata enters the asset/configuration hash and invalidates previous runtime evidence.
+Adjacent parent/child collision geometry supplies connected IK intervals; normal candidate,
+edge and curve checks still run. The analytic orientation-residual Jacobian is checked against
+finite differences, including near-180-degree rotations.
 
 `POST /api/robots/select` queues a command for the existing native owner. It closes the previous
 world, creates the selected robot's world and executor, then persists the successful selection.
@@ -108,10 +115,33 @@ pad along its inferred normal and lifts vertically on a checked Cartesian path; 
 than 2mm of object displacement. A direct joint shortcut previously swept through a released
 cube despite its clear endpoint. Final release requires absent finger contacts, desk support,
 stability and placement accuracy after retreat. Imported spline knots are allocated by source
-joint travel time; an exact derivative bound enforces source velocity limits between knots.
+joint travel time. `control/path_timing.py` applies forward/backward local speed passes with
+motor and tool-space velocity/acceleration limits; a short tight corner does not slow the
+entire path. There is no fixed wait per intermediate IK sample. The official OpenArm path
+retains its existing timing policy.
 The optional `default_armature=None` retains authored inertia without adding Genesis's default rotor
 inertia to small fingers. `simulation/runtime_owner.py` gives native runs, tests and standalone
 Genesis validators the same process lease; the broker still owns no physics world.
+
+`robots/handover.py` searches cube face/pad orientations, pitch, bite depth and height offsets.
+It checks donor travel, receiver loaded-aperture closure, insertion, opening, withdrawal and
+independent lift against a combined joint snapshot. A box probe checks that both inferred pads
+can actually reach the object before a full jaw sweep is attempted. The object is reobserved
+after donor motion; predicted pose is never written into Genesis. Source-limited normal
+preload accounts for payload weight and off-centre contact after donor release.
+
+`robots/placement.py` plans with the measured wrist-to-payload transform. Stable cube faces
+and yaw are searched independently of a fixed canonical wrist pose. Robot/desk clearance,
+payload/robot clearance, other cubes versus both the payload and robot, and the interpolated
+curve all participate. This is a private geometric payload proxy, not an attachment to the
+live object. Execution checks contact and payload follow; contacting the reference cube
+with the robot aborts placement. Empty-hand retreat can rotate out of an existing pad
+contact within a small joint neighbourhood, without increasing its predicted penetration.
+Runtime guards reject new contacts and object displacement above 2mm.
+
+`scripts/verify_imported_sequence.py` runs one instruction through the normal planner and
+executor in a fresh process, records contact-backed final postconditions and motion timing,
+then destroys its scene and exits. It has no interactive process left holding the owner lease.
 
 ## Local model adaptation without training
 

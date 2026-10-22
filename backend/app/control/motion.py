@@ -45,6 +45,8 @@ def joint_spline(waypoints, velocity_limits=None):
         knots /= knots[-1]
     return PchipInterpolator(knots,points,axis=0)
 
+
+
 __all__ = [
     "MotionResult",
     "OpenArmV2Controller",
@@ -236,7 +238,11 @@ class OpenArmV2Controller:
         if q is None:
             return MotionResult(False, "IK_FAILURE", position.tolist(), pos_err)
         planner = getattr(self.env, 'plan_joint_waypoints', None)
-        if planner is not None:
+        if planned_joints is not None:
+            check = getattr(self.env,'joint_waypoints_are_clear',None)
+            if check is not None and not check(side,joint_waypoints):
+                return MotionResult(False,'STALE_MOTION_PLAN',position.tolist(),pos_err)
+        elif planner is not None:
             joint_waypoints = planner(side, joint_waypoints, self.stop_requested)
             if joint_waypoints is None:
                 return MotionResult(False, "COLLISION_PATH", position.tolist(), pos_err)
@@ -253,8 +259,14 @@ class OpenArmV2Controller:
             if nominal_duration is None:
                 # The previous path spent 80ms at each of seven waypoints plus
                 # its interpolation time. Schedule one continuous trajectory.
-                nominal_duration = sum(.56 + max(14, int(np.linalg.norm(b - a) / .005)) * self.timestep
-                                       for a, b in zip(joint_waypoints, joint_waypoints[1:]))
+                if velocity_limits is not None:
+                    # Timing belongs to the whole curve. Adding 560ms per IK
+                    # sample made a densely sampled, smooth path needlessly slow.
+                    nominal_duration=max(.12,1.875*float(np.sum(np.max(
+                        abs(np.diff(joint_waypoints,axis=0))/velocity_limits,axis=1))))
+                else:
+                    nominal_duration = sum(.56 + max(14, int(np.linalg.norm(b - a) / .005)) * self.timestep
+                                           for a, b in zip(joint_waypoints, joint_waypoints[1:]))
             trajectory_duration = nominal_duration / (self.motion_speed if scale_speed else 1.)
             curve = derivative = None
             if curved_path:
@@ -268,6 +280,15 @@ class OpenArmV2Controller:
                 # segment by 3*N needlessly slowed finely sampled approaches.
                 slopes = maximum_spline_slope(curve) if curve is not None else abs(q-start)
                 trajectory_duration = max(trajectory_duration, float(np.max(1.875 * slopes / velocity_limits)))
+            timing=None
+            tool_limits=getattr(self.env,'cartesian_motion_limits',None)
+            if tool_limits:
+                from backend.app.control.path_timing import PathTiming
+                timing=PathTiming(self.env.arm_kinematics(side),curve,start,q,velocity_limits,tool_limits)
+                # The locally timed profile enforces motor limits too. Retain
+                # the caller's nominal pacing; remove the global worst-corner
+                # bound which would slow every other part of the motion.
+                trajectory_duration=max(nominal_duration/(self.motion_speed if scale_speed else 1.),timing.duration)
             result = MotionResult(True)
             steps = max(2, int(np.ceil(trajectory_duration / self.timestep)))
             trajectory_duration = steps * self.timestep
@@ -281,6 +302,10 @@ class OpenArmV2Controller:
                     fraction = index / steps
                     alpha = fraction ** 3 * (10. - 15. * fraction + 6. * fraction ** 2)
                     alpha_dot = 30. * fraction ** 2 * (1. - fraction) ** 2 / trajectory_duration
+                    if timing is not None:
+                        stretch=trajectory_duration/timing.duration
+                        alpha,alpha_dot=timing.phase(index*self.timestep/stretch)
+                        alpha_dot/=stretch
                     reference = start + (q - start) * alpha if curve is None else curve(alpha)
                     velocity = ((q - start) if curve is None else derivative(alpha)) * alpha_dot if scale_speed else None
                     self.env.set_arm(side, reference, velocities=velocity)

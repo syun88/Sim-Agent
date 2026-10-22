@@ -175,7 +175,16 @@ class URDFKinematics:
         return point.copy(), pose[:3, :3].copy(), linear, angular
 
 
-def solve_profile_ik(profile, side, position, rotation=None, *, model=None, q_init=None, snapshot=None):
+def rotation_residual_jacobian(attitude,target,angular):
+    error=Rotation.from_matrix(np.asarray(target)@attitude.T).as_rotvec()
+    x,y,z=error
+    skew=np.array([[0.,-z,y],[z,0.,-x],[-y,x,0.]])
+    theta=np.linalg.norm(error)
+    coefficient=1./12. if theta<1e-5 else (1.-theta/(2.*np.tan(theta/2.)))/(theta*theta)
+    return -(np.eye(3)+skew/2.+coefficient*(skew@skew))@angular
+
+
+def solve_profile_ik(profile, side, position, rotation=None, *, model=None, q_init=None, snapshot=None, joint_limits=None):
     from scipy.optimize import least_squares
     model = model if model is not None else URDFModel(profile['urdf'])
     chain = profile['chains'][side]
@@ -184,13 +193,22 @@ def solve_profile_ik(profile, side, position, rotation=None, *, model=None, q_in
     specs = {joint['name']: joint for joint in model.active}
     lower = [specs[name]['lower'] if specs[name]['lower'] is not None else -np.inf for name in chain['joints']]
     upper = [specs[name]['upper'] if specs[name]['upper'] is not None else np.inf for name in chain['joints']]
+    if joint_limits is not None:
+        lower = np.maximum(lower,np.asarray(joint_limits)[:,0])
+        upper = np.minimum(upper,np.asarray(joint_limits)[:,1])
     target = np.asarray(position)
     start = np.clip(home if q_init is None else np.asarray(q_init), lower, upper)
     def residual(q):
         point, attitude, _, _ = kinematics.evaluate(q)
         orientation = [] if rotation is None else (Rotation.from_matrix(np.asarray(rotation) @ attitude.T).as_rotvec() * .15).tolist()
         return np.r_[point - target, orientation, (q - start) * .0001]
-    result = least_squares(residual, start, bounds=(lower, upper), max_nfev=300, xtol=1e-10, gtol=1e-10, ftol=1e-10)
+    def jacobian(q):
+        _,attitude,linear,angular=kinematics.evaluate(q)
+        pieces=[linear]
+        if rotation is not None:pieces.append(rotation_residual_jacobian(attitude,rotation,angular)*.15)
+        pieces.append(np.eye(len(q))*.0001)
+        return np.vstack(pieces)
+    result = least_squares(residual, start, jac=jacobian, bounds=(lower, upper), max_nfev=300, xtol=1e-10, gtol=1e-10, ftol=1e-10)
     point, attitude, _, _ = kinematics.evaluate(result.x)
     error = float(np.linalg.norm(point - target))
     orientation_error = float(np.linalg.norm(Rotation.from_matrix(np.asarray(rotation) @ attitude.T).as_rotvec())) if rotation is not None else 0.

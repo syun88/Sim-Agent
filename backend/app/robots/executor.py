@@ -20,11 +20,21 @@ class ImportedRobotController(OpenArmV2Controller):
         names = self.env.profile['chains'][side]['joints']
         start = self.env.arm_qpos(side) if q_init is None else np.asarray(q_init)
         edge_start = start if path_start is None else np.asarray(path_start)
-        limits = self.env.arm_limits(side)
+        limits = (self.env.ik_joint_limits(side) if hasattr(self.env,'ik_joint_limits') else self.env.arm_limits(side))
         rng = np.random.default_rng(17)
         home = self.env.home_arm_qpos(side)
         continuation = q_init is not None or side in self.env._gripper_force_holds
         seeds = [start]
+        if continuation and len(start)>6:
+            # A redundant wrist can retain the tool pose while the elbow moves
+            # away from a contact limit. A single nearest IK solution repeatedly
+            # walks into that limit even when another local branch is clear.
+            _,_,linear,angular = self.env.arm_kinematics(side).evaluate(start)
+            jacobian = np.vstack([linear,angular*.15])
+            _,singular,vectors = np.linalg.svd(jacobian,full_matrices=True)
+            rank = int(np.sum(singular>1e-7))
+            for null in vectors[rank:]:
+                seeds.extend(np.clip(start+null*shift,*limits.T) for shift in (-.2,.2,-.5,.5,-1.,1.))
         if not continuation:
             seeds.extend([*self._ik_seeds.get(side, []), home])
             seeds.extend(np.clip(home+axis*shift, *limits.T) for axis in np.eye(len(start)) for shift in [-.5, .5, -1., 1.])
@@ -35,14 +45,14 @@ class ImportedRobotController(OpenArmV2Controller):
             if self.stop_requested():
                 return None, error, error
             result = solve_profile_ik(self.env.profile, side, target_position, target_rotation,
-                model=self.env.model, q_init=seed, snapshot=snapshot)
+                model=self.env.model, q_init=seed, snapshot=snapshot,joint_limits=limits)
             error = min(error, result['position_error']+result['rotation_error']*.2)
             q = self.env.model.nearest_continuous(names,result['q_rad'],start)
             if continuation and np.max(abs(q-start)/self.env.arm_velocity_limits(side))>.75:
                 continue
             tolerance = -minimum_clearance if minimum_clearance else .0002
             collisions = self.env.collision_queries.contacts({**snapshot, **dict(zip(names, q))},tolerance=tolerance) if result['success'] else []
-            if (result['success'] and collisions and seed is seeds[0]
+            if (result['success'] and collisions
                     and max(c['penetration_m'] for c in collisions)<.003 and target_rotation is not None):
                 adjusted = self.env.collision_queries.refine_pose(self.env.profile, side,
                     np.asarray(target_position), target_rotation, q, snapshot,minimum_clearance=minimum_clearance)
@@ -61,28 +71,32 @@ class ImportedRobotController(OpenArmV2Controller):
                     valid = q
         return valid, error, error
 
-    def plan_closure(self, side, object_position, rotation, opened_seed):
+    def plan_closure(self, side, object_position, rotation, opened_seed, *, snapshot=None, check_lift=True, minimum_gap=None):
         """Check arm motion throughout jaw closure, including changed jaw geometry."""
         g = self.env.grippers[side]
         rows = sorted(g['sweep'],key=lambda row:row['q'])
         qs = [row['q'] for row in rows]
         centers = [(row['face_a']+row['face_b'])/2. for row in rows]
         initial_center = np.interp(g['open_q'],qs,centers)
+        closed_q=g['closed_q']
+        if minimum_gap is not None:
+            gap_rows=sorted(rows,key=lambda row:row['gap'])
+            closed_q=float(np.interp(minimum_gap,[r['gap'] for r in gap_rows],[r['q'] for r in gap_rows]))
         normal = np.array(g['pad_region']['normal'])
-        snapshot = self.env.joint_snapshot()
+        snapshot = dict(self.env.joint_snapshot() if snapshot is None else snapshot)
         samples = []
-        snapshot[g['joint']] = g['closed_q']
-        snapshot.update({name:float(g['closed_q']*k) for name,k in g['followers'].items()})
-        target = object_position-rotation@normal*(np.interp(g['closed_q'],qs,centers)-initial_center)
+        snapshot[g['joint']] = closed_q
+        snapshot.update({name:float(closed_q*k) for name,k in g['followers'].items()})
+        target = object_position-rotation@normal*(np.interp(closed_q,qs,centers)-initial_center)
         seed,_,_ = self.solve_ik(side,target,rotation,q_init=opened_seed,snapshot=snapshot,minimum_clearance=.0001)
         if seed is None:return None
         closed_seed = seed.copy()
-        for dz in (.01,.02,.03):
+        for dz in ((.01,.02,.03) if check_lift else ()):
             seed,_,_ = self.solve_ik(side,target+[0.,0.,dz],rotation,q_init=seed,
                 snapshot=snapshot,minimum_clearance=.0001)
             if seed is None:return None
         seed = closed_seed
-        for jaw_q in np.linspace(g['closed_q'],g['open_q'],49):
+        for jaw_q in np.linspace(closed_q,g['open_q'],49):
             snapshot[g['joint']] = float(jaw_q)
             snapshot.update({name:float(jaw_q*k) for name,k in g['followers'].items()})
             target = object_position-rotation@normal*(np.interp(jaw_q,qs,centers)-initial_center)
@@ -103,7 +117,7 @@ class ImportedRobotController(OpenArmV2Controller):
                     if np.linalg.norm(point-expected)>.0008 or np.linalg.norm(orientation_error(attitude,rotation))>.01:
                         return None
             samples.append({'jaw_q':float(jaw_q),'arm_q':seed.copy()})
-        if g.get('cube_size'):
+        if check_lift and g.get('cube_size'):
             # The cube stops closure before the fully-closed command. Verify
             # liftability around that actual aperture, not only at closed_q.
             # A redundant branch can lift when fully closed but run into the
@@ -129,17 +143,21 @@ class ImportedRobotController(OpenArmV2Controller):
 
     def plan_cartesian(self, side, positions, rotation):
         """One locally continuous branch, including every loaded descent."""
-        path = [self.env.arm_qpos(side)]
+        return self.plan_poses(side,positions,[rotation]*len(positions))
+
+    def plan_poses(self,side,positions,rotations,*,snapshot=None,start=None):
+        if len(positions)!=len(rotations):raise ValueError('Each position needs a rotation')
+        path = [self.env.arm_qpos(side) if start is None else np.asarray(start,float)]
         names = self.env.profile['chains'][side]['joints']
-        snapshot = self.env.joint_snapshot()
-        for point in positions:
-            q, _, _ = self.solve_ik(side,point,rotation,q_init=path[-1])
+        snapshot = dict(self.env.joint_snapshot() if snapshot is None else snapshot)
+        for point,rotation in zip(positions,rotations):
+            q, _, _ = self.solve_ik(side,point,rotation,q_init=path[-1],snapshot=snapshot)
             if q is None or not self.env.collision_queries.edge_clear(names,path[-1],q,snapshot,minimum_clearance=.0001):
                 return None
             path.append(q)
         from backend.app.control.motion import joint_spline
         curve = joint_spline(path,self.env.arm_velocity_limits(side))
-        return path if self.env.joint_curve_is_clear(side,curve,path) else None
+        return path if self.env.joint_curve_is_clear(side,curve,path,snapshot=snapshot) else None
 
 
 class ImportedRobotSkills(SkillRunner):
@@ -236,10 +254,11 @@ class ImportedRobotSkills(SkillRunner):
         return {'target': before.tolist(), 'final': result.final_position,
                 'object_displacement': disturbance, 'cube_size': self.env.cube_size}
 
-    def _grasp(self, arm, obj):
-        before = self.env.object_pose(obj)[0].copy()
-        rotation = self._attitude(arm)
+    def _close_pinch(self, arm, obj, *, rotation=None, grasp_bias=None, monitor=None):
+        rotation = self._attitude(arm) if rotation is None else np.asarray(rotation)
+        bias = np.zeros(3) if grasp_bias is None else np.asarray(grasp_bias)
         g = self.env.grippers[arm]
+        self.env.configure_grip_load(arm)
         rows = sorted(g['sweep'], key=lambda row: row['q'])
         commands = [row['q'] for row in rows]
         centers = [(row['face_a']+row['face_b'])/2. for row in rows]
@@ -258,11 +277,13 @@ class ImportedRobotSkills(SkillRunner):
         for _ in range(250):
             if self.controller.stop_requested():
                 raise SkillError('STOPPED', 'Grasp stopped')
+            if monitor:monitor()
             measured = self.env.gripper_position(arm)
             jaw_q = g['open_q']+measured*(g['closed_q']-g['open_q'])
             direction = np.sign(g['closed_q']-g['open_q'])
             offset = normal*(np.interp(jaw_q, commands, centers)-open_center)
-            target = self.env.object_pose(obj)[0]-rotation@offset
+            object_position,object_rotation = self.env.object_pose(obj)
+            target = object_position+object_rotation@bias-rotation@offset
             from backend.app.simulation.transform import orientation_error
             actual_point, actual_rotation = self.env.ee_pose(arm)
             centered = (np.linalg.norm(target-actual_point) < min(.002, self.env.cube_size*.08)
@@ -322,6 +343,12 @@ class ImportedRobotSkills(SkillRunner):
                 stable = 0
         contacts = self.env.object_contacts(obj, arm)
         self._require_hold(arm, obj)
+        if monitor:monitor()
+        return contacts
+
+    def _grasp(self, arm, obj):
+        before = self.env.object_pose(obj)[0].copy()
+        contacts = self._close_pinch(arm,obj)
         position, rotation = self.env.ee_pose(arm)
         self.controller.target_rotations[arm] = self._attitude(arm).copy()
         self._move_relative(arm,[0.,0.,.03])
@@ -407,6 +434,19 @@ class ImportedRobotSkills(SkillRunner):
         obj = self.held_object(arm)
         if obj is None:
             raise SkillError('GRASP_LOST', 'No opposed jaw contacts')
+        from scipy.spatial.transform import Rotation
+        if np.linalg.norm(Rotation.from_matrix(self.env.ee_pose(arm)[1]@self._attitude(arm).T).as_rotvec())>.15:
+            deadline=time.monotonic()+90.
+            for point in self.env.zone_candidates(target):
+                remaining=deadline-time.monotonic()
+                if remaining<=0.:break
+                try:
+                    result=self._loaded_placement(arm,obj,point[:2],self.env.table_height,timeout=remaining)
+                    self.env.resolve_zone(target,np.asarray(result['target']))
+                    return result
+                except SkillError as error:
+                    if error.category!='COLLISION_PATH':raise
+            raise SkillError('COLLISION_PATH','No loaded path reaches the requested table region')
         self._align_for_placement(arm, obj)
         ee, rotation = self.env.ee_pose(arm)
         offset = rotation.T@(self.env.object_pose(obj)[0]-ee)
@@ -434,26 +474,58 @@ class ImportedRobotSkills(SkillRunner):
         self.env.resolve_zone(target,desired)
         distance = sum(np.linalg.norm(b-a) for a,b in zip(centers,centers[1:]))
         result = self._move(arm,desired-rotation@offset,rotation,planned_joints=path,
-            duration=max(.3,distance/.02),on_sample=lambda:self._require_hold(arm,obj))
+            duration=max(.3,distance/.16)*self.controller.motion_speed,on_sample=lambda:self._require_hold(arm,obj))
         actual = self.env.object_pose(obj)[0]
         error = float(np.linalg.norm(actual-desired))
         if error>.008:raise SkillError('GRASP_SLIP',f'Placement tracking error: {error:.6f}m')
         return {'object':obj,'target':desired.tolist(),'position':actual.tolist(),'position_error':error,
                 'planned_cartesian_samples':len(route),'trajectory_duration':result.trajectory_duration}
 
+    def _loaded_placement(self,arm,obj,xy,surface,reference=None,timeout=90.):
+        from backend.app.robots.placement import plan_placement
+        self._require_hold(arm,obj)
+        plan=plan_placement(self,arm,obj,xy,surface,reference=reference,timeout=timeout)
+        start,rotation=self.env.ee_pose(arm)
+        offset=rotation.T@(self.env.object_pose(obj)[0]-start)
+        support_before=self.env.object_pose(reference)[0].copy() if reference else None
+        original_observer=self.env.step_observer
+        def observe():
+            if original_observer:original_observer()
+            if reference and set(self.env.object_contact_links(reference)).intersection(self.env.model.links):
+                raise SkillError('SUPPORT_CONTACT','The robot contacted the reference cube during placement')
+        def monitor():
+            supported=(reference and reference in self.env.object_contact_links(obj)
+                and np.linalg.norm(self.env.object_pose(obj)[0][:2]-plan['object_target'][:2])<.006)
+            if not supported:
+                self._require_hold(arm,obj)
+                point,r=self.env.ee_pose(arm)
+                error=np.linalg.norm(r.T@(self.env.object_pose(obj)[0]-point)-offset)
+                if error>max(.003,self.env.cube_size*.12):
+                    raise SkillError('GRASP_SLIP',f'The payload moved {error:.6f}m inside the grip')
+        self.env.step_observer=observe
+        try:
+            result=self._move(arm,plan['target'],plan['rotation'],planned_joints=plan['path'],on_sample=monitor)
+        finally:
+            self.env.step_observer=original_observer
+        actual=self.env.object_pose(obj)[0]
+        error=float(np.linalg.norm(actual-plan['object_target']))
+        if error>.008:raise SkillError('GRASP_SLIP',f'Loaded placement position error: {error:.6f}m')
+        if reference and np.linalg.norm(self.env.object_pose(reference)[0]-support_before)>.002:
+            raise SkillError('SUPPORT_DISTURBED','The reference cube moved by more than 2mm')
+        self._placement_retreat={**getattr(self,'_placement_retreat',{}),arm:obj}
+        return {'object':obj,'target':plan['object_target'].tolist(),'position':actual.tolist(),'position_error':error,
+            'placement_candidates':plan['candidate_count'],'release_gap_m':plan['release_gap_m'],
+            'trajectory_duration':result.trajectory_duration,'reference_object':reference}
+
     def move_to_object(self, arm, obj, target, relation, distance_cm=None):
         def run():
             from backend.app.skills.spatial_placement import relative_destination
-            self._require_hold(arm, obj)
-            self._align_for_placement(arm, obj)
-            desired = relative_destination(self.env, obj, target, relation, arm, distance_cm)
-            surface = self.env.object_bounds(target)[1 if relation == "on" else 0, 2]
-            desired[2] = max(desired[2], self.env.minimum_release_height(arm, obj, surface))
-            travel = desired.copy()
-            travel[2] = max(self.env.table_height + self.env.cube_size * 2. + .06, desired[2] + .04)
-            self._carry_to(arm, obj, travel)
-            return {**self._carry_to(arm, obj, desired), 'reference_object': target, 'relation': relation}
-        return self._skill('move_to_object', run, time.perf_counter())
+            self._require_hold(arm,obj)
+            desired=relative_destination(self.env,obj,target,relation,arm,distance_cm)
+            surface=float(self.env.object_bounds(target)[1 if relation=='on' else 0,2])
+            return {**self._loaded_placement(arm,obj,desired[:2],surface,reference=target),
+                    'relation':relation,'reference_object':target}
+        return self._skill('move_to_object',run,time.perf_counter())
 
     def _release(self, arm, obj):
         self.env.set_gripper_effort(arm, holding=False)
@@ -470,6 +542,7 @@ class ImportedRobotSkills(SkillRunner):
 
     def retreat(self, arm):
         def run():
+            if arm in getattr(self,'_placement_retreat',{}):return self._retreat_loaded_placement(arm)
             g = self.env.grippers[arm]
             start,rotation = self.env.ee_pose(arm)
             before = {name:self.env.object_pose(name)[0].copy() for name in self.env._objects}
@@ -505,96 +578,120 @@ class ImportedRobotSkills(SkillRunner):
             return {'final':result.final_position,'object_displacement_m':displaced}
         return self._skill('retreat',run,time.perf_counter())
 
+    def _retreat_loaded_placement(self,arm):
+        from backend.app.robots.placement import cleared_empty_path
+        before={name:self.env.object_pose(name)[0].copy() for name in self.env._objects}
+        g=self.env.grippers[arm];start,rotation=self.env.ee_pose(arm)
+        normal=rotation@np.asarray(g['pad_region']['normal'])
+        separated=None
+        for distance in (.003,.006,.009):
+            target=start-normal*distance
+            path=self.controller.plan_cartesian(arm,[target],rotation)
+            if path is None:continue
+            self._move(arm,target,rotation,planned_joints=path)
+            if not any(self.env.object_contacts(name,arm) for name in self.env._objects):
+                separated=self.env.ee_pose(arm)[0].copy();break
+        # A Cartesian translation can be unavailable at a mechanical limit.
+        # The empty-hand planner may instead rotate away, allowing only the
+        # existing pad contact without increasing its initial penetration.
+        path=cleared_empty_path(self.env,arm,self.env.home_arm_qpos(arm),self.controller.stop_requested)
+        if path is None:raise SkillError('COLLISION_PATH','No empty-hand retreat avoids the placed objects')
+        point,attitude,*_=self.env.arm_kinematics(arm).evaluate(path[-1])
+        observer=self.env.step_observer
+        start_q=self.env.arm_qpos(arm)
+        fingers={n for group in g['contact_groups'] for n in group}
+        allowed={name:set(self.env.object_contact_links(name)).intersection(fingers) for name in self.env._objects}
+        cleared=False
+        def observe():
+            nonlocal cleared
+            if observer:observer()
+            touching={name:set(self.env.object_contact_links(name)).intersection(self.env.model.links) for name in self.env._objects}
+            if not any(touching.values()):cleared=True
+            for name,links in touching.items():
+                if (links and (cleared or not links<=allowed[name] or np.max(abs(self.env.arm_qpos(arm)-start_q))>.06)
+                        or np.linalg.norm(self.env.object_pose(name)[0]-before[name])>.002):
+                    raise SkillError('RETREAT_CONTACT','The empty arm failed to separate without moving the placed objects')
+        self.env.step_observer=observe
+        try:self._move(arm,point,attitude,planned_joints=path)
+        finally:self.env.step_observer=observer
+        displaced={name:float(np.linalg.norm(self.env.object_pose(name)[0]-p)) for name,p in before.items()}
+        if max(displaced.values(),default=0.)>.002:
+            error=SkillError('RETREAT_CONTACT','Retreat displaced a placed object by more than 2mm')
+            error.evidence={'object_displacement_m':displaced};raise error
+        self._placement_retreat.pop(arm,None)
+        return {'final':self.env.ee_pose(arm)[0].tolist(),'object_displacement_m':displaced,'empty_hand_path':True}
+
     def _handover(self, arm, obj, receiver):
-        from scipy.spatial.transform import Rotation
-        from backend.app.robots.urdf import solve_profile_ik
+        from backend.app.robots.handover import ExchangePlanner, withdrawal
         if receiver == arm or receiver not in self.env.grippers:
-            raise SkillError('ROBOT_CAPABILITY', 'Handover requires two detected grippers')
-        self._require_hold(arm, obj)
-        if self.held_object(receiver):
-            raise SkillError('HAND_OCCUPIED', 'The receiving hand is occupied')
-        # Search a common six-dimensional workspace using private FK only.
-        # Both mechanisms use their inferred frames; no robot-specific joint names.
-        flat = {s: Rotation.from_euler('y', -g['pitch_degrees'], degrees=True).as_matrix() @ g['grasp_rotation']
-                for s, g in self.env.grippers.items()}
-        xy = np.mean([v for v in self.env._spawn_sampler.preferred.values()], axis=0)
-        rng = np.random.default_rng(9)
-        candidate = None
-        for height in (.34, .49, .24):
-            if self.controller.stop_requested():
-                raise SkillError('STOPPED', 'Handover workspace search stopped')
-            center = np.r_[xy + [-.10, 0.], self.env.table_height + height]
-            for yaw in (90., 120., 60., 0., 180.):
-                for pitch in (0., 30., -30.):
-                    if self.env.step_observer:
-                        self.env.step_observer()
-                    attitudes = {arm: Rotation.from_euler('zy', [yaw, pitch], degrees=True).as_matrix() @ flat[arm],
-                                 receiver: Rotation.from_euler('zy', [yaw + 180., -pitch], degrees=True).as_matrix() @ flat[receiver]}
-                    seeds = {}
-                    for side in (arm, receiver):
-                        for attempt in range(3):
-                            solution = solve_profile_ik(self.env.profile, side, center, attitudes[side], model=self.env.model,
-                                q_init=None if attempt == 0 else rng.uniform(-2., 2., len(self.env.arm_qpos(side))))
-                            if solution['success']:
-                                seeds[side] = np.asarray(solution['q_rad'])
-                                break
-                        if side not in seeds:
-                            break
-                    if len(seeds) == 2:
-                        candidate = center, attitudes, seeds
-                        break
-                if candidate: break
-            if candidate: break
-        if candidate is None:
-            raise SkillError('HANDOVER_UNREACHABLE', 'No shared opposed-jaw handover pose passed both full-pose IK checks')
-        center, attitudes, seeds = candidate
-        self.controller.wait_gripper(receiver, False, .6)
-        # Lift clear of the desk before changing the donor's wrist attitude.
-        position, rotation = self.env.ee_pose(arm)
-        self._move(arm, position + [0., 0., .12], rotation)
-        ee, rotation = self.env.ee_pose(arm)
-        offset = rotation.T @ (self.env.object_pose(obj)[0] - ee)
-        from scipy.spatial.transform import Slerp
-        start = self.env.object_pose(obj)[0].copy()
-        angle = np.linalg.norm(Rotation.from_matrix(attitudes[arm] @ rotation.T).as_rotvec())
-        count = max(8, int(np.ceil(angle / .12)))
-        arc = Slerp([0., 1.], Rotation.from_matrix(np.stack([rotation, attitudes[arm]])))
-        fractions = np.linspace(0., 1., count + 1)[1:]
-        rotations = [arc(t).as_matrix() for t in fractions]
-        positions = [(1.-t)*start+t*center-r@offset for t,r in zip(fractions,rotations)]
-        self._move(arm, positions[-1], rotations[-1], via=positions[:-1], via_rotations=rotations[:-1],
-                   on_sample=lambda: self._require_hold(arm, obj))
-        center = self.env.object_pose(obj)[0].copy()
-        g = self.env.grippers[receiver]
-        center = center + [0., 0., self.env.cube_size * .46]
-        direction = attitudes[receiver] @ (self._attitude(receiver).T @ g['approach_axis'])
-        self._move(receiver, center - direction * .09, attitudes[receiver], q_init=seeds[receiver])
-        for distance in (.06, .03, .0):
-            self._move(receiver, center - direction * distance, attitudes[receiver],
-                       on_sample=lambda: self._require_hold(arm, obj))
-        pinch_target = center - attitudes[receiver] @ np.asarray(g.get('pinch_offset', [0.,0.,0.]))
-        self._move(receiver, pinch_target, attitudes[receiver], on_sample=lambda: self._require_hold(arm,obj))
-        self.controller.wait_gripper(receiver, True, .8)
-        self._require_hold(arm, obj)
-        self._require_hold(receiver, obj)
-        donor_contacts = self.env.object_contacts(obj, arm)
-        receiver_contacts = self.env.object_contacts(obj, receiver)
-        self.controller.wait_gripper(arm, False, .6)
-        donor_direction = attitudes[arm] @ (self._attitude(arm).T @ self.env.grippers[arm]['approach_axis'])
-        pos, rot = self.env.ee_pose(arm)
-        donor_retreat = pos - donor_direction * .06 - [0., 0., .03]
-        donor_rotation = rot.copy()
-        self._require_hold(receiver, obj)
-        before = self.env.object_pose(obj)[0].copy()
-        pos, rot = self.env.ee_pose(receiver)
-        self._move(receiver, pos + [0., 0., .03], rot)
-        self._require_hold(receiver, obj)
-        rise = float(self.env.object_pose(obj)[0][2] - before[2])
-        if rise < .021 or self.env.object_contacts(obj, arm):
-            raise SkillError('HANDOVER_FAILED', 'The receiving hand did not independently lift the released cube')
-        self._move(arm, donor_retreat, donor_rotation)
-        return {'object': obj, 'receiver': receiver, 'giver_contacts_before_release': donor_contacts,
-                'receiver_pinch_contacts': receiver_contacts, 'receiver_lift': rise, 'handover_center': center.tolist()}
+            raise SkillError('ROBOT_CAPABILITY','Handover requires two detected grippers')
+        self._require_hold(arm,obj)
+        if self.held_object(receiver):raise SkillError('HAND_OCCUPIED','The receiving hand is occupied')
+        self.controller.wait_gripper(receiver,False,.6)
+        planner=ExchangePlanner(self)
+        plan=planner.plan(arm,receiver,obj)
+        point,rotation,*_=self.env.arm_kinematics(arm).evaluate(plan['donor_path'][-1])
+        self._move(arm,point,rotation,planned_joints=plan['donor_path'],on_sample=lambda:self._require_hold(arm,obj))
+        # Reobserve after physical travel: the cube's small compliance/slip is
+        # measured, never replaced by the planner's predicted object pose.
+        center,cube_rotation=self.env.object_pose(obj)
+        snapshot=self.env.joint_snapshot();donor_q=self.env.arm_qpos(arm);donor_rotation=self.env.ee_pose(arm)[1]
+        planner=ExchangePlanner(self)
+        recipient=planner.receiver(arm,receiver,center,cube_rotation,snapshot,
+            lambda p:planner.completion(arm,receiver,donor_q,donor_rotation,snapshot,p))
+        if recipient is None:raise SkillError('HANDOVER_UNREACHABLE','The measured exchange pose has no complete receiving path')
+        self._move(receiver,recipient['target'],recipient['rotation'],planned_joints=recipient['path'],
+                   on_sample=lambda:self._require_hold(arm,obj))
+        self._closure_plans={**getattr(self,'_closure_plans',{}),receiver:recipient['closure']}
+        self._close_pinch(receiver,obj,rotation=recipient['rotation'],grasp_bias=recipient['bias'],
+                          monitor=lambda:self._require_hold(arm,obj))
+        self.controller.target_rotations[receiver]=recipient['rotation'].copy()
+        self._require_hold(arm,obj);self._require_hold(receiver,obj)
+        donor_contacts=self.env.object_contacts(obj,arm)
+        receiver_contacts=self.env.object_contacts(obj,receiver)
+        # Check opening and withdrawal with the recipient's ACTUAL loaded jaw.
+        future=self.env.joint_snapshot();g=self.env.grippers[arm]
+        for jaw in np.linspace(future[g['joint']],g['open_q'],33):
+            future.update({g['joint']:jaw,**{n:jaw*k for n,k in g['followers'].items()}})
+            if self.env.collision_queries.contacts(future,tolerance=-.0001):
+                raise SkillError('HANDOVER_BLOCKED','The actual loaded fingers leave no collision-free donor opening')
+        if withdrawal(self,arm,receiver,snapshot=future) is None:
+            raise SkillError('HANDOVER_BLOCKED','The actual loaded fingers leave no collision-free donor withdrawal')
+        self.controller.wait_gripper(arm,False,.6)
+        self.env.configure_grip_load(receiver,float(np.linalg.norm(recipient['bias'])))
+        self.env.hold_gripper_force(receiver)
+        self.env.step(max(1,round(.08/self.env.timestep)))
+        self._require_hold(receiver,obj)
+        retreat=withdrawal(self,arm,receiver)
+        if retreat is None:raise SkillError('HANDOVER_BLOCKED','No withdrawal path after measured donor opening')
+        self._move(arm,retreat['target'],retreat['rotation'],planned_joints=retreat['path'],
+                   on_sample=lambda:self._require_hold(receiver,obj))
+        if self.env.object_contacts(obj,arm):raise SkillError('HANDOVER_FAILED','The donor still contacts the cube')
+        before=self.env.object_pose(obj)[0].copy()
+        self._move_relative(receiver,[0.,0.,.03])
+        self._require_hold(receiver,obj)
+        rise=float(self.env.object_pose(obj)[0][2]-before[2])
+        if rise<.021:raise SkillError('HANDOVER_FAILED',f'The receiver lifted the released cube only {rise:.6f}m')
+        ee,attitude=self.env.ee_pose(receiver);relative=attitude.T@(self.env.object_pose(obj)[0]-ee)
+        samples=[]
+        allowed={name for group in self.env.grippers[receiver]['contact_groups'] for name in group}
+        for _ in range(15):
+            self.env.step(max(1,round(.02/self.env.timestep)))
+            point,rot=self.env.ee_pose(receiver)
+            samples.append({'pinch':self.env.pinch_established(obj,receiver),
+                'relative_drift_m':float(np.linalg.norm(rot.T@(self.env.object_pose(obj)[0]-point)-relative)),
+                'other_support_contacts':sorted(set(self.env.object_contact_links(obj))-allowed)})
+        if (sum(s['pinch'] for s in samples)<14 or max(s['relative_drift_m'] for s in samples)>max(.002,self.env.cube_size*.08)
+                or any(s['other_support_contacts'] for s in samples)):
+            error=SkillError('HANDOVER_FAILED','The receiver did not maintain an independent unsupported pinch for 300ms')
+            error.evidence={'hold_samples':samples};raise error
+        evidence={'grasp_mode':self.env.grasp_mode,'grasp_is_physical_contact':True,'object':obj,'receiver':receiver,
+            'giver_contacts_before_release':donor_contacts,'receiver_pinch_contacts':receiver_contacts,
+            'receiver_lift':rise,'hold_samples':samples,'handover_center':center.tolist(),
+            'receiver_grasp_bias_m':recipient['bias'].tolist(),'planning_attempts':plan['planning_attempts'],
+            'self_collision':self.env.self_collision_report()}
+        self.env.record_grasp_verification(receiver,evidence)
+        return evidence
 
     def _joint_trajectory(self, arm, target, duration=1.):
         start = self.env.arm_qpos(arm)

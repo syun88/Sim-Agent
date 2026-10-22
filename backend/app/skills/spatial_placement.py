@@ -37,7 +37,7 @@ def verify_relative_goal(env, obj, target, relation, arm="left", distance_cm=Non
         supported_fraction = float(np.prod(overlap) / min(np.prod(bounds[1, :2] - bounds[0, :2]),
                                                          np.prod(support[1, :2] - support[0, :2])))
         success = (stable and released and contact and horizontal <= .012 and abs(vertical) < .004
-                   and supported_fraction >= .65 and rotation[2, 2] > np.cos(.20))
+                   and supported_fraction >= .65 and np.max(abs(rotation[2])) > np.cos(.20))
         return {"success": bool(success), "horizontal_position_error": horizontal, "support_gap": vertical,
                 "support_contact": contact, "supported_fraction": supported_fraction, "stable": bool(stable),
                 "released": bool(released), "position": position.tolist(), "support_position": target_position.tolist()}

@@ -12,7 +12,7 @@ from backend.app.robots.urdf import URDFModel, URDFKinematics, solve_profile_ik,
 GENERATED_ROOT = Path(__file__).resolve().parents[3] / "outputs" / "robots"
 OPENARM = {"id": "openarm_v2", "name": "OpenArm v2", "source": "official openarm-mujoco",
            "builtin": True, "capabilities": ["motion", "physical_grasp", "handover", "stack", "pour"]}
-PROFILE_VERSION = 11
+PROFILE_VERSION = 12
 _file_hash_cache = {}
 
 
@@ -20,9 +20,9 @@ def asset_signature(source):
     """Include mesh content: changing an OBJ must invalidate old grasp evidence."""
     import xml.etree.ElementTree as ET
     paths = {Path(source).resolve()}
-    initial = Path(source).with_name('initial_state.json')
-    if initial.is_file():
-        paths.add(initial.resolve())
+    for name in ('initial_state.json','actuators.json'):
+        initial = Path(source).with_name(name)
+        if initial.is_file():paths.add(initial.resolve())
     for mesh in ET.parse(source).getroot().findall('.//mesh'):
         paths.add(mesh_path(mesh.get('filename'), source).resolve())
     records = []
@@ -95,6 +95,8 @@ def import_robot(folder):
     else:
         raise ValueError("The local URDF folder/file does not exist")
     model = URDFModel(source)
+    from backend.app.robots.actuators import apply_actuator_configuration
+    actuator_configuration=apply_actuator_configuration(model,source)
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
     robot_id = (re.sub(r"[^a-z0-9_-]+", "-", model.name.lower()).strip("-") or "robot") + "-" + digest[:10]
     target = GENERATED_ROOT / robot_id
@@ -171,6 +173,9 @@ def import_robot(folder):
                "root_transform": root_transform.tolist(), "capabilities": ["motion", "joint_control", "ik"],
                "profile_version": PROFILE_VERSION, "asset_sha256": asset_signature(source),
                "grasp_calibrated": False, "warnings": warnings, "mesh_count": len(set(meshes))}
+    if actuator_configuration:
+        profile['actuator_configuration']=actuator_configuration
+        profile['warnings']=["Source masses, geometry and joint frames are preserved. Explicit actuators.json supplies motor effort and no-load speed limits."]
     scene = {"robot_id": robot_id, "openarm_cell": False, "table_top": .76, "table_size": [1.6, 1.4, .05],
              "robot_root_transform": root_transform.tolist(), "physics_dt": .002,
              "robot_gravity_compensation": 1., "self_collision": True, "adjacent_collision": True,

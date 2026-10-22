@@ -74,6 +74,7 @@ def test_checked_joint_plan_rejects_stale_start_and_drives_motors_without_resolv
     assert stale.error=='STALE_MOTION_PLAN' and env._sim_step==initial_step
     def unexpected_ik(*args, **kwargs):raise AssertionError('The checked path must execute unchanged')
     monkeypatch.setattr(controller,'solve_ik',unexpected_ik)
+    monkeypatch.setattr(env,'plan_joint_waypoints',unexpected_ik,raising=False)
     result = controller.move_to_site('left',target,rotation,planned_joints=[start,q])
     assert result.success
     assert env.ee_pose('left')[0][2]-point[2]>.007
