@@ -95,14 +95,16 @@ class PrivateCollisionQueries:
         data.geom_xpos[probe]=center
         data.geom_xmat[probe]=np.asarray(rotation).reshape(9)
         result=[]
-        if not hasattr(self,'_probe_link_names'):
-            self._probe_link_names=[self.link_names.get(mj.mj_id2name(model,mj.mjtObj.mjOBJ_BODY,int(b)),
-                mj.mj_id2name(model,mj.mjtObj.mjOBJ_BODY,int(b))) for b in model.geom_bodyid]
-        candidates=np.array([i for i,name in enumerate(self._probe_link_names) if name in links],int)
+        if not hasattr(self,'_probe_body_names'):
+            self._probe_body_names=[mj.mj_id2name(model,mj.mjtObj.mjOBJ_BODY,int(b)) for b in model.geom_bodyid]
+        # Match on body names: MuJoCo's own world body also carries the desk geom, and a
+        # URDF link named 'world' (OpenManipulator-X) would otherwise match the desk.
+        wanted={self.body_names.get(link,link) for link in links}
+        candidates=np.array([i for i,name in enumerate(self._probe_body_names) if name in wanted],int)
         near=(np.linalg.norm(data.geom_xpos[candidates]-center,axis=1)
               <=model.geom_rbound[candidates]+model.geom_rbound[probe]+distance)
         for geom in candidates[near]:
-            name=self._probe_link_names[geom]
+            name=self.link_names.get(self._probe_body_names[geom], self._probe_body_names[geom])
             line=np.zeros(6)
             gap=mj.mj_geomDistance(model,data,geom,probe,distance,line)
             if gap<distance:result.append({'link':name,'distance_m':float(gap),'position':((line[:3]+line[3:])/2.).tolist()})
@@ -119,9 +121,10 @@ class PrivateCollisionQueries:
         for contact in data.contact:
             if contact.dist >= -tolerance:
                 continue
-            a, b = [self.link_names.get(name, name) for name in
-                    (mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[g]))
-                     for g in (contact.geom1, contact.geom2))]
+            # Body names, so a pair indexes the same list refine_pose built. A URDF root
+            # named 'world' is 'robot_world' here; MuJoCo's own world body is 'world'.
+            a, b = [mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[g]))
+                    for g in (contact.geom1, contact.geom2)]
             pair = tuple(sorted([a or 'desk', b or 'desk']))
             pairs[pair] = min(pairs.get(pair, np.inf), float(contact.dist))
         return [{'links': list(pair), 'penetration_m': max(0., -distance), 'distance_m':distance}
