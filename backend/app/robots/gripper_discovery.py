@@ -102,72 +102,90 @@ def _candidate(model, geometry, profile, joint, cube_size=None):
         poses, _ = model.forward(values)
         samples.append((float(q), geometry.in_frame(fixed_links, poses, reference) - pivot,
                         geometry.in_frame(moving_links, poses, reference) - pivot))
-    choices = []
     provisional_edge = cube_size if cube_size is not None else min(.052, length * .35)
-    for depth_fraction in (.70, .78, .85, .90):
-        depth = length * depth_fraction
-        rows = []
-        for q, a, b in samples:
-            a = a[abs(a @ forward - depth) < provisional_edge * .5 + .001]
-            b = b[abs(b @ forward - depth) < provisional_edge * .5 + .001]
-            if min(len(a), len(b)) < 8:
+
+    def sweep(edge_cap):
+        """Try every pad depth at one cube-size cap.
+
+        Also reports the smallest cube the measured closure can squeeze
+        (``minimum <= 0.8 * edge``), so a cap can be told apart from a closure.
+        """
+        choices, required = [], None
+        for depth_fraction in (.70, .78, .85, .90):
+            depth = length * depth_fraction
+            rows = []
+            for q, a, b in samples:
+                a = a[abs(a @ forward - depth) < edge_cap * .5 + .001]
+                b = b[abs(b @ forward - depth) < edge_cap * .5 + .001]
+                if min(len(a), len(b)) < 8:
+                    continue
+                lo = max(np.quantile(a @ height_axis, .05), np.quantile(b @ height_axis, .05))
+                hi = min(np.quantile(a @ height_axis, .95), np.quantile(b @ height_axis, .95))
+                face_a, face_b = float(np.max(a @ normal)), float(np.min(b @ normal))
+                if hi - lo < .004:
+                    continue
+                rows.append({'q': q, 'gap': face_b - face_a, 'face_a': face_a, 'face_b': face_b,
+                             'height': float((lo + hi) / 2.), 'pad_height': float(hi - lo)})
+            if len(rows) < 8:
                 continue
-            lo = max(np.quantile(a @ height_axis, .05), np.quantile(b @ height_axis, .05))
-            hi = min(np.quantile(a @ height_axis, .95), np.quantile(b @ height_axis, .95))
-            face_a, face_b = float(np.max(a @ normal)), float(np.min(b @ normal))
-            if hi - lo < .004:
+            maximum = max(row['gap'] for row in rows)
+            minimum = min(row['gap'] for row in rows)
+            if not .012 < maximum < .20 or maximum - minimum < .012:
                 continue
-            rows.append({'q': q, 'gap': face_b - face_a, 'face_a': face_a, 'face_b': face_b,
-                         'height': float((lo + hi) / 2.), 'pad_height': float(hi - lo)})
-        if len(rows) < 8:
-            continue
-        maximum = max(row['gap'] for row in rows)
-        minimum = min(row['gap'] for row in rows)
-        if not .012 < maximum < .20 or maximum - minimum < .012:
-            continue
-        edge = min(provisional_edge, maximum * .45, max(row['pad_height'] for row in rows) * 3.5)
-        if cube_size is not None:
-            if cube_size > edge + .0001:
+            edge = min(edge_cap, maximum * .45, max(row['pad_height'] for row in rows) * 3.5)
+            required = max(required or 0., minimum / .8)
+            if cube_size is not None:
+                if cube_size > edge + .0001:
+                    continue
+                edge = cube_size
+            if edge < .008 or minimum > edge * .8:
                 continue
-            edge = cube_size
-        if edge < .008 or minimum > edge * .8:
-            continue
-        holding = min(rows, key=lambda row: abs(row['gap'] - edge - .0007))
-        opened = min((row for row in rows if row['gap'] >= edge + .012),
-                     key=lambda row: -row['gap'], default=None)
-        closed = min(rows, key=lambda row: abs(row['gap'] - edge * .9))
-        if opened is None:
-            continue
-        offset = pivot + forward * depth + normal * ((opened['face_a'] + opened['face_b']) / 2.) + height_axis * holding['height']
-        frame = np.column_stack([forward, _unit(np.cross(height_axis, forward)), height_axis])
-        up_sign = 1. if (np.asarray(profile['root_transform'])[:3, :3] @ height_axis)[2] >= 0 else -1.
-        world_frame = np.column_stack([[1., 0., 0.], [0., up_sign, 0.], [0., 0., up_sign]])
-        base_rotation = world_frame @ frame.T
-        for pitch in np.deg2rad([0., 15., 30., 45., 60., 75., 90.]):
-            rotation = Rotation.from_rotvec([0., pitch, 0.]).as_matrix() @ base_rotation
-            minimum_z = float('inf')
-            for row in (holding, opened):
-                closest = min(samples, key=lambda entry: abs(entry[0] - row['q']))
-                points = np.vstack(closest[1:]) + pivot - offset
-                minimum_z = min(minimum_z, float((points @ rotation.T)[:, 2].min()))
-            clearance = edge / 2. + minimum_z
-            if clearance >= .003:
-                choices.append({'joint': joint['name'], 'followers': followers, 'reference_link': parent,
-                    'contact_groups': [fixed_links, moving_links], 'tool_offset': offset.tolist(),
-                    'pinch_offset': (normal * ((holding['face_a'] + holding['face_b'] - opened['face_a'] - opened['face_b']) / 2.)).tolist(),
-                    'grasp_rotation': rotation.tolist(), 'approach_axis': (rotation @ forward).tolist(),
-                    'open_q': opened['q'], 'closed_q': closed['q'], 'holding_q': holding['q'],
-                    'cube_size': edge, 'maximum_aperture': maximum, 'minimum_aperture': minimum,
-                    'pad_height': holding['pad_height'], 'finger_length': length,
-                    'pad_region': {'pivot': pivot.tolist(), 'forward': forward.tolist(), 'normal': normal.tolist(),
-                        'height_axis': height_axis.tolist(), 'depth_min': length * .45,
-                        'depth_max': length * 1.10, 'height_center': holding['height'],
-                        'height_half_extent': holding['pad_height'] * .5 + edge * .25},
-                    'table_clearance': clearance, 'pitch_degrees': float(np.rad2deg(pitch)),
-                    'type': 'sliding_jaws' if joint['type'] == 'prismatic' else 'rotary_jaw',
-                    'sweep': rows, 'status': 'geometry_inferred',
-                    'verification': 'two opposed contacts and lift-follow required during execution'})
-                break
+            holding = min(rows, key=lambda row: abs(row['gap'] - edge - .0007))
+            opened = min((row for row in rows if row['gap'] >= edge + .012),
+                         key=lambda row: -row['gap'], default=None)
+            closed = min(rows, key=lambda row: abs(row['gap'] - edge * .9))
+            if opened is None:
+                continue
+            offset = pivot + forward * depth + normal * ((opened['face_a'] + opened['face_b']) / 2.) + height_axis * holding['height']
+            frame = np.column_stack([forward, _unit(np.cross(height_axis, forward)), height_axis])
+            up_sign = 1. if (np.asarray(profile['root_transform'])[:3, :3] @ height_axis)[2] >= 0 else -1.
+            world_frame = np.column_stack([[1., 0., 0.], [0., up_sign, 0.], [0., 0., up_sign]])
+            base_rotation = world_frame @ frame.T
+            for pitch in np.deg2rad([0., 15., 30., 45., 60., 75., 90.]):
+                rotation = Rotation.from_rotvec([0., pitch, 0.]).as_matrix() @ base_rotation
+                minimum_z = float('inf')
+                for row in (holding, opened):
+                    closest = min(samples, key=lambda entry: abs(entry[0] - row['q']))
+                    points = np.vstack(closest[1:]) + pivot - offset
+                    minimum_z = min(minimum_z, float((points @ rotation.T)[:, 2].min()))
+                clearance = edge / 2. + minimum_z
+                if clearance >= .003:
+                    choices.append({'joint': joint['name'], 'followers': followers, 'reference_link': parent,
+                        'contact_groups': [fixed_links, moving_links], 'tool_offset': offset.tolist(),
+                        'pinch_offset': (normal * ((holding['face_a'] + holding['face_b'] - opened['face_a'] - opened['face_b']) / 2.)).tolist(),
+                        'grasp_rotation': rotation.tolist(), 'approach_axis': (rotation @ forward).tolist(),
+                        'open_q': opened['q'], 'closed_q': closed['q'], 'holding_q': holding['q'],
+                        'cube_size': edge, 'maximum_aperture': maximum, 'minimum_aperture': minimum,
+                        'pad_height': holding['pad_height'], 'finger_length': length,
+                        'pad_region': {'pivot': pivot.tolist(), 'forward': forward.tolist(), 'normal': normal.tolist(),
+                            'height_axis': height_axis.tolist(), 'depth_min': length * .45,
+                            'depth_max': length * 1.10, 'height_center': holding['height'],
+                            'height_half_extent': holding['pad_height'] * .5 + edge * .25},
+                        'table_clearance': clearance, 'pitch_degrees': float(np.rad2deg(pitch)),
+                        'type': 'sliding_jaws' if joint['type'] == 'prismatic' else 'rotary_jaw',
+                        'sweep': rows, 'status': 'geometry_inferred',
+                        'verification': 'two opposed contacts and lift-follow required during execution'})
+                    break
+        return choices, required
+
+    choices, required = sweep(provisional_edge)
+    if not choices and cube_size is None and required and required > provisional_edge:
+        # A gripper can close wider than its finger length suggests: OMX closes to
+        # 20mm while the length heuristic caps the cube at 22.7mm, so the squeeze
+        # rule needs 25mm and every candidate was refused. Retry once with the cube
+        # floor the measured closure requires; the aperture and pad caps still bind,
+        # and a first-pass candidate is never replaced.
+        choices, _ = sweep(min(required * 1.02, .20))
     if not choices:
         raise ValueError('No opposed aperture, object size and desk-clear grasp pose found')
     return max(choices, key=lambda candidate: (candidate['cube_size'], candidate['table_clearance']))

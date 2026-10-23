@@ -84,3 +84,44 @@ def test_mimic_sliding_fingers_are_one_gripper_not_two_arms(tmp_path,monkeypatch
     assert p['grippers']['left']['joint']=='last'
     assert p['grippers']['left']['open_q']>p['grippers']['left']['closed_q']
     assert p['grippers']['left']['contact_groups']==[['partner'],['tool']]
+
+
+def test_a_wide_closing_gripper_gets_the_cube_its_closure_requires(tmp_path, monkeypatch):
+    """A jaw that stops 20mm apart cannot squeeze the cube its finger-length cap allows.
+
+    Measured 2026-10-24 on OpenManipulator-X: it closes to 20.0mm while 35% of its 65mm
+    finger caps the cube at 22.7mm, and the squeeze rule needs 0.8 * cube <= 20mm, i.e. a
+    25mm cube - so every candidate was refused and the import lost physical_grasp.
+    """
+    import xml.etree.ElementTree as ET
+    source = jaw_robot(tmp_path)
+    root = ET.fromstring(source.read_text())
+    for name in ('palm', 'tool'):
+        link = root.find(f"link[@name='{name}']")
+        for item in list(link):
+            link.remove(item)
+    def finger(link, y):
+        collision = ET.SubElement(link, 'collision')
+        ET.SubElement(collision, 'origin', xyz=f'0 {y} .03')
+        ET.SubElement(ET.SubElement(collision, 'geometry'), 'box', size='.02 .008 .06')
+    finger(root.find("link[@name='tool']"), .014)
+    finger(ET.SubElement(root, 'link', name='partner'), -.014)
+    drive = root.find("joint[@name='last']")
+    drive.set('type', 'prismatic')
+    drive.find('axis').set('xyz', '0 1 0')
+    drive.find('limit').set('lower', '0')
+    drive.find('limit').set('upper', '.06')
+    follow = ET.SubElement(root, 'joint', name='coupled', type='prismatic')
+    ET.SubElement(follow, 'parent', link='palm')
+    ET.SubElement(follow, 'child', link='partner')
+    ET.SubElement(follow, 'axis', xyz='0 -1 0')
+    ET.SubElement(follow, 'limit', lower='0', upper='.06', effort='1', velocity='1')
+    ET.SubElement(follow, 'mimic', joint='last', multiplier='1')
+    ET.ElementTree(root).write(source)
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    profile = registry.import_robot(source)
+    gripper = profile['grippers']['left']
+    assert gripper['minimum_aperture'] > .015, 'fixture jaw must not fully close'
+    assert gripper['cube_size'] >= gripper['minimum_aperture'] / .8 - 1e-9
+    assert gripper['maximum_aperture'] > gripper['cube_size']
+    assert 'physical_grasp' in profile['capabilities']
