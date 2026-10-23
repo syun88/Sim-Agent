@@ -78,17 +78,37 @@ A held object must first be released or reset. On load failure the owner reconst
 profile. Only one world/viewer is live. `GenericURDFEnvironment` creates a ground plane, desk and
 selected fixed-base URDF, without the OpenArm Cell or any OpenArm robot entity.
 
-`robots/spawn.py` projects each chain's initial tool position onto the desk and searches separated
-candidate locations. Admission checks full-pose IK at the settled cube center and at 4cm and 8cm
+`robots/spawn.py` projects each chain's initial tool position onto the desk for the default layout.
+Random layouts instead clip a chain-length reach bound against the desk and use jittered strata
+across that rectangle. The candidates must still pass full geometry and IK admission, including
+connected adjacent-link joint intervals; the reach bound itself is not a clearance certificate.
+Admission checks full-pose IK at the settled cube center and at 4cm and 8cm
 above it, including robot/desk collision clearance. Detected jaws also require five closure samples
 with aperture-centering compensation and a 3cm verification-lift pose. The live approach separately
 checks the full 49-sample closure and its interpolation; admission alone is not physical evidence.
 `spawn_validation.json` records the actual solutions and residuals. Random resets sample
-new candidates and repeat the checks; explicit unreachable or colliding coordinates fail. A robot that cannot
+new candidates and repeat the checks; explicit unreachable or colliding coordinates fail. Cubes
+must also be clear of the robot in its setup posture. Missing props are not added after Genesis
+has been built. A robot that cannot
 reach the desk gets no unreachable props. Generic tool origins are not certified pinch frames.
 For OpenArm, `simulation/openarm_v2/spawn.py` instead checks the official fingertip offset,
 calibrated grasp orientation and actual approach waypoints on private official-model data.
 The same checks run on documented defaults, random layouts and explicit setup positions.
+
+`simulation/randomization.py` supplies fresh 32-bit seeds and stratified candidate generation.
+Explicit seed and `shuffle_sides` options pass through the broker, native runner and both backends.
+The default colour/arm assignment can be shuffled, without changing object IDs. The sampled
+setup positions are reproducible for the same model; physical task outcomes are independently
+observed. Random candidates must differ from their default positions by at least 4cm and keep
+10cm between cubes. Sampling failure is reported rather than silently returning a default pose.
+Only X/Y and colour/arm assignment are randomised; initial orientation and prop count stay fixed.
+
+An object's `admitted_grasp_arm` is exposed only while its measured position remains within 5mm
+of its admitted spawn. The compiler prefers that hand when none is requested; an explicit hand
+still wins. Moving an object invalidates the spawn hint. The model prompt now reads imported
+capabilities instead of the stale assertion that imported robots support motion only.
+`scripts/verify_randomized_layouts.py` separately records private IK admission, settled Genesis
+setup and optional physical picks; failed cases keep their seed and measured state.
 
 Imported profiles expose motor-driven relative motion, home and rotary joint angle commands.
 `ImportedRobotExecutor` respects source velocity/effort limits and checks actual final errors.

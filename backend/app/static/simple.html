@@ -24,21 +24,25 @@
 <textarea id="instruction" maxlength="2000">右手で青いキューブを取って左手に渡して左側の赤いキューブの上に乗せて</textarea>
 <div class="row examples" id="examples"></div>
 <div class="row"><button id="execute" class="primary">実行</button><button id="stop" class="danger" disabled>停止</button><button id="reset">シーンを初期化</button><button id="randomize">配置を変えて初期化</button></div>
+<div class="row"><label>配置シード <input id="randomSeed" type="number" min="0" max="4294967295" step="1" placeholder="空欄なら毎回新規" style="width:180px"></label><label><input id="shuffleSides" type="checkbox" checked>色の左右もシャッフル</label><button id="replayRandom" disabled>同じ配置を再現</button></div>
+<p id="randomizationInfo" class="muted">ランダム配置は、手が届く机の範囲から選びます。シードを指定すると同じ配置を再現できます。</p>
 <p id="status" class="status" aria-live="polite">指示を入力して実行できます。</p></section>
 <section class="panel"><h2>腕と物体の状態</h2><div id="world" class="muted">シミュレーションの計測値を待っています。</div></section>
 <section id="planPanel" class="panel" hidden><h2>解釈した作業</h2><div id="provider" class="muted"></div><ol id="actions"></ol><p id="assumptions" class="muted"></p><div id="verification" class="status"></div><details><summary>計測結果と実行ログ</summary><pre id="evidence"></pre></details></section>
 </main>
 <script type="module">
 const $=id=>document.getElementById(id);
-let currentTaskId=null, polling=false, shownPlan='', robotCatalog=[], activeRobot='openarm_v2', isBusy=false;
+let currentTaskId=null, polling=false, shownPlan='', robotCatalog=[], activeRobot='openarm_v2', isBusy=false,lastRandomization=null;
 const arm={left:'左手',right:'右手'}, object={red_cube:'赤いキューブ',blue_cube:'青いキューブ',wine_bottle:'ワインボトル',wine_glass:'グラス'}, target={blue_zone:'青いゾーン',green_zone:'緑のゾーン',left_side:'左側',right_side:'右側',center:'中央',wine_glass:'グラス'};
 const op={pick:'掴んで持つ',handover:'渡す',place:'置く',approach:'近づく',move:'動かす',open:'開く',close:'閉じる',home:'ホームに戻す',throw:'上に投げる',pour:'注ぐ',joint:'関節を動かす'};
 const relation={on:'上に重ねる',left_of:'左隣に置く',right_of:'右隣に置く',front_of:'手前に置く',behind:'奥に置く',near:'そばに置く'};
 function volume(value){if(!Number.isFinite(value))return '不明';if(value===0)return '0';if(value>0&&value<0.0001)return '0.0001未満';return String(Number(value.toFixed(4)));}
 function status(text,tone=''){$('status').className=`status ${tone}`;$('status').textContent=text;}
-function busy(value){isBusy=value;for(const id of ['execute','reset','randomize','robotSelect','switchRobot','urdfFolder','importRobot','jointSelect','jointAngle','moveJoint'])$(id).disabled=value;$('moveJoint').disabled=value||$('robotSelect').value!==activeRobot||!$('jointSelect').options.length;$('stop').disabled=!value||!currentTaskId;}
+function busy(value){isBusy=value;for(const id of ['execute','reset','randomize','robotSelect','switchRobot','urdfFolder','importRobot','jointSelect','jointAngle','moveJoint','randomSeed','shuffleSides'])$(id).disabled=value;$('replayRandom').disabled=value||!lastRandomization;$('moveJoint').disabled=value||$('robotSelect').value!==activeRobot||!$('jointSelect').options.length;$('stop').disabled=!value||!currentTaskId;}
 async function request(path,options){const r=await fetch(path,options);const data=await r.json();if(!r.ok)throw Error(typeof data.detail==='string'?data.detail:JSON.stringify(data.detail));return data;}
 function drawTask(t){
+ if(t.verification?.randomization)drawRandomization(t.verification.randomization);
+ else if(t.status==='FAILED'&&t.randomization_request)drawRandomization({...t.randomization_request,enabled:true});
  if(t.plan){
   $('planPanel').hidden=false;const p=t.plan,key=JSON.stringify(p.program);
   $('provider').textContent=`解釈: ${p.provider==='local_ollama'?'ローカル言語モデル':p.provider==='deterministic_fallback'?'定型文フォールバック':p.provider}${p.provider_error?' / モデルの回答を検証できず、定型文で解釈':''}`;
@@ -46,7 +50,7 @@ function drawTask(t){
   const index=t.step?.action_index??t.result?.action_index;[...$('actions').children].forEach((li,i)=>{li.className=t.status==='SUCCEEDED'||i<index?'done':i===index?'active':'';});
  }
  if(t.verification){const checks=t.verification.checks??[];$('verification').textContent=checks.map(c=>`${object[c.object]??c.object}: ${c.success?'確認済み':'未達成'}${c.target?' / '+(object[c.target]??target[c.target]??c.target):''}${Number.isFinite(c.horizontal_position_error)?' / 誤差 '+(c.horizontal_position_error*1000).toFixed(1)+' mm':''}${Number.isFinite(c.poured_ml)?' / 注いだ量 '+volume(c.poured_ml)+' mL / こぼれ合計 '+volume(c.spilled_ml)+' mL / 空中 '+volume(c.liquid?.in_flight_ml)+' mL':''}${Number.isFinite(c.free_flight_rise)?' / 自由飛行の上昇 '+(c.free_flight_rise*100).toFixed(1)+' cm':''}${c.arm?' / '+arm[c.arm]:''}`).join('\n');}
- $('evidence').textContent=JSON.stringify({verification:t.verification,detail:t.detail,retry_count:t.retry_count,skills:t.skills},null,2);
+ $('evidence').textContent=JSON.stringify({randomization_request:t.randomization_request,verification:t.verification,detail:t.detail,retry_count:t.retry_count,skills:t.skills},null,2);
 }
 async function poll(){
  if(polling)return;polling=true;
@@ -59,8 +63,10 @@ async function poll(){
  }}finally{polling=false;busy(false);loadRobots();}
 }
 async function submit(){const text=$('instruction').value.trim();if(text.length<3){status('指示を3文字以上で入力してください。','bad');return;}busy(true);shownPlan='';$('planPanel').hidden=true;$('verification').textContent='';status('指示を送信しています…');try{const t=await request('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({instruction:text})});currentTaskId=t.task_id;busy(true);poll();}catch(e){status(e.message,'bad');busy(false);}}
-async function reset(randomize){busy(true);try{const t=await request(`/api/scene/reset?randomize=${randomize}`,{method:'POST'});currentTaskId=t.task_id;status('初期化を受け付けました。Genesisの完了を待っています。');busy(true);poll();}catch(e){status(e.message,'bad');busy(false);}}
-async function refresh(){try{const h=await request('/api/health');$('connection').textContent=`Genesis · ${h.robot} · ${h.viewer_online?'接続中':h.viewer_starting?'シーンを準備中':'ビューアーの起動を待っています'} · ${h.provider}`;if(h.viewer_online){const w=await request('/api/scene');$('world').replaceChildren();for(const side of ['left','right']){const d=document.createElement('div');d.textContent=`${arm[side]}: ${object[w.robot[side+'_arm'].held_object]??'持っている物体なし'}`;$('world').append(d);}if(w.fluid){const d=document.createElement('div');d.textContent=`ワイン: ボトル ${volume(w.fluid.bottle_ml)} mL / グラス ${volume(w.fluid.glass_ml)} mL / 空中 ${volume(w.fluid.in_flight_ml)} mL / こぼれ合計 ${volume(w.fluid.spilled_ml)} mL`;$('world').append(d);}}}catch{$('connection').textContent='サーバーに接続できません。起動を確認しています。';}}
+async function reset(randomize,replay=false){busy(true);try{const seed=replay?lastRandomization?.seed:$('randomSeed').value.trim();const shuffle=replay?lastRandomization.shuffle_sides:$('shuffleSides').checked;const query=new URLSearchParams({randomize:String(randomize),shuffle_sides:String(shuffle)});if(randomize&&seed!==''&&seed!=null){const n=Number(seed);if(!Number.isInteger(n)||n<0||n>4294967295)throw Error('シードは0〜4294967295の整数を指定してください。');query.set('seed',String(n));}const t=await request(`/api/scene/reset?${query}`,{method:'POST'});currentTaskId=t.task_id;status(randomize?`手が届く配置を探索しています。シード: ${t.seed}`:'初期化を受け付けました。Genesisの完了を待っています。');busy(true);poll();}catch(e){status(e.message,'bad');busy(false);}}
+$('replayRandom').onclick=()=>reset(true,true);
+function drawRandomization(r){if(!r?.enabled){if(!lastRandomization){$('randomizationInfo').textContent='キューブ配置は、手が届く範囲から選びます。シード指定で再現できます。';$('replayRandom').disabled=true;}return;}lastRandomization={...r,robot_id:r.robot_id??activeRobot};$('randomizationInfo').textContent=`直前のランダム配置シード: ${r.seed} / 色の左右シャッフル: ${r.shuffle_sides?'あり':'なし'}。空欄で「配置を変えて初期化」を押すと新しい配置になります。`;$('replayRandom').disabled=isBusy;}
+async function refresh(){try{const h=await request('/api/health');$('connection').textContent=`Genesis · ${h.robot} · ${h.viewer_online?'接続中':h.viewer_starting?'シーンを準備中':'ビューアーの起動を待っています'} · ${h.provider}`;if(h.viewer_online){const w=await request('/api/scene');if(lastRandomization&&lastRandomization.robot_id!==w.robot.type){lastRandomization=null;$('replayRandom').disabled=true;}drawRandomization({...w.spawn_validation?.randomization,robot_id:w.robot.type});$('world').replaceChildren();for(const side of ['left','right']){const d=document.createElement('div');d.textContent=`${arm[side]}: ${object[w.robot[side+'_arm'].held_object]??'持っている物体なし'}`;$('world').append(d);}for(const o of w.objects??[]){const d=document.createElement('div');d.textContent=`${object[o.id]??o.id}: (${o.position.map(v=>Number(v).toFixed(3)).join(', ')}) m`;$('world').append(d);}if(w.fluid){const d=document.createElement('div');d.textContent=`ワイン: ボトル ${volume(w.fluid.bottle_ml)} mL / グラス ${volume(w.fluid.glass_ml)} mL / 空中 ${volume(w.fluid.in_flight_ml)} mL / こぼれ合計 ${volume(w.fluid.spilled_ml)} mL`;$('world').append(d);}}}catch{$('connection').textContent='サーバーに接続できません。起動を確認しています。';}}
 function showRobot(){
  const r=robotCatalog.find(item=>item.id===$('robotSelect').value);if(!r)return;
  $('robotInfo').replaceChildren();const text=document.createElement('span');

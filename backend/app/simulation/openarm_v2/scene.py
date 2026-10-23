@@ -25,28 +25,14 @@ INITIAL_OBJECT_POSES = {
     "red_cube": (0.44, 0.15, 1.032),
     "blue_cube": (0.50, -0.22, 1.032),
 }
-#: Seed of the documented randomization, shared so every engine randomizes identically.
-RANDOM_SEED = 20261017
-
-
-def initial_object_positions(randomize: bool = False, seed: int = RANDOM_SEED) -> dict[str, np.ndarray]:
-    """Cube placement for a scene reset, identical on every engine.
-
-    `randomize` is a documented scene reset/setup operation: it moves the cubes before a task
-    starts and never during an execution. One generator serves every draw, so the two red-cube
-    axes are independent samples rather than the same sample repeated.
-    """
+def initial_object_positions(randomize: bool = False, seed: int | None = None,
+                             shuffle_sides: bool = True) -> dict[str, np.ndarray]:
+    """Default setup or a broad IK-admitted layout; explicit seeds reproduce it."""
     positions = {name: np.array(pose, dtype=float) for name, pose in INITIAL_OBJECT_POSES.items()}
     if not randomize:
         return positions
-    rng = np.random.default_rng(seed)
-    positions["red_cube"] = np.array(
-        [rng.uniform(0.37, 0.42), rng.uniform(0.11, 0.18), 1.032]
-    )
-    positions["blue_cube"] = positions["blue_cube"] + np.array(
-        [rng.uniform(-0.012, 0.012), rng.uniform(-0.012, 0.012), 0.0]
-    )
-    return positions
+    from backend.app.simulation.openarm_v2.spawn import random_spawn_layout,private_spawn_environment
+    return random_spawn_layout(private_spawn_environment(),seed=seed,shuffle_sides=shuffle_sides)[0]
 
 
 def official_cell_xml() -> str:

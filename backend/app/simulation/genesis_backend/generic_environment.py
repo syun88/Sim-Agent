@@ -120,11 +120,7 @@ class GenericURDFEnvironment(SimulationBackend):
         return dict(zip(self._all_names, self._entity.get_dofs_position(self._all_dofs).cpu().numpy().astype(float)))
 
     def ik_joint_limits(self,side):
-        if not hasattr(self,'_geometric_joint_limits'):self._geometric_joint_limits={}
-        if side not in self._geometric_joint_limits:
-            names=self.profile['chains'][side]['joints']
-            self._geometric_joint_limits[side]=self.collision_queries.adjacent_joint_intervals(names,self.profile['home'])
-        return self._geometric_joint_limits[side]
+        return self._spawn_sampler.arm_joint_limits(side)
 
     def plan_joint_waypoints(self, side, waypoints, stop=lambda: False):
         names = self.profile['chains'][side]['joints']
@@ -156,10 +152,11 @@ class GenericURDFEnvironment(SimulationBackend):
         return {'engine': self.name, 'robot_links': self._entity.n_links, 'degrees_of_freedom': self._entity.n_dofs,
                 'collision_geoms': self._entity.n_geoms, 'openarm_cell': False, 'robot_id': self.robot_id}
 
-    def reset(self, randomize=False, object_positions=None, seed=None):
+    def reset(self, randomize=False, object_positions=None, seed=None,shuffle_sides=True):
         self._resolved_zones = {}
         placements = self._spawn_sampler.layout(randomize=randomize, object_positions=object_positions,
-                                                 base=self._object_start,rng=np.random.default_rng(seed))
+            base=self._object_start,seed=seed,shuffle_sides=shuffle_sides,
+            stop=getattr(self,'planning_pulse',lambda:False))
         self.spawn_validation = placements
         self._sim_step = 0
         self._contact_evidence_cache.clear()

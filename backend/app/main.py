@@ -16,6 +16,8 @@ from backend.app.memory.graph_memory import MemoryStore
 from backend.app.models.schemas import TaskRequest, TaskResponse
 from backend.app.robots.registry import available_robots, get_profile, import_robot, selected_robot
 from pydantic import BaseModel
+from fastapi import Query
+from backend.app.simulation.randomization import resolve_seed
 from backend.app.planning.agent_planner import AgentPlanner
 from backend.app.simulation import ENGINE_DESCRIPTION
 
@@ -96,19 +98,24 @@ def _enqueue(command: dict) -> dict:
     genesis_command_queue.append(command)
     record = {'task_id': task_id, 'instruction': command.get('instruction', 'Scene reset'),
               'status': 'QUEUED_FOR_GENESIS_VIEWER', 'events': [], 'created_at': time.time()}
+    if command.get('randomize'):
+        record['randomization_request']={k:command.get(k) for k in ('seed','shuffle_sides')}
     app.state.executions.append(record)
     return record
 
 
 @app.post('/api/scene/reset')
-def reset_scene(randomize: bool = False):
-    record = _enqueue({'action': 'reset', 'randomize': randomize})
-    return {'status': 'queued', 'randomized': randomize, 'task_id': record['task_id']}
+def reset_scene(randomize: bool = False,seed:int|None=Query(default=None,ge=0,le=2**32-1),shuffle_sides:bool=True):
+    seed=resolve_seed(seed) if randomize else None
+    record = _enqueue({'action': 'reset', 'randomize': randomize,'seed':seed,'shuffle_sides':shuffle_sides})
+    return {'status': 'queued', 'randomized': randomize,'seed':seed,'shuffle_sides':shuffle_sides,'task_id': record['task_id']}
 
 
 @app.post('/api/tasks', response_model=TaskResponse)
 async def create_task(request: TaskRequest):
-    record = _enqueue({'action': 'task', **request.model_dump()})
+    body=request.model_dump()
+    if request.randomize:body['seed']=resolve_seed(request.seed)
+    record = _enqueue({'action': 'task', **body})
     return TaskResponse(task_id=record['task_id'], status='PLANNING', message='Task queued for Genesis viewer')
 
 

@@ -464,6 +464,8 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         self,
         randomize: bool = False,
         object_positions: dict[str, np.ndarray] | None = None,
+        seed: int | None = None,
+        shuffle_sides: bool = True,
     ) -> None:
         """Restore the initial scene.
 
@@ -479,7 +481,14 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         for joint_name, value in self._meta.keyframe_ctrl.items():
             dof = int(entity.get_joint(joint_name).dofs_idx_local[0])
             entity.control_dofs_position(np.array([value], dtype=np.float32), np.array([dof]))
-        placements = initial_object_positions(randomize) if self._cube_names else {}
+        # The scene is now at the default setup. An interrupted/failed search
+        # must not publish the previous layout's seed as the current admission.
+        self.spawn_validation={'objects':{}}
+        random_report=None
+        if randomize and self._cube_names:
+            from backend.app.simulation.openarm_v2.spawn import random_spawn_layout
+            placements,random_report=random_spawn_layout(self,seed=seed,shuffle_sides=shuffle_sides)
+        else:placements=initial_object_positions() if self._cube_names else {}
         if object_positions:
             placements = {
                 **placements,
@@ -487,6 +496,7 @@ class GenesisOpenArmV2Environment(SimulationBackend):
             }
         from backend.app.simulation.openarm_v2.spawn import validate_spawn_positions
         self.spawn_validation = validate_spawn_positions(self, placements)
+        if random_report:self.spawn_validation['randomization']=random_report['randomization']
         if self._wine:
             from backend.app.simulation.genesis_backend.wine import BOTTLE_START
             self.spawn_validation['objects'].update(validate_spawn_positions(self, {'wine_bottle': BOTTLE_START})['objects'])

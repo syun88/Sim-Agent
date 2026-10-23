@@ -2,6 +2,7 @@
 import numpy as np
 
 from backend.app.robots.urdf import URDFModel, URDFKinematics, solve_profile_ik
+from backend.app.simulation.randomization import resolve_seed,desk_candidates,changed_position,SpawnSamplingError
 
 
 class ReachableDeskSpawns:
@@ -12,15 +13,27 @@ class ReachableDeskSpawns:
         self.profile, self.scene = profile, scene
         self._collision_queries = None
         self._validated = {}
+        self._joint_limits={}
         self.half_size = float(scene.get("cube_size", .052)) / 2.
         self.model = URDFModel(profile['urdf'])
         self.preferred = {}
+        self.bounds={}
+        _,axes=self.model.forward(profile['home'],profile['root_transform'])
         for side, chain in profile['chains'].items():
             if profile.get('grippers') and side not in profile['grippers']:
                 continue
             kin = URDFKinematics(self.model, chain, profile['home'], profile['root_transform'], chain['tool_offset'])
             q = np.asarray([profile['home'][name] for name in chain['joints']])
             self.preferred[side] = kin.evaluate(q)[0][:2]
+            chain_joints=self.model.chain(chain['end_link'])
+            first=next((i for i,j in enumerate(chain_joints) if j['name'] in chain['joints']),0)
+            shoulder=axes[chain_joints[first]['name']][0] if chain_joints else np.asarray(profile['root_transform'])[:3,3]
+            reach=sum(np.linalg.norm(np.asarray(j['origin'])[:3,3]) for j in chain_joints[first+1:])+np.linalg.norm(chain['tool_offset'])
+            reach+=sum(max(abs(j['lower']),abs(j['upper'])) for j in chain_joints[first:]
+                       if j['type']=='prismatic')
+            radius=np.sqrt(max(0.,reach**2-(scene['table_top']+self.half_size-shoulder[2])**2))
+            edge=np.asarray(scene['table_size'][:2])/2.-self.half_size-.02
+            self.bounds[side]=(np.maximum(-edge,shoulder[:2]-radius),np.minimum(edge,shoulder[:2]+radius))
 
     @property
     def collision_queries(self):
@@ -28,6 +41,12 @@ class ReachableDeskSpawns:
             from backend.app.robots.collision_planner import PrivateCollisionQueries
             self._collision_queries = PrivateCollisionQueries(self.profile,self.scene['table_top'])
         return self._collision_queries
+
+    def arm_joint_limits(self,side):
+        if side not in self._joint_limits:
+            self._joint_limits[side]=self.collision_queries.adjacent_joint_intervals(
+                self.profile['chains'][side]['joints'],self.profile['home'])
+        return self._joint_limits[side]
 
     def validate(self, position, side):
         point = np.asarray(position, float)
@@ -50,13 +69,19 @@ class ReachableDeskSpawns:
             snapshot.update({g['joint']:g['open_q'],**{n:g['open_q']*k for n,k in g['followers'].items()}})
         gripper = self.profile.get('grippers',{}).get(side)
         attitude = np.array(gripper['grasp_rotation']) if gripper else None
+        joint_limits=self.arm_joint_limits(side)
         def checked_pose(target, initial):
-            result = solve_profile_ik(self.profile,side,target,attitude,model=self.model,q_init=initial,snapshot=snapshot)
+            result = solve_profile_ik(self.profile,side,target,attitude,model=self.model,q_init=initial,
+                snapshot=snapshot,joint_limits=joint_limits)
             if not result['success']:
                 raise ValueError(f'{side}: object or approach is outside IK reach')
             q = np.array(result['q_rad'])
-            if self.collision_queries.contacts({**snapshot,**dict(zip(names,q))},tolerance=-.0001):
-                q = (self.collision_queries.refine_pose(self.profile,side,target,attitude,q,snapshot,minimum_clearance=.0001)
+            collisions=self.collision_queries.contacts({**snapshot,**dict(zip(names,q))},tolerance=-.0001)
+            if collisions:
+                if max(c['penetration_m'] for c in collisions)>.003:
+                    raise ValueError(f'{side}: spawn IK posture deeply intersects the robot or desk')
+                q = (self.collision_queries.refine_pose(self.profile,side,target,attitude,q,snapshot,
+                        minimum_clearance=.0001,joint_limits=joint_limits)
                      if attitude is not None else None)
                 if q is None:
                     raise ValueError(f'{side}: spawn grasp intersects the robot or desk')
@@ -69,6 +94,9 @@ class ReachableDeskSpawns:
             return result,q
         # Plan at the supported height, rather than the 2mm setup drop height.
         supported = point-[0.,0.,self.clearance]
+        if self.collision_queries.box_contact_points(snapshot,supported,np.eye(3),self.half_size*2.,
+                set(self.model.links),distance=.0001):
+            raise ValueError(f'{side}: spawn cube intersects the robot in its setup posture')
         for dz in (0., .04, .08):
             result,seed = checked_pose(supported+[0.,0.,dz],seed)
             checks.append({'height_above_object': dz, **result})
@@ -101,28 +129,46 @@ class ReachableDeskSpawns:
         self._validated[key] = entry
         return entry
 
-    def layout(self, *, randomize=False, object_positions=None, base=None, rng=None):
-        rng = rng if rng is not None else np.random.default_rng()
+    def layout(self, *, randomize=False, object_positions=None, base=None, rng=None,seed=None,
+               shuffle_sides=True,stop=lambda:False):
+        actual_seed=resolve_seed(seed) if rng is None and randomize else seed
+        if rng is None:rng=np.random.default_rng(actual_seed)
         objects, omitted = {}, {}
+        if randomize and base is not None and not base:
+            raise SpawnSamplingError('The current scene has no reachable cubes to randomize')
         assignments = [('red_cube', 'left'), ('blue_cube', 'right')]
+        if randomize and shuffle_sides and rng.integers(2):
+            assignments=[('red_cube','right'),('blue_cube','left')]
+        attempted={}
         for name, preferred_side in assignments:
+            if base is not None and name not in base:
+                omitted[name]='Object is absent from the current scene; reset cannot add a new entity'
+                continue
             side = preferred_side if preferred_side in self.preferred else next(iter(self.preferred))
             explicit = (object_positions or {}).get(name)
             if explicit is not None and (np.asarray(explicit).shape != (3,) or not np.isfinite(explicit).all()):
                 raise ValueError(f'{name}: spawn needs three finite coordinates')
             home_xy = np.asarray((base or {}).get(name, {}).get('position', [*self.preferred[side], 0.]))[:2]
             step = max(.008,min(.025,self.half_size))
-            fine = [(x,y) for r in (step,2*step) for x,y in
+            fine = [(x,y) for r in (step,1.5*step,2*step) for x,y in
                     [(-r,0.),(r,0.),(0.,-r),(0.,r),(-r,-r),(-r,r),(r,-r),(r,r)]]
             offsets = [(0.,0.),*fine,(.10, 0.), (-.10, 0.), (0., .10), (0., -.10),
                        (.07, .07), (.07, -.07), (-.07, .07), (-.07, -.07)]
             if randomize:
-                offsets = [*rng.uniform(-.035, .035, (24, 2)), (0., 0.), *offsets[1:]]
+                lower,upper=self.bounds[side]
+                try:xy=desk_candidates(lower,upper,rng)
+                except ValueError as error:raise SpawnSamplingError(f'{side}: {error}') from None
+                previous_point=(base or {}).get(name,{}).get('position')
+                xy=[p for p in xy if changed_position(p,previous_point)]
             candidates = [np.asarray(explicit)] if explicit is not None else [
-                np.r_[home_xy + offset, self.scene['table_top'] + self.half_size + self.clearance] for offset in offsets]
+                np.r_[point, self.scene['table_top'] + self.half_size + self.clearance]
+                for point in (xy if randomize else [home_xy+offset for offset in offsets])]
+            attempted[name]=0
             for position in candidates:
+                if stop():raise InterruptedError('Desk randomization stopped')
                 if any(np.linalg.norm(position[:2] - np.asarray(other['position'])[:2]) < .10 for other in objects.values()):
                     continue
+                attempted[name]+=1
                 try:
                     objects[name] = self.validate(position, side)
                     break
@@ -130,7 +176,11 @@ class ReachableDeskSpawns:
                     continue
             if name not in objects:
                 if explicit is not None or base and name in base:
-                    raise ValueError(f'No reachable, separated desk spawn for {name}')
+                    raise SpawnSamplingError(f'No changed, reachable, separated desk spawn for {name} after {attempted[name]} candidates')
                 omitted[name] = 'No desk position reachable at object and approach heights; no object spawned'
         return {'objects': objects, 'omitted': omitted, 'openarm_cell': False,
+                'randomization':{'enabled':randomize,'seed':actual_seed,'shuffle_sides':shuffle_sides,
+                    'sampling':'stratified_reachable_workspace' if randomize else 'default',
+                    'minimum_change_m':.04,'change_reference':'default_layout','candidate_attempts':attempted,
+                    'candidate_bounds_m':{s:[a.tolist(),b.tolist()] for s,(a,b) in self.bounds.items()}},
                 'method': 'private URDF IK and collision queries before scene setup', 'grasp_calibrated': False}

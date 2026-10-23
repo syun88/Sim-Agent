@@ -54,6 +54,8 @@ class AgentPlan(BaseModel):
 class TaskRequest(BaseModel):
     instruction: str = Field(min_length=3, max_length=2000)
     randomize: bool = False
+    seed: int | None = Field(default=None,ge=0,le=2**32-1)
+    shuffle_sides: bool = True
     force_failure: bool = False
 
 

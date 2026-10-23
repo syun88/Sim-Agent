@@ -92,6 +92,8 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
 
     def auto_arm(obj: str) -> str:
         grippers = state.get("robot", {}).get("grippers")
+        admitted=objects[obj].get('admitted_grasp_arm')
+        if admitted in available_arms and (grippers is None or admitted in grippers):return admitted
         if grippers and len(grippers) == 1:
             return next(iter(grippers))
         if len(available_arms) == 1:

@@ -74,7 +74,8 @@ class SimulationBackend(ABC):
         """Simulation timestep in seconds."""
 
     @abstractmethod
-    def reset(self, randomize: bool = False, object_positions: dict[str, np.ndarray] | None = None) -> None:
+    def reset(self, randomize: bool = False, object_positions: dict[str, np.ndarray] | None = None,
+              seed: int | None = None,shuffle_sides: bool = True) -> None:
         """Restore the initial scene.
 
         `object_positions` overrides where the objects start - a scene *setup* operation that runs

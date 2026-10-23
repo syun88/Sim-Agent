@@ -163,7 +163,7 @@ class PrivateCollisionQueries:
             limits.append(ends)
         return np.asarray(limits,float)
 
-    def refine_pose(self, profile, side, position, rotation, q, snapshot, minimum_clearance=0.):
+    def refine_pose(self, profile, side, position, rotation, q, snapshot, minimum_clearance=0.,joint_limits=None):
         """Resolve small collisions while retaining the requested tool pose.
 
         Pose-only IK can repeatedly converge to a colliding redundant posture.
@@ -178,6 +178,9 @@ class PrivateCollisionQueries:
         specs = [self.urdf.by_name[name] for name in names]
         lower = [j['lower'] if j['lower'] is not None else -np.inf for j in specs]
         upper = [j['upper'] if j['upper'] is not None else np.inf for j in specs]
+        if joint_limits is not None:
+            lower=np.maximum(lower,np.asarray(joint_limits)[:,0])
+            upper=np.minimum(upper,np.asarray(joint_limits)[:,1])
         bodies = ['world', *self.urdf.links]
         pairs = {tuple(sorted((a,b))): i for i,(a,b) in enumerate(
             ( (a,b) for i,a in enumerate(bodies) for b in bodies[i+1:] ))}

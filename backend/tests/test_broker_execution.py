@@ -52,3 +52,24 @@ def test_a_second_process_cannot_consume_the_registered_viewers_command_or_fake_
         assert client.get("/api/genesis/next").status_code == 409
         assert client.get("/api/genesis/next?viewer_id=owner").json()["task_id"] == task
         assert client.post("/api/genesis/result", json={"task_id": task, "success": True}).status_code == 409
+
+
+def test_random_reset_carries_a_replayable_seed_and_side_shuffle_through_the_queue():
+    with TestClient(app) as client:
+        requested=client.post('/api/scene/reset?randomize=true&seed=0&shuffle_sides=false').json()
+        stored=client.get('/api/tasks/'+requested['task_id']).json()
+        assert stored['randomization_request']=={'seed':0,'shuffle_sides':False}
+        command=client.get('/api/genesis/next').json()
+        assert requested['seed']==command['seed']==0
+        assert command['shuffle_sides'] is False
+        fresh=[client.post('/api/scene/reset?randomize=true').json()['seed'] for _ in range(2)]
+        assert fresh[0]!=fresh[1]
+        assert client.post('/api/scene/reset?randomize=true&seed=-1').status_code==422
+        assert client.post('/api/tasks',json={'instruction':'青を掴んで','randomize':True,'seed':2**32}).status_code==422
+
+
+def test_randomized_task_uses_the_requested_seed():
+    with TestClient(app) as client:
+        client.post('/api/tasks',json={'instruction':'青を掴んで','randomize':True,'seed':123,'shuffle_sides':False})
+        command=client.get('/api/genesis/next').json()
+        assert command['seed']==123 and command['shuffle_sides'] is False

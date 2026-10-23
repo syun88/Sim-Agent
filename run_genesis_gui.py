@@ -18,6 +18,7 @@ from backend.app.planning.agent_planner import AgentPlanner, PlannerProviderErro
 from backend.app.planning.scene_selection import scene_for_instruction
 from backend.app.simulation import create_backend
 from backend.app.robots.registry import get_profile, selected_robot, remember_selection
+from backend.app.simulation.randomization import SpawnSamplingError
 
 BACKEND_URL = 'http://127.0.0.1:8000'
 
@@ -107,6 +108,7 @@ def main() -> None:
             raise InterruptedError('Task stopped between physics steps')
 
     env.step_observer = observe_step
+    env.planning_pulse=should_stop
 
     def prepare_scene(profile):
         nonlocal env, executor, last_publish
@@ -130,6 +132,7 @@ def main() -> None:
             raise
         executor = make_executor(env)
         env.step_observer = observe_step
+        env.planning_pulse=should_stop
         env.step(200)
         last_publish = 0.
         publish('scene_ready', force=True, status='PLANNING', detail=None)
@@ -160,6 +163,7 @@ def main() -> None:
             raise
         executor = make_executor(env)
         env.step_observer = observe_step
+        env.planning_pulse=should_stop
         env.step(200)
         remember_selection(robot_id)
         last_publish = 0.
@@ -190,10 +194,13 @@ def main() -> None:
                 if should_stop():
                     body.update(success=False, status='STOPPED')
                 elif command['action'] == 'reset':
-                    env.reset(randomize=bool(command.get('randomize')))
+                    publish('scene_preparing',force=True,status='PREPARING_SCENE',detail='Sampling reachable desk positions')
+                    env.reset(randomize=bool(command.get('randomize')),seed=command.get('seed'),
+                              shuffle_sides=command.get('shuffle_sides',True))
                     executor.reset_context()
                     env.step(200)
-                    body.update(success=True, verification={'success': True, 'goal_type': 'scene_reset'}, final_world_state=build_world_state(env))
+                    body.update(success=True, verification={'success': True, 'goal_type': 'scene_reset',
+                        'randomization':env.spawn_validation.get('randomization')}, final_world_state=build_world_state(env))
                 elif command['action'] == 'select_robot':
                     prepare_robot(command['robot_id'])
                     body.update(success=True, verification={'success': True, 'goal_type': 'robot_selection', 'robot_id': command['robot_id']},
@@ -202,7 +209,8 @@ def main() -> None:
                     if getattr(env, 'robot_id', 'openarm_v2') == 'openarm_v2':
                         prepare_scene(scene_for_instruction(command['instruction'], env.scene_profile))
                     if command.get('randomize'):
-                        env.reset(randomize=True)
+                        publish('scene_preparing',force=True,status='PREPARING_SCENE',detail='Sampling reachable desk positions')
+                        env.reset(randomize=True,seed=command.get('seed'),shuffle_sides=command.get('shuffle_sides',True))
                         executor.reset_context()
                         env.step(200)
                     state = executor.world_state()
@@ -226,6 +234,8 @@ def main() -> None:
                 print(f"Task {body.get('status', 'SUCCEEDED' if body.get('success') else 'FAILED')}", flush=True)
             except PlannerProviderError as exc:
                 body.update(success=False, detail=f'{exc.category}: {exc}', final_world_state=build_world_state(env))
+            except SpawnSamplingError as exc:
+                body.update(success=False,detail=f'RANDOMIZATION_UNREACHABLE: {exc}',final_world_state=build_world_state(env))
             except Exception as exc:
                 # Never serialize provider HTTP exceptions or environment credentials.
                 body.update(success=False, detail=f'Execution stopped: {type(exc).__name__}', final_world_state=build_world_state(env))

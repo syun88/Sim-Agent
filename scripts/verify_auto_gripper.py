@@ -48,6 +48,9 @@ def main(env=None, ex=None, argv=None):
                       start_layout=args.start_layout,layout_count=args.layouts,random_seed=args.seed)
         for arm,obj,layout in [(s,o,i) for i in range(args.start_layout,args.start_layout+args.layouts) for s,o in assignments]:
             env.reset(randomize=layout>0,seed=args.seed+layout);env.step(200)
+            if env.spawn_validation['objects'][obj]['arm']!=arm:
+                obj=next(name for name,entry in env.spawn_validation['objects'].items() if entry['arm']==arm)
+            result.setdefault('tested_layouts',{})[str(layout)]=env.spawn_validation
             expected=env.cube_size
             bounds=env.object_bounds(obj)
             result['measured_cube_size']=(bounds[1]-bounds[0]).tolist()
@@ -58,7 +61,7 @@ def main(env=None, ex=None, argv=None):
                             (ex.skills.move_to_target,(arm,'right_side' if arm=='right' else 'left_side')),
                             (ex.skills.release_object,(arm,obj)),
                             (ex.skills.retreat,(arm,))]:
-                phase=fn(*call_args);phase['arm']=arm
+                phase=fn(*call_args);phase['arm']=arm;phase['object']=obj
                 phase['layout_seed'] = args.seed+layout
                 phase['self_collision'] = env.self_collision_report()
                 phase['actual_arm_q'] = env.arm_qpos(arm).tolist()

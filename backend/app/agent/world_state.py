@@ -29,6 +29,9 @@ def build_world_state(env: SimulationBackend) -> dict:
     for name, position in frame.objects.items():
         color = name.split("_")[0]
         _, attitude = env.object_pose(name)
+        admission=(getattr(env,'spawn_validation',None) or {}).get('objects',{}).get(name,{})
+        admitted_arm=(admission.get('arm') if admission.get('position') is not None
+            and np.linalg.norm(np.asarray(position)-admission['position'])<.005 else None)
         objects.append({
             "id": name,
             "type": {"wine_bottle": "bottle", "wine_glass": "glass"}.get(name, "cube"),
@@ -40,6 +43,7 @@ def build_world_state(env: SimulationBackend) -> dict:
                                 for other in pair.split('|') if other != name}),
             "graspable": name != "wine_glass" and getattr(env, 'grasp_is_physical_contact', True),
             "held_by": [side for side, obj in holds.items() if obj == name],
+            **({'admitted_grasp_arm':admitted_arm} if admitted_arm else {}),
             **({"bounds": env.object_bounds(name).tolist()} if name.endswith("_cube") else {}),
         })
     targets = []

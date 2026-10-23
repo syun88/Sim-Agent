@@ -111,6 +111,46 @@ Scorpionの外部 `for_sim` は、表示メッシュ・質量・慣性・関節�
 
 物理検証は `uv run python scripts/verify_auto_gripper.py <robot-id>` で実行します。標準では左右×通常配置・ランダム配置2回の6ケースを実行し、`--arm right --layouts 1` で右だけにも絞れます。`--seed` でランダム配置を再現できます。単体検証とネイティブ実行は、プロセス間の所有権ロックでも同時起動を防ぎます。
 
+## 配置のランダム化と再現
+
+Webの「配置を変えて初期化」は、シード欄が空なら毎回新しい乱数シードで机上の位置を選びます。
+OpenArmの固定シードと小範囲のずらし、インポートロボットの通常位置周辺±3.5cmへの偏りを変更しました。
+OpenArmは公式Cellの机形状から、インポートロボットは関節チェーンの長さと机の境界から候補範囲を求め、
+範囲を格子に分けて各区画から乱数候補を作ります。各候補にIKと幾何検査を行います。通常配置から4cm以上離し、
+キューブ間は10cm以上離します。候補が通らなければエラーを返し、同じ通常配置へ黙って戻す処理はありません。
+
+「色の左右もシャッフル」をONにすると、赤＝左手側・青＝右手側という担当を入れ替えられます。
+元の「右手で青、左手側の赤へ」という指示の位置依存だけを調べる場合はOFFにしてください。
+手を指定しない把持は、物体が配置時の位置にある間、配置検査でIKが通った手を優先します。
+物体が移動したら、この配置時の確認情報は現在の到達性として使いません。
+
+使ったシードをWebに表示し、「同じ配置を再現」でシードと左右シャッフル設定を再利用できます。
+シード欄へ0〜4294967295の整数を入力する方法もあります。同じロボット・モデル設定での再現用です。
+APIは `POST /api/scene/reset?randomize=true&seed=20261023&shuffle_sides=true`、
+指示と同時に変える場合は `POST /api/tasks` の `randomize`・`seed`・`shuffle_sides` を利用します。
+今回広げた対象はキューブのX/Y位置と色・担当腕の対応です。個数、サイズ、初期の回転は変更しません。
+
+繰り返し検証では、配置・IKの合格と、Genesisでの把持の成功を分けて記録します。
+失敗した把持を成功扱いにはせず、シード、配置、失敗工程、実際の物体状態をJSONへ保存します。
+
+```sh
+# Genesisを起動せず、24配置のIK・幾何検査と分布を記録
+uv run python scripts/verify_randomized_layouts.py --robot openarm_v2 --layouts 24 --json outputs/random-layouts.json
+
+# 1つのGenesisで4配置を実行し、各配置で1回ずつ物理把持を確認
+uv run python scripts/verify_randomized_layouts.py --robot scorpion-b01c5dce63 --physics --grasp --layouts 4 --json outputs/random-physics.json
+```
+
+2026-10-23の検証では、OpenArm・Scorpionとも24/24配置のIK・幾何検査に合格しました。
+青いキューブの中心位置の最大−最小は、左右入替を含めてOpenArmがX約41cm・Y約76cm、ScorpionがX約30cm・Y約80cmです。
+同じ担当腕内で集計しても、OpenArmはX約36〜42cm・Y約28〜31cm、ScorpionはX約29cm・Y約21〜22cmの観測幅がありました。
+[配置分布](outputs/random-workspace-coverage.png) は私有モデルのIK・幾何検査の結果で、物理把持の成功率を表す図ではありません。
+Genesisでは各ロボット4配置すべてが机上で静止し、初期のロボット接触がないことを確認しました。
+一方、各配置1回の把持はそれぞれ2/4成功で、接近中の物体押し出し・移動の未達・持ち上げ経路の失敗が残っています。
+`outputs/openarm_random_workspace_physics.json`、`outputs/scorpion_random_workspace_physics.json` に失敗も含めて保存しています。
+通常のネイティブ経路でも4回の配置変更が成功し、同じシードの再実行で設定座標と今回の静止後の座標が一致しました。
+`outputs/native_randomization_validation.json` がその記録です。
+
 ## 実行速度
 
 **アームの物理的な移動時間**は `OPENARM_MOTION_SPEED` で指定します（標準6）。
@@ -350,9 +390,9 @@ uv run python scripts/verify_pick_place_genesis.py
 解釈した作業列、各動作の計測値、両指の接触、受け渡し後の持ち上げ、最終配置の誤差を保存します。
 これらの JSON は Git 管理外です。検証スクリプトは、要求された数の実際の受け渡しと全目標の確認が揃った場合だけ終了コード0を返します。
 
-## このマシンでの検証結果（2026-10-22更新）
+## このマシンでの検証結果（2026-10-23更新）
 
-- `uv run pytest -q`: 149件成功（20.34秒）。IKの計算分離、言語解釈・否定・相対配置、OpenArmの物理的な受け渡しと積み重ね、URDF解析・mimic Jacobian、閉鎖中と保持開口幅でのリフト可否、衝突を避けた可到達配置、モーター設定、局所的な軌道時間配分、保持物の衝突、接触からの退避、接触履歴の解除、成功候補の設定変更時の無効化、APIと既存動作の回帰を確認。
+- `uv run pytest -q`: 153件成功（2026-10-23、25.81秒）。IKの計算分離、言語解釈・否定・相対配置、OpenArmの物理的な受け渡しと積み重ね、URDF解析・mimic Jacobian、閉鎖中と保持開口幅でのリフト可否、衝突を避けた可到達配置、モーター設定、局所的な軌道時間配分、保持物の衝突、接触からの退避、接触履歴の解除、成功候補の設定変更時の無効化、配置の分布・シード再現・色と手の入替、APIと既存動作の回帰を確認。広いランダム配置での物理把持の結果は、上の節に別記しています。
 - Scorpionの元の指示「右手で青いキューブを取って左手に渡して左側の赤いキューブの上に乗せて」は、速度変更前のプロファイル12で全7スキルと最終判定が成功し、実行196.43秒。`outputs/robots/scorpion-b01c5dce63/fresh_sequence_validation.json` が比較元です。
 - 同じ指示・通常初期配置をプロファイル14、STS3215-C001/7.4Vで新しいプロセスから実行し、全7スキルと最終判定が成功。初回探索は88.26秒、成功した幾何候補の再利用時は57.20秒（初回シーン構築を除く、このMacでの実時間）。受け渡し位置までの右手の運搬は約16.99→5.06秒、受け手の接近は約11.44→3.84秒でした。全動作が一律4〜8倍になったという結果ではありません。
 - 再利用時の受け手単独の確認リフト28.46mm、300ms保持の15観測すべて両指接触・他の支持なし。最終の中心ずれ3.29mm、支持接触・解放・静止あり、赤の移動0.037mm。4,001物理ステップ中の20ms間隔1,000回の自己接触観測で最大貫通検出0mm。指令関節速度のピークは5.18rad/s以内でした。`outputs/robots/scorpion-b01c5dce63/fast_sequence_validation.json` と `warm_sequence_validation.json` に保存。[実測した最終シーン](outputs/scorpion-fast-stack.png)。既知の文の解釈は明示した `deterministic_fallback` で、LLMの言語汎化を証明する記録ではありません。再実行は `uv run python scripts/verify_imported_sequence.py <robot-id> --json outputs/sequence_validation.json --image outputs/sequence-final.png`。

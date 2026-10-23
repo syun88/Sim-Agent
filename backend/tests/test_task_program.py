@@ -86,6 +86,12 @@ def test_arm_selection_follows_the_measured_object_side_after_a_prior_task():
     assert AgentPlanner().plan("青を掴んで", state).arm == "left"
 
 
+def test_randomized_cube_uses_its_ik_admitted_hand_when_the_user_does_not_specify_one():
+    state={**WORLD,'objects':[{'id':'blue_cube','position':[.1,-.02,1.03],'admitted_grasp_arm':'left'}]}
+    assert AgentPlanner().plan('青を掴んで',state).arm=='left'
+    assert AgentPlanner().plan('右手で青を掴んで',state).arm=='right'
+
+
 @pytest.mark.parametrize("text", ["黄色のキューブを掴んで", "Pick the red and yellow cube", "pick one cube", "左手に渡す"])
 def test_unsupported_or_ambiguous_objects_are_not_replaced_with_a_default_task(text):
     with pytest.raises(PlannerProviderError):
