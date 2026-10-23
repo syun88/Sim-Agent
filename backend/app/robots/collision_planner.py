@@ -23,6 +23,12 @@ class PrivateCollisionQueries:
         ET.SubElement(option, 'flag', filterparent='disable')
         asset = ET.SubElement(root, 'asset')
         world = ET.SubElement(root, 'worldbody')
+        # MuJoCo already owns the body name 'world'. A URDF whose root link carries
+        # that name (OpenManipulator-X, measured 2026-10-24) failed to compile with
+        # "repeated name 'world' in body", so robot bodies get one safe name and the
+        # class maps back to URDF link names at every query boundary.
+        self.body_names = {link: ('robot_world' if link == 'world' else link) for link in self.urdf.links}
+        self.link_names = {body: link for link, body in self.body_names.items()}
         if table_top is not None:
             ET.SubElement(world, 'geom', name='desk', type='box', size='.8 .7 .025',
                           pos=f'0 0 {table_top-.025}')
@@ -31,7 +37,7 @@ class PrivateCollisionQueries:
             quat = Rotation.from_matrix(transform[:3, :3]).as_quat()[[3, 0, 1, 2]]
             return {'pos': ' '.join(map(str, transform[:3, 3])), 'quat': ' '.join(map(str, quat))}
         def link_body(link, parent, transform, joint=None):
-            body = ET.SubElement(parent, 'body', name=link, **pose_args(transform))
+            body = ET.SubElement(parent, 'body', name=self.body_names[link], **pose_args(transform))
             # Mass is irrelevant to collision queries; mj_step is never called.
             ET.SubElement(body, 'inertial', pos='0 0 0', mass='1', diaginertia='1 1 1')
             if joint is not None and joint['type'] != 'fixed':
@@ -90,7 +96,8 @@ class PrivateCollisionQueries:
         data.geom_xmat[probe]=np.asarray(rotation).reshape(9)
         result=[]
         if not hasattr(self,'_probe_link_names'):
-            self._probe_link_names=[mj.mj_id2name(model,mj.mjtObj.mjOBJ_BODY,int(b)) for b in model.geom_bodyid]
+            self._probe_link_names=[self.link_names.get(mj.mj_id2name(model,mj.mjtObj.mjOBJ_BODY,int(b)),
+                mj.mj_id2name(model,mj.mjtObj.mjOBJ_BODY,int(b))) for b in model.geom_bodyid]
         candidates=np.array([i for i,name in enumerate(self._probe_link_names) if name in links],int)
         near=(np.linalg.norm(data.geom_xpos[candidates]-center,axis=1)
               <=model.geom_rbound[candidates]+model.geom_rbound[probe]+distance)
@@ -112,8 +119,9 @@ class PrivateCollisionQueries:
         for contact in data.contact:
             if contact.dist >= -tolerance:
                 continue
-            a, b = [mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[g]))
-                    for g in (contact.geom1, contact.geom2)]
+            a, b = [self.link_names.get(name, name) for name in
+                    (mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[g]))
+                     for g in (contact.geom1, contact.geom2))]
             pair = tuple(sorted([a or 'desk', b or 'desk']))
             pairs[pair] = min(pairs.get(pair, np.inf), float(contact.dist))
         return [{'links': list(pair), 'penetration_m': max(0., -distance), 'distance_m':distance}
@@ -181,7 +189,7 @@ class PrivateCollisionQueries:
         if joint_limits is not None:
             lower=np.maximum(lower,np.asarray(joint_limits)[:,0])
             upper=np.minimum(upper,np.asarray(joint_limits)[:,1])
-        bodies = ['world', *self.urdf.links]
+        bodies = ['world', *self.body_names.values()]
         pairs = {tuple(sorted((a,b))): i for i,(a,b) in enumerate(
             ( (a,b) for i,a in enumerate(bodies) for b in bodies[i+1:] ))}
         initial = np.asarray(q)
