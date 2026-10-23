@@ -64,11 +64,16 @@ def _fetch(path: str) -> bytes:
 
 
 def _stage(destination: Path, refresh: bool) -> dict:
-    """Download the pinned description and record (or verify) its hashes."""
+    """Download the pinned description into ``source/`` and record (or verify) its hashes.
+
+    The hashes pin the *upstream* files. The import-facing copies under ``genesis/`` and
+    ``meshes/`` are published from them and may then be skinned, exactly like a prepared
+    robot package keeps its original beside the prepared one.
+    """
     manifest_path = destination / "provenance.json"
-    files = {URDF_PATH: destination / "genesis" / "open_manipulator_x.urdf"}
+    files = {URDF_PATH: destination / "source" / "open_manipulator_x.urdf"}
     for name in MESHES:
-        files[f"{MESH_DIR}/{name}"] = destination / "meshes" / "open_manipulator_x" / name
+        files[f"{MESH_DIR}/{name}"] = destination / "source" / "meshes" / "open_manipulator_x" / name
     recorded = json.loads(manifest_path.read_text())["files"] if manifest_path.is_file() else None
     manifest = {"repository": REPOSITORY, "commit": COMMIT,
                 "license": "Apache-2.0", "adopted": "2026-10-24", "files": {}}
@@ -82,7 +87,22 @@ def _stage(destination: Path, refresh: bool) -> dict:
         manifest["files"][source] = {"path": str(target.relative_to(destination)),
                                      "sha256": digest, "bytes": target.stat().st_size}
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    _publish(destination, manifest)
     return manifest
+
+
+def _publish(destination: Path, manifest: dict) -> None:
+    """Copy the pinned originals to the paths the importer reads."""
+    import shutil
+    (destination / "genesis").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(destination / "source" / "open_manipulator_x.urdf",
+                 destination / "genesis" / "open_manipulator_x.urdf")
+    for entry in manifest["files"].values():
+        name = Path(entry["path"]).name
+        if name.endswith(".stl"):
+            target = destination / "meshes" / "open_manipulator_x" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(destination / entry["path"], target)
 
 
 def _derive_home(destination: Path) -> dict | None:
