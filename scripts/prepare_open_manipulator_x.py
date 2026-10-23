@@ -17,23 +17,22 @@ The import result measured 2026-10-24 on a host without Genesis:
 
     robot_id      open_manipulator_x-784078c2a5   (source sha256 784078c2a5bb16ac)
     root link     world            (fixed base, single arm)
-    chain         left = joint1..joint4 + gripper_left_joint
-    IK validation success on the arm chain
-    capabilities  motion, joint_control, ik
-    grippers      none            -> no physical_grasp / place / stack
+    chain         left = joint1..joint4 + gripper_left_joint, IK validation success
+    capabilities  motion, joint_control, ik, physical_grasp, place, stack
+    gripper       sliding_jaws on gripper_left_joint: aperture 20.0..82.0 mm,
+                  cube 25.5 mm, holding_q -0.0078 rad, table clearance 4.3 mm
     spawned props none
 
-The arm half works. Grasp does not, and the reason is measurable: the jaw sweep
-reads a 20.0 mm minimum gap at the closed command, while the inference caps the cube
-at 35% of the finger length (22.7 mm) and then requires ``minimum <= 0.8 * cube``
-(18.2 mm) - so it refuses every candidate. A direct nearest-point measurement of the
-two finger clouds at the same closed command gives 0.6 mm, so the model does close;
-the disagreement is in the band/normal the inference reads. The mimic joint is not
-the cause: registering the mimic sibling as a follower changes nothing (measured).
+Before the jaw fix this gripper was refused outright: the sweep reads a 20.0 mm closed
+gap, the finger-length cap allowed only a 22.7 mm cube, and the squeeze rule needs
+``0.8 * cube <= 20 mm`` (a 25 mm cube) - so the arm imported with no grasp at all. The
+sweep now retries once with the cube floor the measured closure requires, which changes
+nothing where a first pass already finds a candidate: Scorpion's analysis is byte-identical
+across the change.
 
-Which side to change needs the physical check plus the pad geometry, so this script
-only stages and reports. The next step belongs on a host with Genesis (the launcher's
-robot import, or ``scripts/verify_auto_gripper.py``).
+Still open, and unchanged by the jaw fix: the desk layout spawns no props for this arm -
+``No desk position reachable at object and approach heights`` for both cubes, from 33
+candidates each. The gripper is inferred, but nothing is placed in front of it yet.
 """
 from __future__ import annotations
 
