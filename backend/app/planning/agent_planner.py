@@ -8,10 +8,13 @@ import unicodedata
 import numpy as np
 
 from backend.app.models.schemas import AgentPlan
-from backend.app.planning.language_fallback import arm_mentions, named_objects, parse_fallback
+from backend.app.planning.language_fallback import VERBS, arm_mentions, motion_distance_cm, named_objects, parse_fallback
 from backend.app.planning.task_program import ActionProposal, GroundingError, InstructionMeaning, TABLE_TARGETS, TaskProgram, compile_program
-from backend.app.planning.spatial_language import validate_instruction_relations, placement_references, preservation_spans
+from backend.app.planning.spatial_language import validate_instruction_relations, placement_references, preservation_spans, strip_preservation
 from backend.app.planning.goal_language import holding_conditions, relative_conditions, unsupported_group_request
+from backend.app.planning.language_schema import meaning_schema
+from backend.app.planning.preparation import compile_prepared_program
+from backend.app.agent.scene_reasoning import SceneReferenceError, bind_scene_references
 
 
 class PlannerProviderError(Exception):
@@ -129,18 +132,22 @@ class AgentPlanner:
                 'A requested final holder is not a prescribed manipulation procedure. Arm belongs only to holding goals, not placement goals. '
                 'Do not reduce requested ordered actions to their final states. '
                 'keep_in_place lists objects explicitly required to stay where they are. '
+                'Return the minimum requested goals. Registered objects are available references, not a list of tasks. '
+                'Never add a holding or placement goal for an object the user did not ask to manipulate. '
+                'A negative clause adds a constraint, never a positive goal. '
                 'Use only registered objects and targets. A reference cube is a target, not another manipulated subject. '
                 'Simultaneously grasping two cubes in one hand, arbitrary new physical skills, unknown objects '
                 'and unclear desired outcomes are unsupported: return interpretation unsupported with a short error. '
                 'Return JSON matching the supplied schema, no invented object poses or successful outcomes.'
             )
-            user = {'instruction': instruction, 'objects': [
-                {key: obj[key] for key in ('id', 'type', 'graspable') if key in obj}
+            user = {'instruction': strip_preservation(instruction,state), 'objects': [
+                {key: obj[key] for key in ('id', 'type', 'graspable', 'position') if key in obj}
                 for obj in state['objects']], 'targets': state['targets'], 'hand_occupancy': occupancy,
                 'available_arms': state.get('robot', {}).get('available_arms', ['left', 'right']),
                 'discourse': state.get('discourse', {}), 'literal_spatial_constraints': user['literal_spatial_constraints'],
                 'leave_in_place': user['leave_in_place']}
-            schema = InstructionMeaning.model_json_schema()
+            user['coordinate_frame'] = '+Y is left, -Y is right, +X is forward. Object location is not the acting hand.'
+            schema = meaning_schema(state)
         user["output_schema"] = schema
         user['required_final_holders'] = holding_conditions(instruction, state)
         user['required_relative_conditions'] = relative_conditions(instruction, state)
@@ -151,6 +158,24 @@ class AgentPlanner:
         if self._repair_feedback:
             user["previous_validation_error"] = self._repair_feedback
         messages = [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]
+        content = self._complete(messages, schema)
+        payload = self._extract_json(content)
+        if self._interpret_meaning:
+            for goal in payload.get('goals',[]):
+                # "on" is a support/contact predicate, not a configurable gap.
+                # Some backends ignore decoder bounds and emit a redundant 0.
+                if goal.get('type')=='relative_placement' and goal.get('relation')=='on' and goal.get('distance_cm')==0:
+                    goal.pop('distance_cm')
+            meaning = InstructionMeaning.model_validate(payload)
+            if meaning.interpretation == 'ordered_actions':
+                return {'needs_actions': True, 'raw': content}
+            program = (TaskProgram(error=meaning.error) if meaning.interpretation == 'unsupported' else
+                       TaskProgram(goals=meaning.goals, keep_in_place=meaning.keep_in_place))
+            return {'payload': program.model_dump(), 'raw': content}
+        proposal = ActionProposal.model_validate(payload)
+        return {"payload": proposal.task_program().model_dump(), "raw": content}
+
+    def _complete(self, messages, schema, *, timeout=60., max_tokens=1600):
         if self.configured_provider == "local_ollama":
             # Ollama's native schema decoder constrains the entire program, rather than just
             # asking a small local model to produce something JSON-shaped.
@@ -165,7 +190,7 @@ class AgentPlanner:
                                            and info.get("template", "").strip() == "{{ .Prompt }}")
             request = {"model": self.local_model, "stream": False,
                        "format": schema,
-                       "options": {"temperature": 0, "num_predict": 1600, "num_ctx": 8192,
+                       "options": {"temperature": 0, "num_predict": max_tokens, "num_ctx": 8192,
                                    "stop": ["<|im_end|>", "<|endoftext|>"]}}
             if self._ollama_raw_chatml:
                 request.update(raw=True, prompt="".join(
@@ -175,7 +200,7 @@ class AgentPlanner:
             else:
                 request.update(messages=messages, think=False)
                 endpoint = "chat"
-            response = httpx.post(f"http://127.0.0.1:11434/api/{endpoint}", timeout=60.0, json=request)
+            response = httpx.post(f"http://127.0.0.1:11434/api/{endpoint}", timeout=timeout, json=request)
             response.raise_for_status()
             content = response.json()["response"] if self._ollama_raw_chatml else response.json()["message"]["content"]
         else:
@@ -183,31 +208,90 @@ class AgentPlanner:
             client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=35.0, max_retries=0)
             response = client.chat.completions.create(
                 model=self.model, messages=messages, response_format={"type": "json_object"},
-                max_tokens=1800, temperature=0,
+                max_tokens=max_tokens, temperature=0,
             )
             content = response.choices[0].message.content or ""
-        payload = self._extract_json(content)
-        if self._interpret_meaning:
-            meaning = InstructionMeaning.model_validate(payload)
-            if meaning.interpretation == 'ordered_actions':
-                return {'needs_actions': True, 'raw': content}
-            program = (TaskProgram(error=meaning.error) if meaning.interpretation == 'unsupported' else
-                       TaskProgram(goals=meaning.goals, keep_in_place=meaning.keep_in_place))
-            return {'payload': program.model_dump(), 'raw': content}
-        proposal = ActionProposal.model_validate(payload)
-        return {"payload": proposal.task_program().model_dump(), "raw": content}
+        return content
+
+    def assess_failure(self, instruction, state, failure, legal_actions):
+        """Choose among physically admitted recovery operations, never a new goal."""
+        if not self.enabled:
+            return {'decision':legal_actions[0], 'reason':'現在の状態で実行可能な復旧手順を選びます。',
+                    'provider':'deterministic_fallback'}
+        schema = {'type':'object','properties':{
+            'decision':{'enum':legal_actions},'reason':{'type':'string'},
+            'requirements':{'type':'array','items':{'type':'string'},'maxItems':5}},
+            'required':['decision','reason'],'additionalProperties':False}
+        facts = {'hand_occupancy':{s:state.get('robot',{}).get(s+'_arm',{}).get('held_object') for s in ('left','right')},
+                 'objects':[{k:o.get(k) for k in ('id','position','held_by','touching','linear_speed_m_s')} for o in state['objects']]}
+        messages = [{'role':'system','content':
+            'Diagnose a robot task failure from measured facts. Choose exactly one legal recovery. '
+            'resume means continue uncompleted operations from the observed state, without replaying completed steps. '
+            'reset_and_retry means visibly restart the simulation scene and retry the SAME bound object/task, discarding progress. '
+            'Prefer resume if meaningful progress exists and its remaining plan is valid; use reset for a failed grasp/path with no useful progress. '
+            'Explain the observed obstacle and required next preparation in Japanese. Reasons for failure are hypotheses; do not invent observations, tools, successful grasps or capabilities.'},
+            {'role':'user','content':json.dumps({'instruction':instruction,'observed':facts,'failure':failure,
+                'legal_recoveries':legal_actions,'output_schema':schema},ensure_ascii=False)}]
+        try:
+            assessment = self._extract_json(self._complete(messages,schema,timeout=25.,max_tokens=450))
+            if assessment.get('decision') not in legal_actions or not isinstance(assessment.get('reason'),str):
+                raise ValueError('Invalid recovery choice')
+            return {**assessment,'provider':self.configured_provider}
+        except Exception:
+            return {'decision':legal_actions[0],'reason':'モデルによる復旧案を検証できないため、観測状態と実行条件から復旧します。',
+                    'provider':'deterministic_fallback','provider_error':'RECOVERY_REASONING_UNAVAILABLE'}
+
+    def _check_coverage(self, instruction, candidate, state):
+        """Independent semantic audit for compound clauses the grammar could not cover."""
+        clauses = [c.strip() for c in re.split(r'(?<=て)から|(?<=た)後(?:に)?|そのあと|その後|それから|[。;；]|\bthen\b',
+            strip_preservation(instruction,state),flags=re.I) if c.strip(' 、,.!?！？')]
+        unknown = [c for c in clauses if not VERBS.search(c) and not re.search(r'ないで|\b(?:do not|don.t|never)\b',c,re.I)]
+        unknown = [c for c in unknown if not re.fullmatch(
+            r'(?:手順|やり方|方法|途中(?:の置き方|の手順)?)(?:は|を)?(?:全部)?(?:任せる|任せます|任せた)[.!。\s]*'
+            r'|(?:work out|figure out|choose)\s+(?:the\s+)?(?:intermediate steps|steps|procedure)(?:\s+yourself)?[.!\s]*',c,re.I)]
+        if len(clauses)<2 or not unknown:
+            return None
+        if not any(VERBS.search(c) for c in clauses) and not re.search(r'てから|た後|そのあと|その後|それから|\bthen\b',instruction,re.I):
+            # Pure final-state prose plus "work out the steps" is not an
+            # unhandled sequence of physical verbs.
+            return None
+        schema = {'type':'object','properties':{'covered':{'type':'boolean'},
+            'omitted_or_unsupported':{'type':'array','items':{'type':'string'}},'reason':{'type':'string'}},
+            'required':['covered','omitted_or_unsupported','reason'],'additionalProperties':False}
+        system = ('Judge whether EACH isolated requested clause can be implemented with the listed robot controllers. '
+            'Return covered=false if ANY clause requires unsupported physical work. '
+            'Available operations only: pick/hold a known cube, handover, place, approach, move an arm, '
+            'open/close/home, upward throw, wine pour, named rotary joint. There is no wiping, rubbing, cleaning, '
+            'cutting or arbitrary new contact controller. Negated/protected clauses are constraints, not extra actions. '
+            'Do not replace an unsupported interaction by grasping or moving an object. '
+            'List each unsupported clause verbatim in omitted_or_unsupported. Return JSON only.')
+        output = self._extract_json(self._complete([{'role':'system','content':system},
+            {'role':'user','content':json.dumps({'isolated_clauses':unknown,'capabilities':state.get('capabilities',{}),
+                'output_schema':schema},ensure_ascii=False)}],timeout=25.,max_tokens=450))
+        if output.get('covered') is not True or output.get('omitted_or_unsupported') != []:
+            raise GroundingError('INCOMPLETE_SEMANTIC_COVERAGE: '+str(output.get('reason','uncovered requested work')))
+        return output
 
     def plan(self, instruction: str, state: dict, memory: list[dict] | None = None) -> AgentPlan:
         started = time.perf_counter()
+        try:
+            observed_binding = bind_scene_references(instruction,state)
+            instruction = observed_binding.instruction
+        except SceneReferenceError as error:
+            raise PlannerProviderError('REFERENCE_NOT_PRESENT',str(error)) from None
         if unsupported_group_request(instruction):
             raise PlannerProviderError('UNSUPPORTED_TASK', 'GROUP_GRASP_UNSUPPORTED: one-hand grouped or simultaneous multi-cube acquisition has no executable contact contract')
+        literal_holders = holding_conditions(instruction, state)
+        for name in {c['object'] for c in literal_holders}:
+            if len({c['arm'] for c in literal_holders if c['object']==name}) > 1:
+                raise PlannerProviderError('AMBIGUOUS_INSTRUCTION', 'One registered object cannot finish in two separate hands: '+name)
         memory = memory or []
         fallback = None
         fallback_source = None
         fallback_error = None
         try:
             fallback_source = parse_fallback(instruction, state)
-            fallback = compile_program(fallback_source, state)
+            fallback = compile_prepared_program(fallback_source, state)
             validate_instruction_relations(fallback, instruction, state)
         except (ValueError, KeyError) as exc:
             fallback_error = str(exc)
@@ -217,7 +301,13 @@ class AgentPlanner:
         provider_error = None
         raw = None
         self._repair_feedback = None
-        self._interpret_meaning = not (fallback_source and fallback_source.actions)
+        # A failed parse/grounding does not turn a procedure into a final state.
+        # In particular 'after picking ... pass ... put ...' and numeric arm
+        # movement need action interpretation even when the fallback cannot parse.
+        temporal = bool(re.search(r'\b(?:after|then|before)\b|てから|た後|渡して|その後', instruction, re.I))
+        verbs = [m.lastgroup for m in VERBS.finditer(instruction)]
+        procedural = (temporal and len(verbs)>1) or ('move' in verbs and motion_distance_cm(instruction) is not None)
+        self._interpret_meaning = not ((fallback_source and fallback_source.actions) or procedural)
         language_stages = []
         # The launcher can immediately execute a fully parsed/grounded request.
         # Unrecognised language still uses the model and the same validation.
@@ -249,6 +339,10 @@ class AgentPlanner:
                         represented = {g.object for g in program.goals} | {g.target for g in program.goals}
                         if mentioned - represented - set(program.keep_in_place):
                             raise GroundingError('Final goals omit explicitly mentioned objects: ' + str(sorted(mentioned-represented-set(program.keep_in_place))))
+                        if mentioned:
+                            extras = {g.object for g in program.goals} - mentioned
+                            if extras:
+                                raise GroundingError('Do not invent tasks for unrequested objects: '+str(sorted(extras)))
                         conditions = holding_conditions(instruction, state)
                         required = {(c['object'], c['arm']) for c in conditions}
                         for obj in {obj for obj, _ in required}:
@@ -268,6 +362,13 @@ class AgentPlanner:
                             raise GroundingError('Preserve requested FINAL holders, not observed current ownership: ' +
                                 json.dumps(sorted(required), ensure_ascii=False))
                         relative = relative_conditions(instruction, state)
+                        for requested_relation in relative:
+                            for goal in program.goals:
+                                if (goal.type=='relative_placement' and goal.object==requested_relation['target']
+                                        and goal.target==requested_relation['object']):
+                                    binding_repairs.append({'type':'relative_roles','model_object':goal.object,
+                                        'model_target':goal.target,'requested':requested_relation})
+                                    goal.object,goal.target,goal.relation = (requested_relation[k] for k in ('object','target','relation'))
                         expected_relative = {(r['object'],r['target'],r['relation']) for r in relative}
                         actual_relative = {(g.object,g.target,g.relation) for g in program.goals if g.type=='relative_placement'}
                         references_only = {r['target'] for r in relative}-{r['object'] for r in relative}
@@ -297,12 +398,16 @@ class AgentPlanner:
                     program.assumptions = []
                     # Revalidate anchored quantities, including the supported range.
                     program = TaskProgram.model_validate(program.model_dump())
-                    candidate = compile_program(program, state)
+                    candidate = compile_prepared_program(program, state)
                     if binding_repairs:
                         candidate.planning_evidence = {**(candidate.planning_evidence or {}),
                             'semantic_binding_repairs': binding_repairs}
-                        candidate.assumptions.append('文章で指定された物体と最終保持者の対応を優先しました。補正内容は実行ログに記録します。')
+                        candidate.assumptions.append('文章で指定された物体・保持者・支持物の対応を優先しました。補正内容は実行ログに記録します。')
                     validate_instruction_relations(candidate, instruction, state)
+                    if not fallback_source:
+                        audit = self._check_coverage(instruction,candidate,state)
+                        if audit:
+                            candidate.planning_evidence = {**(candidate.planning_evidence or {}),'semantic_coverage_audit':audit}
                     if fallback:
                         # When the explicit grammar understood the ENTIRE request, the model
                         # may not drop a handover, swap a colour, or change an explicit arm.
@@ -345,6 +450,9 @@ class AgentPlanner:
             category = "ROBOT_CAPABILITY" if "ROBOT_CAPABILITY:" in detail else "INSTRUCTION_NOT_UNDERSTOOD"
             raise PlannerProviderError(category, f"Cannot ground the full instruction: {detail}")
         plan.provider_error = provider_error
+        if observed_binding.decisions:
+            plan.planning_evidence = {**(plan.planning_evidence or {}),'scene_bindings':observed_binding.decisions}
+            plan.assumptions += [d['explanation'] for d in observed_binding.decisions]
         plan.raw_response = raw
         plan.model = (self.model if plan.provider == "ai&" else
                       self.local_model if plan.provider == "local_ollama" else None)

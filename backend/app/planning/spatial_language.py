@@ -26,7 +26,7 @@ ENGLISH = {
 def preservation_spans(text, state):
     spans = []
     for start, end, name in object_mentions(text, state):
-        suffix = re.match(r"(?:(?:の)?(?:位置|場所)(?:は|を)?|には|は|を|に)?(?:触ら(?:ないで|ず)|動かさ(?:ないで|ず)|変え(?:ないで|ず)|そのまま)(?:[、,\s]*)", text[end:])
+        suffix = re.match(r"(?:(?:の)?(?:位置|場所)(?:は|を)?|には|は|を|に)?(?:触ら(?:ないで|ない(?:こと)?|ず(?:に)?)|動かさ(?:ないで|ない(?:こと)?|ず(?:に)?)|変え(?:ないで|ない(?:こと)?|ず(?:に)?)|そのまま)(?:[、,\s]*)", text[end:])
         english = re.search(r"(?:leave\s+|keep\s+|without\s+(?:moving|touching)\s+|(?:do\s+not|don't)\s+(?:move|touch)\s+)(?:the\s+)?$", text[:start], re.I)
         ending = re.match(r"\s*(?:where\s+it\s+is|alone|untouched|in\s+place|unchanged)[.!\s]*", text[end:], re.I)
         if suffix:
@@ -46,6 +46,12 @@ def strip_preservation(text, state):
 def placement_references(text, state):
     references = []
     for start, end, name in object_mentions(text, state):
+        possessive = re.match(r"['’]s\s+(left|right|front|back)\b",text[end:],re.I)
+        prefix = re.search(r'\b(?:on|to|at)\s+(?:the\s+)?$',text[:start],re.I)
+        if possessive and prefix:
+            references.append({'target':name,'relation':{'left':'left_of','right':'right_of','front':'front_of','back':'behind'}[possessive.group(1).lower()],
+                               'span':(prefix.start(),end+possessive.end())})
+            continue
         for relation, pattern in JAPANESE.items():
             match = re.match(pattern, text[end:])
             if match:

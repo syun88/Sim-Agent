@@ -28,6 +28,7 @@
 <p id="randomizationInfo" class="muted">ランダム配置は、手が届く机の範囲から選びます。シードを指定すると同じ配置を再現できます。</p>
 <p id="status" class="status" aria-live="polite">指示を入力して実行できます。</p></section>
 <section class="panel"><h2>腕と物体の状態</h2><div id="world" class="muted">シミュレーションの計測値を待っています。</div></section>
+<section id="agentPanel" class="panel" hidden><h2>状況判断と復旧</h2><ol id="agentDecisions"></ol><details><summary>判断の根拠と試行履歴</summary><pre id="agentEvidence"></pre></details></section>
 <section id="planPanel" class="panel" hidden><h2>解釈した作業</h2><div id="provider" class="muted"></div><p id="goals" class="status" hidden></p><ol id="actions"></ol><p id="assumptions" class="muted"></p><div id="verification" class="status"></div><details><summary>計測結果と実行ログ</summary><pre id="evidence"></pre></details></section>
 </main>
 <script type="module">
@@ -41,6 +42,8 @@ function status(text,tone=''){$('status').className=`status ${tone}`;$('status')
 function busy(value){isBusy=value;for(const id of ['execute','reset','randomize','robotSelect','switchRobot','urdfFolder','importRobot','jointSelect','jointAngle','moveJoint','randomSeed','shuffleSides'])$(id).disabled=value;$('replayRandom').disabled=value||!lastRandomization;$('moveJoint').disabled=value||$('robotSelect').value!==activeRobot||!$('jointSelect').options.length;$('stop').disabled=!value||!currentTaskId;}
 async function request(path,options){const r=await fetch(path,options);const data=await r.json();if(!r.ok)throw Error(typeof data.detail==='string'?data.detail:JSON.stringify(data.detail));return data;}
 function drawTask(t){
+ $('agentPanel').hidden=!t.agent_trace?.length;
+ if(t.agent_trace?.length){$('agentPanel').hidden=false;$('agentDecisions').replaceChildren();for(const d of t.agent_trace){const li=document.createElement('li');li.textContent=d.explanation;$('agentDecisions').append(li);}$('agentEvidence').textContent=JSON.stringify({diagnosis:t.diagnosis,decisions:t.agent_trace,attempts:t.agent_attempts?.map(a=>({attempt:a.attempt,success:a.result.success,failure:a.result.verification?.failure_category})),scene_resets:t.verification?.scene_resets},null,2);}
  if(t.verification?.randomization)drawRandomization(t.verification.randomization);
  else if(t.status==='FAILED'&&t.randomization_request)drawRandomization({...t.randomization_request,enabled:true});
  if(t.plan){
@@ -51,7 +54,7 @@ function drawTask(t){
   const index=t.step?.action_index??t.result?.action_index;[...$('actions').children].forEach((li,i)=>{li.className=recorded?(recorded[i].result.success?'done':'bad'):t.status==='SUCCEEDED'||i<index?'done':i===index?'active':'';});
  }
  if(t.verification){const checks=t.verification.checks??[];$('verification').textContent=checks.map(c=>`${object[c.object]??c.object}: ${c.success?'確認済み':'未達成'}${c.target?' / '+(object[c.target]??target[c.target]??c.target):''}${Number.isFinite(c.horizontal_position_error)?' / 誤差 '+(c.horizontal_position_error*1000).toFixed(1)+' mm':''}${Number.isFinite(c.poured_ml)?' / 注いだ量 '+volume(c.poured_ml)+' mL / こぼれ合計 '+volume(c.spilled_ml)+' mL / 空中 '+volume(c.liquid?.in_flight_ml)+' mL':''}${Number.isFinite(c.free_flight_rise)?' / 自由飛行の上昇 '+(c.free_flight_rise*100).toFixed(1)+' cm':''}${c.arm?' / '+arm[c.arm]:''}`).join('\n');}
- $('evidence').textContent=JSON.stringify({randomization_request:t.randomization_request,verification:t.verification,detail:t.detail,retry_count:t.retry_count,skills:t.skills},null,2);
+ $('evidence').textContent=JSON.stringify({randomization_request:t.randomization_request,verification:t.verification,detail:t.detail,diagnosis:t.diagnosis,agent_trace:t.agent_trace,agent_attempts:t.agent_attempts,retry_count:t.retry_count,skills:t.skills},null,2);
 }
 async function poll(){
  if(polling)return;polling=true;

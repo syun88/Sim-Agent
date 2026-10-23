@@ -79,7 +79,9 @@ class TaskProgram(BaseModel):
 
 
 class GroundingError(ValueError):
-    pass
+    def __init__(self, message, *, preparation=None):
+        super().__init__(message)
+        self.preparation = preparation
 
 
 class ActionProposal(BaseModel):
@@ -118,8 +120,8 @@ class InstructionMeaning(BaseModel):
         if self.interpretation == 'final_state':
             if not self.goals or self.error:
                 raise ValueError('Final-state interpretation needs goals and no error')
-        elif self.goals or self.keep_in_place:
-            raise ValueError('Only final_state may contain goals/keep_in_place')
+        elif self.goals or (self.keep_in_place and self.interpretation!='ordered_actions'):
+            raise ValueError('Only final_state may contain goals; preservation may also constrain ordered actions')
         elif (self.interpretation == 'unsupported') != bool(self.error):
             raise ValueError('Only unsupported needs an error')
         return self
@@ -184,7 +186,9 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
         if grippers is not None and arm not in grippers:
             raise GroundingError(f"ROBOT_CAPABILITY: no opposed actuated jaws were detected for {arm}")
         if held[arm] and held[arm] != obj:
-            raise GroundingError(f"{arm} hand already holds {held[arm]}; place it before picking {obj}")
+            raise GroundingError(f"{arm} hand already holds {held[arm]}; place it before picking {obj}",
+                preparation={'kind':'free_hand','arm':arm,'object':held[arm],'action_index':index,
+                             'resolved_action':{**program.actions[index].model_dump(),'object':obj,'arm':arm}})
         source = owner(obj)
         if source == arm:
             return
@@ -209,10 +213,13 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
         if obj in {"it", "that", "それ", "そのキューブ", "same"}:
             obj = last_object
         elif obj in {"held:left", "held:right"}:
-            obj = held[obj.split(":")[1]]
+            requested_hand = obj.split(':')[1]
+            obj = held[requested_hand]
+            if obj is None:
+                raise GroundingError(f'REFERENCE_NOT_PRESENT: {requested_hand} hand is empty; specify or acquire a known object before using held:{requested_hand}')
         elif obj in {"left_cube", "right_cube"}:
             side = obj.split("_")[0]
-            candidates = [v for v in objects.values() if "position" in v]
+            candidates = [v for v in objects.values() if "position" in v and v.get('type','cube')=='cube']
             obj = (max if side == "left" else min)(candidates, key=lambda x: x["position"][1])["id"] if candidates else None
         needs_object = action.op in {"pick", "handover", "place", "approach", "throw", "pour"}
         if obj is None and needs_object:
@@ -246,7 +253,9 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
                 raise GroundingError(f"Action {index + 1}: handover needs two different hands")
             acquire(obj, arm, index)
             if held[receiver]:
-                raise GroundingError(f"{receiver} hand holds {held[receiver]}; cannot receive {obj}")
+                raise GroundingError(f"{receiver} hand holds {held[receiver]}; cannot receive {obj}",
+                    preparation={'kind':'free_hand','arm':receiver,'object':held[receiver],'action_index':index,
+                                 'resolved_action':action.model_dump()})
             emit("handover_object", arm, index, object=obj, receiver=receiver)
             held[arm], held[receiver] = None, obj
             checks[obj] = {"type": "holding", "object": obj, "arm": receiver}

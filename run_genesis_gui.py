@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import httpx
 
 from backend.app.agent.world_state import build_world_state
+from backend.app.agent.task_agent import TaskAgent
 from backend.app.execution.task_executor import TaskExecutor
 from backend.app.planning.agent_planner import AgentPlanner, PlannerProviderError
 from backend.app.planning.scene_selection import scene_for_instruction
@@ -173,6 +174,18 @@ def main() -> None:
           f'target pacing {env.simulation_speed:g}x '
           f'(limited by computation). Open {args.backend_url}/simple', flush=True)
     with ThreadPoolExecutor(max_workers=1) as planning_pool:
+        def language_call(fn, *arguments):
+            # The provider works off an immutable snapshot in a worker. Every
+            # Genesis observation, reset, controller and window stays here.
+            future = planning_pool.submit(fn, *arguments)
+            while not future.done() and not should_stop():
+                env.refresh_viewer()
+                publish(status='PLANNING')
+                time.sleep(.04)
+            if should_stop():
+                future.cancel()
+                raise InterruptedError('Stopped during language reasoning')
+            return future.result()
         while True:
             env.refresh_viewer()
             publish()
@@ -213,29 +226,19 @@ def main() -> None:
                         env.reset(randomize=True,seed=command.get('seed'),shuffle_sides=command.get('shuffle_sides',True))
                         executor.reset_context()
                         env.step(200)
-                    state = executor.world_state()
                     publish('planning', force=True, status='PLANNING')
-                    # Only language parsing runs in a worker. Genesis stays on the main
-                    # thread, including its native macOS viewer and every motor command.
-                    future = planning_pool.submit(planner.plan, command['instruction'], state, [])
-                    while not future.done() and not should_stop():
-                        env.refresh_viewer()
-                        publish(status='PLANNING')
-                        should_stop()
-                        time.sleep(.04)
-                    if should_stop():
-                        future.cancel()
-                        body.update(success=False, status='STOPPED')
-                    else:
-                        plan = future.result()
-                        publish('plan_generated', force=True, status='VALIDATING', plan=plan.model_dump())
-                        print(f"Instruction: {command['instruction']}\nProvider: {plan.provider}; actions: {len(plan.program['actions'])}", flush=True)
-                        body.update(executor.run(plan, emit=emit, should_stop=should_stop, force_failure=command.get('force_failure', False)))
+                    agent = TaskAgent(executor,planner,
+                        plan_call=lambda *a: language_call(planner.plan,*a),
+                        recovery_call=lambda *a: language_call(planner.assess_failure,*a))
+                    body.update(agent.run(command['instruction'],emit=emit,should_stop=should_stop,
+                        force_failure=command.get('force_failure',False)))
                 print(f"Task {body.get('status', 'SUCCEEDED' if body.get('success') else 'FAILED')}", flush=True)
             except PlannerProviderError as exc:
                 body.update(success=False, detail=f'{exc.category}: {exc}', final_world_state=build_world_state(env))
             except SpawnSamplingError as exc:
                 body.update(success=False,detail=f'RANDOMIZATION_UNREACHABLE: {exc}',final_world_state=build_world_state(env))
+            except InterruptedError:
+                body.update(success=False,status='STOPPED',detail='Stopped during observation or reasoning',final_world_state=build_world_state(env))
             except Exception as exc:
                 # Never serialize provider HTTP exceptions or environment credentials.
                 body.update(success=False, detail=f'Execution stopped: {type(exc).__name__}', final_world_state=build_world_state(env))

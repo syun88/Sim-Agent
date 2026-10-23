@@ -216,7 +216,7 @@ def viewer_state(body: dict):
         record = _record(task_id)
         if record['status'] not in TERMINAL | {'STOP_REQUESTED'}:
             record['status'] = body.get('status', record['status'])
-        for field in ('plan', 'step_index', 'step', 'result', 'detail'):
+        for field in ('plan', 'step_index', 'step', 'result', 'detail', 'agent_trace'):
             if field in body:
                 record[field] = body[field]
         if body.get('event'):
@@ -228,7 +228,7 @@ def viewer_state(body: dict):
 def genesis_result(result: dict[str, Any]):
     _owns_scene(result.get('viewer_id'))
     record = _record(result.get('task_id', ''))
-    for field in ('plan', 'skills', 'verification', 'detail', 'retry_count', 'total_duration', 'initial_world_state', 'final_world_state'):
+    for field in ('plan', 'skills', 'verification', 'detail', 'retry_count', 'total_duration', 'initial_world_state', 'final_world_state', 'agent_trace', 'agent_attempts', 'diagnosis'):
         if field in result:
             record[field] = result[field]
     stopped = record['status'] == 'STOP_REQUESTED' or result.get('status') == 'STOPPED'

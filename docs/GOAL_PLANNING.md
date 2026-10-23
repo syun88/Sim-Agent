@@ -128,7 +128,8 @@ uv run python scripts/verify_goal_planning.py --case swap --provider local --jso
 同時集合把持の追加1例は、意味を単一把持へ縮めず能力チェックで拒否した。
 `outputs/goal-language-current.json` が5ケースの記録で、3つの最終状態の解釈は約1.93〜2.31秒。
 この記録は凍結した観測状態に対する言語・計画の検証であり、別の物理実行として数えていない。
-全体の回帰は `uv run pytest -q` で185件成功（22.82秒）。
+目標探索を導入した時点の全体回帰は `uv run pytest -q` で185件成功（22.82秒）。
+その後の状況判断・復旧の追加と検証は [TASK_AGENT.md](TASK_AGENT.md) とREADMEの検証記録を参照。
 
 ## 残る境界
 

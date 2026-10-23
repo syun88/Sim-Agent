@@ -24,6 +24,20 @@ def unsupported_group_request(instruction: str) -> bool:
 
 def relative_conditions(instruction: str, state: dict) -> list[dict]:
     text = strip_preservation(instruction, state)
+    # Subject/complement roles also express support without a placement verb:
+    # "red is bottom, blue is top". This adds a literal obligation to the
+    # language model, rather than inventing a second manipulated support goal.
+    levels = {'top':set(), 'bottom':set()}
+    for _, end, name in object_mentions(text, state):
+        for level, pattern in {
+            'top':r'(?:が|は|を)(?:一番)?上(?:[、,。\s]|に|で|$)|\s+(?:is\s+)?(?:on\s+)?(?:the\s+)?top\b',
+            'bottom':r'(?:が|は|を)(?:一番)?下(?:[、,。\s]|に|で|$)|\s+(?:is\s+)?(?:on\s+)?(?:the\s+)?bottom\b',
+        }.items():
+            if re.match(pattern, text[end:], re.I):
+                levels[level].add(name)
+    if len(levels['top']) == len(levels['bottom']) == 1 and levels['top'] != levels['bottom']:
+        return [{'type':'relative_placement','object':next(iter(levels['top'])),
+                 'target':next(iter(levels['bottom'])), 'relation':'on'}]
     references = placement_references(text, state)
     masked = list(text)
     for reference in references:
@@ -34,7 +48,8 @@ def relative_conditions(instruction: str, state: dict) -> list[dict]:
         return []
     subject = next(iter(subjects))
     return [{'type':'relative_placement', 'object':subject, 'target':r['target'], 'relation':r['relation']}
-            for r in references if r['target'] != subject]
+            for r in references if r['target'] != subject and not (r['relation']=='near' and any(
+                other['target']==r['target'] and other['relation'] in {'left_of','right_of','front_of','behind'} for other in references))]
 
 
 def holding_conditions(instruction: str, state: dict) -> list[dict]:
@@ -45,16 +60,22 @@ def holding_conditions(instruction: str, state: dict) -> list[dict]:
     if re.search(r"\b(?:don't|do not|never)\b|しない|さない|ないで", text):
         return []
     result = []
-    hand_context = bool(re.search(r'\b(?:hands?|grippers?)\b|[左右両]手', text))
+    hand_context = bool(re.search(r'\b(?:hands?|grippers?)\b|[左右両]手|グリッパー|ハンド', text))
     if hand_context:
         for clause in re.split(r'\band\b|[、,;。.!?]', text):
             objects = {name for _, _, name in object_mentions(clause, state)}
             arms = set()
-            for match in re.finditer(r'\b(left|right)\b|([左右])(?:手|腕|アーム)', clause):
+            for match in re.finditer(r'\b(left|right)\b|([左右])(?:の)?(?:手|腕|アーム|グリッパー|ハンド)', clause):
                 arms.add(match.group(1) or ('left' if match.group(2) == '左' else 'right'))
             if (len(objects) == len(arms) == 1
                     and not re.search(r'\b(?:side|zone|next|beside)\b|側|隣', clause)):
                 result.append({'object': next(iter(objects)), 'arm': next(iter(arms)), 'source': clause.strip()[:240]})
+            elif len(objects) == 1 and len(arms) > 1 and re.search(r'それぞれ|一個ずつ|\beach\b', clause):
+                # One registered cube cannot be duplicated into two separate
+                # holders. Expose the contradiction instead of adding another
+                # colour to make a feasible but unrelated request.
+                result.extend({'object':next(iter(objects)), 'arm':arm, 'source':clause.strip()[:240]}
+                              for arm in sorted(arms))
     exchange = re.search(r'\b(?:swap|exchange)\b|\b(?:opposite|other)\s+hands?\b|(?:両手|左右|中身|手に).*?(?:逆|入れ替)', text)
     if exchange and not result:
         robot = state.get('robot', {})

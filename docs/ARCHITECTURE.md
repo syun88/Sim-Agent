@@ -121,16 +121,18 @@ not executable code or recorded motor playback. Reuse recomputes and validates t
 
 `TaskExecutor.discourse` is a short reference context, cleared on reset; it does not prove a hold.
 `memory/graph_memory.py` implements Neo4j/local history storage, but the normal native caller
-currently invokes `planner.plan(instruction, state, [])`. It neither retrieves history for this
-call nor automatically saves `/api/genesis/result` through `MemoryStore.save_execution`.
+passes the current task's reference/preparation decisions to `planner.plan` as context.
+It neither retrieves Neo4j history for this call nor automatically saves
+`/api/genesis/result` through `MemoryStore.save_execution`.
 The broker's task records are held in `app.state.executions` until server restart. Standalone
 verification scripts separately export JSON evidence. A connected Neo4j status does not imply
 experience retrieval or automatic learning in the native planning loop.
 
 Each action and hand currently refer to one object. Stacking two cubes is implemented; jointly
 grasping and handing over that stack is not. The support-relation helper does not supply group
-grasp/transport semantics. Rubbing, arbitrary contact tasks, new skill synthesis and a general
-LLM replanning loop after physical failure remain unimplemented. No fine tuning, VLA or learned
+grasp/transport semantics. Rubbing, arbitrary contact tasks and new physical skill synthesis
+remain unimplemented. The bounded task supervisor described below chooses existing recovery
+tools; it does not generate a new contact controller. No fine tuning, VLA or learned
 world model is used by this implementation.
 
 ## URDF registration, scene selection and reachable setup
@@ -366,9 +368,22 @@ cube. Placement refuses an occupied target rather than accidentally stacking obj
 
 `execution/task_executor.py` observes before and after each skill and records the evidence with
 its action index. A failed table approach or empty pinch can be reacquired once from the current
-measured state. A lost transport or a failed handover is reported, not replayed from a scene reset.
-The initial `randomize` option and an explicit reset are setup operations; retries do not reset.
-This is a bounded recovery rule, not a general LLM-generated recovery or replanning loop.
+measured state. The native caller now wraps this executor in `agent/task_agent.py`.
+It binds references from observed contacts/positions, then uses `planning/preparation.py` to
+satisfy compiler-reported empty-hand requirements using physical placements and guarded parking.
+Pronouns are frozen before staging another object, so preparation cannot change the antecedent.
+
+After eligible rigid-cube failures, the supervisor admits only an independently compiled remaining
+suffix and/or a scene restart. `AgentPlanner.assess_failure` can choose between those tools from
+fresh measured facts; provider failure uses a labelled deterministic policy. At most three
+attempts and one reset are allowed. A reset discards progress and is explicitly recorded; it is
+not evidence of success in the original layout. Object IDs and requested roles remain bound;
+unspecified grasp hands may be recomputed after reset. Explicit preservation, fluid operations,
+throws and relative/joint increments cannot trigger an automatic reset/replay. Stop cancels recovery.
+Original final predicates are independently measured after a resumed suffix. Each restart uses
+a new scene epoch for unmentioned-object displacement checks, while retaining all previous results.
+`agent_trace`, `agent_attempts`, and `verification.scene_resets` pass through the broker into `/simple`.
+See [task supervisor design](TASK_AGENT.md) for the acceptance checks and limits.
 
 The discourse context stores only the last object, hand, and released target. It advances from
 successful execution steps and is cleared with a scene reset. It is a reference aid, not evidence

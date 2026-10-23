@@ -73,3 +73,19 @@ def test_randomized_task_uses_the_requested_seed():
         client.post('/api/tasks',json={'instruction':'青を掴んで','randomize':True,'seed':123,'shuffle_sides':False})
         command=client.get('/api/genesis/next').json()
         assert command['seed']==123 and command['shuffle_sides'] is False
+
+
+def test_agent_diagnosis_and_failed_attempts_survive_broker_updates():
+    with TestClient(app) as client:
+        client.post('/api/genesis/register',json={'viewer_id':'owner'})
+        task=client.post('/api/tasks',json={'instruction':'青を掴んで'}).json()['task_id']
+        client.get('/api/genesis/next?viewer_id=owner')  # Isolated test queue only.
+        trace=[{'kind':'reset_and_retry','explanation':'実測の失敗を記録して初期化します。'}]
+        client.post('/api/genesis/state',json={'viewer_id':'owner','task_id':task,'agent_trace':trace})
+        assert client.get('/api/tasks/'+task).json()['agent_trace']==trace
+        attempts=[{'result':{'success':False}},{'result':{'success':True}}]
+        client.post('/api/genesis/result',json={'viewer_id':'owner','task_id':task,'success':True,
+            'agent_trace':trace,'agent_attempts':attempts,'diagnosis':{'category':'MOTION_BLOCKED'}})
+        stored=client.get('/api/tasks/'+task).json()
+        assert stored['success'] and stored['agent_attempts']==attempts
+        assert stored['diagnosis']['category']=='MOTION_BLOCKED'

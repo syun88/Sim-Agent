@@ -17,7 +17,7 @@ VERBS = re.compile(
     r"|(?P<pour>注(?:いで|ぐ|げ)|そそ(?:いで|ぐ)|\bpour\b)"
     r"|(?P<handover>受け渡(?:して|す)|渡(?:した|して|す|せ)|手渡(?:して|す)|\bhandover\b|\bhand[ -]over\b|\bpass(?:es)?\b|\bhand(?=\s+(?:it|the|that)))"
     r"|(?P<place>置(?:いた|いて|く|け)|(?:乗|載)せ(?:て|る)|重ね(?:て|る)|積(?:んで|む)|入(?:れて|れる)|運(?:んで|ぶ)|\bplace\b|\bput(?:s)?\b|\bstack\b|\bset\s+down\b|\bleave\b)"
-    r"|(?P<pick>掴(?:んで|む|め)|つか(?:んで|む)|持ち上げ(?:て|る)|握(?:って|る)|取(?:って|る)|と(?:って|る)|\bpick(?:s)?(?:\s+up)?\b|\bgrab\b|\bgrasp\b|\btake(?:s)?\b|\blift\b)"
+    r"|(?P<pick>掴(?:んで|む|め)|つか(?:んで|む)|持ち上げ(?:て|る)|持って(?:いて|て)?|保持(?:して(?:おいて)?|する)?|握(?:って|る)|取(?:って|る)|と(?:って|る)|\bpick(?:s)?(?:\s+up)?\b|\bgrab\b|\bgrasp\b|\btake(?:s)?\b|\blift\b)"
     r"|(?P<approach>近づ(?:いて|けて|く)|アプローチ|\bapproach\b)"
     r"|(?P<open>開(?:いて|けて|く|け)|\bopen\b)"
     r"|(?P<close>閉(?:じて|めて|じる|める)|\bclose\b)"
@@ -30,6 +30,25 @@ ARMS = {"left": r"左(?:手|腕|アーム|ハンド)?|\bleft(?:\s+(?:hand|arm))?
 def arm_mentions(text: str) -> list[str]:
     matches = [(m.start(), side) for side, pattern in ARMS.items() for m in re.finditer(pattern, text, re.I)]
     return [side for _, side in sorted(matches)]
+
+
+def acting_arm(text: str) -> str | None:
+    """An actor marker outranks object locations and destination side words.
+
+    'on the right ... with the left hand' contains two sides but only one actor.
+    Keep the broad mentions helper for receiver/direction references.
+    """
+    patterns = [r'([左右])(?:手|腕|アーム|ハンド)(?:で|が|は)',
+                r'\b(?:with|using|by)\s+(?:your\s+|the\s+)?(left|right)\s+(?:hand|arm|gripper)\b',
+                r'\b(?:the\s+)?(left|right)\s+(?:hand|arm|gripper)\s+(?:picks?|grabs?|grasps?|takes?|holds?|lifts?|moves?)\b']
+    sides = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.I):
+            value = match.group(1).lower()
+            sides.append('left' if value in {'left','左'} else 'right')
+    if len(set(sides)) > 1:
+        raise GroundingError('Multiple acting hands in one clause need language interpretation')
+    return sides[0] if sides else None
 
 
 def target_in(text: str) -> str | None:
@@ -51,13 +70,26 @@ def target_in(text: str) -> str | None:
 
 def direction_in(text: str) -> str | None:
     for direction, pattern in {
-        "up": r"上[にへ]|\bup\b", "down": r"下[にへ]|\bdown\b",
+        "up": r"上[にへ]|\bup(?:ward)?s?\b", "down": r"下[にへ]|\bdown(?:ward)?s?\b",
         "right": r"右[にへ]|\bright\b(?!\s+(?:hand|arm))", "left": r"左[にへ]|\bleft\b(?!\s+(?:hand|arm))",
         "forward": r"前[にへ]|前方|\bforward\b|\bfront\b", "back": r"後ろ[にへ]|奥に|\bback(?:ward)?s?\b",
     }.items():
         if re.search(pattern, text, re.I):
             return direction
     return None
+
+
+def motion_distance_cm(text: str) -> float | None:
+    """Read explicit SI units; a leading m in 'millimeters' is never meters."""
+    match = re.search(r'(\d+(?:\.\d+)?)\s*(mm\b|millimet(?:er|re)s?\b|ミリ(?:メートル)?|cm\b|centimet(?:er|re)s?\b|センチ(?:メートル)?|m\b|met(?:er|re)s?\b|メートル)', text, re.I)
+    if not match:
+        return None
+    value, unit = float(match.group(1)), match.group(2).lower()
+    if unit.startswith(('mm','milli','ミリ')):
+        return value/10
+    if unit in {'m','meter','meters','metre','metres','メートル'}:
+        return value*100
+    return value
 
 
 def parse_fallback(instruction: str, state: dict) -> TaskProgram:
@@ -110,6 +142,13 @@ def parse_fallback(instruction: str, state: dict) -> TaskProgram:
     if re.fullmatch(r"(?:red|blue)(?:[ _-]*cube)?|[赤青](?:い|の)?(?:キューブ|ブロック|箱)?", text):
         return TaskProgram(actions=[TaskAction(op="pick", object=named_objects(text, state)[0])])
     text = strip_preservation(text, state)
+    # A recognised final verb does not cover an earlier, unknown task. Split
+    # explicit temporal boundaries before claiming this is a complete grammar
+    # match ("wipe the table, then pick blue" must reach the language model).
+    for clause in re.split(r'(?<=て)から|(?<=た)後(?:に)?|その後|[。;；]', text):
+        if clause.strip() and not VERBS.search(clause):
+            if re.sub(r'ください|下さい|お願い(?:します)?|です|ね|よ|[\s、,.!！?？]', '', clause):
+                raise GroundingError('Unrecognised temporal clause: '+clause.strip())
     verbs = list(VERBS.finditer(text))
     if not verbs:
         raise GroundingError("No supported action understood; describe which cube, hand and destination")
@@ -121,7 +160,7 @@ def parse_fallback(instruction: str, state: dict) -> TaskProgram:
     # connectors first so that 'right hand picks ...' retains its explicit subject.
     segments: list[tuple[str, str]] = []
     if english:
-        clauses = re.split(r"[,;.]+|\b(?:and then|then|after that|next(?!\s+to\b)|afterwards)\b|\band\s+(?=(?:pick|grab|pass|hand|put|place|move|open|close|take|lift|throw|toss|pour)\b)", text)
+        clauses = re.split(r"[,;]+|(?<!\d)\.|\.(?!\d)|\b(?:and then|then|after that|next(?!\s+to\b)|afterwards)\b|\band\s+(?=(?:pick|grab|pass|hand|put|place|move|open|close|take|lift|throw|toss|pour)\b)", text)
         for clause in clauses:
             if re.search(r"\b(?:do\s+not|don't|never)\b", clause, re.I):
                 continue
@@ -164,7 +203,7 @@ def parse_fallback(instruction: str, state: dict) -> TaskProgram:
         if obj is None:
             if re.search(r"左(?:側)?の(?:キューブ|箱)|\bleft(?:most)?\s+cube", segment): obj = "left_cube"
             if re.search(r"右(?:側)?の(?:キューブ|箱)|\bright(?:most)?\s+cube", segment): obj = "right_cube"
-        arm = arms[0] if arms else None
+        arm = acting_arm(segment) or (arms[0] if arms else None)
         target = relative[0]["target"] if relative else target_in(segment)
         if op == "move" and target and not re.search(r"\d", segment):
             op = "place"
@@ -194,18 +233,15 @@ def parse_fallback(instruction: str, state: dict) -> TaskProgram:
         if op == "place":
             # Destination words do not change the acting hand. An explicit 'with left hand'
             # or '左手で' can; otherwise continue with the current holder.
-            explicit = re.search(r"(left|right)\s+(?:hand|arm)|([左右])(?:手|腕)で", segment)
-            arm = None if target else arm
-            if explicit and ("with" in segment or "で" in segment):
-                arm = "left" if explicit.group(0).startswith(("left", "左")) else "right"
+            arm = acting_arm(segment) or (None if target else arm)
         distance = None
         direction = None
         if op == "move":
             direction = direction_in(segment)
-            match = re.search(r"(\d+(?:\.\d+)?)\s*(mm|ミリ|cm|センチ|m|メートル)?", segment)
-            distance = float(match.group(1)) if match else 5.0
-            if match and match.group(2) in {"mm", "ミリ"}: distance /= 10
-            if match and match.group(2) in {"m", "メートル"}: distance *= 100
+            distance = motion_distance_cm(segment)
+            if distance is None:
+                match = re.search(r"(\d+(?:\.\d+)?)", segment)
+                distance = float(match.group(1)) if match else 5.0
         action = TaskAction(op=op, object=obj, arm=arm, receiver=receiver, target=target,
                             direction=direction, distance_cm=distance, relation=relation)
         if op == "throw":
