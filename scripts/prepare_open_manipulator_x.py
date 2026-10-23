@@ -111,12 +111,55 @@ def _derive_home(destination: Path) -> dict | None:
     return state
 
 
+
+def _collision_declaration(destination: Path, threshold_mm: float) -> dict | None:
+    """Declare the adjacent link pairs whose source meshes overlap in the setup posture.
+
+    These meshes are visual-quality parts: they overlap at every joint by design, so the
+    runtime must be told which adjacent pairs not to collide (the URDF cannot say it).
+    Only measured overlaps at or above the threshold are declared, and a non-adjacent pair
+    is refused by the importer rather than silently accepted.
+    """
+    from backend.app.robots.registry import import_robot
+    from backend.app.robots.collision_planner import PrivateCollisionQueries
+    profile = import_robot(str(destination))
+    scene = json.loads((Path(profile['directory']) / 'scene.json').read_text())
+    queries = PrivateCollisionQueries(profile, scene['table_top'])
+    snapshot = dict(profile['home'])
+    for gripper in (profile.get('grippers') or {}).values():
+        snapshot.update({gripper['joint']: gripper['open_q'],
+                         **{name: gripper['open_q'] * k for name, k in gripper['followers'].items()}})
+    from backend.app.robots.urdf import URDFModel
+    # Adjacency is body adjacency: fixed and mimic children count too, or the declaration
+    # would miss the pairs the engine also cannot filter.
+    model = URDFModel(profile['urdf'])
+    adjacent = {tuple(sorted((joint['parent'], joint['child']))) for joint in model.joints}
+    measured = {}
+    for contact in queries.contacts(snapshot, tolerance=-.0001):
+        names = tuple(sorted(queries.link_names.get(name, name) for name in contact['links']))
+        depth_mm = float(contact['penetration_m']) * 1000.
+        if names in adjacent and depth_mm >= threshold_mm:
+            measured[names] = round(depth_mm, 3)
+    if not measured:
+        print(f'no adjacent-pair overlap at or above {threshold_mm:g} mm; nothing declared', flush=True)
+        return None
+    pairs = [list(pair) for pair in sorted(measured)]
+    print(f'declaring {len(pairs)} overlapping adjacent pairs: '
+          + ', '.join(f'{a}|{b} {measured[(a, b)]:.1f}mm' for a, b in sorted(measured)), flush=True)
+    return {'runtime_excluded_adjacent_pairs': pairs,
+            'excluded_adjacent_pairs': pairs,
+            'measured_setup_posture_overlap_mm': {f'{a}|{b}': measured[(a, b)] for a, b in sorted(measured)},
+            'measured_threshold_mm': threshold_mm}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dest", type=Path,
                         default=Path("~/.cache/sim-agent/open_manipulator_x").expanduser())
     parser.add_argument("--refresh", action="store_true", help="re-download and re-record the hashes")
     parser.add_argument("--check", action="store_true", help="verify the recorded hashes only")
+    parser.add_argument("--overlap-threshold-mm", type=float, default=5.,
+                        help="declare an adjacent pair whose setup-posture meshes overlap by at least this")
     args = parser.parse_args()
     destination = args.dest.expanduser()
     if not (destination / "provenance.json").is_file() and args.check:
@@ -131,6 +174,11 @@ def main() -> int:
         state = _derive_home(destination)
         if state:
             initial.write_text(json.dumps(state, indent=2) + "\n")
+    declaration = destination / "genesis" / "collision_config.json"
+    if not declaration.is_file():
+        settings = _collision_declaration(destination, args.overlap_threshold_mm)
+        if settings:
+            declaration.write_text(json.dumps(settings, indent=2) + "\n")
     profile = import_robot(str(destination))
     directory = Path(profile["directory"])
     analysis = json.loads((directory / "gripper_analysis.json").read_text())
@@ -140,6 +188,8 @@ def main() -> int:
               "root_link": profile["root_link"], "actuated_joints": [j["name"] for j in profile["joints"]],
               "chains": {side: chain["joints"] for side, chain in profile["chains"].items()},
               "capabilities": profile["capabilities"], "cube_size_m": profile.get("cube_size"),
+              "collision_config": profile.get("collision_config"),
+              "adjacent_collision": json.loads((directory / "scene.json").read_text()).get("adjacent_collision"),
               "grippers": analysis["grippers"], "gripper_failures": analysis["failures"],
               "ik_validation": ik, "spawned_objects": spawn.get("objects"), "directory": str(directory),
               "physical_grasp_verified": False}
