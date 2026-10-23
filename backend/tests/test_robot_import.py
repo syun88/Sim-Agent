@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.robots import registry
@@ -110,3 +111,35 @@ def test_robot_selection_is_queued_for_one_owner_and_never_constructs_physics(tm
         file = client.get(f'/api/robots/{robot_id}/files/scene.json')
         assert file.status_code == 200 and file.json()['openarm_cell'] is False
         assert client.get(f'/api/robots/{robot_id}/files/not-a-generated-file').status_code == 404
+
+
+def test_a_package_declaring_adjacent_mesh_overlap_does_not_collide_them(tmp_path, monkeypatch):
+    """A manufacturer URDF's adjacent meshes overlap; the runtime must be told, in data."""
+    source = source_robot(tmp_path)
+    (source.parent / 'collision_config.json').write_text(json.dumps(
+        {'runtime_excluded_adjacent_pairs': [['base', 'link1'], ['link1', 'tool']]}))
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    profile = registry.import_robot(source.parent.parent)
+    scene = json.loads((Path(profile['directory']) / 'scene.json').read_text())
+    assert profile['collision_config']['covers_adjacent_pairs'] is True
+    assert scene['adjacent_collision'] is False
+    assert scene['runtime_excluded_adjacent_pairs'] == [['base', 'link1'], ['link1', 'tool']]
+
+
+def test_a_declaration_that_names_a_non_adjacent_pair_is_refused(tmp_path, monkeypatch):
+    source = source_robot(tmp_path)
+    (source.parent / 'collision_config.json').write_text(json.dumps(
+        {'runtime_excluded_adjacent_pairs': [['base', 'tool']]}))
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    with pytest.raises(ValueError, match='non-adjacent'):
+        registry.import_robot(source.parent.parent)
+
+
+def test_documented_overlaps_are_not_a_runtime_request(tmp_path, monkeypatch):
+    """The Scorpion package documents its overlaps; only the runtime key may change behaviour."""
+    source = source_robot(tmp_path)
+    (source.parent / 'collision_config.json').write_text(json.dumps(
+        {'excluded_adjacent_pairs': [['base', 'link1']]}))
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    profile = registry.import_robot(source.parent.parent)
+    assert json.loads((Path(profile['directory']) / 'scene.json').read_text())['adjacent_collision'] is True

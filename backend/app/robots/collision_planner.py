@@ -74,6 +74,14 @@ class PrivateCollisionQueries:
                     link_body(child['child'], body, np.asarray(child['origin']), child)
         link_body(self.urdf.root, world, np.asarray(profile['root_transform']))
         ET.SubElement(world,'geom',name='grasp_probe',type='box',size='.01 .01 .01',contype='0',conaffinity='0')
+        # A robot whose source meshes overlap at adjacent joints declares those pairs and the
+        # queries must not collide them either, or the planner and the engine disagree.
+        excluded = (profile.get('collision_config') or {}).get('runtime_excluded_adjacent_pairs') or []
+        if excluded:
+            contact = ET.SubElement(root, 'contact')
+            for first, second in excluded:
+                ET.SubElement(contact, 'exclude', body1=self.body_names.get(first, first),
+                              body2=self.body_names.get(second, second))
         self.model = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding='unicode'))
         self.data = mujoco.MjData(self.model)
         self.addresses = {j['name']: self.model.jnt_qposadr[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, j['name'])]

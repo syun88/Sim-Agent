@@ -41,12 +41,17 @@ class GenericURDFEnvironment(SimulationBackend):
         self.cube_mass = scene_config.get("cube_mass", .05)
         self._spawn_sampler = ReachableDeskSpawns(self.profile, scene_config)
         self.spawn_validation = self._spawn_sampler.layout()
+        self._adjacent_collision = bool(scene_config.get('adjacent_collision', True))
         self._dt = float(scene_config["physics_dt"])
         self._scene = gs.Scene(sim_options=gs.options.SimOptions(dt=self._dt, substeps=int(scene_config.get('physics_substeps',2))),
             rigid_options=gs.options.RigidOptions(constraint_solver=gs.constraint_solver.Newton,
                 friction_cone=gs.friction_cone.elliptic, enable_torsional_friction=True, enable_rolling_friction=True,
                 enable_self_collision=True, enable_neutral_collision=True,
-                enable_adjacent_collision=True, max_collision_pairs=max(512, sum(
+                # scene.json owns this per robot: a URDF whose adjacent link meshes overlap by
+                # design declares the pairs and the engine cannot collide them (see
+                # registry.collision_declaration). Anything else stays as before.
+                enable_adjacent_collision=bool(scene_config.get('adjacent_collision', True)),
+                max_collision_pairs=max(512, sum(
                     len(link.findall('collision')) for link in self.model.links.values()) * 4)),
             viewer_options=gs.options.ViewerOptions(refresh_rate=60, realtime_factor=self.simulation_speed,
                 camera_pos=(1.1, -1.3, 1.5), camera_lookat=(0., 0., 1.)), show_viewer=show_viewer)
@@ -392,7 +397,10 @@ class GenericURDFEnvironment(SimulationBackend):
         for a, b, depth in zip(data['link_a'], data['link_b'], data['penetration']):
             names = tuple(sorted([self._link_names[int(a)], self._link_names[int(b)]]))
             pairs[names] = max(pairs.get(names, 0.), float(depth))
-        return {'adjacent_collision': True, 'maximum_penetration_m': max(pairs.values(), default=0.),
+        declared = (self.profile.get('collision_config') or {}).get('runtime_excluded_adjacent_pairs') or []
+        return {'adjacent_collision': bool(self._adjacent_collision),
+                'declared_excluded_adjacent_pairs': declared,
+                'maximum_penetration_m': max(pairs.values(), default=0.),
                 'pairs': [{'links': list(pair), 'penetration_m': value} for pair, value in pairs.items()]}
 
     def contact_names(self):
