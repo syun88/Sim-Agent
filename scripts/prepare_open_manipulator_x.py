@@ -13,7 +13,7 @@ The import itself is static: URDF parse, FK/Jacobian seeds, jaw inference, priva
 IK and desk-spawn sampling. Reaching, contact, grasp and hold are NOT verified here
 - they need Genesis (run ``scripts/verify_auto_gripper.py`` on the host that has it).
 
-The import result measured 2026-10-24 on a host without Genesis:
+The import result measured 2026-10-24 (this host, Genesis installed for the last rows):
 
     robot_id      open_manipulator_x-784078c2a5   (source sha256 784078c2a5bb16ac)
     root link     world            (fixed base, single arm)
@@ -21,18 +21,21 @@ The import result measured 2026-10-24 on a host without Genesis:
     capabilities  motion, joint_control, ik, physical_grasp, place, stack
     gripper       sliding_jaws on gripper_left_joint: aperture 20.0..82.0 mm,
                   cube 25.5 mm, holding_q -0.0078 rad, table clearance 4.3 mm
+    setup posture derived by private IK (joint2 -0.724, joint3 0.333, joint4 0.380, jaw open)
     spawned props none
 
-Before the jaw fix this gripper was refused outright: the sweep reads a 20.0 mm closed
-gap, the finger-length cap allowed only a 22.7 mm cube, and the squeeze rule needs
-``0.8 * cube <= 20 mm`` (a 25 mm cube) - so the arm imported with no grasp at all. The
-sweep now retries once with the cube floor the measured closure requires, which changes
-nothing where a first pass already finds a candidate: Scorpion's analysis is byte-identical
-across the change.
+Two blockers were found and fixed on the way: the jaw inference refused a gripper that closes
+wider than its finger length allows (now the sweep retries with the closure-derived cube
+floor), and the private collision model failed to compile because this URDF's root link is
+called 'world' (now robot bodies get a safe name and queries map back).
 
-Still open, and unchanged by the jaw fix: the desk layout spawns no props for this arm -
-``No desk position reachable at object and approach heights`` for both cubes, from 33
-candidates each. The gripper is inferred, but nothing is placed in front of it yet.
+Still open, with Genesis installed here: the desk props are refused. The source collision
+meshes interpenetrate at every adjacent joint - link2/link3 43.1 mm, link3/link4 43.3 mm,
+link4/link5 43.2 mm, link1/link2 21.4 mm, each finger against link5 9.1 mm at the setup
+posture - so every candidate is rejected as "deeply intersects the robot", and 0 of 8 sampled
+directions are clear at every radius from 0.08 to 0.34 m. Preparing collision geometry (the
+Scorpion pipeline's inset/refine tools) or declaring the overlapping adjacent pairs is the
+next step; this script stages and reports only.
 """
 from __future__ import annotations
 
@@ -82,6 +85,32 @@ def _stage(destination: Path, refresh: bool) -> dict:
     return manifest
 
 
+def _derive_home(destination: Path) -> dict | None:
+    """Ask the robot's own IK for a posture clear of the desk and record it.
+
+    This URDF's zero posture lies over the desk, so every desk prop was rejected with
+    "spawn cube intersects the robot in its setup posture" (measured 2026-10-24).
+    ``import_robot`` reads ``initial_state.json`` from the URDF's folder, which is the
+    documented way to give an imported robot a usable setup posture.
+    """
+    import numpy as np
+    from backend.app.robots.registry import import_robot
+    from backend.app.robots.urdf import solve_profile_ik
+    profile = import_robot(str(destination))
+    side = next(iter(profile['chains']))
+    target = np.asarray(profile['root_transform'])[:3, 3] + np.array([.20, 0., .22])
+    solution = solve_profile_ik(profile, side, target)
+    if not solution.get('success'):
+        print('no desk-clear setup posture found:', solution.get('detail'), flush=True)
+        return None
+    state = {name: 0. for name in profile['home']}
+    state.update(dict(zip(profile['chains'][side]['joints'], np.asarray(solution['q_rad']).tolist())))
+    for gripper in (profile.get('grippers') or {}).values():
+        state[gripper['joint']] = float(gripper['open_q'])
+    print('setup posture from private IK:', {k: round(v, 4) for k, v in state.items()}, flush=True)
+    return state
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dest", type=Path,
@@ -97,6 +126,11 @@ def main() -> int:
     if args.check:
         return 0
     from backend.app.robots.registry import import_robot
+    initial = destination / "genesis" / "initial_state.json"
+    if not initial.is_file():
+        state = _derive_home(destination)
+        if state:
+            initial.write_text(json.dumps(state, indent=2) + "\n")
     profile = import_robot(str(destination))
     directory = Path(profile["directory"])
     analysis = json.loads((directory / "gripper_analysis.json").read_text())
