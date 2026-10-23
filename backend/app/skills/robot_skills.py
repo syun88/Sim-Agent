@@ -498,6 +498,43 @@ class SkillRunner:
             return self._move_relative(arm, rotation[:, 2] * .08 + [0., 0., .04])
         return self._skill("retreat", run, started)
 
+    def park_empty_arm(self, arm: str) -> dict:
+        def run():
+            if self.held_object(arm):
+                raise SkillError('HAND_OCCUPIED', 'Only an empty hand can be parked')
+            frame = self.env.frame()
+            for obj in frame.objects:
+                if self.env.object_contacts(obj, arm):
+                    raise SkillError('HAND_CONTACT', 'Release and retreat before parking an empty arm')
+            others = {other: self.held_object(other) for other in ('left', 'right') if other != arm}
+            stationary = {obj: self.env.object_pose(obj)[0].copy() for obj in frame.objects
+                          if obj not in others.values()}
+            start, rotation = self.env.ee_pose(arm)
+            target, target_rotation, _, _ = self.env.arm_kinematics(arm).evaluate(self.env.home_arm_qpos(arm))
+            sizes = [float(np.max(self.env.object_bounds(obj)[1]-self.env.object_bounds(obj)[0]))
+                     for obj in stationary if obj.endswith('_cube')]
+            height = max(start[2], target[2]) + max(.08, 2*max(sizes, default=.04))
+            high_start, high_target = start.copy(), target.copy()
+            high_start[2] = high_target[2] = height
+            def guard():
+                for other, obj in others.items():
+                    if obj:
+                        self._require_hold(other, obj)
+                for obj, position in stationary.items():
+                    if (self.env.object_contacts(obj, arm)
+                            or np.linalg.norm(self.env.object_pose(obj)[0]-position) > .002):
+                        raise SkillError('PARK_COLLISION', f'Empty-arm parking disturbed {obj}')
+            # Lift first, then move/rotate above table objects, then descend at the
+            # model-derived home frame. Every move uses the normal IK and motors.
+            for position, attitude in ((high_start, rotation), (high_target, target_rotation), (target, target_rotation)):
+                moved = self.controller.move_to_site(arm, position, attitude, on_sample=guard)
+                if not moved.success:
+                    raise SkillError(moved.error or 'MOTION_BLOCKED', 'Empty arm could not clear the handover workspace')
+                guard()
+            return {'target': target.tolist(), 'clearance_height_m': height,
+                    'stationary_object_displacements_m': {obj: float(np.linalg.norm(self.env.object_pose(obj)[0]-position)) for obj,position in stationary.items()}}
+        return self._skill('park_empty_arm', run, time.perf_counter())
+
     def return_home(self, arm: str) -> dict:
         started = time.perf_counter()
         def run():
@@ -523,7 +560,12 @@ class SkillRunner:
             arm = step.get("arm", "left")
             if progress:
                 progress(skill)
-            if skill == "approach_object":
+            if skill == "observe_scene":
+                from backend.app.agent.world_state import build_world_state
+                result = {"skill": skill, "success": True, "evidence": build_world_state(self.env)}
+            elif skill == "park_empty_arm":
+                result = self.park_empty_arm(arm)
+            elif skill == "approach_object":
                 result = self.approach_object(arm, step["object"], progress, step.get("fault_offset"), step.get("grasp_offset_x", 0.))
             elif skill == "grasp_object":
                 result = self.grasp_object(arm, step["object"])

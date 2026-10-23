@@ -35,21 +35,94 @@ class TaskAction(BaseModel):
     position_deg: float | None = Field(default=None, allow_inf_nan=False)
 
 
-class TaskProgram(BaseModel):
+class TaskGoal(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    type: Literal["holding", "placement", "relative_placement"]
+    object: str
+    arm: Literal["left", "right"] | None = None
+    target: str | None = None
+    relation: Literal["on", "left_of", "right_of", "front_of", "behind", "near"] | None = None
+    distance_cm: float | None = Field(default=None, ge=1, le=30)
+
+    @model_validator(mode="after")
+    def required_arguments(self):
+        if self.type == "holding":
+            if self.arm is None or self.target is not None or self.relation is not None or self.distance_cm is not None:
+                raise ValueError("A holding goal needs one arm and no placement arguments")
+        elif self.type == "placement":
+            if self.target is None or self.arm is not None or self.relation is not None or self.distance_cm is not None:
+                raise ValueError("A placement goal needs a table target and no relation")
+        elif self.target is None or self.relation is None or self.arm is not None:
+            raise ValueError("A relative placement goal needs a reference object and relation")
+        return self
+
+
+class TaskProgram(BaseModel):
+    model_config = ConfigDict(extra="forbid", json_schema_extra={'oneOf': [
+        {'required': ['actions'], 'properties': {'actions': {'minItems': 1}, 'goals': {'maxItems': 0}, 'error': {'type': 'null'}}},
+        {'required': ['goals'], 'properties': {'goals': {'minItems': 1}, 'actions': {'maxItems': 0}, 'error': {'type': 'null'}}},
+        {'required': ['error'], 'properties': {'error': {'type': 'string', 'minLength': 1}, 'actions': {'maxItems': 0}, 'goals': {'maxItems': 0}}},
+    ]})
     actions: list[TaskAction] = Field(default_factory=list, max_length=24)
+    goals: list[TaskGoal] = Field(default_factory=list, max_length=12)
+    keep_in_place: list[str] = Field(default_factory=list, max_length=12)
     assumptions: list[str] = Field(default_factory=list, max_length=12)
     error: str | None = Field(default=None, max_length=300)
 
     @model_validator(mode="after")
     def actions_or_error(self):
-        if bool(self.actions) == bool(self.error):
-            raise ValueError("Return either a nonempty action list or an error, never a guessed partial task")
+        if sum(map(bool, (self.actions, self.goals, self.error))) != 1:
+            raise ValueError("Return exactly one of actions, final goals, or an error; never a guessed partial task")
+        if self.keep_in_place and not self.goals:
+            raise ValueError("keep_in_place is a goal-program constraint")
         return self
 
 
 class GroundingError(ValueError):
     pass
+
+
+class ActionProposal(BaseModel):
+    """One model output array, with a declared interpretation of its items.
+
+    In the inspected Ollama setup, oneOf alone did not prevent responses from
+    filling both optional actions/goals arrays. Each language stage now owns one
+    array and item type, while the compiler-facing TaskProgram stays explicit.
+    """
+    model_config = ConfigDict(extra='forbid')
+    mode: Literal['actions', 'error']
+    items: list[TaskAction] = Field(default_factory=list, max_length=24)
+    assumptions: list[str] = Field(default_factory=list, max_length=12)
+    error: str | None = Field(default=None, max_length=300)
+
+    def task_program(self) -> TaskProgram:
+        if self.mode == 'error':
+            if self.items or not self.error:
+                raise ValueError('Error mode needs an error and empty items')
+            return TaskProgram(error=self.error)
+        if not self.items or self.error:
+            raise ValueError('Action mode requires action items and no error')
+        return TaskProgram(actions=self.items, assumptions=self.assumptions)
+
+
+class InstructionMeaning(BaseModel):
+    """Extract end-state meaning without exposing action recipes to the model."""
+    model_config = ConfigDict(extra='forbid')
+    interpretation: Literal['final_state', 'ordered_actions', 'unsupported']
+    goals: list[TaskGoal] = Field(default_factory=list, max_length=12)
+    keep_in_place: list[str] = Field(default_factory=list, max_length=12)
+    error: str | None = Field(default=None, max_length=300)
+
+    @model_validator(mode='after')
+    def consistent_mode(self):
+        if self.interpretation == 'final_state':
+            if not self.goals or self.error:
+                raise ValueError('Final-state interpretation needs goals and no error')
+        elif self.goals or self.keep_in_place:
+            raise ValueError('Only final_state may contain goals/keep_in_place')
+        elif (self.interpretation == 'unsupported') != bool(self.error):
+            raise ValueError('Only unsupported needs an error')
+        return self
 
 
 def observed_holds(state: dict) -> dict[str, str | None]:
@@ -60,6 +133,9 @@ def observed_holds(state: dict) -> dict[str, str | None]:
 def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
     if program.error:
         raise GroundingError(program.error)
+    if program.goals:
+        from backend.app.planning.goal_search import compile_goal_program
+        return compile_goal_program(program, state)
     objects = {item["id"]: item for item in state["objects"]}
     targets = {item["id"] for item in state["targets"]} | set(TABLE_TARGETS)
     held = observed_holds(state)

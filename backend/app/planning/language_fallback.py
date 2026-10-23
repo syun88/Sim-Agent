@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from backend.app.planning.task_program import GroundingError, TaskAction, TaskProgram
+from backend.app.planning.task_program import GroundingError, TaskAction, TaskGoal, TaskProgram, observed_holds
 from backend.app.planning.references import named_objects
 from backend.app.planning.spatial_language import placement_references, strip_preservation
 
@@ -62,6 +62,27 @@ def direction_in(text: str) -> str | None:
 
 def parse_fallback(instruction: str, state: dict) -> TaskProgram:
     text = unicodedata.normalize("NFKC", instruction).lower().strip()
+    # A complete bounded goal request, not a substring rewrite of action prose.
+    # General paraphrases still go through the configured language model.
+    exchange = re.fullmatch(
+        r"(?:(?:今|現在)(?:持っている|持ってる)?|持っている|持ってる)?(?:両手の|左右の手の|左右の)?(?:キューブ|cube)(?:を)?(?:左右で)?入れ替え(?:て|る)(?:ください)?[。.!\s]*"
+        r"|(?:swap|exchange)\s+(?:the\s+)?(?:cubes|objects)(?:\s+(?:in|between)\s+(?:my|the|both|your)\s+hands)?[.!\s]*", text)
+    if exchange:
+        held = observed_holds(state)
+        if not all(held.values()) or held['left'] == held['right']:
+            raise GroundingError('An exchange requires two distinct observed held cubes')
+        return TaskProgram(goals=[TaskGoal(type='holding', object=held['right'], arm='left'),
+                                  TaskGoal(type='holding', object=held['left'], arm='right')])
+    final_hands = re.fullmatch(
+        r"(?:最終的に|最後は|最後に)?\s*(?:左手に(?P<left>青|赤)[、,\s]+右手に(?P<right>青|赤)|"
+        r"(?P<first>青|赤)(?:いキューブ)?(?:を|は)左手[、,\s]+(?P<second>青|赤)(?:いキューブ)?(?:を|は)右手)"
+        r"(?:を)?(?:で)?(?:持って(?:いて)?|持たせて|持つ状態にして)(?:ください)?[。.!\s]*", text)
+    if final_hands:
+        ids = {'青': 'blue_cube', '赤': 'red_cube'}
+        left = final_hands.group('left') or final_hands.group('first')
+        right = final_hands.group('right') or final_hands.group('second')
+        return TaskProgram(goals=[TaskGoal(type='holding', object=ids[left], arm='left'),
+                                  TaskGoal(type='holding', object=ids[right], arm='right')])
     joints = state.get("robot", {}).get("joints", [])
     for joint in joints:
         name = joint["name"]

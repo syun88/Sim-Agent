@@ -9,8 +9,9 @@ import numpy as np
 
 from backend.app.models.schemas import AgentPlan
 from backend.app.planning.language_fallback import arm_mentions, named_objects, parse_fallback
-from backend.app.planning.task_program import GroundingError, TABLE_TARGETS, TaskProgram, compile_program
+from backend.app.planning.task_program import ActionProposal, GroundingError, InstructionMeaning, TABLE_TARGETS, TaskProgram, compile_program
 from backend.app.planning.spatial_language import validate_instruction_relations, placement_references, preservation_spans
+from backend.app.planning.goal_language import holding_conditions, relative_conditions, unsupported_group_request
 
 
 class PlannerProviderError(Exception):
@@ -41,6 +42,7 @@ class AgentPlanner:
         self.exact_grammar_fast_path = os.getenv("OPENARM_FAST_LANGUAGE", "0").strip() == "1"
         self._repair_feedback: str | None = None
         self._ollama_raw_chatml: bool | None = None
+        self._interpret_meaning = False
 
     @property
     def configured_provider(self) -> str:
@@ -58,7 +60,10 @@ class AgentPlanner:
     def _ai_plan(self, instruction: str, state: dict, memory: list[dict]) -> dict:
         system = (
             "Translate informal Japanese, English or mixed language into an ordered task program for the robot in world_state. "
-            "Return JSON with actions and assumptions. Preserve EVERY task, its order, object, hand and destination. "
+            "Return one JSON envelope with mode, items, assumptions and error. Never return separate actions/goals arrays or keep_in_place. "
+            "Mode actions: items are ordered TaskAction objects with op. "
+            "Mode error: items is empty and error explains why. Preserve EVERY requested task, order, object, hand and destination. "
+            "Use mode actions for the complete requested sequence. Preservation is checked independently from source text and physical state. "
             "Operations: pick (grasp and hold), handover (giver arm + receiver), place (put on table), "
             "approach, move (direction + distance_cm), open, close, home, throw (upward cube toss + height_cm), "
             "pour (wine_bottle into wine_glass, volume_ml 5 to 35, default 20). "
@@ -88,7 +93,7 @@ class AgentPlanner:
             "Return only operations requested in the CURRENT instruction. Do not add a second object's pick, "
             "an extra handover, or a destination absent from it. Resolve each clause independently, in order. "
             "A single place action automatically acquires its object; a handover automatically acquires if needed. "
-            "If the FULL task is unsupported or ambiguous, return actions:[] and error with a short explanation; never guess a partial task."
+            "If the FULL task is unsupported or ambiguous, return mode error with empty items and a short error; never guess a partial task."
         )
         # Setup diagnostics include many numerical IK candidates. They belong in the
         # evidence API, not the language context where they waste the model budget.
@@ -102,7 +107,47 @@ class AgentPlanner:
         user["hand_occupancy"] = occupancy
         held_objects = {obj for obj in occupancy.values() if obj}
         user["pronoun_it"] = state.get("discourse", {}).get("last_object") or (next(iter(held_objects)) if len(held_objects) == 1 else None)
-        user["output_schema"] = TaskProgram.model_json_schema()
+        schema = ActionProposal.model_json_schema()
+        if self._interpret_meaning:
+            # Do not put action examples/recipes in this context: a small model
+            # otherwise copies two impossible handovers instead of stating the
+            # desired ownership. Planning the preparation is the solver's job.
+            system = (
+                'Read the instruction and identify its meaning, without proposing any robot procedure. '
+                'Return interpretation final_state if the user describes how objects should end up, '
+                'an arrangement, ownership, or asks to exchange what the hands contain without prescribing steps. '
+                'For final_state, express only desired predicates: holding(object,arm), placement(object,target), '
+                'relative_placement(object,target,relation,distance_cm optional). Relations on,left_of,right_of,front_of,behind,near. '
+                'On another cube ALWAYS means type relative_placement, target that cube ID and relation on, never placement in a coloured zone. '
+                'required_relative_conditions gives literal object/reference bindings: preserve them; a support is not another goal subject. '
+                'A request to exchange held cubes means each ends in the opposite hand. Read actual hand_occupancy. '
+                'Observed hand_occupancy describes the CURRENT state, never the requested final state. '
+                'required_final_holders gives literal bindings from the instruction; preserve them exactly. '
+                'Never try to describe temporary steps. The solver can free occupied hands using table buffers. '
+                'Use interpretation ordered_actions with empty goals when the user prescribes a temporal sequence, '
+                'an explicit manipulation procedure, or asks for a primitive pick, grasp, approach, movement, throw, pour, open, close or joint angle. '
+                'A requested final holder is not a prescribed manipulation procedure. Arm belongs only to holding goals, not placement goals. '
+                'Do not reduce requested ordered actions to their final states. '
+                'keep_in_place lists objects explicitly required to stay where they are. '
+                'Use only registered objects and targets. A reference cube is a target, not another manipulated subject. '
+                'Simultaneously grasping two cubes in one hand, arbitrary new physical skills, unknown objects '
+                'and unclear desired outcomes are unsupported: return interpretation unsupported with a short error. '
+                'Return JSON matching the supplied schema, no invented object poses or successful outcomes.'
+            )
+            user = {'instruction': instruction, 'objects': [
+                {key: obj[key] for key in ('id', 'type', 'graspable') if key in obj}
+                for obj in state['objects']], 'targets': state['targets'], 'hand_occupancy': occupancy,
+                'available_arms': state.get('robot', {}).get('available_arms', ['left', 'right']),
+                'discourse': state.get('discourse', {}), 'literal_spatial_constraints': user['literal_spatial_constraints'],
+                'leave_in_place': user['leave_in_place']}
+            schema = InstructionMeaning.model_json_schema()
+        user["output_schema"] = schema
+        user['required_final_holders'] = holding_conditions(instruction, state)
+        user['required_relative_conditions'] = relative_conditions(instruction, state)
+        if self._interpret_meaning and user['required_relative_conditions']:
+            # Do not offer unrelated coloured zones to a model interpreting an
+            # explicitly object-relative request. The compiler still validates IDs.
+            user['targets'] = [t for t in state['targets'] if t['id'] in instruction]
         if self._repair_feedback:
             user["previous_validation_error"] = self._repair_feedback
         messages = [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]
@@ -119,7 +164,7 @@ class AgentPlanner:
                 self._ollama_raw_chatml = (info.get("model_info", {}).get("general.architecture") == "qwen3vl"
                                            and info.get("template", "").strip() == "{{ .Prompt }}")
             request = {"model": self.local_model, "stream": False,
-                       "format": TaskProgram.model_json_schema(),
+                       "format": schema,
                        "options": {"temperature": 0, "num_predict": 1600, "num_ctx": 8192,
                                    "stop": ["<|im_end|>", "<|endoftext|>"]}}
             if self._ollama_raw_chatml:
@@ -141,15 +186,28 @@ class AgentPlanner:
                 max_tokens=1800, temperature=0,
             )
             content = response.choices[0].message.content or ""
-        return {"payload": self._extract_json(content), "raw": content}
+        payload = self._extract_json(content)
+        if self._interpret_meaning:
+            meaning = InstructionMeaning.model_validate(payload)
+            if meaning.interpretation == 'ordered_actions':
+                return {'needs_actions': True, 'raw': content}
+            program = (TaskProgram(error=meaning.error) if meaning.interpretation == 'unsupported' else
+                       TaskProgram(goals=meaning.goals, keep_in_place=meaning.keep_in_place))
+            return {'payload': program.model_dump(), 'raw': content}
+        proposal = ActionProposal.model_validate(payload)
+        return {"payload": proposal.task_program().model_dump(), "raw": content}
 
     def plan(self, instruction: str, state: dict, memory: list[dict] | None = None) -> AgentPlan:
         started = time.perf_counter()
+        if unsupported_group_request(instruction):
+            raise PlannerProviderError('UNSUPPORTED_TASK', 'GROUP_GRASP_UNSUPPORTED: one-hand grouped or simultaneous multi-cube acquisition has no executable contact contract')
         memory = memory or []
         fallback = None
+        fallback_source = None
         fallback_error = None
         try:
-            fallback = compile_program(parse_fallback(instruction, state), state)
+            fallback_source = parse_fallback(instruction, state)
+            fallback = compile_program(fallback_source, state)
             validate_instruction_relations(fallback, instruction, state)
         except (ValueError, KeyError) as exc:
             fallback_error = str(exc)
@@ -159,21 +217,62 @@ class AgentPlanner:
         provider_error = None
         raw = None
         self._repair_feedback = None
+        self._interpret_meaning = not (fallback_source and fallback_source.actions)
+        language_stages = []
         # The launcher can immediately execute a fully parsed/grounded request.
         # Unrecognised language still uses the model and the same validation.
         # This avoids a model round trip just to reconfirm an identical program.
         use_ai = self.enabled and not (fallback and (self.exact_grammar_fast_path or (
             len(fallback.program["actions"]) == 1 and fallback.goal["type"] == "direct_command")))
         if use_ai:
-            for _ in range(2):
+            for _ in range(3 if self._interpret_meaning else 2):
                 try:
+                    language_stages.append('meaning' if self._interpret_meaning else 'actions')
                     response = self._ai_plan(instruction, state, memory)
+                    if response.get('needs_actions'):
+                        self._interpret_meaning = False
+                        self._repair_feedback = None
+                        continue
                     program = TaskProgram.model_validate(response["payload"])
+                    binding_repairs = []
                     if program.error:
                         if fallback:
                             provider_error = "PROVIDER_UNSUPPORTED_LANGUAGE"
                             break
                         raise PlannerProviderError("UNSUPPORTED_TASK", program.error)
+                    if program.goals:
+                        if fallback_source and fallback_source.actions:
+                            raise GroundingError('Keep the explicitly understood ordered actions; do not replace them by final goals')
+                        program.keep_in_place = sorted(set(program.keep_in_place) |
+                            {name for _, _, name in preservation_spans(instruction, state)})
+                        mentioned = set(named_objects(instruction, state))
+                        represented = {g.object for g in program.goals} | {g.target for g in program.goals}
+                        if mentioned - represented - set(program.keep_in_place):
+                            raise GroundingError('Final goals omit explicitly mentioned objects: ' + str(sorted(mentioned-represented-set(program.keep_in_place))))
+                        conditions = holding_conditions(instruction, state)
+                        required = {(c['object'], c['arm']) for c in conditions}
+                        for obj in {obj for obj, _ in required}:
+                            requested = {arm for name, arm in required if name == obj}
+                            if len(requested) != 1:
+                                raise GroundingError('Conflicting literal final holders for ' + obj)
+                            goal = next((g for g in program.goals if g.object == obj and g.type == 'holding'), None)
+                            if goal is not None and goal.arm not in requested:
+                                # Like literal mL quantities, an unambiguous
+                                # source binding is authoritative over model bias.
+                                target_arm = next(iter(requested))
+                                binding_repairs.append({'object': obj, 'model_arm': goal.arm, 'requested_arm': target_arm,
+                                    'source': next(c['source'] for c in conditions if c['object'] == obj)})
+                                goal.arm = target_arm
+                        actual = {(g.object, g.arm) for g in program.goals if g.type == 'holding'}
+                        if required-actual:
+                            raise GroundingError('Preserve requested FINAL holders, not observed current ownership: ' +
+                                json.dumps(sorted(required), ensure_ascii=False))
+                        relative = relative_conditions(instruction, state)
+                        expected_relative = {(r['object'],r['target'],r['relation']) for r in relative}
+                        actual_relative = {(g.object,g.target,g.relation) for g in program.goals if g.type=='relative_placement'}
+                        references_only = {r['target'] for r in relative}-{r['object'] for r in relative}
+                        if expected_relative-actual_relative or any(g.object in references_only for g in program.goals):
+                            raise GroundingError('Use the requested final relative goals; do not manipulate support-only objects: '+json.dumps(relative, ensure_ascii=False))
                     normalized = unicodedata.normalize("NFKC", instruction)
                     amounts = re.findall(r"(-?\d+(?:\.\d+)?)\s*(?:ml(?![a-z])|ミリリットル)", normalized, re.I)
                     pours = [a for a in program.actions if a.op == "pour"]
@@ -199,6 +298,10 @@ class AgentPlanner:
                     # Revalidate anchored quantities, including the supported range.
                     program = TaskProgram.model_validate(program.model_dump())
                     candidate = compile_program(program, state)
+                    if binding_repairs:
+                        candidate.planning_evidence = {**(candidate.planning_evidence or {}),
+                            'semantic_binding_repairs': binding_repairs}
+                        candidate.assumptions.append('文章で指定された物体と最終保持者の対応を優先しました。補正内容は実行ログに記録します。')
                     validate_instruction_relations(candidate, instruction, state)
                     if fallback:
                         # When the explicit grammar understood the ENTIRE request, the model
@@ -248,6 +351,8 @@ class AgentPlanner:
         plan.memory_used = memory[-3:]
         plan.memory_decision = "Use live geometry and contacts; past experience never overrides physical preconditions."
         plan.planning_latency = time.perf_counter() - started
+        if language_stages:
+            plan.planning_evidence = {**(plan.planning_evidence or {}), 'language_stages': language_stages}
         # Keep the established idempotent place behaviour, but verify it physically at execution.
         if plan.goal["type"] == "place_in_zone" and self._already_at_target(state, plan.goal["object"], plan.goal["target"]):
             from backend.app.models.schemas import PlanStep
@@ -333,6 +438,6 @@ def validate_plan(plan: AgentPlan, state: dict) -> tuple[bool, list[str]]:
             errors.append(f"Step {i}: relative placement must move the actually held object")
         elif step.skill == "open_gripper":
             held[step.arm] = None
-        elif step.skill == "return_home" and held[step.arm]:
+        elif step.skill in {"return_home", "park_empty_arm"} and held[step.arm]:
             errors.append(f"Step {i}: place the held object before homing")
     return not errors, errors

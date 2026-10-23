@@ -74,6 +74,9 @@ def verify_task_goal(env: SimulationBackend, plan, results: list[dict], initial_
         elif check["type"] == "released":
             contacts = env.object_contacts(obj)
             evidence = {"success": not contacts, "contacts": contacts}
+        elif check["type"] == "preserved":
+            displacement = float(np.linalg.norm(env.object_pose(obj)[0] - check['position']))
+            evidence = {"success": displacement < .006, "displacement": displacement, "tolerance": .006}
         elif check["type"] == "approach":
             from backend.app.simulation.openarm_v2.definition import FINGERTIP_MIDPOINT
             position, rotation = env.ee_pose(check["arm"])
@@ -121,6 +124,7 @@ def verify_task_goal(env: SimulationBackend, plan, results: list[dict], initial_
         measured.append({**check, **evidence})
     if initial_state:
         touched = {s.object for s in plan.steps if s.object}
+        touched.update(plan.goal.get('allowed_object_motion', []))
         touched.update(s.target for s in plan.steps if s.skill == "pour_liquid" and s.target)
         for item in initial_state["objects"]:
             if item["id"] not in touched:

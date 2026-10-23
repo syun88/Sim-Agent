@@ -9,6 +9,8 @@ SkillName = Literal[
     "close_gripper", "move_relative",
     "handover_object",
     "throw_object", "pour_liquid", "move_to_object", "move_joint",
+    "observe_scene",
+    "park_empty_arm",
 ]
 ArmName = Literal["left", "right"]
 MoveDirection = Literal["up", "down", "left", "right", "forward", "back"]
@@ -48,6 +50,8 @@ class AgentPlan(BaseModel):
     planning_latency: float | None = None
     raw_response: str | None = None
     program: dict[str, Any] | None = None
+    goal_program: dict[str, Any] | None = None
+    planning_evidence: dict[str, Any] | None = None
     assumptions: list[str] = Field(default_factory=list)
 
 

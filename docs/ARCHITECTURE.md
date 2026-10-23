@@ -25,7 +25,13 @@ Random layout planning reads the measured positions after reset rather than reme
 
 ## Language and grounding
 
-`planning/agent_planner.py` asks a configured provider for a `TaskProgram`, not motor commands.
+`planning/agent_planner.py` asks a configured provider for typed meaning/proposals, not motor commands.
+Unfamiliar language first uses a compact `InstructionMeaning` context without action recipes:
+desired final predicates, a request for ordered actions, or an unsupported task. Ordered
+interpretations then use `ActionProposal`, with a declared actions/error `mode` and one action `items` array.
+Validated meaning/proposals become the compiler-facing `TaskProgram`. Literal end-holder
+bindings are checked independently by `planning/goal_language.py`; corrections of model
+ownership bias are recorded in `planning_evidence.semantic_binding_repairs`.
 The bounded Pydantic schema in `planning/task_program.py` has eleven operations: pick, handover,
 place, approach, move, open, close, home, throw, pour, joint. Each action can name an object, acting arm, receiving
 arm, semantic destination, or a 1–30cm relative motion. Extra fields and arbitrary code are rejected.
@@ -70,9 +76,36 @@ actual support contact, at least 65% horizontal support overlap, a support gap b
 horizontal alignment within 12mm, upright attitude, stable speed and no finger hold. The support
 must remain undisturbed. IK success alone never establishes a stack.
 
+## Goal search and observed execution
+
+An unordered final-state request can instead specify up to twelve `TaskGoal` predicates:
+holding, table placement or relative placement, plus `keep_in_place` constraints. Actions,
+goals and an error are mutually exclusive in `TaskProgram`. Procedural instructions retain
+their explicit sequence and hands; the goal path does not replace them with a final-state shortcut.
+
+`planning/goal_search.py` searches known pick/handover/place/empty-arm preparation effects,
+with a 4,000-state and 24-action budget. It models occupied hands, elevated holds versus table
+pinches, support clearance, table buffers and measured empty-arm preparation. Objects that are
+not goal subjects remain protected at their original positions. Source geometry and spawn-admitted arms
+inform costs and buffer overlap checks, not a claim of certified physical executability.
+
+`execution/goal_executor.py` executes one semantic action, reobserves Genesis and searches the
+remaining goals. Look-ahead grasp offsets from the complete suffix are retained. The helper
+`park_empty_arm` rises, changes posture above table objects and descends to a private-FK home
+frame; it monitors object disturbance and the other hand's real hold. Preparation evidence is
+bound to the measured hand pose. `observe_scene` independently verifies final predicates with
+the existing physical goal checker. No object state is prescribed by symbolic transitions.
+
+Only a stable, contact-free table pick failure is eligible for at most two search repairs.
+Failed transitions remain blocked even if an empty arm is merely parked; partial exchanges
+and loaded failures stop. The result retains failed attempts, all requested final predicates
+and original preservation positions. Frame permission for another requested goal object does
+not waive its physical hold or any explicit protection condition. See
+[design, research context and reproducible cases](GOAL_PLANNING.md).
+
 ## Executable skills, experience and limits
 
-`models/schemas.py` defines fifteen `PlanStep` skill names. `skills/robot_skills.py` dispatches
+`models/schemas.py` defines seventeen `PlanStep` skill names. `skills/robot_skills.py` dispatches
 the executable Python implementations, with `skills/dynamic_skills.py`, `skills/pouring.py` and
 `skills/spatial_placement.py` supplying specialised operations. `robots/executor.py` adapts the
 controller and skills to imported robot geometry while sharing `TaskExecutor`'s execution loop.

@@ -97,7 +97,7 @@ def main() -> None:
         return stop_cache
 
     def emit(event, **payload):
-        status = 'VERIFYING' if event == 'verifying' else 'EXECUTING'
+        status = payload.pop('status', 'VERIFYING' if event == 'verifying' else 'EXECUTING')
         publish(event, force=True, status=status, **payload)
         env.refresh_viewer()
 

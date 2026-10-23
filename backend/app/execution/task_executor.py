@@ -29,6 +29,9 @@ class TaskExecutor:
         self.controller.target_rotations.clear()
 
     def run(self, plan, *, emit=None, should_stop=None, force_failure=False) -> dict:
+        if plan.goal_program:
+            from backend.app.execution.goal_executor import run_goal_program
+            return run_goal_program(self, plan, emit=emit, should_stop=should_stop, force_failure=force_failure)
         started = time.perf_counter()
         self.controller.cancelled = False
         self.controller.should_stop = should_stop

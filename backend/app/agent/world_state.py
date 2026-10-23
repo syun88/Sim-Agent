@@ -99,8 +99,8 @@ def build_world_state(env: SimulationBackend) -> dict:
         "support_relations": supports,
         "workspace": {"table_height_m":env.table_height,"position_unit":"m","rotation":"world_from_object"},
         "capabilities": {"relative_placement": ["on", "left_of", "right_of", "front_of", "behind", "near"],
-                         "skills": ["move_relative", "return_home", "move_joint"] if imported and not env.profile.get("grippers") else
-                         ["approach_object", "grasp_object", "lift_object", "move_to_target", "move_to_object",
+                         "skills": ["observe_scene", "park_empty_arm", "move_relative", "return_home", "move_joint"] if imported and not env.profile.get("grippers") else
+                         ["observe_scene", "park_empty_arm", "approach_object", "grasp_object", "lift_object", "move_to_target", "move_to_object",
                           "release_object", "retreat", "return_home", "open_gripper", "close_gripper",
                           "move_relative", "handover_object", *([] if imported else ["throw_object", "pour_liquid"]),
                           *(["move_joint"] if imported else [])],

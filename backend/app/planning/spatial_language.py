@@ -26,12 +26,12 @@ ENGLISH = {
 def preservation_spans(text, state):
     spans = []
     for start, end, name in object_mentions(text, state):
-        suffix = re.match(r"(?:には|は|を|に)?(?:触ら(?:ないで|ず)|動かさ(?:ないで|ず)|そのまま)(?:[、,\s]*)", text[end:])
-        english = re.search(r"(?:leave\s+|without\s+(?:moving|touching)\s+)(?:the\s+)?$", text[:start], re.I)
-        ending = re.match(r"\s*(?:where\s+it\s+is|alone|untouched)[.!\s]*", text[end:], re.I)
+        suffix = re.match(r"(?:(?:の)?(?:位置|場所)(?:は|を)?|には|は|を|に)?(?:触ら(?:ないで|ず)|動かさ(?:ないで|ず)|変え(?:ないで|ず)|そのまま)(?:[、,\s]*)", text[end:])
+        english = re.search(r"(?:leave\s+|keep\s+|without\s+(?:moving|touching)\s+|(?:do\s+not|don't)\s+(?:move|touch)\s+)(?:the\s+)?$", text[:start], re.I)
+        ending = re.match(r"\s*(?:where\s+it\s+is|alone|untouched|in\s+place|unchanged)[.!\s]*", text[end:], re.I)
         if suffix:
             spans.append((start, end + suffix.end(), name))
-        elif english and (ending or "without" in english.group().lower()):
+        elif english and (ending or re.search(r"without|do\s+not|don't", english.group(), re.I)):
             spans.append((english.start(), end + (ending.end() if ending else 0), name))
     return spans
 
@@ -65,6 +65,8 @@ def validate_instruction_relations(plan, instruction, state):
     requested = Counter((ref["target"], ref["relation"]) for ref in references)
     actual = Counter((action["target"], action["relation"]) for action in plan.program["actions"]
                      if action["op"] == "place" and action.get("relation"))
+    actual.update((goal['target'], goal['relation']) for goal in
+                  (plan.goal_program or {}).get('goals', []) if goal['type'] == 'relative_placement')
     for target, relation in list(requested):
         if relation == "near":
             actual[(target, "near")] += sum(actual[(target, specific)] for specific in ("left_of", "right_of", "front_of", "behind"))
