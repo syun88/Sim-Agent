@@ -131,8 +131,12 @@ class ReachableDeskSpawns:
                 result = {**result,'q_rad':q.tolist(),'position_error':float(np.linalg.norm(actual-target)),
                     'rotation_error':float(np.linalg.norm(Rotation.from_matrix(frame@rotation.T).as_rotvec()))}
             return result,q,frame
-        # Plan at the supported height, rather than the 2mm setup drop height.
-        supported = point-[0.,0.,self.clearance]
+        # Plan at the supported height. The object rests on the desk, so that height is the
+        # desk's, not the caller's z minus the setup clearance: re-validating a settled object
+        # (which sits exactly on the desk) otherwise plans 2mm below it and a marginal pose
+        # fails (measured 2026-10-24: blue_cube settled 2.03mm lower and was refused, while
+        # the same pose validated at the spawn height).
+        supported = np.r_[point[:2], self.scene['table_top'] + self.half_size]
         if self.collision_queries.box_contact_points(snapshot,supported,np.eye(3),self.half_size*2.,
                 set(self.model.links),distance=.0001):
             raise ValueError(f'{side}: spawn cube intersects the robot in its setup posture')
@@ -183,6 +187,44 @@ class ReachableDeskSpawns:
         cosine = abs(float(ideal @ held)) / max(float(np.linalg.norm(ideal) * np.linalg.norm(held)), 1e-12)
         return float(np.degrees(np.arccos(np.clip(cosine, -1., 1.))))
 
+
+    def measured_candidates(self, side, samples=(13, 16)):
+        """Object positions the arm can actually reach, measured at the spawn height.
+
+        ``bounds`` is a sphere approximation of reach - measured 2026-10-24 for a 0.3 m arm:
+        x -0.69..0.22, y +/-0.45 - so random sampling inside it spends nearly every candidate
+        on positions no IK can reach and the layout then omits the prop. Radii and angles are
+        sampled around the base and kept only where the private position-only IK succeeds and
+        the posture is free of deep contact; the caller validates them in the normal way.
+        """
+        chain = self.profile['chains'][side]
+        root = np.asarray(self.profile['root_transform'])[:3, 3]
+        z = self.scene['table_top'] + self.half_size + self.clearance
+        half_table = np.asarray(self.scene['table_size'][:2]) / 2.
+        snapshot = dict(self.profile['home'])
+        for gripper in self.profile.get('grippers', {}).values():
+            snapshot.update({gripper['joint']: gripper['open_q'],
+                             **{n: gripper['open_q'] * k for n, k in gripper['followers'].items()}})
+        names = chain['joints']
+        limits = self.arm_joint_limits(side)
+        reach = float(np.sum([np.linalg.norm(np.asarray(j['origin'])[:3, 3]) for j in self.model.chain(chain['end_link'])]))
+        found = []
+        for radius in np.linspace(.06, max(.10, min(.34, reach)), samples[0]):
+            for angle in np.linspace(-np.pi, np.pi, samples[1], endpoint=False):
+                point = np.r_[root[:2] + radius * np.array([np.cos(angle), np.sin(angle)]), z]
+                if np.any(abs(point[:2]) + self.half_size + .02 > half_table):
+                    continue
+                result = solve_profile_ik(self.profile, side, point, None, model=self.model,
+                                          snapshot=snapshot, joint_limits=limits)
+                if not result['success']:
+                    continue
+                posture = {**snapshot, **dict(zip(names, result['q_rad']))}
+                if any(c['penetration_m'] > .003
+                       for c in self.collision_queries.contacts(posture, tolerance=-.0001)):
+                    continue
+                found.append(point.tolist())
+        return found
+
     def layout(self, *, randomize=False, object_positions=None, base=None, rng=None,seed=None,
                shuffle_sides=True,stop=lambda:False):
         actual_seed=resolve_seed(seed) if rng is None and randomize else seed
@@ -194,6 +236,7 @@ class ReachableDeskSpawns:
         if randomize and shuffle_sides and rng.integers(2):
             assignments=[('red_cube','right'),('blue_cube','left')]
         attempted={}
+        measured_sampling=False
         for name, preferred_side in assignments:
             if base is not None and name not in base:
                 omitted[name]='Object is absent from the current scene; reset cannot add a new entity'
@@ -228,13 +271,33 @@ class ReachableDeskSpawns:
                     break
                 except ValueError:
                     continue
+            if name not in objects and explicit is None and not (base and name in base):
+                # The rectangular bounds can be mostly unreachable; fall back to the measured
+                # band once, so a small arm still receives a prop instead of having none.
+                measured = self.measured_candidates(side)
+                order = rng.permutation(len(measured)) if randomize else range(len(measured))
+                for index in order:
+                    position = np.asarray(measured[index], float)
+                    if stop():
+                        raise InterruptedError('Desk randomization stopped')
+                    if any(np.linalg.norm(position[:2] - np.asarray(other['position'])[:2]) < .10
+                           for other in objects.values()):
+                        continue
+                    attempted[name] += 1
+                    try:
+                        objects[name] = self.validate(position.tolist(), side)
+                        measured_sampling = True
+                        break
+                    except ValueError:
+                        continue
             if name not in objects:
                 if explicit is not None or base and name in base:
                     raise SpawnSamplingError(f'No changed, reachable, separated desk spawn for {name} after {attempted[name]} candidates')
                 omitted[name] = 'No desk position reachable at object and approach heights; no object spawned'
         return {'objects': objects, 'omitted': omitted, 'openarm_cell': False,
                 'randomization':{'enabled':randomize,'seed':actual_seed,'shuffle_sides':shuffle_sides,
-                    'sampling':'stratified_reachable_workspace' if randomize else 'default',
+                    'sampling': ('measured_reachable_band' if measured_sampling else
+                                 'stratified_reachable_workspace' if randomize else 'default'),
                     'minimum_change_m':.04,'change_reference':'default_layout','candidate_attempts':attempted,
                     'candidate_bounds_m':{s:[a.tolist(),b.tolist()] for s,(a,b) in self.bounds.items()}},
                 'method': 'private URDF IK and collision queries before scene setup', 'grasp_calibrated': False}
