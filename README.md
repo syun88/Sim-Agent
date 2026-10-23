@@ -13,6 +13,21 @@
 この指示は「青を右で取る → 左に渡す → 左側に置く → 赤を左で取る → 右に渡す → 右側に置く」に分解されます。
 左右の手が同じキューブを接触で保持し、受け手の把持を確認してから渡し手を開く、直接の受け渡しです。
 
+現在の構成は、**言語解釈 → 型付きの作業プログラム → 実装済みスキルへの展開 → IK・経路計画 → Genesisのモーター制御 → 実測による成否判定**です。
+LLMの重みは変更しません。物体情報はGenesisから取得し、通常の言語モデル呼び出しには画像を渡していません。
+対応する操作を言い換え・組み合わせて実行できますが、未知の動作の制御コードを自動生成する構成にはまだなっていません。
+このREADMEは、現在のコードにある処理と、未実装・未検証の部分を分けて説明します。
+
+- [起動](#起動)
+- [アーキテクチャーと処理の流れ](#アーキテクチャーと処理の流れ)
+- [ROBOT選択とURDFの追加](#robot選択とurdfの追加)
+- [配置のランダム化と再現](#配置のランダム化と再現)
+- [実行速度](#実行速度)
+- [指示の例](#指示の例)
+- [投げ上げとワイン](#投げ上げとワイン)
+- [検証の再実行](#検証の再実行)・[実行済みの結果](#このマシンでの検証結果2026-10-23更新)
+- [対応範囲と未実装の部分](#対応範囲と未実装の部分)
+
 ## 起動
 
 Python 3.12 または 3.13 と `uv` を使用します。プロジェクトのルートで実行してください。
@@ -35,13 +50,297 @@ uv sync
 # ローカルモデルを明示して起動する場合
 OPENARM_LOCAL_PLANNER=1 OPENARM_OLLAMA_MODEL=qwen3-vl:4b ./run_genesis_gui.sh
 
-# 言語モデルを使わず、対応する定型文だけで操作する場合
+# Ollamaを使わない場合（外部プロバイダーの設定もなければ定型文のみ）
 OPENARM_LOCAL_PLANNER=0 ./run_genesis_gui.sh
 ```
 
 モデルを利用できない場合は `deterministic_fallback` と表示します。理解できない指示を、勝手な赤キューブの移動に置き換えることはありません。
 インポートされた Qwen3-VL の Ollama テンプレートが `{{ .Prompt }}` だけの場合は、モデルのアーキテクチャを確認してから
 会話の区切りと非推論の出力開始形式を補います。ほかのモデルのテンプレートや、Ollama に保存されたモデル自体は変更しません。
+
+## アーキテクチャーと処理の流れ
+
+### プロセス構成と世界の所有者
+
+```mermaid
+flowchart TD
+    UI["Web /simple: 指示・ROBOT選択・初期化・停止"]
+    Broker["FastAPI: キュー・進捗・結果の仲介"]
+    UI --> Broker
+    subgraph Native["run_genesis_gui.py: 唯一のGenesis所有プロセス"]
+        Language["AgentPlanner: LLM / 明示した定型文フォールバック"]
+        Program["TaskProgram: 型付きの意図列"]
+        Compiler["compile_program: 物体参照・手の占有・能力を検証"]
+        Executor["TaskExecutor: スキルを順に実行"]
+        Skills["Pythonスキル: 把持・受け渡し・配置など"]
+        Motion["IK・経路計画・軌道の時間配分"]
+        Genesis["Genesis: モーター制御・接触・剛体・流体"]
+        Observe["world_state: 実際の位置・姿勢・接触・保持"]
+        Verify["成功判定: 追従・独立保持・解放・支持・静止"]
+        Language --> Program --> Compiler --> Executor --> Skills --> Motion
+        Motion -->|"位置・速度・力の制限内で指令"| Genesis
+        Genesis --> Observe
+        Observe --> Language
+        Observe --> Compiler
+        Observe --> Executor
+        Observe --> Verify
+        Executor --> Verify
+    end
+    Broker -->|"所有者がコマンドを取得"| Language
+    Verify -->|"実行結果と計測値"| Broker
+    Broker -->|"現在の状態・解釈・失敗理由"| UI
+    Model["公式MJCF / 選択したURDF・衝突メッシュ"] --> Motion
+```
+
+`./run_genesis_gui.sh` はFastAPIの仲介サーバーと、ネイティブビューアーを起動します。
+サーバーはGenesisの世界を作らず、`POST /api/tasks` などから受けたコマンドをキューへ入れます。
+ネイティブ側がコマンドを取り出し、唯一の世界を動かして状態と結果を返します。
+ロボットやシーンの切り替えもこの所有者が処理し、前の世界を閉じてから次を作ります。
+
+所有者は[プロセス間ロック](backend/app/simulation/runtime_owner.py)とサーバーへの登録で管理します。
+同時に別のビューアーや物理検証を起動し、別々の状態を「現在の世界」とする構成は許しません。
+`GET /api/genesis/next` はキューを消費する内部APIなので、状態確認には `GET /api/scene`、
+`GET /api/executions`、`GET /api/tasks/{task_id}` を使ってください。
+
+言語解釈だけをワーカースレッドに渡します。Genesisの参照・操作、モーター指令、macOSの描画はメインスレッドで行います。
+言語モデルを待つ間も描画と停止要求の確認を続け、停止後に届いたモデル回答を動作へ流しません。
+通常の起動経路は[run_genesis_gui.py](run_genesis_gui.py)です。
+[ExecutionEngine](backend/app/execution/engine.py) という非同期ラッパーも残っていますが、
+通常のFastAPIサーバーはそれを生成せず、シミュレーションも所有しません。
+
+### オブジェクトをどう認識しているか
+
+[build_world_state](backend/app/agent/world_state.py) が、Genesisに登録されたエンティティから現在の状態を組み立てます。
+
+- `id` は `red_cube`、`blue_cube`、ワイン用シーンの `wine_bottle`、`wine_glass` など、シーン構築時の既知の名前です。
+- 位置・姿勢・速度・衝突境界・接触は、その時点のGenesisの物体から取得します。初期座標を言語モデルに覚えさせて動かす方式ではありません。
+- 色は現在 `red_cube` などの名前から、種類は既知のIDから与えます。画像の画素を分類しているわけではありません。
+- 手が何を持っているかは、各物体に対する指の接触と `pinch_established` から求めます。モデルの「持っているはず」という回答を採用しません。
+- 「上にある」は[支持関係](backend/app/agent/scene_relations.py)、衝突AABB、実接触から判定します。左右・近さ・ゾーンとの関係も現在の座標から作ります。
+- 利用できる腕・関節・グリッパー・スキルを `capabilities` とロボット情報へ入れ、選択したロボットにない機能を計画から除きます。
+
+座標の単位はm、世界座標の `+Y` が左、`-Y` が右、`+X` が前方です。
+「左側のキューブ」の解決にも現在の位置を使います。ランダム配置後には、その配置を観測してから計画します。
+手の指定がない場合は現在の保持者を使い、未把持なら配置時のIK検査で確認した手を優先します。
+この `admitted_grasp_arm` は物体が配置検査の座標から5mm未満の間だけ公開し、移動後には使いません。
+その情報がなければ、検出されたグリッパー・利用できる腕・物体の左右位置から選びます。
+相対配置で手を省略した場合には、参照物の側の手を選び、必要なら受け渡しを補う処理もあります。
+
+**通常の実行には、画像から未知の物体を検出・追跡するVLMの観測系は接続されていません。**
+`qwen3-vl:4b` というモデル名でも、送っているのは指示と状態のテキストJSONです。
+外見の色だけを変えてIDを変えなければ、現在のコードはIDに由来する色として扱います。
+登録されていない物体の発見、RGB/depthからの姿勢推定、遮蔽後の再識別は別途実装が必要です。
+URDF・EEメッシュから指や工具位置を推定する幾何解析も、この画像認識とは別の処理です。
+そのため、現在のランダム配置試験は位置変化に対する計画と物理実行の検証で、カメラからの認識精度を測る試験ではありません。
+
+### タスクプランナーとOllamaの役割
+
+[AgentPlanner](backend/app/planning/agent_planner.py) の担当は、自然文を型付きの意図列へ翻訳することです。
+「どの物体を、どちらの手で、どこへ、どの順序で操作するか」を決めます。
+モデルへ関節角や任意のPythonを直接生成させる処理はありません。
+
+プロバイダーは次の優先順位で決まります。
+
+1. `AI_AND_API_KEY`・`AI_AND_BASE_URL`・`AI_AND_MODEL` がすべて有効なら、外部のOpenAI互換エンドポイント。計画の `provider` は `ai&` です。
+2. `OPENARM_LOCAL_PLANNER=1` ならローカルOllama。モデルは `OPENARM_OLLAMA_MODEL`、既定は `qwen3-vl:4b`、`provider` は `local_ollama` です。
+3. モデルを設定していない場合、またはモデル回答を採用できず全文を定型文で解釈できた場合は、明示した `deterministic_fallback` です。
+
+ただし、通常ランチャーは `OPENARM_FAST_LANGUAGE=1` にします。
+[language_fallback.py](backend/app/planning/language_fallback.py) の文法で**全文**を解釈し、
+現在の物体と手へ結び付けられた指示は、モデルへの問い合わせを省いて `deterministic_fallback` として返します。
+この場合、`plan.model` は `null` です。「Ollamaが起動している」ことと「その指示の解釈にOllamaを使った」ことは同じではありません。
+採用した経路はWebの解釈表示と実行結果の `plan.provider`、`plan.model`、`plan.provider_error` で確認できます。
+
+```bash
+# 全文を定型文で解釈できる複数工程も、モデルで確認する経路を選ぶ
+OPENARM_FAST_LANGUAGE=0 OPENARM_LOCAL_PLANNER=1 ./run_genesis_gui.sh
+```
+
+`OPENARM_FAST_LANGUAGE=0` でも、対応する単一の直接操作はモデルを省く場合があります。
+定型文で解釈できない言い換えには、設定したモデルを使います。
+モデルにも定型文にも解釈できなければ、全文を実行可能な計画にできなかった理由を返します。
+
+モデルへの入力には、指示、現在の物体と左右の手、空間関係、参照履歴、ロボットの能力、出力JSONスキーマを入れます。
+「赤を動かさず」「赤の上に」などの保持条件・参照物は、モデル生成と独立した
+[references.py](backend/app/planning/references.py)・[spatial_language.py](backend/app/planning/spatial_language.py) の処理でも照合します。
+定型文で全文を解釈できている場合は、その指示の物体・手・順序・行き先をモデルが勝手に変えた計画を採用しません。
+無効な回答には検証理由を渡して1回修正を求めます。モデル問い合わせは最大2回です。
+それでも解けなければ、全文を解釈できた定型文へ戻るか、エラーにします。
+
+ローカルOllamaは `http://127.0.0.1:11434` を使い、JSONスキーマによる出力制約と `temperature=0` を指定します。
+通常は `/api/chat`、`think=false` です。`/api/show` で `qwen3vl` かつテンプレートが `{{ .Prompt }}` だけだと確認した場合に限り、
+会話区切りと閉じたthinking開始部を付けた `/api/generate` の `raw=true` を使います。
+この補正は入力形式の調整で、重みの学習やOllamaのモデル保存内容の変更はしません。
+
+### 意図の中間表現とタスクコンパイラー
+
+[TaskProgram / TaskAction](backend/app/planning/task_program.py) はLLMと制御処理の間の共通形式です。
+現在の操作は次の11種類です。選択したロボットの `capabilities.skills` によって、実際に使える範囲は狭くなります。
+
+- `pick`: 掴んで保持する。
+- `handover`: 指定した渡し手から受け手へ渡す。
+- `place`: 机の領域・ゾーン・別のキューブとの相対位置へ置く。
+- `approach`: 物体へ接近する。
+- `move`: 手先を指定方向へ1〜30cm動かす。対象物を指定した場合は先に取得する。
+- `open`・`close`・`home`: 指を開く・閉じる、腕を初期姿勢へ戻す。
+- `throw`: キューブを上向きに投げる。指定できる自由上昇量は1〜10cm。
+- `pour`: ボトルからグラスへ5〜35mL注ぎ、ボトルを元の場所へ立てて戻す。
+- `joint`: インポートした既知の回転関節を、URDF範囲内の指定角度へ動かす。
+
+物体間の配置関係は `on`・`left_of`・`right_of`・`front_of`・`behind`・`near` です。
+1指示は最大24の意図、展開後は最大144スキルです。スキーマにない引数や任意のコードは受け付けません。
+
+例えば次の指示を送ります。
+
+```text
+右手で青いキューブを取って左手に渡して左側の赤いキューブの上に乗せて
+```
+
+両手が空で2つのキューブがある場合、意味は次の3つになります。以下は主要な引数だけの表示です。
+
+```json
+{
+  "actions": [
+    {"op": "pick", "object": "blue_cube", "arm": "right"},
+    {"op": "handover", "object": "blue_cube", "arm": "right", "receiver": "left"},
+    {"op": "place", "object": "blue_cube", "arm": "left", "target": "red_cube", "relation": "on"}
+  ]
+}
+```
+
+`compile_program` がこれを次の7スキルへ展開し、最後に「青が赤の上で解放・支持されている」という目標条件を付けます。
+
+```text
+1. approach_object  right / blue_cube
+2. grasp_object     right / blue_cube
+3. lift_object      right / blue_cube
+4. handover_object  right / blue_cube -> left
+5. move_to_object   left  / blue_cube -> red_cube / on
+6. release_object   left  / blue_cube
+7. retreat          left
+```
+
+この文の赤は支持する物体なので、赤を掴む工程はありません。
+「左側の赤いキューブの上」の行き先は `red_cube / on` で、机の `left_side` へ置き換えません。
+
+コンパイラーは観測した保持状態から始め、全意図の順序に沿って手の占有を仮計算します。
+別の手が持つ物体を取るなら受け渡しへ変換し、未取得の物体を置くなら取得動作を補います。
+「それ」、`held:left`、左右位置の参照もこの段階で具体的なIDに解決します。
+受け手が別の物体を持つ、1つの手に2個を持たせる、未知の物体を操作する、必要なグリッパーがない、
+指定範囲を超える、といった計画は動かす前に拒否します。
+
+ここで作るのは、既存の操作規則による実行手順と目標条件です。
+任意の目的から未知の道具・動作を探索する汎用の行動合成や、学習したworld modelによる将来予測は実装していません。
+この前提条件の検査に通ったことだけでは、IK到達・衝突回避・実際の把持の成立までは証明されません。
+
+### IKとモーションプランナー
+
+タスクプランナーの後に、物理動作を成立させるための計算があります。
+
+1. **目標姿勢を作る。** 現在の物体位置、指の工具位置、実際の把持オフセット、参照物の衝突境界から、接近・保持・置き場所の位置と向きを求めます。
+2. **IKを解く。** OpenArmは[公式モデルの私有計算データ](backend/app/simulation/openarm_v2/kinematics.py)、インポート機は[URDFのFK・Jacobian](backend/app/robots/urdf.py) を使います。関節制限を守り、位置と必要な姿勢の誤差を検査します。
+3. **衝突のない経路を探す。** インポート機の[collision_planner.py](backend/app/robots/collision_planner.py) は、腕同士・隣接リンク・机を検査し、直線経路が塞がる場合はRRT-connectで迂回を探します。閉鎖中の腕と指、運搬する物体、解放後の空の指の退避も、それぞれの動作に応じて検査します。
+4. **軌道に時間を割り当てる。** [motion.py](backend/app/control/motion.py) と、インポート機の [path_timing.py](backend/app/control/path_timing.py) が関節・手先の速度と加速度を考慮します。途中点ごとに停止させず、補間した位置・速度の指令をモーターへ渡します。
+5. **実際に到達したか測る。** Genesisで物理を進め、実際の手先位置・姿勢・接触・物体の追従を読みます。IK解があっても物理的に届かなければ `MOTION_BLOCKED` などで失敗します。
+
+衝突照会にはMuJoCoのモデル・運動学・形状関数も使いますが、そこで `mj_step` を回す第二の物理世界はありません。
+候補姿勢をGenesisへ書いて戻す試行も行いません。これにより、計算中の候補が画面に再生されることを防ぎます。
+保持物を含む経路検査用の予測形状は私有モデル内のもので、Genesisの物体を指に固定する処理ではありません。
+実際の動作と成否の正はGenesisです。
+
+### 実行スキルはどこにあるか
+
+ロボットが実行するスキルは、Gitで管理するPythonの処理です。
+1つの決まった文章に1つのスクリプトを用意する方式ではなく、同じ操作を物体・腕・配置の引数で再利用します。
+
+- [models/schemas.py](backend/app/models/schemas.py): 実行可能なスキル名と `PlanStep` の引数。現在15種類です。
+- [skills/robot_skills.py](backend/app/skills/robot_skills.py): 共通の実行振り分けと、公式OpenArmの接近・把持・持ち上げ・運搬・受け渡し・解放など。
+- [skills/spatial_placement.py](backend/app/skills/spatial_placement.py): 参照物に対する配置位置の計算と、積み重ね・相対配置の検証。
+- [skills/dynamic_skills.py](backend/app/skills/dynamic_skills.py)・[skills/pouring.py](backend/app/skills/pouring.py): 投げ上げとワイン注ぎの物理制御。
+- [robots/executor.py](backend/app/robots/executor.py): インポート機の工具・指・関節構成に合わせるコントローラー、スキル、実行器。
+- [robots/handover.py](backend/app/robots/handover.py)・[robots/placement.py](backend/app/robots/placement.py): インポート機の受け渡し候補、閉鎖・離脱・確認リフト、保持物を含む配置経路。
+
+新しい文章でも、この操作群に分解できれば、その文章専用のスキルを追加する必要はありません。
+一方、「擦る」などに必要な接触力や往復軌道の制御がなければ、LLMが単語を理解しても実行できません。
+拡張する場合は、意図・引数の表現、能力の公開、実行処理、前提条件、観測による成功判定を揃える必要があります。
+`SKILL.md` を置くと新しいロボット動作を自動で読み込む仕組みはありません。
+Codexの開発作業用スキルと、このロボットの実行スキルは別です。
+
+特に「積んだ2個を両方取って渡す」は未実装です。現在は各アクションの `object` が1つ、保持状態も1つの手につき1つのIDです。
+支持関係を認識できることと、その集合をまとめて掴み・運び・渡し・検証できることは別です。
+複数物体の把持表現・接触条件・荷重と経路・受け渡し・事後検証を追加する必要があります。
+
+### 実行中の観測・回復・成功判定
+
+[TaskExecutor](backend/app/execution/task_executor.py) は開始時に実測状態で計画を再検証し、スキルを順番に実行します。
+各スキルの前後で状態を読み、`action_index` とともに記録します。
+OpenArmの `TaskExecutor` とインポート機の `ImportedRobotExecutor` はこの実行ループを共有し、
+工具や指などに依存する部分だけを選択した実装に置き換えます。
+
+成功はLLMの自己申告ではなく、スキルの実測値と [goal_verification.py](backend/app/verification/goal_verification.py) の目標判定で決まります。
+
+- **把持:** 両側の必要な指接触と、持ち上げ時の物体の追従を確認します。インポート機では、末端パッド・対向する法線・接触力・元のメッシュとの距離・貫通量も調べ、30mmの確認リフトと300msの独立保持を要求します。
+- **受け渡し:** 渡し手が保持したまま受け手が接近して実接触を作り、渡し手を開いて離脱します。その後に受け手だけで持ち上げ、他の支持を受けず保持できることを測ります。
+- **机の領域への配置:** 水平40mm以内・垂直50mm以内、指からの解放、速度20mm/s未満、100物理ステップで移動2mm未満を要求します。OpenArmのキューブでは100ステップは100msです。実測の誤差を別に表示します。
+- **積み重ね:** 支持する物体との接触、支持面の重なり65%以上、中心の水平ずれ12mm以内、支持面の隙間4mm未満、面を下にした姿勢、解放と静止を確認します。机領域への配置と同じ40mm許容値では判定しません。
+- **操作対象以外:** 最初の位置からの変位6mm未満を最終判定で確認します。例の積み重ねでは、土台の赤を動かしていないことも対象です。
+- **投げ上げ・注ぐ:** 自由飛行の軌跡、粒子から求めた量・こぼれ・空中分、ボトルの置き戻しなど、その動作固有の計測を使います。
+
+全スキルが完了していない計画は、偶然の最終座標が近くても成功にしません。
+通常の実行で物体の座標を書き換えて追従や保持を作る処理はなく、物体の位置指定は初期配置・リセットに限定します。
+
+回復は限定的です。机上の接近・把持が `GRASP_FAILED` または `IK_FAILURE` になり、
+その物体を保持しておらず両手との接触もない場合に、その失敗スキルから1回だけ再接近できます。
+運搬中の落下や途中まで進んだ受け渡しは、現在の物理状態と理由を残して止まります。
+シーンを途中で初期化して完了済みの工程をやり直す処理はありません。
+実行失敗後にLLMへ再観測を渡して任意の回復計画を作らせる、汎用の再計画ループも現在はありません。
+
+失敗の段階は、結果の計画・スキル・実測値から区別できます。
+
+- `INSTRUCTION_NOT_UNDERSTOOD` / `UNSUPPORTED_TASK`: 文全体を対応する操作へ結び付けられない、またはモデルが未対応と返した段階。
+- `ROBOT_CAPABILITY`: 指定ロボットの手や操作能力が不足している段階。
+- `RANDOMIZATION_UNREACHABLE`: ランダム配置でIK・幾何検査を通る候補を見つけられなかった段階。
+- `IK_FAILURE` / `COLLISION_PATH`: 目標姿勢や衝突を避ける経路を作れなかった段階。
+- `MOTION_BLOCKED` / `GRASP_FAILED`: モーターを動かした実測が到達条件・物理把持の条件を満たさなかった段階。
+- `GOAL_NOT_SATISFIED`: 工程後の状態が、配置・支持・解放などの最終条件を満たさない段階。
+
+言語解釈が正しいこと、IKが解けること、物理動作が成功することはそれぞれ別に確認します。
+
+### 参照履歴・成功候補の保存・Neo4j
+
+保存する情報には別々の役割があります。
+
+- **参照履歴:** `TaskExecutor.discourse` に直前の物体・手・置き場所を持ち、次の「それ」「そこ」を解決します。成功した工程から更新し、初期化で消します。保持の証拠には使いません。
+- **成功した受け渡し候補:** [robots/skill_recipes.py](backend/app/robots/skill_recipes.py) が、インポート機の `outputs/robots/<robot-id>/handover_skills.json` に幾何パラメーターを保存します。
+- **タスクの進捗・結果:** 通常のネイティブ経路ではFastAPIの `app.state.executions` にあります。サーバー再起動で消えるメモリー上の記録です。検証スクリプトは必要な計測を別途 `outputs/*.json` などへ出力します。
+- **Neo4j / ローカル履歴ストア:** [memory/graph_memory.py](backend/app/memory/graph_memory.py) に `MemoryStore` の保存・検索処理があり、サーバーは接続状態と履歴のAPIを持ちます。ただし、通常のネイティブ経路ではこの履歴を取得して計画へ入れていません。
+
+`handover_skills.json` が保存するのは、受け渡し位置、物体に対する手の姿勢、受け手の把持位置、IKの初期候補などです。
+独立した確認リフトと300ms保持の物理検証が成立した候補だけを記録します。
+モーター軌道の録画ではなく、次回も現在の関節・物体の姿勢から経路、閉鎖、渡し手の離脱、受け手のリフトを再計算・再検査します。
+形状・モーター・制御方針のハッシュが変われば無効にし、候補が通らなければ通常の探索へ戻ります。
+ファイルがなくても最初の探索は可能です。新しい動作コードを獲得したことを意味しません。
+このファイルと生成プロファイルは機械固有のためGit管理外です。Pythonのスキル本体はGitに含めます。
+
+ネイティブ側は現在 `planner.plan(instruction, state, [])` と呼び、過去経験のリストは空です。
+`/api/genesis/result` も `MemoryStore.save_execution` へ自動保存する経路ではありません。
+したがって、Neo4jが接続済みと表示されても、すべてのタスクが自動学習・経験検索で改善するわけではありません。
+現在のFTなしの適応は、推論時の言語解釈と検証、幾何パラメーターの自動生成、検証済み候補の再利用によるものです。
+
+### ソースコードを読む順序
+
+実際の入口から追う場合は、次の順で確認できます。
+
+1. [run_genesis_gui.sh](run_genesis_gui.sh) → [run_genesis_gui.py](run_genesis_gui.py): 起動、所有権、コマンド取得、シーン切り替え、計画と実行。
+2. [main.py](backend/app/main.py) → [simple.html](backend/app/static/simple.html): Web/APIのキュー・状態・結果・ROBOT選択。
+3. [world_state.py](backend/app/agent/world_state.py): Genesisからの物体・手・能力・関係の取得。
+4. [agent_planner.py](backend/app/planning/agent_planner.py) → [task_program.py](backend/app/planning/task_program.py): モデル呼び出し、意図列、参照解決とスキル展開。
+5. [task_executor.py](backend/app/execution/task_executor.py) → [robot_skills.py](backend/app/skills/robot_skills.py) / [robots/executor.py](backend/app/robots/executor.py): 実行・接触・把持・受け渡し・配置。
+6. [motion.py](backend/app/control/motion.py)・[collision_planner.py](backend/app/robots/collision_planner.py)・[path_timing.py](backend/app/control/path_timing.py): IK、衝突回避、軌道追従。
+7. [environment.py](backend/app/simulation/genesis_backend/environment.py) / [generic_environment.py](backend/app/simulation/genesis_backend/generic_environment.py) → [goal_verification.py](backend/app/verification/goal_verification.py): Genesisとの接続と実測の成功判定。
+8. [registry.py](backend/app/robots/registry.py)・[gripper_discovery.py](backend/app/robots/gripper_discovery.py)・[spawn.py](backend/app/robots/spawn.py): URDF登録、指の幾何解析、キューブ寸法と到達可能な初期位置。
+
+英語での補足と動作ごとの詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) にあります。
 
 ## ROBOT選択とURDFの追加
 
@@ -65,6 +364,10 @@ OpenArm以外ではCellを読み込まず、地面・机・選択したURDF・IK
 - `ik_seeds.json`, `ik_validation.json`: 非公開の計算用FK・JacobianとIK解の検査。
 - `spawn_validation.json`: 机に落ち着く高さの物体中心と4cm・8cm上の接近位置に対するIK解・誤差、腕・机との衝突、指の閉鎖5点、物体の厚みに相当する開口幅の前後での確認リフト。ランダム初期化も同じ基準を通った位置だけ採用します。実行時にはさらに49点の閉鎖経路と実接触を検査します。
 - `solve_ik.py`: `uv run python outputs/robots/<robot-id>/solve_ik.py left X Y Z` でIK解をファイル出力。実際のロボットは動かしません。
+
+実際の把持や受け渡しが成功した後には、`gripper_runtime.json` に腕ごとの把持の物理計測、
+`handover_skills.json` に再利用する受け渡し候補を保存します。幾何解析だけで物理検証済みにはしません。
+`grasp_calibrated` は現在の設定ハッシュに一致する腕ごとの検証記録から決まり、任意の配置やタスクの成功保証ではありません。
 
 机上の候補でIKが解けない場合や把持姿勢が腕・机に衝突する場合は生成しません。明示した位置がこの検査を通らない場合はエラーを返します。
 OpenArmでも公式指先形状と把持姿勢で、物体位置・接近位置・上の経由点を検証してから配置します。
@@ -274,7 +577,7 @@ Pour 10 ml of wine into the glass
 ```
 
 「取る」だけなら保持します。「置く」まで指定した場合は解放と安定を確認します。
-手を省略した場合は現在持っている手、または実測位置に近い手を選びます。
+手を省略した場合は現在の保持、配置時のIK確認、利用可能なグリッパーと実測位置から選びます。相対配置では参照物の側の手を選ぶ場合もあります。
 置く場所を省略した場合は保持している手の側に置き、その解釈を画面に表示します。
 「それ」は指示内の直前の物体、続く指示では直前に扱った物体を参照します。
 シーンの初期化で参照履歴も初期化します。
@@ -324,37 +627,6 @@ SPHの粒子間隔・粘性係数・内部時間刻みは連動して設定し�
 移動中も20ms間隔で両指の保持と容器間の隙間を検査します。
 直立した液体入りボトルの運搬は、軌道の最大速度0.65m/s・最大加速度4m/s²に基づく最短時間も守ります。
 短い指定時間を一律6分の1にしてボトルを滑らせることを避け、注ぎ口の微修正も物理時間0.12秒で行います。
-
-## 構成
-
-```mermaid
-flowchart TD
-    Input[Web の言語指示] --> Language[LLM / 明示した定型文フォールバック]
-    Language --> Program[型付き TaskProgram]
-    Scene[Genesis の実測状態と参照履歴] --> Grounding[物体参照・左右・手の占有を解決]
-    Program --> Grounding
-    Grounding --> Validator[全工程の前提条件を事前検証]
-    Validator --> Executor[状態を再観測しながら実行]
-    Executor --> Skills[把持・運搬・受け渡し・配置・投げ上げ・注ぐ]
-    Model[公式 OpenArm v2 モデルと衝突メッシュ] --> Skills
-    Skills --> IK[IK とモーター位置制御]
-    IK --> Genesis[唯一の Genesis シミュレーション]
-    Genesis --> Scene
-    Genesis --> Check[接触・追従・解放・安定・全物体の最終目標]
-    Check --> Executor
-    Check --> Results[Web の計測結果]
-```
-
-言語モデルの仕事は意図の分解です。自由なPythonや物体の座標書き換えは生成させません。
-関節指定は、インポートされた既知の関節名と度単位の操作に限定し、元のURDFの制限を検証します。
-1つの手が2つのキューブを持つ計画、受け手が塞がった受け渡し、未知の物体、範囲外の相対移動は事前に拒否します。
-無効なモデル回答は検証理由を添えて1回修正し、それでも無効なら理解できた定型文へ戻るか、理由を示して失敗します。
-
-受け渡しでは、公式メッシュに基づいて両腕とキューブの姿勢を一緒に解きます。受け手は物体の外側から直線で接近し、
-両指の接触を確認してから渡し手を開いて後退します。その後、受け手だけで3cm持ち上げ、物体の追従と接触を確認します。
-運搬も短い直線経路に分けます。IK が解けただけで動作を成功扱いせず、実際の到達位置と姿勢を測ります。
-
-詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) を参照してください。
 
 ## 検証の再実行
 
@@ -431,14 +703,17 @@ uv run python scripts/verify_pick_place_genesis.py
 これらは現在の2.5mm粒子・0.1mL上限での成功の根拠には使用しません。
 このMacでは流体付きの動作は実時間より遅く進みます。
 
-## 対応範囲
+## 対応範囲と未実装の部分
 
-- 標準の公式OpenArm v2 Cellでは、キューブ用シーンとワイン用シーンを切り替えて使用します。インポートURDFは机の別シーンでFK/IKと関節操作を利用できます。
+- 標準の公式OpenArm v2 Cellでは、キューブ用シーンとワイン用シーンを切り替えて使用します。インポートURDFは机の別シーンでFK/IKと関節操作を利用し、対向する駆動指が検出された場合は物理把持・運搬・受け渡し・相対配置を試行できます。到達・把持・タスク完了は個別の実行で検証します。
 - 言語モデルを利用すれば言い換えを扱えますが、任意の日本語・英語を常に正しく解釈する保証はありません。
-- このシーンの操作スキルの組み合わせに限定しています。キューブ2個の積み重ねと相対配置に対応します。未知の物体、柔軟物、ボトルの受け渡し、同時に別々の物体を交換する動作は実装対象に含みません。
+- このシーンの実装済み操作の組み合わせが対象です。キューブ2個の積み重ねと相対配置は実装していますが、積んだ2個を同時に把持して渡す操作は未実装です。
+- 未登録物体の画像認識、柔軟物、擦るなどの任意の接触作業、ボトルの受け渡し、同時に別々の物体を交換する動作には対応していません。実行失敗後の汎用LLM再計画、動作コードの自動合成も未実装です。
+- 任意のURDFを追加すれば自動で全作業に成功する状態ではありません。現在の自動解析は固定ベースのツリーと最大2本の操作チェーン、対向する駆動指を中心にしています。検出できないEEや特殊なハンドには追加の表現と制御が必要です。
+- 広いランダム配置では、2026-10-23の各4ケースで物理把持がOpenArm・Scorpionとも2/4成功でした。24/24のIK・幾何検査合格は、物理把持や後続タスク全体の成功を意味しません。キューブ個数・サイズ・回転、ワイン容器の配置はこのランダム化の対象外です。
 - 受け手の手が塞がっている場合は、先に置く指示が必要です。目標に別のキューブがある場合も、意図せず積み重ねることを避けて停止します。
 - 物理の失敗は現在の状態を残して報告します。限定したテーブル上の把持の再試行は行いますが、シーンを途中で初期化する回復は行いません。
-- 配置判定は水平40mm以内、垂直50mm以内、指からの解放、低速かつ100msの安定を要求します。実際の誤差も別途表示します。
+- 机領域への配置と物体上の積み重ねは別の成功条件です。前者は水平40mm以内・垂直50mm以内、後者は中心ずれ12mm以内・支持面の隙間4mm未満などを要求し、どちらも解放と静止を確認します。許容値と実際の誤差は区別して表示します。
 
 ## 公式モデルとライセンス
 

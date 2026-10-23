@@ -4,6 +4,25 @@ The native viewer owns the only live simulation. FastAPI is a command, progress,
 it does not instantiate an environment. The same `TaskExecutor` is used by the native owner,
 headless verification scripts, and the asynchronous execution wrapper.
 
+The [Japanese README](../README.md#アーキテクチャーと処理の流れ) describes the end-to-end
+runtime, provider selection, task compilation, executable skills and their storage. This document
+adds implementation details. The normal broker does not construct the asynchronous wrapper.
+
+## Observed state and perception boundary
+
+`agent/world_state.py` builds state from known Genesis entities. Positions, orientations,
+velocities, collision bounds and contacts are measured from the live simulation. Object IDs are
+registered by scene setup; colour currently comes from the ID and type from known names, not
+image classification. `agent/scene_relations.py` combines contacts and bounds for support
+relations. Hand occupancy is derived from `pinch_established`, with one object ID per hand;
+an ambiguous multiple-object pinch is not represented as a group hold.
+
+The normal Ollama request contains text and state JSON, with no image payload, including when
+the configured model is named `qwen3-vl:4b`. Unknown-object detection, RGB/depth pose estimation,
+occlusion tracking and arbitrary object discovery are not connected to this runtime. Mesh-based
+gripper discovery is geometric analysis of supplied robot assets, not VLM visual perception.
+Random layout planning reads the measured positions after reset rather than remembered defaults.
+
 ## Language and grounding
 
 `planning/agent_planner.py` asks a configured provider for a `TaskProgram`, not motor commands.
@@ -50,6 +69,36 @@ separation. A stack releases the held cube above the support's top surface. Veri
 actual support contact, at least 65% horizontal support overlap, a support gap below 4mm,
 horizontal alignment within 12mm, upright attitude, stable speed and no finger hold. The support
 must remain undisturbed. IK success alone never establishes a stack.
+
+## Executable skills, experience and limits
+
+`models/schemas.py` defines fifteen `PlanStep` skill names. `skills/robot_skills.py` dispatches
+the executable Python implementations, with `skills/dynamic_skills.py`, `skills/pouring.py` and
+`skills/spatial_placement.py` supplying specialised operations. `robots/executor.py` adapts the
+controller and skills to imported robot geometry while sharing `TaskExecutor`'s execution loop.
+These files are version-controlled code; no runtime `SKILL.md` loader synthesises a new action.
+New sentences can compose existing operations without a sentence-specific implementation.
+A new physical operation still needs a representation, controller, capabilities, preconditions
+and measured postconditions. The planner does not synthesise arbitrary robot code.
+
+Imported robot bundles in gitignored `outputs/robots/<id>/` contain generated geometry, IK and
+scene settings. `robots/skill_recipes.py` can also save `handover_skills.json` after a physically
+verified exchange. It stores configuration-bound geometric parameters and initial IK candidates,
+not executable code or recorded motor playback. Reuse recomputes and validates the current path.
+
+`TaskExecutor.discourse` is a short reference context, cleared on reset; it does not prove a hold.
+`memory/graph_memory.py` implements Neo4j/local history storage, but the normal native caller
+currently invokes `planner.plan(instruction, state, [])`. It neither retrieves history for this
+call nor automatically saves `/api/genesis/result` through `MemoryStore.save_execution`.
+The broker's task records are held in `app.state.executions` until server restart. Standalone
+verification scripts separately export JSON evidence. A connected Neo4j status does not imply
+experience retrieval or automatic learning in the native planning loop.
+
+Each action and hand currently refer to one object. Stacking two cubes is implemented; jointly
+grasping and handing over that stack is not. The support-relation helper does not supply group
+grasp/transport semantics. Rubbing, arbitrary contact tasks, new skill synthesis and a general
+LLM replanning loop after physical failure remain unimplemented. No fine tuning, VLA or learned
+world model is used by this implementation.
 
 ## URDF registration, scene selection and reachable setup
 
@@ -286,6 +335,7 @@ cube. Placement refuses an occupied target rather than accidentally stacking obj
 its action index. A failed table approach or empty pinch can be reacquired once from the current
 measured state. A lost transport or a failed handover is reported, not replayed from a scene reset.
 The initial `randomize` option and an explicit reset are setup operations; retries do not reset.
+This is a bounded recovery rule, not a general LLM-generated recovery or replanning loop.
 
 The discourse context stores only the last object, hand, and released target. It advances from
 successful execution steps and is cleared with a scene reset. It is a reference aid, not evidence
@@ -294,7 +344,8 @@ of ownership; hand occupancy is always observed from Genesis contacts.
 `verification/goal_verification.py` checks every final object predicate, including objects placed
 earlier in the task. Holding requires both fingers and an elevated object. Placement requires
 horizontal error <=40mm, vertical error <=50mm, no finger contact, linear speed <20mm/s, and
-less than 2mm displacement over a 100ms observation window. Unmentioned objects must stay within
+less than 2mm displacement over 100 physics steps (100ms in the official cube scene, longer
+with a larger physics timestep). Unmentioned objects must stay within
 6mm of their initial positions. The displayed result includes measured errors and tolerances.
 A truncated plan or an unfinished skill cannot become a success just because some final position
 happens to match.
