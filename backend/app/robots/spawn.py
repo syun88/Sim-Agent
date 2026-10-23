@@ -8,6 +8,12 @@ from backend.app.simulation.randomization import resolve_seed,desk_candidates,ch
 class ReachableDeskSpawns:
     half_size = .026
     clearance = .002
+    #: How far an achieved jaw frame may sit from the inferred one when the arm cannot hold
+    #: the inferred frame exactly (measured 2026-10-24: OpenManipulator-X has four arm joints,
+    #: so a fixed six-constraint grasp pose is unreachable for 75 of 99 desk probes, while a
+    #: free attitude reaches all of them collision-free). Cubes still pinch with the pad faces
+    #: a few degrees off, and the physical check remains two contacts plus lift-follow.
+    attitude_tolerance_deg = 25.
 
     def __init__(self, profile, scene):
         self.profile, self.scene = profile, scene
@@ -62,6 +68,25 @@ class ReachableDeskSpawns:
         if key in self._validated:
             import copy
             return copy.deepcopy(self._validated[key])
+        modes = ('inferred', 'arm-achieved') if self.profile.get('grippers',{}).get(side) else ('inferred',)
+        failure = None
+        for mode in modes:
+            try:
+                entry = self._validated_pose(side, point, mode)
+                break
+            except ValueError as error:
+                failure = error
+        else:
+            raise failure
+        self._validated[key] = entry
+        return entry
+
+    def achieved_attitude(self, side, q, snapshot):
+        chain = self.profile['chains'][side]
+        kinematics = URDFKinematics(self.model, chain, snapshot, self.profile['root_transform'], chain['tool_offset'])
+        return np.asarray(kinematics.evaluate(np.asarray(q))[1])
+
+    def _validated_pose(self, side, point, mode):
         checks, seed = [], None
         names = self.profile['chains'][side]['joints']
         snapshot = dict(self.profile['home'])
@@ -71,8 +96,22 @@ class ReachableDeskSpawns:
         attitude = np.array(gripper['grasp_rotation']) if gripper else None
         joint_limits=self.arm_joint_limits(side)
         def checked_pose(target, initial):
-            result = solve_profile_ik(self.profile,side,target,attitude,model=self.model,q_init=initial,
+            frame = attitude
+            result = solve_profile_ik(self.profile,side,target,frame,model=self.model,q_init=initial,
                 snapshot=snapshot,joint_limits=joint_limits)
+            if mode == 'arm-achieved' and not result['success']:
+                # A fixed jaw frame is a six-constraint request; an arm with fewer joints can
+                # still pinch, holding whatever frame its own joints reach. Re-solve with that
+                # frame fixed, so every offset below stays consistent with what the arm holds.
+                free = solve_profile_ik(self.profile,side,target,None,model=self.model,q_init=initial,
+                    snapshot=snapshot,joint_limits=joint_limits)
+                if free['success']:
+                    frame = self.achieved_attitude(side, free['q_rad'], snapshot)
+                    off = self.attitude_offset_deg(frame, attitude, gripper)
+                    if off > self.attitude_tolerance_deg:
+                        raise ValueError(f'{side}: the arm can only hold a jaw frame {off:.0f} deg off the inferred one')
+                    result = solve_profile_ik(self.profile,side,target,frame,model=self.model,q_init=free['q_rad'],
+                        snapshot=snapshot,joint_limits=joint_limits)
             if not result['success']:
                 raise ValueError(f'{side}: object or approach is outside IK reach')
             q = np.array(result['q_rad'])
@@ -90,15 +129,16 @@ class ReachableDeskSpawns:
                 actual,rotation,_,_ = kin.evaluate(q)
                 from scipy.spatial.transform import Rotation
                 result = {**result,'q_rad':q.tolist(),'position_error':float(np.linalg.norm(actual-target)),
-                    'rotation_error':float(np.linalg.norm(Rotation.from_matrix(attitude@rotation.T).as_rotvec()))}
-            return result,q
+                    'rotation_error':float(np.linalg.norm(Rotation.from_matrix(frame@rotation.T).as_rotvec()))}
+            return result,q,frame
         # Plan at the supported height, rather than the 2mm setup drop height.
         supported = point-[0.,0.,self.clearance]
         if self.collision_queries.box_contact_points(snapshot,supported,np.eye(3),self.half_size*2.,
                 set(self.model.links),distance=.0001):
             raise ValueError(f'{side}: spawn cube intersects the robot in its setup posture')
+        frame = None
         for dz in (0., .04, .08):
-            result,seed = checked_pose(supported+[0.,0.,dz],seed)
+            result,seed,frame = checked_pose(supported+[0.,0.,dz],seed)
             checks.append({'height_above_object': dz, **result})
         closure,lifted,holding_lifts = [],None,[]
         if gripper:
@@ -107,27 +147,41 @@ class ReachableDeskSpawns:
             centers = [(row['face_a']+row['face_b'])/2. for row in rows]
             seed = np.array(checks[0]['q_rad'])
             opened = np.interp(gripper['open_q'],qs,centers)
+            # Offsets follow the frame the arm actually holds, not the inferred one.
+            pad_normal = frame @ np.array(gripper['pad_region']['normal'])
             for jaw in np.linspace(gripper['open_q'],gripper['closed_q'],5):
                 snapshot.update({gripper['joint']:float(jaw),**{n:float(jaw*k) for n,k in gripper['followers'].items()}})
-                target = supported-attitude@np.array(gripper['pad_region']['normal'])*(np.interp(jaw,qs,centers)-opened)
-                result,seed = checked_pose(target,seed)
+                target = supported-pad_normal*(np.interp(jaw,qs,centers)-opened)
+                result,seed,frame = checked_pose(target,seed)
                 closure.append({'jaw_q':float(jaw),**result})
-            lifted,seed = checked_pose(target+[0.,0.,.03],seed)
+            lifted,seed,frame = checked_pose(target+[0.,0.,.03],seed)
             for factor in (.95,1.,1.05):
                 row = min(rows,key=lambda row:abs((row['face_b']-row['face_a'])-gripper['cube_size']*factor))
                 jaw = row['q']
                 snapshot.update({gripper['joint']:jaw,**{n:float(jaw*k) for n,k in gripper['followers'].items()}})
-                target = supported-attitude@np.array(gripper['pad_region']['normal'])*(np.interp(jaw,qs,centers)-opened)
-                result,seed = checked_pose(target,np.array(checks[0]['q_rad']))
+                target = supported-pad_normal*(np.interp(jaw,qs,centers)-opened)
+                result,seed,frame = checked_pose(target,np.array(checks[0]['q_rad']))
                 for dz in (.01,.02,.03):
-                    result,seed = checked_pose(target+[0.,0.,dz],seed)
+                    result,seed,frame = checked_pose(target+[0.,0.,dz],seed)
                     holding_lifts.append({'jaw_q':jaw,'rise_m':dz,**result})
         entry = {'arm': side, 'position': point.tolist(), 'checks': checks,'closure_checks':closure,'lift_check':lifted,
                 'holding_lift_checks':holding_lifts,
+                'attitude_mode': mode,
+                'attitude_offset_deg': self.attitude_offset_deg(frame, attitude, gripper),
                 'scope': 'Supported-height grasp/approach IK, robot/desk clearance and sampled jaw closure; execution separately checks the full path and physical contact',
                 'cube_size': self.half_size * 2.}
-        self._validated[key] = entry
         return entry
+
+    @staticmethod
+    def attitude_offset_deg(frame, attitude, gripper):
+        """How far the held jaw frame's pad facing sits from the inferred one."""
+        if frame is None or attitude is None or not gripper:
+            return 0.
+        normal = np.asarray(gripper['pad_region']['normal'])
+        ideal = np.asarray(attitude) @ normal
+        held = np.asarray(frame) @ normal
+        cosine = abs(float(ideal @ held)) / max(float(np.linalg.norm(ideal) * np.linalg.norm(held)), 1e-12)
+        return float(np.degrees(np.arccos(np.clip(cosine, -1., 1.))))
 
     def layout(self, *, randomize=False, object_positions=None, base=None, rng=None,seed=None,
                shuffle_sides=True,stop=lambda:False):
