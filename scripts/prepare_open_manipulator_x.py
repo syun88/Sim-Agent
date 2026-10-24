@@ -46,6 +46,8 @@ from pathlib import Path
 import sys
 import urllib.request
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 REPOSITORY = "ROBOTIS-GIT/open_manipulator"
 COMMIT = "ee9a720bcc45acda9c0df8fe689b1182844307db"
 
