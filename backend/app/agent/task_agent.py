@@ -10,6 +10,7 @@ from copy import deepcopy
 import time
 
 from backend.app.agent.scene_reasoning import SceneReferenceError, bind_scene_references
+from backend.app.agent.recovery_policy import reset_evidence
 from backend.app.planning.agent_planner import PlannerProviderError
 from backend.app.planning.preparation import compile_prepared_program
 from backend.app.planning.spatial_language import preservation_spans
@@ -36,7 +37,7 @@ def completed_prefix(plan, result):
 
 
 class TaskAgent:
-    def __init__(self, executor, planner, *, plan_call=None, recovery_call=None, max_attempts=3, max_resets=1):
+    def __init__(self, executor, planner, *, plan_call=None, recovery_call=None, max_attempts=4, max_resets=1):
         self.executor, self.planner = executor, planner
         self.plan_call = plan_call or planner.plan
         self.recovery_call = recovery_call or planner.assess_failure
@@ -46,13 +47,15 @@ class TaskAgent:
         started = time.perf_counter()
         initial = self.executor.world_state()
         epoch_initial = initial
-        decisions, attempts, resets = [], [], 0
+        decisions, attempts, recoveries, resets = [], [], [], 0
+        staging_used=False
+        alternate_used=False
         def announce(decision):
             decisions.append(decision)
             if emit:
                 emit('agent_decision',status='REPLANNING',agent_trace=deepcopy(decisions), detail=decision['explanation'])
         def finish(result):
-            result = {**result,'agent_trace':decisions,'agent_attempts':attempts,
+            result = {**result,'agent_trace':decisions,'agent_attempts':attempts,'agent_recoveries':recoveries,
                 'initial_world_state':initial,'final_world_state':self.executor.world_state(),
                 'total_duration':time.perf_counter()-started}
             result['verification'] = {**result.get('verification',{}),'agent_attempts':len(attempts),
@@ -64,6 +67,9 @@ class TaskAgent:
                 'diagnosis':diagnosis or {},'verification':{'success':False,'failure_category':category}})
         if should_stop and should_stop():
             return finish({'success':False,'status':'STOPPED','skills':[],'verification':{'success':False}})
+        announce({'kind':'scene_observed','explanation':'現在のシーンを観測し、この配置・支持関係・保持状態から新しい作業を計画します。',
+            'sim_time':initial.get('sim_time'),'objects':[{k:o.get(k) for k in ('id','position','held_by','touching')} for o in initial['objects']],
+            'support_relations':initial.get('support_relations',[])})
         try:
             binding = bind_scene_references(instruction, initial)
             for decision in binding.decisions:
@@ -80,6 +86,9 @@ class TaskAgent:
             announce({'kind':'planning_blocked','explanation':str(error),'observed':diagnosis})
             return blocked(f'{error.category}: {error}',error.category,diagnosis)
         original = plan.model_copy(deep=True)
+        plan.planning_evidence={**(plan.planning_evidence or {}),'task_start_observation':{
+            'sim_time':initial.get('sim_time'),'objects':deepcopy(initial['objects']),
+            'support_relations':deepcopy(initial.get('support_relations',[]))}}
         for item in (plan.planning_evidence or {}).get('preparations',[]):
             announce({'kind':'prepare_precondition',**item})
         for decision in binding.decisions:
@@ -126,7 +135,26 @@ class TaskAgent:
                     result.update(success=False,status='FAILED')
                     result['verification'].update(success=False,failure_category=final['failure_category'])
             attempts.append({'attempt':iteration+1,'plan':plan.model_dump(),'result':deepcopy(result)})
-            if result['success'] or result.get('status')=='STOPPED':
+            if result['success']:
+                # Homing is part of task completion, not a reset. A requested
+                # physical hold is retained; empty arms return to model home.
+                home_required=bool(source.goals) or (source.actions[-1].op in {'pick','handover','place','throw','pour'})
+                if home_required:
+                    home=self.executor.home_empty_arms(emit=emit,should_stop=should_stop)
+                    result['post_task_homing']=home
+                    result['verification']['task_goal_before_homing']=True
+                    if not home['success']:
+                        result.update(success=False,status=home.get('status','FAILED'),
+                            detail='作業の配置は維持していますが、空の腕のホーム復帰を完了できませんでした。')
+                        result['verification'].update(success=False,failure_category='POST_TASK_HOME_FAILED')
+                    elif restartable:
+                        final=verify_task_goal(self.executor.env,check,[],initial_state=epoch_initial)
+                        result['verification']['after_homing_postconditions']=final
+                        if not final['success']:
+                            result.update(success=False,status='FAILED',detail='ホーム復帰後に作業の最終状態を確認できませんでした。')
+                            result['verification'].update(success=False,failure_category='POST_TASK_SCENE_CHANGED')
+                return finish(result)
+            if result.get('status')=='STOPPED':
                 return finish(result)
             category = result.get('verification',{}).get('failure_category')
             failed = next((s for s in reversed(result.get('skills',[])) if not s['success']),{})
@@ -137,13 +165,13 @@ class TaskAgent:
             if iteration+1==self.max_attempts or category not in RECOVERABLE or not restartable:
                 result['detail'] = result.get('detail') or f'{category}: 自動復旧できる操作の範囲または試行上限に達しました。'
                 return finish(result)
-            legal, continuation = [], None
+            legal, continuation, alternate = [], None, None
             prefix = 0 if plan.goal_program else completed_prefix(plan,result)
             if plan.goal_program:
                 # The goal executor already replans locally. Avoid restarting its
                 # exhausted failure transition under a fresh, forgotten ban list.
                 prefix = 0
-            elif prefix>0 and prefix<len(plan.program['actions']):
+            elif prefix<len(plan.program['actions']):
                 try:
                     remaining = TaskProgram(actions=plan.program['actions'][prefix:])
                     continuation = compile_prepared_program(remaining,observed)
@@ -151,13 +179,32 @@ class TaskAgent:
                     # placed before this suffix. The scene has not been reset.
                     continuation.goal = deepcopy(original.goal)
                     continuation.goal['allowed_object_motion'] = sorted({s.object for s in original.steps if s.object})
-                    legal.append('resume')
+                    # First try useful progress. With no completed action,
+                    # clear/reposition free arms before another approach.
+                    if prefix>0 and not any(r.get('decision')=='resume' for r in recoveries):
+                        legal.append('resume')
                 except GroundingError:
                     pass
-            if reset_allowed and resets<self.max_resets:
+            if not staging_used:
+                legal.append('recover_in_place')
+            if (not alternate_used and len(source.actions)==1 and source.actions[0].op=='pick'
+                    and source.actions[0].arm is None and not any(observed['robot'].get(a+'_arm',{}).get('held_object') for a in ('left','right'))):
+                previous_arm=plan.program['actions'][0]['arm']
+                for arm in observed['robot'].get('available_arms',['left','right']):
+                    if arm==previous_arm:continue
+                    try:
+                        request=source.model_copy(deep=True)
+                        request.actions[0].arm=arm
+                        alternate=compile_prepared_program(request,observed)
+                        legal.append('alternate_arm')
+                        break
+                    except GroundingError:
+                        pass
+            certificate=reset_evidence(observed,source)
+            if not legal and certificate and reset_allowed and resets<self.max_resets:
                 legal.append('reset_and_retry')
             if not legal:
-                result['detail'] = f'{category}: 現在の制約を保った復旧手順がありません。'+('位置を保持する指示があるためシーンを初期化しません。' if not reset_allowed else '')
+                result['detail'] = f'{category}: 同じシーン内で利用できる復旧案を試しました。配置を維持して停止します。'
                 return finish(result)
             assessment = self.recovery_call(instruction,observed,
                 {'category':category,'detail':failed.get('detail') or result.get('detail'),
@@ -168,9 +215,39 @@ class TaskAgent:
                 result.update(success=False,status='STOPPED')
                 return finish(result)
             announce({'kind':assessment['decision'],'explanation':assessment.get('reason','復旧します。'),
-                'assessment':assessment,'completed_action_prefix':prefix})
+                'assessment':assessment,'completed_action_prefix':prefix,'reset_evidence':certificate})
+            recovery={'decision':assessment['decision'],'before':observed}
+            recoveries.append(recovery)
             if assessment['decision']=='resume':
                 plan = continuation
+            elif assessment['decision']=='alternate_arm':
+                alternate_used=True
+                plan=alternate
+                # No arm was requested: the same cube may be held by either
+                # admitted arm. Preserve explicit ownership everywhere else.
+                original.goal=deepcopy(plan.goal)
+            elif assessment['decision']=='recover_in_place':
+                staging_used=True
+                staging=self.executor.home_empty_arms(emit=emit,should_stop=should_stop,clear_contacts=True)
+                recovery['staging']=staging
+                recovery['after']=self.executor.world_state()
+                if staging.get('status')=='STOPPED':
+                    result.update(success=False,status='STOPPED')
+                    return finish(result)
+                try:
+                    observed=self.executor.world_state()
+                    if source.goals:
+                        # The inner goal executor already tracks failed effects;
+                        # repositioning the arms is a real change before retrying.
+                        plan=compile_prepared_program(source,observed)
+                    else:
+                        remaining=TaskProgram(actions=plan.program['actions'][prefix:])
+                        plan=compile_prepared_program(remaining,observed)
+                        plan.goal=deepcopy(original.goal)
+                    plan.goal['allowed_object_motion']=sorted({s.object for s in original.steps if s.object})
+                except GroundingError as error:
+                    result['detail']='現状を維持した復旧後も計画できませんでした: '+str(error)
+                    return finish(result)
             else:
                 if emit:
                     emit('agent_reset',status='PREPARING_SCENE',detail='失敗した試行を記録し、シーンを初期化して同じ対象・目標で再試行します。')

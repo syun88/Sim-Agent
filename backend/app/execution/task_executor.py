@@ -6,6 +6,7 @@ it never resets the scene or replays completed handovers to manufacture success.
 from __future__ import annotations
 
 import time
+import numpy as np
 
 from backend.app.agent.world_state import build_world_state
 from backend.app.control.motion import OpenArmV2Controller
@@ -27,6 +28,55 @@ class TaskExecutor:
     def reset_context(self):
         self.discourse.clear()
         self.controller.target_rotations.clear()
+
+    def home_empty_arms(self, *, emit=None, should_stop=None, clear_contacts=False):
+        """Return free arms to a clear home posture, preserving objects/discourse.
+
+        A holding task retains its physical grasp and loaded arm. Contact
+        clearance is a separately recorded recovery, never a scene reset.
+        """
+        self.controller.should_stop=should_stop
+        self.controller.cancelled=False
+        before=self.world_state()
+        results=[]
+        for arm in before['robot'].get('available_arms',['left','right']):
+            if should_stop and should_stop():
+                return {'success':False,'status':'STOPPED','arms':results}
+            held=self.skills.held_object(arm)
+            if held:
+                results.append({'arm':arm,'success':True,'skipped':'holding_requested_object','object':held})
+                continue
+            contacts=[o['id'] for o in self.world_state()['objects'] if self.env.object_contacts(o['id'],arm)]
+            if contacts and clear_contacts:
+                opening=self.controller.wait_gripper(arm,False)
+                if not opening.success:
+                    return {'success':False,'status':'FAILED','arms':results,'failure_category':opening.error}
+                retreat=self.skills.retreat(arm)
+                results.append({'arm':arm,'phase':'clear_contacts',**retreat})
+                if not retreat['success']:
+                    return {'success':False,'status':'FAILED','arms':results,'failure_category':retreat.get('error')}
+            target=self.env.home_arm_qpos(arm)
+            if np.max(abs(self.env.arm_qpos(arm)-target)) <= .025 and not any(
+                    self.env.object_contacts(o['id'],arm) for o in self.world_state()['objects']):
+                results.append({'arm':arm,'success':True,'already_home':True,
+                    'maximum_joint_error_rad':float(np.max(abs(self.env.arm_qpos(arm)-target)))})
+                continue
+            if emit:
+                emit('task_homing',status='HOMING',detail=f'{arm}: 物体の配置を維持してホームへ戻します。')
+            result=self.skills.park_empty_arm(arm)
+            results.append({'arm':arm,**result})
+            if not result['success']:
+                return {'success':False,'status':'STOPPED' if self.controller.stop_requested() else 'FAILED',
+                    'arms':results,'failure_category':result.get('error')}
+        after=self.world_state()
+        held={v.get('held_object') for k,v in before['robot'].items() if k in {'left_arm','right_arm'}}
+        positions={o['id']:o['position'] for o in before['objects']}
+        displacement={o['id']:float(np.linalg.norm(np.asarray(o['position'])-positions[o['id']]))
+                      for o in after['objects'] if o['id'] not in held}
+        preserved=all(d<.006 for d in displacement.values())
+        return {'success':preserved,'status':'SUCCEEDED' if preserved else 'FAILED','arms':results,
+                'stationary_object_displacements_m':displacement,
+                'failure_category':None if preserved else 'HOMING_DISTURBED_SCENE'}
 
     def run(self, plan, *, emit=None, should_stop=None, force_failure=False) -> dict:
         if plan.goal_program:

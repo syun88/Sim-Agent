@@ -227,8 +227,11 @@ class AgentPlanner:
         messages = [{'role':'system','content':
             'Diagnose a robot task failure from measured facts. Choose exactly one legal recovery. '
             'resume means continue uncompleted operations from the observed state, without replaying completed steps. '
+            'recover_in_place means open/retreat only empty contacting grippers, return free arms home, '
+            'then replan from the SAME unchanged scene. alternate_arm uses another available hand only when the user omitted a hand. '
             'reset_and_retry means visibly restart the simulation scene and retry the SAME bound object/task, discarding progress. '
-            'Prefer resume if meaningful progress exists and its remaining plan is valid; use reset for a failed grasp/path with no useful progress. '
+            'Reset is a last resort; it is legal only after in-place alternatives are exhausted and the caller records an unrecoverable scene condition. '
+            'Prefer resume if meaningful progress exists and its remaining plan is valid; ordinary grasp, IK or path failures do not justify resetting the scene. '
             'Explain the observed obstacle and required next preparation in Japanese. Reasons for failure are hypotheses; do not invent observations, tools, successful grasps or capabilities.'},
             {'role':'user','content':json.dumps({'instruction':instruction,'observed':facts,'failure':failure,
                 'legal_recoveries':legal_actions,'output_schema':schema},ensure_ascii=False)}]

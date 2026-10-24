@@ -54,14 +54,14 @@ function drawTask(t){
   const index=t.step?.action_index??t.result?.action_index;[...$('actions').children].forEach((li,i)=>{li.className=recorded?(recorded[i].result.success?'done':'bad'):t.status==='SUCCEEDED'||i<index?'done':i===index?'active':'';});
  }
  if(t.verification){const checks=t.verification.checks??[];$('verification').textContent=checks.map(c=>`${object[c.object]??c.object}: ${c.success?'確認済み':'未達成'}${c.target?' / '+(object[c.target]??target[c.target]??c.target):''}${Number.isFinite(c.horizontal_position_error)?' / 誤差 '+(c.horizontal_position_error*1000).toFixed(1)+' mm':''}${Number.isFinite(c.poured_ml)?' / 注いだ量 '+volume(c.poured_ml)+' mL / こぼれ合計 '+volume(c.spilled_ml)+' mL / 空中 '+volume(c.liquid?.in_flight_ml)+' mL':''}${Number.isFinite(c.free_flight_rise)?' / 自由飛行の上昇 '+(c.free_flight_rise*100).toFixed(1)+' cm':''}${c.arm?' / '+arm[c.arm]:''}`).join('\n');}
- $('evidence').textContent=JSON.stringify({randomization_request:t.randomization_request,verification:t.verification,detail:t.detail,diagnosis:t.diagnosis,agent_trace:t.agent_trace,agent_attempts:t.agent_attempts,retry_count:t.retry_count,skills:t.skills},null,2);
+ $('evidence').textContent=JSON.stringify({randomization_request:t.randomization_request,verification:t.verification,detail:t.detail,diagnosis:t.diagnosis,agent_trace:t.agent_trace,agent_attempts:t.agent_attempts,agent_recoveries:t.agent_recoveries,post_task_homing:t.post_task_homing,retry_count:t.retry_count,skills:t.skills},null,2);
 }
 async function poll(){
  if(polling)return;polling=true;
  try{while(currentTaskId){
   try{const t=await request(`/api/tasks/${currentTaskId}`);drawTask(t);
    if(['SUCCEEDED','FAILED','STOPPED'].includes(t.status)){const failure=t.skills?.find(s=>!s.success);status(t.status==='SUCCEEDED'?'作業が完了し、計測値から目標達成を確認しました。':t.status==='STOPPED'?'停止しました。現在の物体の状態を保っています。':`作業を完了できませんでした。\n${failure?.detail??t.detail??t.verification?.failure_category??'目標の状態を確認できませんでした。'}`,t.status==='SUCCEEDED'?'ok':'bad');currentTaskId=null;break;}
-   const labels={QUEUED_FOR_GENESIS_VIEWER:'Genesisの受付を待っています',PREPARING_SCENE:'作業用のシーンを準備しています',PLANNING:'指示を解釈しています',REPLANNING:'現在の物体と手の状態から残りの手順を更新しています',VALIDATING:'作業の整合性を確認しています',EXECUTING:'作業を実行しています',VERIFYING:'物体の位置と接触を確認しています',STOP_REQUESTED:'停止を要求しています'};status(`${labels[t.status]??t.status}${t.step?'\n'+(arm[t.step.arm]??'')+' · '+t.step.skill:''}`);
+   const labels={QUEUED_FOR_GENESIS_VIEWER:'Genesisの受付を待っています',PREPARING_SCENE:'作業用のシーンを準備しています',PLANNING:'指示を解釈しています',REPLANNING:'現在の物体と手の状態から残りの手順を更新しています',VALIDATING:'作業の整合性を確認しています',EXECUTING:'作業を実行しています',VERIFYING:'物体の位置と接触を確認しています',HOMING:'配置を維持して空の腕をホームへ戻しています',STOP_REQUESTED:'停止を要求しています'};status(`${labels[t.status]??t.status}${t.step?'\n'+(arm[t.step.arm]??'')+' · '+t.step.skill:''}`);
   }catch(e){status('通信を再試行しています: '+e.message,'bad');}
   await new Promise(r=>setTimeout(r,400));
  }}finally{polling=false;busy(false);loadRobots();}

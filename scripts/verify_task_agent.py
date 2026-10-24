@@ -1,4 +1,4 @@
-"""Real Genesis checks for missing preconditions and an actual failed-layout reset.
+"""Real Genesis checks for missing preconditions and same-scene failed-layout recovery.
 
 No contact/hold is mocked. Layout seed 20261023 previously failed physical pickup;
 the recovery case records its actual attempts whether it reproduces or succeeds.
@@ -66,9 +66,12 @@ def main():
                 row['interpretation_mode']='typed_goal_physics_only'
             result=active_agent.run(text,emit=emit,should_stop=lambda:time.monotonic()>deadline)
             row.update(instruction=text,result=result,success=result['success'])
-            row['recovery_reproduced']=result['verification'].get('scene_resets',0)>0
+            row['recovery_reproduced']=bool(result.get('agent_recoveries'))
+            row['scene_resets']=result['verification'].get('scene_resets',0)
+            if name=='failed_layout':
+                row['success']=row['success'] and row['scene_resets']==0
             save()
-            print('CASE',name,row['success'],'reset',row['recovery_reproduced'],flush=True)
+            print('CASE',name,row['success'],'resets',row['scene_resets'],flush=True)
         report['success']=all(c['success'] for c in report['cases'])
         save()
         return 0 if report['success'] else 1

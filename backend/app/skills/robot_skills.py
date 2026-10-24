@@ -168,10 +168,22 @@ class SkillRunner:
         # 3) swing high above the object, drop onto the approach axis, slide straight in
         if obj != "wine_bottle":
             waypoints += (("pregrasp_high", high), ("pregrasp", standoff), ("pinch", pinch))
-        destinations = waypoints if self.controller.motion_speed == 1. else [waypoints[-1]]
+        approach_evidence = {}
+        if obj.endswith('_cube'):
+            from backend.app.skills.approach import plan_cube_approach
+            route,approach_evidence=plan_cube_approach(self.env,self.controller,arm,obj,pinch,standoff,
+                                                       APPROACH_OVERFLY,STAGING_ALTITUDE)
+            if route is None:
+                error=SkillError('IK_FAILURE','No reachable collision-screened cube approach from the current scene')
+                error.evidence=approach_evidence
+                raise error
+            destinations=[('pinch',pinch)]
+        else:
+            destinations = waypoints if self.controller.motion_speed == 1. else [waypoints[-1]]
         for name, target in destinations:
-            via = [point for _, point in waypoints[:-1]] if self.controller.motion_speed != 1. else None
-            result = self.controller.move_to_site(arm, target, progress=progress, via=via)
+            via = [point for _, point in waypoints[:-1]] if self.controller.motion_speed != 1. and not approach_evidence else None
+            result = self.controller.move_to_site(arm, target, progress=progress, via=via,
+                                                  planned_joints=route if approach_evidence else None)
             if not result.success:
                 raise SkillError(result.error or "IK_FAILURE", f"Unable to reach the {name} pose "
                                  f"(position error={result.position_error}, rotation error={result.rotation_error})")
@@ -189,6 +201,7 @@ class SkillRunner:
             "fingertip_midpoint_error": midpoint_error,
             "object_displacement": disturbance,
             "grasp_offset_x": grasp_offset_x,
+            "planning":approach_evidence,
         }
 
     def grasp_object(self, arm: str, obj: str) -> dict:
@@ -509,13 +522,12 @@ class SkillRunner:
             others = {other: self.held_object(other) for other in ('left', 'right') if other != arm}
             stationary = {obj: self.env.object_pose(obj)[0].copy() for obj in frame.objects
                           if obj not in others.values()}
-            start, rotation = self.env.ee_pose(arm)
-            target, target_rotation, _, _ = self.env.arm_kinematics(arm).evaluate(self.env.home_arm_qpos(arm))
-            sizes = [float(np.max(self.env.object_bounds(obj)[1]-self.env.object_bounds(obj)[0]))
-                     for obj in stationary if obj.endswith('_cube')]
-            height = max(start[2], target[2]) + max(.08, 2*max(sizes, default=.04))
-            high_start, high_target = start.copy(), target.copy()
-            high_start[2] = high_target[2] = height
+            from backend.app.skills.homing import plan_empty_arm_home
+            route, planning = plan_empty_arm_home(self.env, self.controller, arm)
+            if route is None:
+                error = SkillError(planning['error'], 'No reachable clear route to the model home posture')
+                error.evidence = planning
+                raise error
             def guard():
                 for other, obj in others.items():
                     if obj:
@@ -523,27 +535,35 @@ class SkillRunner:
                 for obj, position in stationary.items():
                     if (self.env.object_contacts(obj, arm)
                             or np.linalg.norm(self.env.object_pose(obj)[0]-position) > .002):
-                        raise SkillError('PARK_COLLISION', f'Empty-arm parking disturbed {obj}')
-            # Lift first, then move/rotate above table objects, then descend at the
-            # model-derived home frame. Every move uses the normal IK and motors.
-            for position, attitude in ((high_start, rotation), (high_target, target_rotation), (target, target_rotation)):
-                moved = self.controller.move_to_site(arm, position, attitude, on_sample=guard)
+                        error = SkillError('PARK_COLLISION', f'Empty-arm parking disturbed {obj}')
+                        error.evidence = {**planning,'object':obj,'contacts':self.env.object_contacts(obj,arm),
+                                          'displacement_m':float(np.linalg.norm(self.env.object_pose(obj)[0]-position))}
+                        raise error
+            # Execute only an admitted route. Exact final joint targets preserve
+            # the canonical home branch of a redundant arm; normal motors move it.
+            for joints in route[1:]:
+                kin = self.env.arm_kinematics(arm)
+                position, attitude, _, _ = kin.evaluate(joints)
+                check = getattr(kin, 'empty_arm_path_is_clear', None)
+                edge = [self.env.arm_qpos(arm), joints]
+                if check and not check(edge, {o:self.env.object_pose(o) for o in self.env.frame().objects}):
+                    raise SkillError('PARK_COLLISION', 'Home route is no longer clear in the observed scene')
+                moved = self.controller.move_to_site(arm, position, attitude, planned_joints=edge, on_sample=guard)
                 if not moved.success:
                     raise SkillError(moved.error or 'MOTION_BLOCKED', 'Empty arm could not clear the handover workspace')
                 guard()
-            return {'target': target.tolist(), 'clearance_height_m': height,
+            joint_error = float(np.max(abs(self.env.arm_qpos(arm)-route[-1])))
+            if joint_error > .025:
+                raise SkillError('HOME_POSTURE_NOT_REACHED', f'Home joint residual {joint_error:.4f} rad')
+            target = self.env.arm_kinematics(arm).evaluate(route[-1])[0]
+            return {'target': target.tolist(), **planning, 'maximum_joint_error_rad':joint_error,
                     'stationary_object_displacements_m': {obj: float(np.linalg.norm(self.env.object_pose(obj)[0]-position)) for obj,position in stationary.items()}}
         return self._skill('park_empty_arm', run, time.perf_counter())
 
     def return_home(self, arm: str) -> dict:
-        started = time.perf_counter()
-        def run():
-            target = np.array([0.401, 0.1535 if arm == "left" else -0.1535, 1.120])
-            result = self.controller.move_to_site(arm, target)
-            if not result.success:
-                raise SkillError(result.error or "IK_FAILURE", "Home pose unreachable")
-            return {"final": result.final_position}
-        return self._skill("return_home", run, started)
+        # Home is the model's joint posture, with clearance above current
+        # objects, rather than a fixed point near the original cube locations.
+        return {**self.park_empty_arm(arm),'skill':'return_home'}
 
     def throw_object(self, arm: str, obj: str, height_cm: float = 3.) -> dict:
         from backend.app.skills.dynamic_skills import throw_up

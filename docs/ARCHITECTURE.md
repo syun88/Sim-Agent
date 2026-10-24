@@ -373,16 +373,33 @@ It binds references from observed contacts/positions, then uses `planning/prepar
 satisfy compiler-reported empty-hand requirements using physical placements and guarded parking.
 Pronouns are frozen before staging another object, so preparation cannot change the antecedent.
 
-After eligible rigid-cube failures, the supervisor admits only an independently compiled remaining
-suffix and/or a scene restart. `AgentPlanner.assess_failure` can choose between those tools from
-fresh measured facts; provider failure uses a labelled deterministic policy. At most three
-attempts and one reset are allowed. A reset discards progress and is explicitly recorded; it is
-not evidence of success in the original layout. Object IDs and requested roles remain bound;
-unspecified grasp hands may be recomputed after reset. Explicit preservation, fluid operations,
-throws and relative/joint increments cannot trigger an automatic reset/replay. Stop cancels recovery.
+Every new prompt starts with a fresh Genesis snapshot, including current supports, contacts and
+hand occupancy. Completed object arrangements and discourse survive the task boundary. After
+object manipulation, empty arms return home before success is reported; requested holds and
+explicit arm-position commands retain their requested final state. Home routing uses the measured
+posture and current objects. If objects occupy the model's nominal home configuration, a clear
+nearby rest posture is selected and recorded instead. OpenArm screens sampled routes in private
+official-model FK data, with observed object poses and positive object clearance, then monitors
+Genesis contacts and object displacement during motor execution. The cube approach likewise selects
+reachable overflight heights from the current layout. These are sampled geometric checks, not a
+second dynamics engine or proof of continuous collision freedom. Imported robots retain their own
+approach implementation and collision planner.
+
+After eligible rigid-cube failures, the supervisor admits an independently compiled remaining
+suffix, free-arm contact clearance/parking followed by same-scene replanning, or an alternate hand
+for an unspecified single pick. Ordinary IK, path and pinch failures never certify a reset.
+Only after those alternatives are exhausted can missing/nonfinite object state or an observed
+fall below the tabletop admit a reset, within the currently implemented tabletop capabilities.
+`AgentPlanner.assess_failure` chooses only from the admitted tools using fresh measured facts;
+provider failure uses a labelled deterministic policy. At most four attempts and one reset are
+allowed. A reset discards progress and is explicitly recorded; it is not evidence of success in
+the original layout. Object IDs and explicit roles remain bound. Explicit preservation, fluid
+operations, throws and relative/joint increments cannot trigger automatic reset/replay. Stop cancels recovery.
 Original final predicates are independently measured after a resumed suffix. Each restart uses
 a new scene epoch for unmentioned-object displacement checks, while retaining all previous results.
-`agent_trace`, `agent_attempts`, and `verification.scene_resets` pass through the broker into `/simple`.
+Homing rechecks the final rigid-object predicates, and a homing failure never replays a completed task.
+`agent_trace`, `agent_attempts`, `agent_recoveries`, `post_task_homing` and `verification.scene_resets`
+pass through the broker into `/simple`. Scene keywords cannot replace a world with task history.
 See [task supervisor design](TASK_AGENT.md) for the acceptance checks and limits.
 
 The discourse context stores only the last object, hand, and released target. It advances from

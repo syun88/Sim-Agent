@@ -52,7 +52,16 @@ def plan_handover_geometry(env, giver: str, obj: str, receiver_bias: float = .01
         for name in (GRIPPER_JOINTS[side], f"openarm_{side}_finger_joint2"):
             joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
             data.qpos[model.jnt_qposadr[joint]] = value
-    relative = np.diag([-1., -1., 1.]) @ GRASP_ROTATION
+    opposite = np.diag([-1., -1., 1.])
+    relative = opposite @ GRASP_ROTATION
+    if obj.endswith('_cube'):
+        # A previously placed cube may have turned 180 degrees. The same box
+        # faces are then geometrically equivalent, but a fixed object-frame
+        # receiver attitude would send both hands in from the SAME side.
+        # Choose the equivalent face frame with opposed approach directions;
+        # this only changes the candidate grasp, never the object's pose.
+        relative = min((relative,opposite@relative),
+                       key=lambda candidate:float((grasp_rotation@candidate)[2,2]))
     desired_cube = np.array([.44, 0., 1.15])
 
     def poses(q):

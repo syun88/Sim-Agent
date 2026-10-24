@@ -16,7 +16,7 @@ ArmName = Literal["left", "right"]
 MoveDirection = Literal["up", "down", "left", "right", "forward", "back"]
 ExecutionState = Literal[
     "IDLE", "PLANNING", "PREPARING_SCENE", "VALIDATING", "EXECUTING", "VERIFYING",
-    "SUCCEEDED", "FAILED", "REPLANNING", "STOPPED",
+    "SUCCEEDED", "FAILED", "REPLANNING", "HOMING", "STOPPED",
 ]
 
 

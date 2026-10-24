@@ -62,6 +62,7 @@ def main() -> None:
     last_control = 0.0
     last_viewer_refresh = 0.0
     stop_cache = False
+    scene_has_tasks = False
 
     def publish(event=None, force=False, **payload):
         nonlocal last_publish
@@ -118,6 +119,9 @@ def main() -> None:
         state = executor.world_state()
         if any(state['robot'][side + '_arm']['held_object'] for side in ('left', 'right')):
             raise PlannerProviderError('SCENE_BUSY', 'Place the held object or reset before changing the scene')
+        if scene_has_tasks:
+            raise PlannerProviderError('SCENE_CHANGE_REQUIRED',
+                '現在の作業結果を維持しています。新しい指示のためにシーンを作り直しません。別のシーンは起動時に --scene で選択してください。')
         publish('scene_preparing', force=True, status='PREPARING_SCENE', detail='Preparing ' + profile + ' scene')
         client.post('/api/genesis/register', json={'viewer_id': viewer_id, 'provider': planner.configured_provider}).raise_for_status()
         env.close()
@@ -139,7 +143,7 @@ def main() -> None:
         publish('scene_ready', force=True, status='PLANNING', detail=None)
 
     def prepare_robot(robot_id):
-        nonlocal env, executor, last_publish
+        nonlocal env, executor, last_publish, scene_has_tasks
         current_id = getattr(env, 'robot_id', 'openarm_v2')
         profile = get_profile(robot_id)
         robot_id = profile['id']
@@ -163,6 +167,7 @@ def main() -> None:
             publish(force=True)
             raise
         executor = make_executor(env)
+        scene_has_tasks = False
         env.step_observer = observe_step
         env.planning_pulse=should_stop
         env.step(200)
@@ -211,6 +216,7 @@ def main() -> None:
                     env.reset(randomize=bool(command.get('randomize')),seed=command.get('seed'),
                               shuffle_sides=command.get('shuffle_sides',True))
                     executor.reset_context()
+                    scene_has_tasks = False
                     env.step(200)
                     body.update(success=True, verification={'success': True, 'goal_type': 'scene_reset',
                         'randomization':env.spawn_validation.get('randomization')}, final_world_state=build_world_state(env))
@@ -225,11 +231,13 @@ def main() -> None:
                         publish('scene_preparing',force=True,status='PREPARING_SCENE',detail='Sampling reachable desk positions')
                         env.reset(randomize=True,seed=command.get('seed'),shuffle_sides=command.get('shuffle_sides',True))
                         executor.reset_context()
+                        scene_has_tasks = False
                         env.step(200)
                     publish('planning', force=True, status='PLANNING')
                     agent = TaskAgent(executor,planner,
                         plan_call=lambda *a: language_call(planner.plan,*a),
                         recovery_call=lambda *a: language_call(planner.assess_failure,*a))
+                    scene_has_tasks = True
                     body.update(agent.run(command['instruction'],emit=emit,should_stop=should_stop,
                         force_failure=command.get('force_failure',False)))
                 print(f"Task {body.get('status', 'SUCCEEDED' if body.get('success') else 'FAILED')}", flush=True)
