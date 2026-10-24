@@ -188,92 +188,23 @@ def _collision_declaration(destination: Path, threshold_mm: float) -> dict | Non
 JAW_LINKS = {"gripper_left_link", "gripper_right_link"}
 
 
-def _clean(mesh):
-    """A manifold, consistently wound solid for decomposition."""
-    import trimesh
-    solid = mesh.copy()
-    solid.merge_vertices()
-    solid.update_faces(solid.nondegenerate_faces())
-    solid.update_faces(solid.unique_faces())
-    trimesh.repair.fix_winding(solid)
-    trimesh.repair.fix_inversion(solid)
-    trimesh.repair.fix_normals(solid)
-    return solid
-
-
 def _collision_proxies(destination: Path, concavity: float, skin_mm: float, max_pieces: int) -> dict | None:
-    """Replace the arm's collision meshes with inset convex pieces.
+    """Apply the shared inset-convex-piece preparation to this package's arm links.
 
-    The source meshes are visual-quality parts: link1 and link3 overlap by 0.5-0.6 mm in
-    every posture (measured), and the neighbouring links overlap by 21-43 mm. One whole-link
-    convex hull cannot fix that (hulling a concave link adds volume: link3 grew 4.3x), and
-    a URDF cannot filter individual pairs. CoACD (MIT, SIGGRAPH 2022) splits each authored
-    mesh into collision-aware convex pieces, and each piece is then clipped against the
-    authored visual's inset halfspaces by the repo's own primitive - the piece-level shape of
-    this repo's prepared collision geometry. The jaws are left authored.
+    The preparation itself (CoACD split, inset clip, template clone) lives in
+    backend/app/robots/collision_geometry.py so another prepared package can share it; what is
+    specific here is the package layout and which links keep their authored pads.
     """
-    import xml.etree.ElementTree as ET
-    import numpy as np
-    import trimesh
-    import coacd
-    from backend.app.robots.collision_geometry import inset_authored_boundary
-    from backend.app.robots.urdf import URDFModel, mesh_path
-    urdf = destination / "genesis" / "open_manipulator_x.urdf"
-    tree = ET.parse(urdf)
-    model = URDFModel(urdf)
-    source_dir = destination / "source" / "meshes" / "open_manipulator_x"
-    proxy_dir = destination / "meshes" / "open_manipulator_x_proxy"
-    proxy_dir.mkdir(parents=True, exist_ok=True)
-    distance = skin_mm / 1000.
-    record, pieces_total = {}, 0
-    for link, body in model.links.items():
-        if link in JAW_LINKS or not body.findall("collision"):
-            continue
-        visual_element = body.find("visual/geometry/mesh")
-        visual = trimesh.load(mesh_path(visual_element.get("filename"), model.path), force="mesh", process=False)
-        pieces = []
-        for collision in body.findall("collision"):
-            mesh_element = collision.find("geometry/mesh")
-            authored = source_dir / Path(mesh_element.get("filename")).name
-            solid = _clean(trimesh.load(authored, force="mesh", process=False))
-            decomposed = coacd.run_coacd(
-                coacd.Mesh(np.asarray(solid.vertices, np.float64), np.asarray(solid.faces, np.int32)),
-                threshold=concavity, max_convex_hull=max_pieces, preprocess_mode="auto",
-                preprocess_resolution=50, resolution=1000, mcts_iterations=60, seed=0)
-            kept = 0
-            for vertices, faces in decomposed:
-                piece = trimesh.Trimesh(np.asarray(vertices, float), np.asarray(faces, np.int64), process=True)
-                inset = inset_authored_boundary(piece, visual, distance)
-                if inset is None or not len(inset.faces):
-                    continue
-                inset.export(proxy_dir / f"{link}_{kept}.stl")
-                pieces.append(proxy_dir / f"{link}_{kept}.stl")
-                kept += 1
-            if not kept:
-                raise SystemExit(f"{link}: no collision piece survived a {skin_mm:g} mm skin")
-        element = next(e for e in tree.getroot().findall("link") if e.get("name") == link)
-        # The authored collision carries the mm->m scale and a per-collision origin; a proxy
-        # written without them is a thousand times too large and offset (measured: the
-        # declaration then read a 16 m "overlap"). Clone it and swap only the mesh.
-        template = element.find("collision")
-        for existing in element.findall("collision"):
-            element.remove(existing)
-        for path in pieces:
-            collision = copy.deepcopy(template)
-            collision.find("geometry/mesh").set(
-                "filename", f"package://open_manipulator_description/meshes/open_manipulator_x_proxy/{path.name}")
-            element.append(collision)
-        pieces_total += len(pieces)
-        record[link] = {"pieces": [path.name for path in pieces], "skin_mm": skin_mm,
-                        "concavity_threshold": concavity,
-                        "volume_authored_mm3": round(float(_clean(trimesh.load(source_dir / (link + '.stl'), force='mesh', process=False)).volume), 1),
-                        "volume_proxy_mm3": round(sum(float(trimesh.load(path, force='mesh').volume) for path in pieces), 1)}
-    ET.indent(tree)
-    tree.write(urdf, encoding="utf-8", xml_declaration=True)
-    print(f"collision proxies: {pieces_total} convex pieces over {len(record)} links, jaws authored", flush=True)
-    return {"method": "CoACD (MIT) convex pieces, each clipped by inset_authored_boundary",
-            "skin_mm": skin_mm, "concavity_threshold": concavity, "max_pieces": max_pieces,
-            "jaw_links_kept_authored": sorted(JAW_LINKS), "links": record}
+    from backend.app.robots.collision_geometry import inset_convex_pieces
+    record = inset_convex_pieces(
+        destination / "genesis" / "open_manipulator_x.urdf",
+        source_mesh_dir=destination / "source" / "meshes" / "open_manipulator_x",
+        proxy_dir=destination / "meshes" / "open_manipulator_x_proxy",
+        proxy_uri_prefix="package://open_manipulator_description/meshes/open_manipulator_x_proxy",
+        keep_authored=JAW_LINKS, concavity=concavity, skin_mm=skin_mm, max_pieces=max_pieces)
+    print(f"collision proxies: {record['pieces']} convex pieces over {len(record['links'])} links, jaws authored", flush=True)
+    return {**record, "jaw_links_kept_authored": sorted(JAW_LINKS)}
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
