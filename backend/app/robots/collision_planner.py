@@ -29,6 +29,13 @@ class PrivateCollisionQueries:
         # class maps back to URDF link names at every query boundary.
         self.body_names = {link: ('robot_world' if link == 'world' else link) for link in self.urdf.links}
         self.link_names = {body: link for link, body in self.body_names.items()}
+        # The two jaws of one gripper are meant to meet: a contact between them is the pinch,
+        # not a collision, and reporting it blocked every grasp posture of a jaw whose source
+        # meshes overlap at the closed command (measured 2026-10-24: 1.18 mm). The physical
+        # grasp is still decided by two contacts plus lift-follow in the engine.
+        self.intended_contacts = {frozenset(self.body_names.get(link, link) for group in
+            (gripper.get('contact_groups') or []) for link in group)
+            for gripper in (profile.get('grippers') or {}).values()}
         if table_top is not None:
             ET.SubElement(world, 'geom', name='desk', type='box', size='.8 .7 .025',
                           pos=f'0 0 {table_top-.025}')
@@ -134,6 +141,8 @@ class PrivateCollisionQueries:
             a, b = [mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[g]))
                     for g in (contact.geom1, contact.geom2)]
             pair = tuple(sorted([a or 'desk', b or 'desk']))
+            if frozenset(pair) in self.intended_contacts:
+                continue
             pairs[pair] = min(pairs.get(pair, np.inf), float(contact.dist))
         return [{'links': list(pair), 'penetration_m': max(0., -distance), 'distance_m':distance}
                 for pair, distance in pairs.items()]
