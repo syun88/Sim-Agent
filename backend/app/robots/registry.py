@@ -82,6 +82,28 @@ def get_profile(robot_id):
     return profile
 
 
+def collision_declaration(source):
+    """Read a robot package's declared collision semantics.
+
+    A manufacturer URDF's meshes are visual-quality parts: adjacent links overlap at every
+    joint by design (measured 2026-10-24 on OpenManipulator-X: 21.4-43.3 mm), so a robot
+    whose source geometry does this must *declare* which adjacent pairs the runtime must not
+    collide - the URDF cannot say it. Documentation of overlaps
+    (``excluded_adjacent_pairs``, as the Scorpion package carries) is not a runtime request;
+    ``runtime_excluded_adjacent_pairs`` is, and only that key changes behaviour.
+    """
+    for candidate in (source.parent / "collision_config.json", source.parent.parent / "collision_config.json"):
+        if candidate.is_file():
+            break
+    else:
+        return {"source": None, "runtime_excluded_adjacent_pairs": [], "covers_adjacent_pairs": None}
+    settings = json.loads(candidate.read_text())
+    pairs = [[str(a), str(b)] for a, b in settings.get("runtime_excluded_adjacent_pairs", [])]
+    return {"source": str(candidate), "runtime_excluded_adjacent_pairs": pairs,
+            "covers_adjacent_pairs": None,
+            "documented_excluded_adjacent_pairs": len(settings.get("excluded_adjacent_pairs", []))}
+
+
 def import_robot(folder):
     root = Path(folder).expanduser().resolve()
     if root.is_file() and root.suffix.lower() == ".urdf":
@@ -97,6 +119,38 @@ def import_robot(folder):
     else:
         raise ValueError("The local URDF folder/file does not exist")
     model = URDFModel(source)
+    declaration = collision_declaration(source)
+    adjacent = {tuple(sorted((joint['parent'], joint['child']))) for joint in model.joints}
+    declared = {tuple(sorted(pair)) for pair in declaration['runtime_excluded_adjacent_pairs']}
+    unknown = sorted({link for pair in declared for link in pair if link not in model.links})
+    if unknown:
+        raise ValueError('runtime_excluded_adjacent_pairs names unknown links: ' + ', '.join(unknown))
+    if any(pair[0] == pair[1] for pair in declared):
+        raise ValueError('runtime_excluded_adjacent_pairs pairs two identical links')
+    if [pair for pair in declared if pair not in adjacent]:
+        raise ValueError('A URDF path cannot filter non-adjacent link pairs: '
+                         + json.dumps(sorted(pair for pair in declared if pair not in adjacent)))
+    # Only pairs whose two links both carry collision geometry can ever collide; a virtual
+    # frame (world, end_effector) cannot, so it needs no declaration. Coverage means every
+    # such pair is declared - the engine can only turn adjacent collision off wholesale, and
+    # doing that while an undeclared pair could collide would drop a real constraint.
+    collidable = {pair for pair in adjacent
+                  if all(len(model.links[link].findall('collision')) for link in pair)}
+    declaration['covers_adjacent_pairs'] = bool(declared) and declared >= collidable
+    if declared and not declaration['covers_adjacent_pairs']:
+        # The engine can only turn adjacent collision off wholesale, so a partial runtime
+        # declaration leaves the private queries ignoring pairs the engine still collides.
+        # Measured 2026-10-24: with one of two overlapping adjacent pairs declared, the engine was
+        # told adjacent_collision=True while the private model was silent on the declared pair, so a
+        # posture colliding only there passes validation and then collides in physics. A partial set
+        # belongs in the documentation-only key.
+        raise ValueError(
+            'runtime_excluded_adjacent_pairs must declare every collidable adjacent pair (%d of %d '
+            'declared), because the engine turns adjacent collision off wholesale and cannot match a '
+            'partial set; use excluded_adjacent_pairs to document an overlap instead.'
+            % (len(declared & collidable), len(collidable)))
+    declaration['adjacent_pair_count'] = len(collidable)
+    declaration['non_collidable_adjacent_pairs'] = len(adjacent) - len(collidable)
     from backend.app.robots.actuators import apply_actuator_configuration
     actuator_configuration=apply_actuator_configuration(model,source)
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -167,6 +221,14 @@ def import_robot(folder):
     ET.ElementTree(model.xml).write(normalized, encoding="utf-8", xml_declaration=True)
     warnings = [
                 "URDF effort, velocity, mass and continuous-joint status are preserved; these may be uncalibrated."]
+    if declaration['covers_adjacent_pairs']:
+        warnings.append('Source meshes overlap at adjacent joints: the engine does not collide adjacent links '
+                        '(%d pairs) and the private queries exclude the same pairs; non-adjacent self-collision stays on.'
+                        % len(declared))
+    elif declaration['runtime_excluded_adjacent_pairs']:
+        warnings.append('Declared adjacent-pair overlaps are partial (%d of %d): the private queries exclude them, '
+                        'the engine keeps adjacent collision on for the undeclared rest.'
+                        % (len(declared), declaration['adjacent_pair_count']))
     if len(candidates) > 2:
         warnings.append("Longest distinct chains selected; all candidate chains are recorded for configuration.")
     profile = {"id": robot_id, "name": model.name, "builtin": False, "source": str(source), "source_sha256": digest,
@@ -182,7 +244,11 @@ def import_robot(folder):
     scene = {"robot_id": robot_id, "openarm_cell": False, "table_top": .76, "table_size": [1.6, 1.4, .05],
              "robot_root_transform": root_transform.tolist(), "physics_dt": IMPORTED_ROBOT_POLICY['physics_dt_max_s'],
              "physics_substeps":IMPORTED_ROBOT_POLICY['physics_substeps'],
-             "robot_gravity_compensation": 1., "self_collision": True, "adjacent_collision": True,
+             "robot_gravity_compensation": 1., "self_collision": True,
+             # URDF cannot filter individual pairs, so the engine expresses only a declaration
+             # that covers every adjacent pair (see collision_declaration).
+             "adjacent_collision": not declaration['covers_adjacent_pairs'],
+             "runtime_excluded_adjacent_pairs": declaration['runtime_excluded_adjacent_pairs'],
              "default_armature": None,
              "constraint_solver": "Newton", "friction_cone": "elliptic",
              "torsional_friction": True, "rolling_friction": True}
@@ -202,6 +268,7 @@ def import_robot(folder):
     scene['physics_dt']=min(IMPORTED_ROBOT_POLICY['physics_dt_max_s'],max(IMPORTED_ROBOT_POLICY['physics_dt_min_s'],
         scene['cube_size']*IMPORTED_ROBOT_POLICY['physics_dt_per_cube_meter']))
     profile['cube_size'] = scene['cube_size']
+    profile['collision_config'] = declaration
     (target / 'gripper_analysis.json').write_text(json.dumps(analysis, indent=2) + '\n')
     seeds = {}
     for side, chain in chains.items():
@@ -240,7 +307,10 @@ def import_robot(folder):
         "spawn_validation.json admits desk props only when supported-height grasp/approach IK, robot/desk clearance and sampled jaw closure pass. Full paths and contacts are verified during execution.\n"
         "Opposed jaws and cube size are inferred from collision geometry. Every grasp still requires two contacts and lift-follow in Genesis. Continuous joints have no invented finite limits.\n")
     profile['configuration_sha256'] = hashlib.sha256(json.dumps(
-        {'source': profile['asset_sha256'], 'version': PROFILE_VERSION, 'policy':policy_signature(),'adjacent_collision': True,
+        {'source': profile['asset_sha256'], 'version': PROFILE_VERSION, 'policy':policy_signature(),
+         'adjacent_collision': not declaration['covers_adjacent_pairs'],
+         **({'runtime_excluded_adjacent_pairs': declaration['runtime_excluded_adjacent_pairs']}
+            if declaration['runtime_excluded_adjacent_pairs'] else {}),
          'chains': chains, 'grippers': profile['grippers'], 'cube_size': scene['cube_size'],
          'home': home, 'root': profile['root_transform']}, sort_keys=True).encode()).hexdigest()
     # The catalog sees only complete registrations, after all IK/setup files exist.

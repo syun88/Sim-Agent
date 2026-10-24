@@ -23,6 +23,19 @@ class PrivateCollisionQueries:
         ET.SubElement(option, 'flag', filterparent='disable')
         asset = ET.SubElement(root, 'asset')
         world = ET.SubElement(root, 'worldbody')
+        # MuJoCo already owns the body name 'world'. A URDF whose root link carries
+        # that name (OpenManipulator-X, measured 2026-10-24) failed to compile with
+        # "repeated name 'world' in body", so robot bodies get one safe name and the
+        # class maps back to URDF link names at every query boundary.
+        self.body_names = {link: ('robot_world' if link == 'world' else link) for link in self.urdf.links}
+        self.link_names = {body: link for link, body in self.body_names.items()}
+        # The two jaws of one gripper are meant to meet: a contact between them is the pinch,
+        # not a collision, and reporting it blocked every grasp posture of a jaw whose source
+        # meshes overlap at the closed command (measured 2026-10-24: 1.18 mm). The physical
+        # grasp is still decided by two contacts plus lift-follow in the engine.
+        self.intended_contacts = {frozenset(self.body_names.get(link, link) for group in
+            (gripper.get('contact_groups') or []) for link in group)
+            for gripper in (profile.get('grippers') or {}).values()}
         if table_top is not None:
             ET.SubElement(world, 'geom', name='desk', type='box', size='.8 .7 .025',
                           pos=f'0 0 {table_top-.025}')
@@ -31,7 +44,7 @@ class PrivateCollisionQueries:
             quat = Rotation.from_matrix(transform[:3, :3]).as_quat()[[3, 0, 1, 2]]
             return {'pos': ' '.join(map(str, transform[:3, 3])), 'quat': ' '.join(map(str, quat))}
         def link_body(link, parent, transform, joint=None):
-            body = ET.SubElement(parent, 'body', name=link, **pose_args(transform))
+            body = ET.SubElement(parent, 'body', name=self.body_names[link], **pose_args(transform))
             # Mass is irrelevant to collision queries; mj_step is never called.
             ET.SubElement(body, 'inertial', pos='0 0 0', mass='1', diaginertia='1 1 1')
             if joint is not None and joint['type'] != 'fixed':
@@ -68,6 +81,14 @@ class PrivateCollisionQueries:
                     link_body(child['child'], body, np.asarray(child['origin']), child)
         link_body(self.urdf.root, world, np.asarray(profile['root_transform']))
         ET.SubElement(world,'geom',name='grasp_probe',type='box',size='.01 .01 .01',contype='0',conaffinity='0')
+        # A robot whose source meshes overlap at adjacent joints declares those pairs and the
+        # queries must not collide them either, or the planner and the engine disagree.
+        excluded = (profile.get('collision_config') or {}).get('runtime_excluded_adjacent_pairs') or []
+        if excluded:
+            contact = ET.SubElement(root, 'contact')
+            for first, second in excluded:
+                ET.SubElement(contact, 'exclude', body1=self.body_names.get(first, first),
+                              body2=self.body_names.get(second, second))
         self.model = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding='unicode'))
         self.data = mujoco.MjData(self.model)
         self.addresses = {j['name']: self.model.jnt_qposadr[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, j['name'])]
@@ -89,13 +110,16 @@ class PrivateCollisionQueries:
         data.geom_xpos[probe]=center
         data.geom_xmat[probe]=np.asarray(rotation).reshape(9)
         result=[]
-        if not hasattr(self,'_probe_link_names'):
-            self._probe_link_names=[mj.mj_id2name(model,mj.mjtObj.mjOBJ_BODY,int(b)) for b in model.geom_bodyid]
-        candidates=np.array([i for i,name in enumerate(self._probe_link_names) if name in links],int)
+        if not hasattr(self,'_probe_body_names'):
+            self._probe_body_names=[mj.mj_id2name(model,mj.mjtObj.mjOBJ_BODY,int(b)) for b in model.geom_bodyid]
+        # Match on body names: MuJoCo's own world body also carries the desk geom, and a
+        # URDF link named 'world' (OpenManipulator-X) would otherwise match the desk.
+        wanted={self.body_names.get(link,link) for link in links}
+        candidates=np.array([i for i,name in enumerate(self._probe_body_names) if name in wanted],int)
         near=(np.linalg.norm(data.geom_xpos[candidates]-center,axis=1)
               <=model.geom_rbound[candidates]+model.geom_rbound[probe]+distance)
         for geom in candidates[near]:
-            name=self._probe_link_names[geom]
+            name=self.link_names.get(self._probe_body_names[geom], self._probe_body_names[geom])
             line=np.zeros(6)
             gap=mj.mj_geomDistance(model,data,geom,probe,distance,line)
             if gap<distance:result.append({'link':name,'distance_m':float(gap),'position':((line[:3]+line[3:])/2.).tolist()})
@@ -112,9 +136,13 @@ class PrivateCollisionQueries:
         for contact in data.contact:
             if contact.dist >= -tolerance:
                 continue
+            # Body names, so a pair indexes the same list refine_pose built. A URDF root
+            # named 'world' is 'robot_world' here; MuJoCo's own world body is 'world'.
             a, b = [mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[g]))
                     for g in (contact.geom1, contact.geom2)]
             pair = tuple(sorted([a or 'desk', b or 'desk']))
+            if frozenset(pair) in self.intended_contacts:
+                continue
             pairs[pair] = min(pairs.get(pair, np.inf), float(contact.dist))
         return [{'links': list(pair), 'penetration_m': max(0., -distance), 'distance_m':distance}
                 for pair, distance in pairs.items()]
@@ -181,7 +209,7 @@ class PrivateCollisionQueries:
         if joint_limits is not None:
             lower=np.maximum(lower,np.asarray(joint_limits)[:,0])
             upper=np.minimum(upper,np.asarray(joint_limits)[:,1])
-        bodies = ['world', *self.urdf.links]
+        bodies = ['world', *self.body_names.values()]
         pairs = {tuple(sorted((a,b))): i for i,(a,b) in enumerate(
             ( (a,b) for i,a in enumerate(bodies) for b in bodies[i+1:] ))}
         initial = np.asarray(q)

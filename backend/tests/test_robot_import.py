@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.robots import registry
@@ -110,3 +111,139 @@ def test_robot_selection_is_queued_for_one_owner_and_never_constructs_physics(tm
         file = client.get(f'/api/robots/{robot_id}/files/scene.json')
         assert file.status_code == 200 and file.json()['openarm_cell'] is False
         assert client.get(f'/api/robots/{robot_id}/files/not-a-generated-file').status_code == 404
+
+
+def test_a_package_declaring_adjacent_mesh_overlap_does_not_collide_them(tmp_path, monkeypatch):
+    """A manufacturer URDF's adjacent meshes overlap; the runtime must be told, in data."""
+    source = source_robot(tmp_path)
+    (source.parent / 'collision_config.json').write_text(json.dumps(
+        {'runtime_excluded_adjacent_pairs': [['base', 'link1'], ['link1', 'tool']]}))
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    profile = registry.import_robot(source.parent.parent)
+    scene = json.loads((Path(profile['directory']) / 'scene.json').read_text())
+    assert profile['collision_config']['covers_adjacent_pairs'] is True
+    assert scene['adjacent_collision'] is False
+    assert scene['runtime_excluded_adjacent_pairs'] == [['base', 'link1'], ['link1', 'tool']]
+
+
+def test_a_declaration_that_names_a_non_adjacent_pair_is_refused(tmp_path, monkeypatch):
+    source = source_robot(tmp_path)
+    (source.parent / 'collision_config.json').write_text(json.dumps(
+        {'runtime_excluded_adjacent_pairs': [['base', 'tool']]}))
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    with pytest.raises(ValueError, match='non-adjacent'):
+        registry.import_robot(source.parent.parent)
+
+
+def test_documented_overlaps_are_not_a_runtime_request(tmp_path, monkeypatch):
+    """The Scorpion package documents its overlaps; only the runtime key may change behaviour."""
+    source = source_robot(tmp_path)
+    (source.parent / 'collision_config.json').write_text(json.dumps(
+        {'excluded_adjacent_pairs': [['base', 'link1']]}))
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    profile = registry.import_robot(source.parent.parent)
+    assert json.loads((Path(profile['directory']) / 'scene.json').read_text())['adjacent_collision'] is True
+
+
+def cartesian_jaw_robot(tmp_path):
+    """A reachable three-axis arm with one rotary jaw, so the pinch frame has a home to be decided at."""
+    root = tmp_path / 'jaw_source' / 'genesis'
+    root.mkdir(parents=True)
+    def jaw(link, y):
+        return (f'<collision><origin xyz=".055 {y} 0"/><geometry>'
+                f'<box size=".08 .008 .02"/></geometry></collision>')
+    text = '<robot name="cartesian_jaw"><link name="base"/><link name="a"/><link name="b"/>'
+    text += f'<link name="palm">{jaw("palm", -.022)}</link>'
+    text += f'<link name="tool">{jaw("tool", .022)}</link>'
+    parent = 'base'
+    for name, child, axis in (('axis0', 'a', '1 0 0'), ('axis1', 'b', '0 1 0'), ('axis2', 'palm', '0 0 1')):
+        text += (f'<joint name="{name}" type="prismatic"><parent link="{parent}"/><child link="{child}"/>'
+                 f'<axis xyz="{axis}"/><limit lower="-.4" upper=".4" effort="5" velocity="1"/></joint>')
+        parent = child
+    text += ('<joint name="jaw" type="continuous"><parent link="palm"/><child link="tool"/>'
+             '<axis xyz="0 0 1"/><limit effort="1" velocity="2"/></joint></robot>')
+    path = root / 'robot.urdf'
+    path.write_text(text)
+    return path
+
+
+def test_spawn_validation_resolves_one_jaw_frame_for_the_whole_pinch(tmp_path, monkeypatch):
+    """Execution holds one jaw frame through the closure, so validation must not test several.
+
+    A Codex review of this branch found _validated_pose re-deriving an achieved frame inside every
+    checked_pose call: the approach, closure and lift checks could each pass holding a different
+    orientation than execution can maintain, and the closure offsets read whichever frame the last
+    check happened to use. The frame is decided once, at the grasp pose, and this pins that count.
+    """
+    from backend.app.robots import spawn as spawn_module
+    from backend.app.robots.spawn import ReachableDeskSpawns
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    profile = registry.import_robot(cartesian_jaw_robot(tmp_path).parent.parent)
+    assert profile.get('grippers'), 'the fixture must carry a jaw for a pinch frame to be decided'
+    scene = json.loads((Path(profile['directory']) / 'scene.json').read_text())
+    sampler = ReachableDeskSpawns(profile, scene)
+    point = np.array([0.0, 0.0, scene['table_top'] + sampler.half_size + sampler.clearance])
+    # Force the underactuated path: the inferred frame cannot be held, the achieved one can. Only
+    # the inferred request is refused, so every check after the first still runs - which is how a
+    # per-check frame decision shows up as more than one resolution.
+    inferred = np.asarray(profile['grippers']['left']['grasp_rotation'])
+    original_ik = spawn_module.solve_profile_ik
+    def inferred_frame_never_solves(*args, **kwargs):
+        rotation = args[3] if len(args) > 3 else kwargs.get('rotation')
+        result = original_ik(*args, **kwargs)
+        if rotation is not None and np.allclose(np.asarray(rotation), inferred):
+            return {**result, 'success': False}
+        return result
+    monkeypatch.setattr(spawn_module, 'solve_profile_ik', inferred_frame_never_solves)
+    resolutions = []
+    original_frame = sampler.achieved_attitude
+    def counted(side, q, snapshot):
+        resolutions.append(side)
+        return original_frame(side, q, snapshot)
+    sampler.achieved_attitude = counted
+    try:
+        sampler._validated_pose('left', point, 'arm-achieved')
+    except ValueError:
+        # The forced failure can leave this synthetic arm unable to pinch here; what is under test
+        # is how many times the jaw frame is decided, not whether this fixture can grasp.
+        pass
+    assert resolutions == ['left'], resolutions
+
+
+def overlapping_arm(tmp_path):
+    """A package whose source meshes overlap at two adjacent joints, both with collision geometry."""
+    root = tmp_path / 'overlap_source' / 'genesis'
+    root.mkdir(parents=True)
+    text = ('<robot name="overlap"><link name="base"><collision><geometry>'
+            '<box size=".06 .06 .06"/></geometry></collision></link>'
+            '<link name="link1"><collision><origin xyz="0 0 .02"/><geometry>'
+            '<box size=".06 .06 .06"/></geometry></collision></link>'
+            '<link name="tool"><collision><origin xyz="0 0 .04"/><geometry>'
+            '<box size=".06 .06 .06"/></geometry></collision></link>'
+            '<link name="tip"/>'
+            '<joint name="j1" type="revolute"><parent link="base"/><child link="link1"/>'
+            '<axis xyz="0 0 1"/><limit lower="-.5" upper=".5" effort="3" velocity="1"/></joint>'
+            '<joint name="j2" type="revolute"><parent link="link1"/><child link="tool"/>'
+            '<origin xyz=".1 0 0"/><axis xyz="0 1 0"/><limit lower="-.5" upper=".5" effort="3" velocity="1"/></joint>'
+            '<joint name="j3" type="revolute"><parent link="tool"/><child link="tip"/>'
+            '<axis xyz="0 0 1"/><limit lower="-.5" upper=".5" effort="3" velocity="1"/></joint></robot>')
+    path = root / 'robot.urdf'
+    path.write_text(text)
+    return path
+
+
+def test_a_partial_runtime_declaration_is_refused(tmp_path, monkeypatch):
+    """A partial runtime set would make validation more permissive than the engine.
+
+    Measured 2026-10-24: declaring one of two overlapping adjacent pairs left the engine with
+    adjacent_collision=True while the private queries were silent on the declared pair, so a posture
+    colliding only there passed validation and then collided in physics. The engine can only turn
+    adjacent collision off wholesale, so a partial set cannot be enforced - the documentation-only
+    key is the place for it.
+    """
+    source = overlapping_arm(tmp_path)
+    (source.parent / 'collision_config.json').write_text(json.dumps(
+        {'runtime_excluded_adjacent_pairs': [['base', 'link1']]}))
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    with pytest.raises(ValueError, match='every collidable adjacent pair'):
+        registry.import_robot(source.parent.parent)

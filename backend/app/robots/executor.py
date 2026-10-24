@@ -171,14 +171,60 @@ class ImportedRobotSkills(SkillRunner):
                               'close_trace': getattr(self, '_close_trace', [])}
             raise error
 
-    def _attitude(self, arm):
+    def _nominal_attitude(self, arm):
         return np.asarray(self.env.grippers[arm]['grasp_rotation'])
+
+    def _attitude(self, arm):
+        """The jaw frame this arm is pinching with - the inferred grasp rotation by default.
+
+        A fixed jaw frame is a six-constraint request, so an arm with fewer joints pinches
+        holding whatever frame its own joints reach. The approach plans with that frame when the
+        nominal one leaves no corridor, and every later step - closing the jaws, holding through
+        the lift, placing - must use the same frame: measured 2026-10-24 on a 4-DOF arm, the
+        nominal frame is 6.6mm short at the object while the achieved frame solves to 1e-11, so
+        closing with the nominal frame fails with 'Cannot keep the aperture centered while
+        closing' even though the approach succeeded.
+        """
+        planned = getattr(self, '_pinch_frames', {}).get(arm)
+        return self._nominal_attitude(arm) if planned is None else np.asarray(planned)
 
     def _move(self, arm, target, rotation=None, **kwargs):
         result = self.controller.move_to_site(arm, np.asarray(target), self._attitude(arm) if rotation is None else rotation, **kwargs)
         if not result.success:
             raise SkillError(result.error or 'IK_FAILURE', f'Cannot reach {np.round(target, 4).tolist()}: {result}')
         return result
+
+
+    def _approach_rotations(self, arm, target, snapshot):
+        """Jaw frames to plan the pinch with, the nominal grasp rotation first.
+
+        A fixed jaw frame is a six-constraint request. An arm with fewer joints pinches holding
+        whatever frame its own joints reach - the frame the spawn sampler validated
+        (``attitude_mode='arm-achieved'``) - so planning only with the nominal frame can make an
+        executable spawn unreachable. Measured 2026-10-24 on a 4-DOF arm: the nominal frame
+        stopped 6.6 mm short of the object while the achieved frame solved to 1e-11, and the
+        approach then reported COLLISION_PATH. Arms whose nominal frame works are unaffected:
+        it is tried first, and the achieved frame is only added when it is within the sampler's
+        own tolerance of the nominal one.
+        """
+        nominal = self._nominal_attitude(arm)
+        gripper = self.env.profile.get('grippers', {}).get(arm)
+        sampler = getattr(self.env, '_spawn_sampler', None)
+        if not gripper or sampler is None:
+            return [nominal]
+        from backend.app.robots.urdf import solve_profile_ik
+        free = solve_profile_ik(self.env.profile, arm, target, None, model=self.env.model,
+                                q_init=self.env.home_arm_qpos(arm), snapshot=snapshot)
+        if not free['success']:
+            return [nominal]
+        frame = sampler.achieved_attitude(arm, free['q_rad'], snapshot)
+        if frame is None or sampler.attitude_offset_deg(frame, nominal, gripper) > sampler.attitude_tolerance_deg:
+            return [nominal]
+        if np.allclose(frame, nominal):
+            # A capable arm holds the inferred frame itself, so the free solve reproduces it.
+            # Planning twice with the same frame would only cost time.
+            return [nominal]
+        return [nominal, np.asarray(frame)]
 
     def _approach(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
         if arm not in self.env.grippers:
@@ -194,7 +240,6 @@ class ImportedRobotSkills(SkillRunner):
         # for the high point in isolation can force a several-radian posture
         # change beside the cube, even for the last millimetres of approach.
         # All these poses and edges are checked on the private collision model.
-        rotation = self._attitude(arm)
         insertion = [standoff + (before-standoff)*a for a in np.linspace(0.,1.,9)]
         from backend.app.robots.urdf import solve_profile_ik
         home = self.env.home_arm_qpos(arm)
@@ -205,47 +250,52 @@ class ImportedRobotSkills(SkillRunner):
         reverse_seeds = None
         snapshot = self.env.joint_snapshot()
         names = self.env.profile['chains'][arm]['joints']
-        for guess in guesses:
-            if self.controller.stop_requested():raise SkillError('STOPPED','Approach planning stopped')
-            goal = solve_profile_ik(self.env.profile,arm,before,rotation,model=self.env.model,q_init=guess,snapshot=snapshot)
-            if not goal['success']:continue
-            seed = self.env.model.nearest_continuous(names,goal['q_rad'],self.env.arm_qpos(arm))
-            if not self.env.collision_queries.clear({**snapshot,**dict(zip(names,seed))}):continue
-            closure = self.controller.plan_closure(arm,before,rotation,seed)
-            if closure is None:continue
-            seed = closure[0]['arm_q']
-            corridor = [seed]
-            for point in reversed(insertion[:-1]):
-                seed, _, _ = self.controller.solve_ik(arm, point, rotation, q_init=seed)
-                if seed is None:break
-                corridor.append(seed)
-            if seed is not None:
-                # Reconfiguration is allowed in the high, empty-hand transit.
-                # Only the final insertion needs a single Cartesian branch.
-                high_seed = None
-                for height in (.08,.05,max(.025,self.env.cube_size)):
-                    candidate_high = standoff+[0.,0.,height]
-                    high_seed,_,_ = self.controller.solve_ik(arm,candidate_high,rotation,q_init=seed,
-                        path_start=self.env.arm_qpos(arm),require_direct=True)
-                    if high_seed is None:
-                        high_seed,_,_ = self.controller.solve_ik(arm,candidate_high,rotation,
-                            path_start=self.env.arm_qpos(arm),require_direct=True)
-                    if high_seed is not None and self.env.collision_queries.edge_clear(
-                            names,high_seed,seed,snapshot,minimum_clearance=.0001):
-                        high = candidate_high
-                        break
+        rotations = self._approach_rotations(arm, before, snapshot)
+        for rotation in rotations:
+            for guess in guesses:
+                if self.controller.stop_requested():raise SkillError('STOPPED','Approach planning stopped')
+                goal = solve_profile_ik(self.env.profile,arm,before,rotation,model=self.env.model,q_init=guess,snapshot=snapshot)
+                if not goal['success']:continue
+                seed = self.env.model.nearest_continuous(names,goal['q_rad'],self.env.arm_qpos(arm))
+                if not self.env.collision_queries.clear({**snapshot,**dict(zip(names,seed))}):continue
+                closure = self.controller.plan_closure(arm,before,rotation,seed)
+                if closure is None:continue
+                seed = closure[0]['arm_q']
+                corridor = [seed]
+                for point in reversed(insertion[:-1]):
+                    seed, _, _ = self.controller.solve_ik(arm, point, rotation, q_init=seed)
+                    if seed is None:break
+                    corridor.append(seed)
+                if seed is not None:
+                    # Reconfiguration is allowed in the high, empty-hand transit.
+                    # Only the final insertion needs a single Cartesian branch.
                     high_seed = None
-                if high_seed is None:continue
-                corridor.append(high_seed)
-                reverse_seeds = corridor
-                self._closure_plans = {**getattr(self,'_closure_plans',{}),arm:closure}
-                self.controller._approach_seeds[seed_key] = [corridor[0],*self.controller._approach_seeds.get(seed_key,[])][:4]
-                break
+                    for height in (.08,.05,max(.025,self.env.cube_size)):
+                        candidate_high = standoff+[0.,0.,height]
+                        high_seed,_,_ = self.controller.solve_ik(arm,candidate_high,rotation,q_init=seed,
+                            path_start=self.env.arm_qpos(arm),require_direct=True)
+                        if high_seed is None:
+                            high_seed,_,_ = self.controller.solve_ik(arm,candidate_high,rotation,
+                                path_start=self.env.arm_qpos(arm),require_direct=True)
+                        if high_seed is not None and self.env.collision_queries.edge_clear(
+                                names,high_seed,seed,snapshot,minimum_clearance=.0001):
+                            high = candidate_high
+                            break
+                        high_seed = None
+                    if high_seed is None:continue
+                    corridor.append(high_seed)
+                    reverse_seeds = corridor
+                    self._closure_plans = {**getattr(self,'_closure_plans',{}),arm:closure}
+                    self.controller._approach_seeds[seed_key] = [corridor[0],*self.controller._approach_seeds.get(seed_key,[])][:4]
+                    break
+            if reverse_seeds is not None:break
         if reverse_seeds is None:
             raise SkillError('COLLISION_PATH','No grasp posture has a continuous collision-free approach corridor')
-        self._move(arm, high, q_init=reverse_seeds[-1], progress=progress)
-        self._move(arm, standoff, q_init=reverse_seeds[-2], progress=progress)
-        result = self._move(arm,before,progress=progress,planned_joints=[
+        # The frame that planned the corridor is the frame this arm pinches with from now on.
+        self._pinch_frames = {**getattr(self, '_pinch_frames', {}), arm: np.asarray(rotation)}
+        self._move(arm, high, rotation=rotation, q_init=reverse_seeds[-1], progress=progress)
+        self._move(arm, standoff, rotation=rotation, q_init=reverse_seeds[-2], progress=progress)
+        result = self._move(arm,before,rotation=rotation,progress=progress,planned_joints=[
             self.env.arm_qpos(arm),*reversed(reverse_seeds[:-2])])
         after = self.env.object_pose(obj)[0]
         disturbance = float(np.linalg.norm(after - before))
