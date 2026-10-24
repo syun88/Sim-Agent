@@ -126,14 +126,14 @@ def test_detect_mobile_base_kiwi(tmp_path):
              '<cylinder radius="0.05" length="0.03"/></geometry></collision></link>')
     joint = ('<joint name="base_{name}_wheel" type="continuous">'
              '<parent link="base_link"/><child link="{name}_link"/>'
-             '<origin xyz="{xyz}" rpy="0 0 0"/><axis xyz="0 1 0"/>'
+             '<origin xyz="{xyz}" rpy="0 0 0"/><axis xyz="{axis}"/>'
              '<limit velocity="6" effort="1"/></joint>')
     urdf = ('<robot name="tiny_kiwi">'
             '<link name="base_link"/>'
             + wheel.format(name="left") + wheel.format(name="back") + wheel.format(name="right")
-            + joint.format(name="left", xyz="0.10 0.12 0")
-            + joint.format(name="back", xyz="-0.14 0 0")
-            + joint.format(name="right", xyz="0.10 -0.12 0")
+            + joint.format(name="left", xyz="0 0.14 0", axis="0 1 0")
+            + joint.format(name="back", xyz="-0.14 0 0", axis="-1 0 0")
+            + joint.format(name="right", xyz="0 -0.14 0", axis="0 -1 0")
             + '</robot>')
     path = tmp_path / "tiny.urdf"
     path.write_text(urdf)
@@ -146,9 +146,9 @@ def test_detect_mobile_base_kiwi(tmp_path):
     # Per-wheel lever arms come from the wheel bodies' own positions.
     assert len(spec["wheel_levers"]) == 3
     assert abs(spec["wheel_levers"][1] - 0.14) < 1e-9
-    # Axles point along +y in this fixture: the left wheel's axle points
-    # radially outward (sign -1), the other two do not.
-    assert spec["wheel_signs"] == [-1, 1, 1]
+    # Every axle points radially outward in this fixture, so every sign is
+    # -1: the no-slip sign t . (a x z) with an outward axle is always -1.
+    assert spec["wheel_signs"] == [-1, -1, -1]
 
 
 class _FakeNavEnv:

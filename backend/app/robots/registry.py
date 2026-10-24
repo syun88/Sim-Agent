@@ -169,15 +169,22 @@ def _detect_mobile_base(model, chains):
     root_position = poses[model.root][:3, 3]
     bodies = [_wheel_body_link(model, j) for j in wheels]
     centres = np.array([poses[body][:3, 3] - root_position for body in bodies])
-    # A wheel's positive spin moves its centre along +tangential or
-    # -tangential depending on whether its axle points radially inward or
-    # outward; measure it from the model's own world axes instead of
-    # assuming a mounting convention (LeKiwi's axles point outward: -1).
+    # Sign of each wheel's spin, from the no-slip condition at the contact:
+    # spinning about the axle a moves the contact patch along -(a x z), so
+    # the dof sign that rolls the wheel along its tangent t is t . (a x z).
+    # Measured from the model's own world axes, never assumed (LeKiwi's
+    # axles all point radially outward and all three signs come out -1;
+    # a differential pair with mirrored outward axles comes out (+1, -1)).
+    forward_axis = poses[model.root][:3, :3] @ np.array([1., 0., 0.])
     signs = []
     for j, centre in zip(wheels, centres):
-        radial = centre[:2] / max(np.linalg.norm(centre[:2]), 1e-12)
-        axis_xy = np.asarray(axes[j["name"]][1])[:2]
-        signs.append(-1 if float(axis_xy @ radial) > 0 else 1)
+        if len(wheels) == 3:
+            theta = np.arctan2(centre[1], centre[0])
+            tangent = np.array([-np.sin(theta), np.cos(theta), 0.])
+        else:
+            tangent = forward_axis
+        axis_world = np.asarray(axes[j["name"]][1], dtype=float)
+        signs.append(1 if float(tangent @ np.cross(axis_world, np.array([0., 0., 1.]))) > 0 else -1)
     radii = [_link_wheel_radius(model, body) for body in bodies]
     wheel_radius = float(np.mean([r for r in radii if r])) if any(radii) else None
     if len(wheels) == 3:
@@ -353,9 +360,13 @@ def import_robot(folder):
         meshes.append(str(resolved))
     parents = {j["parent"] for j in model.joints}
     leaves = [name for name in model.links if name not in parents]
+    # Wheel joints are a base, not an arm: a chain that exists only to reach
+    # a wheel (a standalone cart's only chains) must not be picked as an arm.
+    wheel_joint_names = {j["name"] for j in model.active if "wheel" in j["name"].lower()}
     candidates = []
     for leaf in leaves:
-        joints = [j["name"] for j in model.chain(leaf) if j["type"] != "fixed" and not j["mimic"]]
+        joints = [j["name"] for j in model.chain(leaf)
+                  if j["type"] != "fixed" and not j["mimic"] and j["name"] not in wheel_joint_names]
         if joints:
             candidates.append({"end_link": leaf, "joints": joints, "tool_offset": [0., 0., 0.]})
     candidates.sort(key=lambda c: (-len(c["joints"]), c["end_link"]))
@@ -366,8 +377,6 @@ def import_robot(folder):
         other = max(candidates[1:], key=lambda c: (len(set(c['joints']) - first), len(c['joints'])))
         if len(set(other['joints']) - first) >= 3 and len(first - set(other['joints'])) >= 3:
             chosen.append(other)
-    if not chosen:
-        raise ValueError("No actuated chain found in this URDF")
     chains = {}
     for candidate in chosen:
         tokens = " ".join([candidate["end_link"], *candidate["joints"]])
@@ -383,6 +392,8 @@ def import_robot(folder):
         if np.linalg.norm(delta[:2]) > .01:
             yaw = np.pi / 2. - np.arctan2(delta[1], delta[0])
     mobile_base = _detect_mobile_base(model, chains)
+    if not chosen and not mobile_base:
+        raise ValueError("No actuated chain found in this URDF")
     # Fit the root link to the desk using its actual visual mesh bounds.
     import trimesh
     minimum_z = 0.
@@ -444,7 +455,7 @@ def import_robot(folder):
     profile = {"id": robot_id, "name": model.name, "builtin": False, "source": str(source), "source_sha256": digest,
                "urdf": str(normalized), "directory": str(target), "root_link": model.root, "links": len(model.links),
                "joints": model.active, "chains": chains, "all_chains": candidates, "home": home,
-               "root_transform": root_transform.tolist(), "capabilities": ["motion", "joint_control", "ik"],
+               "root_transform": root_transform.tolist(), "capabilities": ["motion", "joint_control", "ik"] if chains else [],
                "profile_version": PROFILE_VERSION, "asset_sha256": asset_signature(source),
                "control_policy_sha256":policy_signature(),"control_policy":IMPORTED_ROBOT_POLICY,
                "grasp_calibrated": False, "warnings": warnings, "mesh_count": len(set(meshes))}

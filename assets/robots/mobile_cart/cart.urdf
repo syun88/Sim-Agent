@@ -1,0 +1,97 @@
+<?xml version="1.0"?>
+<!-- A minimal differential-drive cart with no arm: two driven wheels and
+     two caster spheres. Imported through the regular URDF importer, it
+     exercises the wheel-only path (no actuated arm chain) and gives the
+     navigation skills a standalone base to drive. Wheel joint axes point
+     radially outward on both sides, matching the importer's measured
+     spin-sign convention. The caster spheres sit 1.5 mm high: they are
+     tip guards, not load bearers — a rigid sphere caster cannot roll, so
+     a load-bearing one just drags (measured: it halves the drive). -->
+<robot name="mobile_cart">
+  <link name="chassis">
+    <inertial>
+      <mass value="3.0"/>
+      <inertia ixx="0.020" ixy="0" ixz="0" iyy="0.030" iyz="0" izz="0.045"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.075"/>
+      <geometry><box size="0.34 0.26 0.07"/></geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.075"/>
+      <geometry><box size="0.34 0.26 0.07"/></geometry>
+    </collision>
+  </link>
+
+  <link name="left_wheel_link">
+    <inertial>
+      <mass value="0.3"/>
+      <inertia ixx="0.0006" ixy="0" ixz="0" iyy="0.0011" iyz="0" izz="0.0006"/>
+    </inertial>
+    <visual>
+      <origin rpy="1.5707963 0 0"/>
+      <geometry><cylinder radius="0.06" length="0.04"/></geometry>
+    </visual>
+    <collision>
+      <origin rpy="1.5707963 0 0"/>
+      <geometry><cylinder radius="0.06" length="0.04"/></geometry>
+    </collision>
+  </link>
+  <joint name="base_left_wheel" type="continuous">
+    <parent link="chassis"/>
+    <child link="left_wheel_link"/>
+    <origin xyz="0 0.15 0.06"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="10" velocity="10"/>
+  </joint>
+
+  <link name="right_wheel_link">
+    <inertial>
+      <mass value="0.3"/>
+      <inertia ixx="0.0006" ixy="0" ixz="0" iyy="0.0011" iyz="0" izz="0.0006"/>
+    </inertial>
+    <visual>
+      <origin rpy="1.5707963 0 0"/>
+      <geometry><cylinder radius="0.06" length="0.04"/></geometry>
+    </visual>
+    <collision>
+      <origin rpy="1.5707963 0 0"/>
+      <geometry><cylinder radius="0.06" length="0.04"/></geometry>
+    </collision>
+  </link>
+  <joint name="base_right_wheel" type="continuous">
+    <parent link="chassis"/>
+    <child link="right_wheel_link"/>
+    <origin xyz="0 -0.15 0.06"/>
+    <axis xyz="0 -1 0"/>
+    <limit effort="10" velocity="10"/>
+  </joint>
+
+  <link name="front_caster">
+    <inertial>
+      <mass value="0.1"/>
+      <inertia ixx="0.00004" ixy="0" ixz="0" iyy="0.00004" iyz="0" izz="0.00004"/>
+    </inertial>
+    <visual><geometry><sphere radius="0.03"/></geometry></visual>
+    <collision><geometry><sphere radius="0.03"/></geometry></collision>
+  </link>
+  <joint name="front_caster_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="front_caster"/>
+    <origin xyz="0.13 0 0.0315"/>
+  </joint>
+
+  <link name="back_caster">
+    <inertial>
+      <mass value="0.1"/>
+      <inertia ixx="0.00004" ixy="0" ixz="0" iyy="0.00004" iyz="0" izz="0.00004"/>
+    </inertial>
+    <visual><geometry><sphere radius="0.03"/></geometry></visual>
+    <collision><geometry><sphere radius="0.03"/></geometry></collision>
+  </link>
+  <joint name="back_caster_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="back_caster"/>
+    <origin xyz="-0.13 0 0.0315"/>
+  </joint>
+</robot>
