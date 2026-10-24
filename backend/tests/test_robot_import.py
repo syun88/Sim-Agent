@@ -143,3 +143,68 @@ def test_documented_overlaps_are_not_a_runtime_request(tmp_path, monkeypatch):
     monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
     profile = registry.import_robot(source.parent.parent)
     assert json.loads((Path(profile['directory']) / 'scene.json').read_text())['adjacent_collision'] is True
+
+
+def cartesian_jaw_robot(tmp_path):
+    """A reachable three-axis arm with one rotary jaw, so the pinch frame has a home to be decided at."""
+    root = tmp_path / 'jaw_source' / 'genesis'
+    root.mkdir(parents=True)
+    def jaw(link, y):
+        return (f'<collision><origin xyz=".055 {y} 0"/><geometry>'
+                f'<box size=".08 .008 .02"/></geometry></collision>')
+    text = '<robot name="cartesian_jaw"><link name="base"/><link name="a"/><link name="b"/>'
+    text += f'<link name="palm">{jaw("palm", -.022)}</link>'
+    text += f'<link name="tool">{jaw("tool", .022)}</link>'
+    parent = 'base'
+    for name, child, axis in (('axis0', 'a', '1 0 0'), ('axis1', 'b', '0 1 0'), ('axis2', 'palm', '0 0 1')):
+        text += (f'<joint name="{name}" type="prismatic"><parent link="{parent}"/><child link="{child}"/>'
+                 f'<axis xyz="{axis}"/><limit lower="-.4" upper=".4" effort="5" velocity="1"/></joint>')
+        parent = child
+    text += ('<joint name="jaw" type="continuous"><parent link="palm"/><child link="tool"/>'
+             '<axis xyz="0 0 1"/><limit effort="1" velocity="2"/></joint></robot>')
+    path = root / 'robot.urdf'
+    path.write_text(text)
+    return path
+
+
+def test_spawn_validation_resolves_one_jaw_frame_for_the_whole_pinch(tmp_path, monkeypatch):
+    """Execution holds one jaw frame through the closure, so validation must not test several.
+
+    A Codex review of this branch found _validated_pose re-deriving an achieved frame inside every
+    checked_pose call: the approach, closure and lift checks could each pass holding a different
+    orientation than execution can maintain, and the closure offsets read whichever frame the last
+    check happened to use. The frame is decided once, at the grasp pose, and this pins that count.
+    """
+    from backend.app.robots import spawn as spawn_module
+    from backend.app.robots.spawn import ReachableDeskSpawns
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    profile = registry.import_robot(cartesian_jaw_robot(tmp_path).parent.parent)
+    assert profile.get('grippers'), 'the fixture must carry a jaw for a pinch frame to be decided'
+    scene = json.loads((Path(profile['directory']) / 'scene.json').read_text())
+    sampler = ReachableDeskSpawns(profile, scene)
+    point = np.array([0.0, 0.0, scene['table_top'] + sampler.half_size + sampler.clearance])
+    # Force the underactuated path: the inferred frame cannot be held, the achieved one can. Only
+    # the inferred request is refused, so every check after the first still runs - which is how a
+    # per-check frame decision shows up as more than one resolution.
+    inferred = np.asarray(profile['grippers']['left']['grasp_rotation'])
+    original_ik = spawn_module.solve_profile_ik
+    def inferred_frame_never_solves(*args, **kwargs):
+        rotation = args[3] if len(args) > 3 else kwargs.get('rotation')
+        result = original_ik(*args, **kwargs)
+        if rotation is not None and np.allclose(np.asarray(rotation), inferred):
+            return {**result, 'success': False}
+        return result
+    monkeypatch.setattr(spawn_module, 'solve_profile_ik', inferred_frame_never_solves)
+    resolutions = []
+    original_frame = sampler.achieved_attitude
+    def counted(side, q, snapshot):
+        resolutions.append(side)
+        return original_frame(side, q, snapshot)
+    sampler.achieved_attitude = counted
+    try:
+        sampler._validated_pose('left', point, 'arm-achieved')
+    except ValueError:
+        # The forced failure can leave this synthetic arm unable to pinch here; what is under test
+        # is how many times the jaw frame is decided, not whether this fixture can grasp.
+        pass
+    assert resolutions == ['left'], resolutions
