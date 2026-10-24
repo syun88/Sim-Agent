@@ -14,7 +14,7 @@ class ImportedRobotController(OpenArmV2Controller):
         self._approach_seeds = {}
 
     def solve_ik(self, side, target_position, target_rotation=None, q_init=None, max_iterations=500,
-                 snapshot=None, minimum_clearance=.0001,path_start=None,require_direct=False):
+                 snapshot=None, minimum_clearance=.0001,path_start=None,require_direct=False,relaxed=None):
         from backend.app.robots.urdf import solve_profile_ik
         snapshot = self.env.joint_snapshot() if snapshot is None else snapshot
         names = self.env.profile['chains'][side]['joints']
@@ -46,13 +46,21 @@ class ImportedRobotController(OpenArmV2Controller):
                 return None, error, error
             result = solve_profile_ik(self.env.profile, side, target_position, target_rotation,
                 model=self.env.model, q_init=seed, snapshot=snapshot,joint_limits=limits)
+            # A transit waypoint only has to be collision-free and close: the caller asks for a looser
+            # acceptance where the arm is allowed to reorient, and keeps the solver's own thresholds
+            # for the grasp pose itself. Measured 2026-10-24 on UR5e + 2F-85: one insertion waypoint
+            # 27.5 mm behind the object is reachable in position (error 0.00000) but misses the inferred
+            # frame by about 1.7 degrees, which the strict acceptance refuses.
+            solved = result['success'] or (relaxed is not None
+                                           and result['position_error'] <= relaxed
+                                           and result['rotation_error'] <= relaxed)
             error = min(error, result['position_error']+result['rotation_error']*.2)
             q = self.env.model.nearest_continuous(names,result['q_rad'],start)
             if continuation and np.max(abs(q-start)/self.env.arm_velocity_limits(side))>.75:
                 continue
             tolerance = -minimum_clearance if minimum_clearance else .0002
-            collisions = self.env.collision_queries.contacts({**snapshot, **dict(zip(names, q))},tolerance=tolerance) if result['success'] else []
-            if (result['success'] and collisions
+            collisions = self.env.collision_queries.contacts({**snapshot, **dict(zip(names, q))},tolerance=tolerance) if solved else []
+            if (solved and collisions
                     and max(c['penetration_m'] for c in collisions)<.003 and target_rotation is not None):
                 adjusted = self.env.collision_queries.refine_pose(self.env.profile, side,
                     np.asarray(target_position), target_rotation, q, snapshot,minimum_clearance=minimum_clearance)
@@ -63,7 +71,7 @@ class ImportedRobotController(OpenArmV2Controller):
                     from backend.app.simulation.transform import orientation_error
                     result['position_error'] = float(np.linalg.norm(point-target_position))
                     result['rotation_error'] = float(np.linalg.norm(orientation_error(attitude,target_rotation)))
-            if result['success'] and not collisions:
+            if solved and not collisions:
                 if self.env.collision_queries.edge_clear(names, edge_start, q, snapshot,minimum_clearance=minimum_clearance):
                     self._ik_seeds[side] = [q.copy(), *self._ik_seeds.get(side, [])][:6]
                     return q, result['position_error'], result['rotation_error']
@@ -249,6 +257,11 @@ class ImportedRobotSkills(SkillRunner):
         # change beside the cube, even for the last millimetres of approach.
         # All these poses and edges are checked on the private collision model.
         insertion = [standoff + (before-standoff)*a for a in np.linspace(0.,1.,9)]
+        # The insertion is a straight push along the approach axis, so its intermediate poses are transit:
+        # the final grasp pose is what must hold the jaw frame exactly, and the closure plan is checked on
+        # its own. Measured 2026-10-24 on UR5e + 2F-85: the strict acceptance refuses one of these
+        # waypoints over about 1.7 degrees of orientation while its position solves exactly.
+        transit = .06
         from backend.app.robots.urdf import solve_profile_ik
         home = self.env.home_arm_qpos(arm)
         limits = self.env.arm_limits(arm)
@@ -271,14 +284,14 @@ class ImportedRobotSkills(SkillRunner):
                 seed = closure[0]['arm_q']
                 corridor = [seed]
                 for point in reversed(insertion[:-1]):
-                    seed, _, _ = self.controller.solve_ik(arm, point, rotation, q_init=seed)
+                    seed, _, _ = self.controller.solve_ik(arm, point, rotation, q_init=seed, relaxed=transit)
                     if seed is None:
                         # A single local solve can miss one waypoint of a Cartesian branch it has not
                         # explored, which drops an otherwise executable corridor: measured 2026-10-24
                         # on UR5e + 2F-85, every attempt died on exactly one insertion point. Passing
                         # no seed makes the controller try its whole seed set, the way the grasp itself
                         # already does for every guess. When the local solve works nothing changes.
-                        seed, _, _ = self.controller.solve_ik(arm, point, rotation)
+                        seed, _, _ = self.controller.solve_ik(arm, point, rotation, relaxed=transit)
                     if seed is None:break
                     corridor.append(seed)
                 if seed is not None:
@@ -288,10 +301,10 @@ class ImportedRobotSkills(SkillRunner):
                     for height in (.08,.05,max(.025,self.env.cube_size)):
                         candidate_high = standoff+[0.,0.,height]
                         high_seed,_,_ = self.controller.solve_ik(arm,candidate_high,rotation,q_init=seed,
-                            path_start=self.env.arm_qpos(arm),require_direct=True)
+                            path_start=self.env.arm_qpos(arm),require_direct=True,relaxed=transit)
                         if high_seed is None:
                             high_seed,_,_ = self.controller.solve_ik(arm,candidate_high,rotation,
-                                path_start=self.env.arm_qpos(arm),require_direct=True)
+                                path_start=self.env.arm_qpos(arm),require_direct=True,relaxed=transit)
                         if high_seed is not None and self.env.collision_queries.edge_clear(
                                 names,high_seed,seed,snapshot,minimum_clearance=.0001):
                             high = candidate_high
