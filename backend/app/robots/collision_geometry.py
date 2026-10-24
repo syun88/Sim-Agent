@@ -186,3 +186,89 @@ def faithful_convex_parts(proxy, visual, volume_tolerance=5e-10, max_depth=18, l
         neighbors=list(tree.intersection(box));tree.insert(i,bounds[i])
         for b in neighbors:propose(i,b)
     return [(mesh,max(0.,(manifold(mesh,True)-base).volume())) for mesh in active.values()]
+
+
+def clean_solid(mesh):
+    """A manifold, consistently wound solid for decomposition."""
+    solid = mesh.copy()
+    solid.merge_vertices()
+    solid.update_faces(solid.nondegenerate_faces())
+    return solid
+
+
+def inset_convex_pieces(urdf_path, *, source_mesh_dir, proxy_dir, proxy_uri_prefix, keep_authored=(),
+                        concavity=.01, skin_mm=.7, max_pieces=64):
+    """Replace a prepared URDF's collision meshes with inset convex pieces, in place.
+
+    The source meshes are visual-quality parts: neighbouring links overlap by tens of millimetres
+    at every joint, and a URDF cannot filter individual pairs. One whole-link convex hull cannot
+    fix that either (hulling a concave link adds volume; link3 of one arm grew 4.3x), so CoACD
+    (MIT, SIGGRAPH 2022) splits each authored mesh into collision-aware convex pieces and each
+    piece is clipped against the authored visual's inset halfspaces by this module's own primitive
+    - the piece-level shape of a prepared package. ``keep_authored`` names links whose authored
+    collision geometry is the point of them (distal jaws: skinning them would move the aperture and
+    the cube size the gripper inference measured).
+
+    Returns the record of what was written; the caller stores it beside the package.
+    """
+    import copy
+    from pathlib import Path
+    import xml.etree.ElementTree as ET
+    import numpy as np
+    import trimesh
+    import coacd
+    from backend.app.robots.urdf import URDFModel, mesh_path
+
+    tree = ET.parse(urdf_path)
+    model = URDFModel(urdf_path)
+    source_mesh_dir, proxy_dir = Path(source_mesh_dir), Path(proxy_dir)
+    proxy_dir.mkdir(parents=True, exist_ok=True)
+    distance = skin_mm / 1000.
+    record, pieces_total = {}, 0
+    for link, body in model.links.items():
+        if link in set(keep_authored) or not body.findall("collision"):
+            continue
+        visual_element = body.find("visual/geometry/mesh")
+        visual = trimesh.load(mesh_path(visual_element.get("filename"), model.path), force="mesh", process=False)
+        pieces, authored_volume = [], 0.
+        for collision in body.findall("collision"):
+            mesh_element = collision.find("geometry/mesh")
+            authored = source_mesh_dir / Path(mesh_element.get("filename")).name
+            solid = clean_solid(trimesh.load(authored, force="mesh", process=False))
+            authored_volume += float(solid.volume)
+            decomposed = coacd.run_coacd(
+                coacd.Mesh(np.asarray(solid.vertices, np.float64), np.asarray(solid.faces, np.int32)),
+                threshold=concavity, max_convex_hull=max_pieces, preprocess_mode="auto",
+                preprocess_resolution=50, resolution=1000, mcts_iterations=60, seed=0)
+            kept = 0
+            for vertices, faces in decomposed:
+                piece = trimesh.Trimesh(np.asarray(vertices, float), np.asarray(faces, np.int64), process=True)
+                inset = inset_authored_boundary(piece, visual, distance)
+                if inset is None or not len(inset.faces):
+                    continue
+                inset.export(proxy_dir / f"{link}_{kept}.stl")
+                pieces.append(proxy_dir / f"{link}_{kept}.stl")
+                kept += 1
+            if not kept:
+                raise SystemExit(f"{link}: no collision piece survived a {skin_mm:g} mm skin")
+        element = next(e for e in tree.getroot().findall("link") if e.get("name") == link)
+        # The authored collision carries the mm->m scale and a per-collision origin; a proxy
+        # written without them is a thousand times too large and offset (measured: the
+        # declaration then read a 16 m "overlap"). Clone it and swap only the mesh.
+        template = element.find("collision")
+        for existing in element.findall("collision"):
+            element.remove(existing)
+        for path in pieces:
+            collision = copy.deepcopy(template)
+            collision.find("geometry/mesh").set("filename", f"{proxy_uri_prefix}/{path.name}")
+            element.append(collision)
+        pieces_total += len(pieces)
+        record[link] = {"pieces": [path.name for path in pieces], "skin_mm": skin_mm,
+                        "concavity_threshold": concavity,
+                        "volume_authored_mm3": round(authored_volume, 1),
+                        "volume_proxy_mm3": round(sum(float(trimesh.load(path, force="mesh").volume) for path in pieces), 1)}
+    ET.indent(tree)
+    tree.write(urdf_path, encoding="utf-8", xml_declaration=True)
+    return {"method": "CoACD (MIT) convex pieces, each clipped by inset_authored_boundary",
+            "skin_mm": skin_mm, "concavity_threshold": concavity, "max_pieces": max_pieces,
+            "keep_authored": sorted(set(keep_authored)), "pieces": pieces_total, "links": record}
