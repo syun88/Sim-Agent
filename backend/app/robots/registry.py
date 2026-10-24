@@ -13,7 +13,7 @@ from backend.app.robots.policy import IMPORTED_ROBOT_POLICY,policy_signature
 GENERATED_ROOT = Path(__file__).resolve().parents[3] / "outputs" / "robots"
 OPENARM = {"id": "openarm_v2", "name": "OpenArm v2", "source": "official openarm-mujoco",
            "builtin": True, "capabilities": ["motion", "physical_grasp", "handover", "stack", "pour"]}
-PROFILE_VERSION = 14
+PROFILE_VERSION = 15
 _file_hash_cache = {}
 
 
@@ -102,6 +102,96 @@ def collision_declaration(source):
     return {"source": str(candidate), "runtime_excluded_adjacent_pairs": pairs,
             "covers_adjacent_pairs": None,
             "documented_excluded_adjacent_pairs": len(settings.get("excluded_adjacent_pairs", []))}
+
+
+def _link_wheel_radius(model, link_name):
+    """Rolling radius of a wheel link from its own geometry, or None.
+
+    A cylinder/sphere collision gives the radius directly; a mesh (the usual
+    CAD export) gives it as half its largest extent, the wheel's diameter.
+    """
+    link = model.links[link_name]
+    for kind in ("collision", "visual"):
+        for element in link.findall(kind):
+            cylinder = element.find("geometry/cylinder")
+            if cylinder is not None and cylinder.get("radius"):
+                return float(cylinder.get("radius"))
+            sphere = element.find("geometry/sphere")
+            if sphere is not None and sphere.get("radius"):
+                return float(sphere.get("radius"))
+            mesh = element.find("geometry/mesh")
+            if mesh is not None:
+                import trimesh
+                geometry = trimesh.load(mesh_path(mesh.get("filename"), model.path), force="mesh", process=False)
+                # CAD exports often model in millimetres and carry the unit
+                # conversion in the mesh scale; apply it like the root fit.
+                scale = vector(mesh.get("scale"), [1., 1., 1.])
+                extents = (np.asarray(geometry.bounds[1]) - np.asarray(geometry.bounds[0])) * scale
+                return float(extents.max()) / 2.
+    return None
+
+
+def _wheel_body_link(model, joint):
+    """The link that actually rolls for a wheel joint.
+
+    The joint's child is often just a mount (LeKiwi: omni_wheel_mount) and
+    the wheel body hangs below it on a fixed joint; measuring the mount
+    understates both the radius (~28 mm instead of ~52 mm) and the lever
+    arm. Follow fixed joints down and keep the descendant whose own
+    geometry gives the largest radius.
+    """
+    descendants = [joint["child"]]
+    queue = [joint["child"]]
+    while queue:
+        parent = queue.pop()
+        for other in model.joints:
+            if other["parent"] == parent and other["type"] == "fixed":
+                descendants.append(other["child"])
+                queue.append(other["child"])
+    return max(descendants, key=lambda name: _link_wheel_radius(model, name) or 0.)
+
+
+def _detect_mobile_base(model, chains):
+    """Detect a wheeled mobile base among the joints no arm chain claims.
+
+    A wheel joint is an actuated joint with "wheel" in its name that is not
+    part of any selected arm chain (LeKiwi: base_left_wheel, base_back_wheel,
+    base_right_wheel). Three wheels make a holonomic kiwi drive, two a
+    differential drive. Wheel positions come from the model's own forward
+    kinematics at the zero pose, so the drive geometry is measured from the
+    URDF, never assumed. Returns None when the robot has no wheeled base.
+    """
+    chain_joints = {name for chain in chains.values() for name in chain["joints"]}
+    wheels = [j for j in model.active if "wheel" in j["name"].lower() and j["name"] not in chain_joints]
+    if len(wheels) not in (2, 3):
+        return None
+    poses, axes = model.forward({})
+    root_position = poses[model.root][:3, 3]
+    bodies = [_wheel_body_link(model, j) for j in wheels]
+    centres = np.array([poses[body][:3, 3] - root_position for body in bodies])
+    # A wheel's positive spin moves its centre along +tangential or
+    # -tangential depending on whether its axle points radially inward or
+    # outward; measure it from the model's own world axes instead of
+    # assuming a mounting convention (LeKiwi's axles point outward: -1).
+    signs = []
+    for j, centre in zip(wheels, centres):
+        radial = centre[:2] / max(np.linalg.norm(centre[:2]), 1e-12)
+        axis_xy = np.asarray(axes[j["name"]][1])[:2]
+        signs.append(-1 if float(axis_xy @ radial) > 0 else 1)
+    radii = [_link_wheel_radius(model, body) for body in bodies]
+    wheel_radius = float(np.mean([r for r in radii if r])) if any(radii) else None
+    if len(wheels) == 3:
+        return {"drive": "kiwi", "wheel_joints": [j["name"] for j in wheels],
+                "wheel_angles": [float(np.arctan2(c[1], c[0])) for c in centres],
+                "wheel_signs": signs,
+                "wheel_levers": [float(np.linalg.norm(c[:2])) for c in centres],
+                "base_radius": float(np.mean(np.linalg.norm(centres[:, :2], axis=1))),
+                "wheel_radius": wheel_radius}
+    order = sorted(range(len(wheels)), key=lambda i: -centres[i, 1])
+    return {"drive": "diff", "wheel_joints": [wheels[i]["name"] for i in order],
+            "wheel_signs": [signs[i] for i in order],
+            "track_width": float(abs(centres[order[0], 1] - centres[order[1], 1])),
+            "wheel_radius": wheel_radius}
 
 
 def import_robot(folder):
@@ -193,6 +283,7 @@ def import_robot(folder):
         delta = left - right
         if np.linalg.norm(delta[:2]) > .01:
             yaw = np.pi / 2. - np.arctan2(delta[1], delta[0])
+    mobile_base = _detect_mobile_base(model, chains)
     # Fit the root link to the desk using its actual visual mesh bounds.
     import trimesh
     minimum_z = 0.
@@ -208,7 +299,25 @@ def import_robot(folder):
         minimum_z = float(np.concatenate(vertices)[:, 2].min())
     root_transform = np.eye(4)
     root_transform[:3, :3] = Rotation.from_euler("z", yaw).as_matrix()
-    root_transform[:3, 3] = [-.25, 0., .76 - minimum_z + .001]
+    if mobile_base:
+        # A wheeled base stands on the floor, not on the desk: rest the whole
+        # robot's lowest measured point on z=0, using every link's visual
+        # mesh transformed by the zero-pose forward kinematics.
+        floor_z = minimum_z
+        for link_name, pose in poses.items():
+            for visual in model.links[link_name].findall("visual"):
+                mesh = visual.find("geometry/mesh")
+                if mesh is None:
+                    continue
+                geometry = trimesh.load(mesh_path(mesh.get("filename"), source), force="mesh", process=False)
+                points = np.asarray(geometry.vertices) * vector(mesh.get("scale"), [1., 1., 1.])
+                transform = origin(visual.find("origin"))
+                world = points @ transform[:3, :3].T + transform[:3, 3]
+                world = world @ pose[:3, :3].T + pose[:3, 3]
+                floor_z = min(floor_z, float(world[:, 2].min()))
+        root_transform[:3, 3] = [0., 0., -floor_z + .001]
+    else:
+        root_transform[:3, 3] = [-.25, 0., .76 - minimum_z + .001]
     initial = {}
     initial_file = source.with_name("initial_state.json")
     if initial_file.is_file():
@@ -238,10 +347,14 @@ def import_robot(folder):
                "profile_version": PROFILE_VERSION, "asset_sha256": asset_signature(source),
                "control_policy_sha256":policy_signature(),"control_policy":IMPORTED_ROBOT_POLICY,
                "grasp_calibrated": False, "warnings": warnings, "mesh_count": len(set(meshes))}
+    if mobile_base:
+        profile['mobile_base'] = mobile_base
+        profile['capabilities'] += ['navigation']
     if actuator_configuration:
         profile['actuator_configuration']=actuator_configuration
         profile['warnings']=["Source masses, geometry and joint frames are preserved. Explicit actuators.json supplies motor effort and no-load speed limits."]
-    scene = {"robot_id": robot_id, "openarm_cell": False, "table_top": .76, "table_size": [1.6, 1.4, .05],
+    scene = {"robot_id": robot_id, "openarm_cell": False,
+             "table_top": 0. if mobile_base else .76, "table_size": [0., 0., 0.] if mobile_base else [1.6, 1.4, .05],
              "robot_root_transform": root_transform.tolist(), "physics_dt": IMPORTED_ROBOT_POLICY['physics_dt_max_s'],
              "physics_substeps":IMPORTED_ROBOT_POLICY['physics_substeps'],
              "robot_gravity_compensation": 1., "self_collision": True,
@@ -283,7 +396,9 @@ def import_robot(folder):
                  for side, seed in seeds.items()}
     (target / 'ik_validation.json').write_text(json.dumps(ik_checks, indent=2) + '\n')
     from backend.app.robots.spawn import ReachableDeskSpawns
-    spawn = ReachableDeskSpawns(profile, scene).layout()
+    # Desk spawn validation measures desk reach; a floor robot has no desk
+    # props in this slice, so its scene starts empty.
+    spawn = {"objects": {}} if mobile_base else ReachableDeskSpawns(profile, scene).layout()
     scene['objects'] = spawn['objects']
     (target / 'scene.json').write_text(json.dumps(scene, indent=2) + '\n')
     (target / 'spawn_validation.json').write_text(json.dumps(spawn, indent=2) + '\n')
@@ -312,7 +427,7 @@ def import_robot(folder):
          **({'runtime_excluded_adjacent_pairs': declaration['runtime_excluded_adjacent_pairs']}
             if declaration['runtime_excluded_adjacent_pairs'] else {}),
          'chains': chains, 'grippers': profile['grippers'], 'cube_size': scene['cube_size'],
-         'home': home, 'root': profile['root_transform']}, sort_keys=True).encode()).hexdigest()
+         'home': home, 'root': profile['root_transform'], 'mobile_base': mobile_base}, sort_keys=True).encode()).hexdigest()
     # The catalog sees only complete registrations, after all IK/setup files exist.
     temporary = target / 'profile.json.tmp'
     temporary.write_text(json.dumps(profile, ensure_ascii=False, indent=2) + '\n')

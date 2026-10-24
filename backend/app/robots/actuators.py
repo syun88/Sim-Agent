@@ -29,7 +29,13 @@ def apply_actuator_configuration(model,source):
         motor=dict(PRESETS[preset])
         joint['effort']=float(motor['peak_effort_Nm']);joint['velocity']=float(motor['no_load_velocity_rad_s'])
         element=model.xml.find(f"joint[@name='{joint['name']}']/limit")
-        if element is None:raise ValueError(f"Missing URDF limit for {joint['name']}")
+        if element is None:
+            if joint['type']!='continuous':raise ValueError(f"Missing URDF limit for {joint['name']}")
+            # A continuous joint has no position limits to preserve, but its
+            # effort/velocity limits are exactly what an actuator preset
+            # supplies (CAD exports commonly omit the element entirely).
+            import xml.etree.ElementTree as ET
+            element=ET.SubElement(model.xml.find(f"joint[@name='{joint['name']}']"),'limit')
         element.set('effort',str(joint['effort']));element.set('velocity',str(joint['velocity']))
         applied[joint['name']]={'preset':preset,**motor}
     return {'source':str(path),'joints':applied}

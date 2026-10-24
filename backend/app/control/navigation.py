@@ -109,31 +109,38 @@ class KiwiDrive:
     base centre, radians) and rolls tangentially. Wheel speeds here are the
     *linear* rolling speeds (m/s); divide by the wheel radius for rad/s.
 
-    Draft note: the default angles follow the LeKiwi layout (wheels at
-    30/150/270 degrees). Sign conventions must be re-checked against
-    LeRobot's own ``lekiwi`` kinematics when this is integrated, the same
-    way grasp geometry is checked against the official model description.
+    The default angles follow the LeKiwi layout (wheels at 30/150/270
+    degrees); the robot importer measures each wheel's actual angle, lever
+    arm and spin sign from the URDF and passes them in, so these defaults
+    only serve tests and previews.
     """
 
     def __init__(
         self,
-        base_radius: float,
+        base_radius: float | list[float],
         wheel_angles: tuple[float, float, float] = (
             math.radians(30.0),
             math.radians(150.0),
             math.radians(270.0),
         ),
     ):
-        if base_radius <= 0:
-            raise ValueError("base_radius must be positive")
-        self.base_radius = float(base_radius)
+        # ``base_radius`` is each wheel's lever arm (centre-to-wheel
+        # distance); real bases are not perfectly symmetric (LeKiwi's back
+        # wheel sits farther out), so a per-wheel sequence is accepted.
+        levers = np.atleast_1d(np.asarray(base_radius, dtype=float))
+        if levers.size == 1:
+            levers = np.full(3, float(levers[0]))
+        if levers.size != 3 or np.any(levers <= 0):
+            raise ValueError("base_radius must be positive, scalar or per-wheel")
+        self.base_radius = float(levers.mean())
+        self.wheel_levers = levers
         self.wheel_angles = tuple(float(a) for a in wheel_angles)
         # Row i maps body velocity (vx, vy, omega) to wheel i's rolling
         # speed: the tangential component of the contact-point velocity.
         self._matrix = np.array(
             [
-                [-math.sin(a), math.cos(a), self.base_radius]
-                for a in self.wheel_angles
+                [-math.sin(a), math.cos(a), lever]
+                for a, lever in zip(self.wheel_angles, self.wheel_levers)
             ]
         )
         self._inverse = np.linalg.inv(self._matrix)

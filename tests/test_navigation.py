@@ -45,6 +45,14 @@ def test_kiwi_drive_round_trip():
     assert np.allclose(wheels, 0.12)
 
 
+def test_kiwi_drive_per_wheel_levers():
+    drive = KiwiDrive(base_radius=[0.10, 0.20, 0.30])
+    # Pure rotation: each wheel rolls at omega * its own lever arm.
+    assert np.allclose(drive.wheel_speeds(0.0, 0.0, 1.0), [0.10, 0.20, 0.30])
+    vx, vy, omega = drive.body_velocity(np.array([0.10, 0.20, 0.30]))
+    assert abs(vx) < 1e-12 and abs(vy) < 1e-12 and abs(omega - 1.0) < 1e-12
+
+
 def test_kiwi_drive_integrate_lateral():
     drive = KiwiDrive(base_radius=0.12)
     # Facing +y (yaw = pi/2), body-frame +x points along world +y.
@@ -92,6 +100,84 @@ def test_controller_aligns_final_yaw():
                          target_yaw=math.pi / 2)
     assert status == "arrived"
     assert abs(wrap_angle(pose.yaw - math.pi / 2)) <= 0.05
+
+
+def test_detect_mobile_base_kiwi(tmp_path):
+    from backend.app.robots.registry import _detect_mobile_base
+    from backend.app.robots.urdf import URDFModel
+
+    wheel = ('<link name="{name}_link"><collision><geometry>'
+             '<cylinder radius="0.05" length="0.03"/></geometry></collision></link>')
+    joint = ('<joint name="base_{name}_wheel" type="continuous">'
+             '<parent link="base_link"/><child link="{name}_link"/>'
+             '<origin xyz="{xyz}" rpy="0 0 0"/><axis xyz="0 1 0"/>'
+             '<limit velocity="6" effort="1"/></joint>')
+    urdf = ('<robot name="tiny_kiwi">'
+            '<link name="base_link"/>'
+            + wheel.format(name="left") + wheel.format(name="back") + wheel.format(name="right")
+            + joint.format(name="left", xyz="0.10 0.12 0")
+            + joint.format(name="back", xyz="-0.14 0 0")
+            + joint.format(name="right", xyz="0.10 -0.12 0")
+            + '</robot>')
+    path = tmp_path / "tiny.urdf"
+    path.write_text(urdf)
+    spec = _detect_mobile_base(URDFModel(path), {})
+    assert spec["drive"] == "kiwi"
+    assert spec["wheel_joints"] == ["base_left_wheel", "base_back_wheel", "base_right_wheel"]
+    assert abs(spec["wheel_radius"] - 0.05) < 1e-9
+    assert abs(spec["base_radius"] - 0.14) < 0.02
+    assert len(spec["wheel_angles"]) == 3
+    # Per-wheel lever arms come from the wheel bodies' own positions.
+    assert len(spec["wheel_levers"]) == 3
+    assert abs(spec["wheel_levers"][1] - 0.14) < 1e-9
+    # Axles point along +y in this fixture: the left wheel's axle points
+    # radially outward (sign -1), the other two do not.
+    assert spec["wheel_signs"] == [-1, 1, 1]
+
+
+class _FakeNavEnv:
+    """Duck-typed backend: a diff-drive base integrated exactly, no engine."""
+
+    timestep = 0.002
+
+    def __init__(self, blocked=False):
+        self._drive = DiffDrive(wheel_radius=0.05, track_width=0.4)
+        self._pose = BasePose(0.0, 0.0, 0.0)
+        self._command = (0.0, 0.0)
+        self._blocked = blocked
+
+    def base_pose(self):
+        return np.array([self._pose.x, self._pose.y, self._pose.yaw])
+
+    def command_base_velocity(self, vx, vy, omega):
+        self._command = (vx, omega)
+
+    def step(self, steps):
+        for _ in range(steps):
+            self._pose = self._drive.integrate(self._pose, *self._command, self.timestep)
+
+    def frame(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(objects={"crate": [0.0, 0.0, 0.0]} if self._blocked else {})
+
+    def object_bounds(self, name):
+        return np.array([[0.9, -1.0, 0.0], [1.1, 1.0, 0.3]])
+
+
+def test_navigate_to_skill_arrives():
+    from backend.app.skills.robot_skills import SkillRunner
+    runner = SkillRunner(_FakeNavEnv(), None)
+    result = runner.navigate_to((0.5, 0.3), timeout=30.)
+    assert result["success"] is True
+    assert result["final_distance_m"] <= 0.05
+
+
+def test_navigate_to_skill_blocked():
+    from backend.app.skills.robot_skills import SkillRunner
+    runner = SkillRunner(_FakeNavEnv(blocked=True), None)
+    result = runner.navigate_to((2.0, 0.0), timeout=30.)
+    assert result["success"] is False
+    assert result["error"] == "NAVIGATION_BLOCKED"
 
 
 def test_controller_stops_for_obstacle():
