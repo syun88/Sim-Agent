@@ -83,6 +83,14 @@ class ImportedRobotController(OpenArmV2Controller):
             gap_rows=sorted(rows,key=lambda row:row['gap'])
             closed_q=float(np.interp(minimum_gap,[r['gap'] for r in gap_rows],[r['q'] for r in gap_rows]))
         normal = np.array(g['pad_region']['normal'])
+        # Keeping the pads on the object's face while the jaws close only means anything to within a
+        # fraction of that face, so the tolerances scale with the object: the nominal 52 mm cube keeps
+        # the original 0.8 mm and 0.01 rad exactly. Measured 2026-10-24 on UR5e + 2F-85 (78 mm cube):
+        # the first intermediate posture missed by 1.036 mm and 0.0101 rad - just outside limits
+        # calibrated on a 25 mm object - and every closure plan failed, so the approach reported
+        # COLLISION_PATH. More closure samples did not change it, because the gap comes from the IK's
+        # own acceptance (2 mm, 0.03 rad), not from the chord between samples.
+        slack = max(1., float(g.get('cube_size') or .052) / .052)
         snapshot = dict(self.env.joint_snapshot() if snapshot is None else snapshot)
         samples = []
         snapshot[g['joint']] = closed_q
@@ -114,7 +122,7 @@ class ImportedRobotController(OpenArmV2Controller):
                     point,attitude,_,_ = self.env.arm_kinematics(side).evaluate(q)
                     expected = object_position-rotation@normal*(np.interp(j,qs,centers)-initial_center)
                     from backend.app.simulation.transform import orientation_error
-                    if np.linalg.norm(point-expected)>.0008 or np.linalg.norm(orientation_error(attitude,rotation))>.01:
+                    if np.linalg.norm(point-expected)>.0008*slack or np.linalg.norm(orientation_error(attitude,rotation))>.01*slack:
                         return None
             samples.append({'jaw_q':float(jaw_q),'arm_q':seed.copy()})
         if check_lift and g.get('cube_size'):
@@ -264,6 +272,13 @@ class ImportedRobotSkills(SkillRunner):
                 corridor = [seed]
                 for point in reversed(insertion[:-1]):
                     seed, _, _ = self.controller.solve_ik(arm, point, rotation, q_init=seed)
+                    if seed is None:
+                        # A single local solve can miss one waypoint of a Cartesian branch it has not
+                        # explored, which drops an otherwise executable corridor: measured 2026-10-24
+                        # on UR5e + 2F-85, every attempt died on exactly one insertion point. Passing
+                        # no seed makes the controller try its whole seed set, the way the grasp itself
+                        # already does for every guess. When the local solve works nothing changes.
+                        seed, _, _ = self.controller.solve_ik(arm, point, rotation)
                     if seed is None:break
                     corridor.append(seed)
                 if seed is not None:
