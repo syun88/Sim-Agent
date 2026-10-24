@@ -171,8 +171,22 @@ class ImportedRobotSkills(SkillRunner):
                               'close_trace': getattr(self, '_close_trace', [])}
             raise error
 
-    def _attitude(self, arm):
+    def _nominal_attitude(self, arm):
         return np.asarray(self.env.grippers[arm]['grasp_rotation'])
+
+    def _attitude(self, arm):
+        """The jaw frame this arm is pinching with - the inferred grasp rotation by default.
+
+        A fixed jaw frame is a six-constraint request, so an arm with fewer joints pinches
+        holding whatever frame its own joints reach. The approach plans with that frame when the
+        nominal one leaves no corridor, and every later step - closing the jaws, holding through
+        the lift, placing - must use the same frame: measured 2026-10-24 on a 4-DOF arm, the
+        nominal frame is 6.6mm short at the object while the achieved frame solves to 1e-11, so
+        closing with the nominal frame fails with 'Cannot keep the aperture centered while
+        closing' even though the approach succeeded.
+        """
+        planned = getattr(self, '_pinch_frames', {}).get(arm)
+        return self._nominal_attitude(arm) if planned is None else np.asarray(planned)
 
     def _move(self, arm, target, rotation=None, **kwargs):
         result = self.controller.move_to_site(arm, np.asarray(target), self._attitude(arm) if rotation is None else rotation, **kwargs)
@@ -193,7 +207,7 @@ class ImportedRobotSkills(SkillRunner):
         it is tried first, and the achieved frame is only added when it is within the sampler's
         own tolerance of the nominal one.
         """
-        nominal = self._attitude(arm)
+        nominal = self._nominal_attitude(arm)
         gripper = self.env.profile.get('grippers', {}).get(arm)
         sampler = getattr(self.env, '_spawn_sampler', None)
         if not gripper or sampler is None:
@@ -273,6 +287,8 @@ class ImportedRobotSkills(SkillRunner):
             if reverse_seeds is not None:break
         if reverse_seeds is None:
             raise SkillError('COLLISION_PATH','No grasp posture has a continuous collision-free approach corridor')
+        # The frame that planned the corridor is the frame this arm pinches with from now on.
+        self._pinch_frames = {**getattr(self, '_pinch_frames', {}), arm: np.asarray(rotation)}
         self._move(arm, high, rotation=rotation, q_init=reverse_seeds[-1], progress=progress)
         self._move(arm, standoff, rotation=rotation, q_init=reverse_seeds[-2], progress=progress)
         result = self._move(arm,before,rotation=rotation,progress=progress,planned_joints=[
