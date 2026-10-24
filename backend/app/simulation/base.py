@@ -38,6 +38,8 @@ class Frame:
     contacts: list[str]
     fluid: dict | None = None
     scene_profile: str = "cubes"
+    # Planar pose [x, y, yaw] of the scene's mobile base, when it has one.
+    base: list[float] | None = None
 
 
 class ArmKinematics(Protocol):
@@ -118,6 +120,22 @@ class SimulationBackend(ABC):
     @abstractmethod
     def object_velocity(self, name: str) -> np.ndarray:
         """World linear velocity (m/s), measured by the physics engine."""
+
+    # -- mobile base (optional; only scenes with a wheeled base implement it) ----
+
+    def base_pose(self) -> np.ndarray:
+        """Measured planar pose [x, y, yaw] of the mobile base, in metres/radians."""
+        raise NotImplementedError
+
+    def command_base_velocity(self, vx: float, vy: float, omega: float) -> None:
+        """Command the base's body velocity (m/s, m/s, rad/s).
+
+        The base moves only through its wheel actuators, exactly like an arm
+        moves through its joint motors: no operation may write the base's
+        pose during an execution. ``vy`` is nonzero only for holonomic
+        (omnidirectional) bases.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def object_contact_links(self, name: str) -> list[str]:
