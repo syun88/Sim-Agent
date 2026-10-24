@@ -439,6 +439,7 @@ OpenArm以外ではCellを読み込まず、地面・机・選択したURDF・IK
 ```
 
 フォルダー内の `genesis/*.urdf` を優先します。候補が複数ある場合はURDFファイルを指定してください。
+Web からの追加に加えて、リポジトリ側に準備スクリプトを持つロボットがあります。`uv run python scripts/prepare_open_manipulator_x.py` は上流を1コミットに pin し、取得した各ファイルの sha256 を検証したうえで、Web からの追加と同じ `outputs/robots/<robot-id>/` を生成します。
 元のURDF・メッシュは変更せず、`outputs/robots/<robot-id>/` に次を生成します。このフォルダーは機械固有の絶対パスを含むためGit対象外です。
 
 - `robot.urdf`: 元メッシュへの絶対参照を解決したロード用URDF。
@@ -758,7 +759,7 @@ uv run python scripts/verify_pick_place_genesis.py
 
 ## このマシンでの検証結果（2026-10-24更新）
 
-- 現在の `uv run pytest -q`: **230件成功、29.26秒**。既存の把持・配置・IK・衝突・言語・APIの回帰と、現在配置の引き継ぎ、空の腕の復帰、保持継続、ホームを物体が占める場合の幾何検査、通常失敗での初期化禁止、復旧上限を確認。
+- 現在の `uv run pytest -q`: **247件成功、45.04秒**。既存の把持・配置・IK・衝突・言語・APIの回帰と、現在配置の引き継ぎ、空の腕の復帰、保持継続、ホームを物体が占める場合の幾何検査、通常失敗での初期化禁止、復旧上限を確認。加えて、取り込み経路の修正を固定する17件（`world` という root link 名、宣言された隣接ペアの重なりと部分宣言の拒否、6自由度未満の把持フレーム、1回の把持で1つの工具フレーム、姿勢ごとに工具フレームを取り直さないこと、指長より広く閉じるグリッパ）を含みます。
 - 共通TaskAgentに3指示を続けて送り、一つのGenesisシーンで取得・受け渡し・積み重ね、積んだ青の取得・逆向きの受け渡し・机への配置、再取得・受け渡し・再積み重ねが成功。各指示後の空の腕の復帰、次の指示での配置継承、初期化0回・外側の再試行0回を確認。`outputs/persistent-scene.json` に保存。各タスクは約4.64／4.54／4.49秒、選択したホーム目標との最大関節残差は約0.000061rad、退避中の物体変位はこの記録では0m。物理継続性を分けて調べるため、この検査は明示した決定的な文法経路を使い、自由文全般・VLM・任意のURDFの性能は測っていません。
 - 現在のポリシーでも、空の手からの取得・受け渡し、塞がった受け手の一時置きと受け渡し、型付き最終保持目標からの準備・実行が成功。保持を要求した腕は維持し、空の腕だけが退避することを確認。`outputs/task-agent-persistent-policy.json` に保存。同じ報告の既知の難しいランダム配置（seed `20261023`）は取得が未成功で、同じシーン内の退避・再計画・別の手を含む3試行後、初期化0回で停止しました。このため、この4ケース全体の検証スクリプトの終了コードは1です。
 - 更新した通常ランチャー・実際のWeb実行ボタンからも取得・受け渡し・積み重ねとホーム復帰が成功（約14.73秒、初期化0回）。Webで完了表示、正しい3操作の解釈、空の両手、青が赤より高い現在座標を確認し、`outputs/native-persistent-scene.json` に保存。その後のワイン用シーンを必要とする指示は `SCENE_CHANGE_REQUIRED` で停止し、積み重ねた物体の位置を維持しました（`outputs/native-scene-preservation-policy.json`）。これは注ぎ動作の再検証ではありません。
@@ -781,6 +782,8 @@ uv run python scripts/verify_pick_place_genesis.py
 - 衝突形状修正前のScorpionの把持記録は、左側の衝突メッシュのずれと隣接リンクの衝突除外があったため、現在のモデルの成功記録としては使いません。
 - 衝突修正前のネイティブ読み込み記録：Scorpionの17リンク・16DOF・370衝突形状、OpenArm Cellなしを確認。通常配置とランダム配置2回で、落ち着いた物体位置もIKが通りました。左右1cm上昇の到達誤差は1.07mm／1.03mm、関節速度の指令は元のURDF上限以内でした。`outputs/robots/scorpion-77bd0313b2/runtime_validation.json` に保存。現在の2,029形状の物理検証結果とは区別します。
 - Webと同じAPIでScorpionへの切り替え→関節角指定→手先移動→ランダム初期化→OpenArm復帰を確認。[実際のネイティブ画面](outputs/scorpion-desk-native.png)。Webボタンのブラウザー自動操作は未確認です。
+- OpenManipulator-X（`open_manipulator_x-111aa6d8ba`、4自由度の腕と1軸グリッパ、上流 `ROBOTIS-GIT/open_manipulator` @ `ee9a720` を sha256 付きで pin、隣接6ペアの重なりを実測から宣言、衝突形状は320の凸ピース）を取り込み、机の2つのキューブの配置、片手の取得と机上配置を実測しました。取得は3スキル（接近・把持・持ち上げ）が約1.34秒で成功し、保持は両指の実接触（`gripper_left_link` と `gripper_right_link` が `blue_cube` に触れる）、キューブは 0.7727→0.8037m へ上昇、もう一方のキューブの変位はこの記録で 1.4e-12m でした（`outputs/open_manipulator_x-pick.json`）。配置は6スキル（接近・把持・持ち上げ・運搬・解放・退避）が約3.43秒で成功し、`blue_cube on red_cube` の水平誤差は 0.53mm、この記録での赤の変位は 0.027mm でした（`outputs/open_manipulator_x-stack.json`）。同じ記録で1,579物理ステップを17.8ms間隔で394回観測し、自己接触の最大貫通は 0m、指令関節速度のピークは 3.841rad/s以内です。[実測した最終シーン](outputs/open_manipulator_x-stack.png)。再実行は `uv run python scripts/prepare_open_manipulator_x.py` の後に `uv run python scripts/verify_imported_sequence.py open_manipulator_x-111aa6d8ba --instruction '青いキューブを掴んで赤いキューブの上に置いて' --json outputs/open_manipulator_x-stack.json --image outputs/open_manipulator_x-stack.png` です。`outputs/robots/open_manipulator_x-111aa6d8ba/` の `spawn_validation.json` と `runtime_validation.json`（FK誤差 3.7e-8、モータ駆動IK追従 0.32mm、指令速度比 0.21）も保存しています。指示の解釈は明示した `deterministic_fallback` で、LLMの言語汎化を証明する記録ではありません。この記録は取り込み・把持・机上配置の検証で、同じ機体の把持一般や他機体への一般化を示すものではありません。
+- この腕は4自由度のため、厳密な6自由度の工具姿勢を机上の把持点では取れません。計画は推論した工具フレームを先に試し、経路が無い場合だけ腕が実際に保持できるフレームを使い、検証も1つのフレームで通します。上流が同梱する6関節機（OMY系）は、ベンダー自身の URDF と MJCF が4節リンクを線形 mimic で近似しており、指先パッドが閉じ切る前に互いを突き抜けるため（実測: 内側面ギャップ −76→−53mm）、取り込み対象に含めていません。
 - 現行の連続傾斜と運搬条件で、OpenArmの20mL注入→置き戻し→解放まで成功。実測20.0875mL、こぼれ0.0500mL（4粒子分）、完了時の空中分0mL。3,600粒子・45mLを保存し、ボトルは元の位置から2.46mmで直立・静止。`outputs/wine_smooth_verified.json` に保存。Scorpionのワイン注ぎは対象外です。
 - 連続傾斜は53姿勢・実測3.68秒、20ms間隔170点の記録で角度は約0.19→105.66度に進み、最大の逆戻りは約0.031度でした。この区間の容器間の隙間は観測最小6.87mm。全動作終点での最小は3.62mm、元の位置への戻し移動は0.578秒でした。
 - 速度変更前のワイン基準記録（同じ2.5mm・32サブステップ）: ネイティブ経路で20mLを指示し、実測19.4875mL、こぼれ0mL、完了時の空中分0mL。3,600粒子・45mLの保存、両指の接触、持ち上げ、解放、元の位置での直立・静止を確認。ボトルの戻り誤差は約1.44mm。
