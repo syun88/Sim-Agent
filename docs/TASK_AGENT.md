@@ -145,6 +145,11 @@ uv run python scripts/verify_language_challenge.py --suite holdout --json output
 保持を要求した腕は保持を維持し、空の腕だけが退避する。一方、難しいランダム配置 seed `20261023` の取得は3試行後も未成功で、初期化0回のまま状態と理由を残して停止した。
 この4ケース全体の検証は終了コード1であり、ランダム配置の物理成功率が解決したという記録ではない。
 
+通常ランチャーとWebの実行ボタンを通した取得・受け渡し・積み重ね・退避も約14.73秒で成功した。
+`outputs/native-persistent-scene.json` に結果を保存し、Webの完了表示と正しい3操作の解釈を確認した。
+続いて異なる種類のシーンを要求する指示を送ると `SCENE_CHANGE_REQUIRED` で停止し、既存の積み重ねを維持した。
+その前後の実測を `outputs/native-scene-preservation-policy.json` に保存した。
+
 以下は以前の `8864ad0` の検証記録であり、現在の初期化条件と区別する。
 2026-10-24の実Genesis検査では、右手が空の取得・受け渡し、左手の赤を一時置きして青を受け取る動作を確認した。
 受け手準備の確定版は `outputs/task-agent-occupied-verified.json` に保存した。
