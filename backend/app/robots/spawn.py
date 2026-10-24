@@ -213,8 +213,16 @@ class ReachableDeskSpawns:
         names = chain['joints']
         limits = self.arm_joint_limits(side)
         reach = float(np.sum([np.linalg.norm(np.asarray(j['origin'])[:3, 3]) for j in self.model.chain(chain['end_link'])]))
+        # The band has to come from the arm, not from a constant. A constant was measured for a 0.3 m
+        # arm, and an arm whose base sits on the desk reaches this height only *outside* the radius
+        # such an arm uses - measured 2026-10-24 on UR5e + 2F-85, whose 0.34 m cap covered only the
+        # region its own base blocks, so every candidate failed and the layout omitted both props.
+        # The table bounds the band on the outside, and the radius sample count keeps the density the
+        # same as the band it replaces, so a short arm keeps sampling exactly what it sampled before.
+        outer = max(.10, min(reach, float(np.min(half_table)) - self.half_size - .02))
+        radii = max(int(samples[0]), int(round(samples[0] * outer / .34)))
         found = []
-        for radius in np.linspace(.06, max(.10, min(.34, reach)), samples[0]):
+        for radius in np.linspace(.06, outer, radii):
             for angle in np.linspace(-np.pi, np.pi, samples[1], endpoint=False):
                 point = np.r_[root[:2] + radius * np.array([np.cos(angle), np.sin(angle)]), z]
                 if np.any(abs(point[:2]) + self.half_size + .02 > half_table):
