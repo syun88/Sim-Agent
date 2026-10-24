@@ -1,5 +1,6 @@
 """URDF import, private Jacobians and broker-only selection are separate gates."""
 import json
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
 import numpy as np
@@ -232,18 +233,30 @@ def overlapping_arm(tmp_path):
     return path
 
 
-def test_a_partial_runtime_declaration_is_refused(tmp_path, monkeypatch):
-    """A partial runtime set would make validation more permissive than the engine.
+def test_a_partial_runtime_declaration_ships_an_engine_model(tmp_path, monkeypatch):
+    """A partial declaration is allowed exactly when the package ships a model that excludes those pairs.
 
-    Measured 2026-10-24: declaring one of two overlapping adjacent pairs left the engine with
-    adjacent_collision=True while the private queries were silent on the declared pair, so a posture
-    colliding only there passed validation and then collided in physics. The engine can only turn
-    adjacent collision off wholesale, so a partial set cannot be enforced - the documentation-only
-    key is the place for it.
+    Measured 2026-10-24: declaring one of two overlapping adjacent pairs used to be refused, because a
+    URDF cannot filter individual pairs and telling the engine to drop adjacent collision wholesale
+    while the private queries were silent on the declared pair left validation more permissive than
+    physics. A package whose overlaps live in its authored visuals has no complete set to declare - no
+    amount of collision-mesh preparation removes them - so the import shapes the private collision
+    model into an engine model whose exclusions are the declaration itself. This test fails if that
+    model stops carrying exactly the declared pairs.
     """
     source = overlapping_arm(tmp_path)
     (source.parent / 'collision_config.json').write_text(json.dumps(
         {'runtime_excluded_adjacent_pairs': [['base', 'link1']]}))
     monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
-    with pytest.raises(ValueError, match='every collidable adjacent pair'):
-        registry.import_robot(source.parent.parent)
+    profile = registry.import_robot(source.parent.parent)
+    engine = profile.get('engine_model') or {}
+    assert engine.get('morph') == 'mjcf', 'a partial declaration must force an engine model'
+    root = ElementTree.parse(engine['file']).getroot()
+    excluded = sorted(tuple(sorted((e.get('body1'), e.get('body2')))) for e in root.iter('exclude'))
+    assert excluded == [('base', 'link1')], 'the engine model must exclude exactly the declared pairs'
+    assert not any(geometry.get('name') == 'desk' for geometry in root.iter('geom'))
+    bodies = {body.get('name') for body in root.iter('body')}
+    assert {'base', 'link1', 'tool', 'tip'} <= bodies
+    assert all(body.find('inertial') is not None for body in root.iter('body')), 'every body needs an inertial'
+    assert sum(len(body.findall('joint')) for body in root.iter('body')) == 3
+    assert profile['collision_config']['covers_adjacent_pairs'] is False

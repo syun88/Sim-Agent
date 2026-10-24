@@ -61,10 +61,18 @@ class GenericURDFEnvironment(SimulationBackend):
             material=gs.materials.Rigid(friction=.6), surface=gs.surfaces.Default(color=(.62, .58, .51)))
         self._root_transform = np.asarray(self.profile["root_transform"])
         xyzw = Rotation.from_matrix(self._root_transform[:3, :3]).as_quat()
-        self._entity = self._scene.add_entity(gs.morphs.URDF(file=self.profile["urdf"], fixed=True,
-            pos=tuple(self._root_transform[:3, 3]), quat=tuple(xyzw[[3, 0, 1, 2]]),
-            merge_fixed_links=False, recompute_inertia=False, default_armature=None,
-            convexify=False, decimate=False, watertighten=None),
+        placement = dict(pos=tuple(self._root_transform[:3, 3]), quat=tuple(xyzw[[3, 0, 1, 2]]))
+        # A package may ship an engine model when its declared adjacent overlaps cannot be expressed in
+        # a URDF: that MJCF carries the per-pair exclusions. The URDF-only morph options do not apply
+        # to it, and its root is already placed the way the profile's transform places the URDF.
+        engine_model = self.profile.get('engine_model') or {}
+        if engine_model.get('morph') == 'mjcf':
+            morph = gs.morphs.MJCF(file=engine_model['file'], convexify=False, **placement)
+        else:
+            morph = gs.morphs.URDF(file=self.profile["urdf"], fixed=True, merge_fixed_links=False,
+                recompute_inertia=False, default_armature=None, convexify=False, decimate=False,
+                watertighten=None, **placement)
+        self._entity = self._scene.add_entity(morph,
             material=gs.materials.Rigid(friction=.6, gravity_compensation=1.))
         self._objects = {}
         self._object_start = self.spawn_validation['objects']

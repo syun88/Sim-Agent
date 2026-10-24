@@ -137,18 +137,13 @@ def import_robot(folder):
     collidable = {pair for pair in adjacent
                   if all(len(model.links[link].findall('collision')) for link in pair)}
     declaration['covers_adjacent_pairs'] = bool(declared) and declared >= collidable
-    if declared and not declaration['covers_adjacent_pairs']:
-        # The engine can only turn adjacent collision off wholesale, so a partial runtime
-        # declaration leaves the private queries ignoring pairs the engine still collides.
-        # Measured 2026-10-24: with one of two overlapping adjacent pairs declared, the engine was
-        # told adjacent_collision=True while the private model was silent on the declared pair, so a
-        # posture colliding only there passes validation and then collides in physics. A partial set
-        # belongs in the documentation-only key.
-        raise ValueError(
-            'runtime_excluded_adjacent_pairs must declare every collidable adjacent pair (%d of %d '
-            'declared), because the engine turns adjacent collision off wholesale and cannot match a '
-            'partial set; use excluded_adjacent_pairs to document an overlap instead.'
-            % (len(declared & collidable), len(collidable)))
+    # A partial declaration is legitimate only when the engine can exclude exactly the declared pairs.
+    # A URDF cannot filter individual pairs, which is why a complete set is normally required - but a
+    # package whose overlaps live in its authored visuals has no complete set to declare, and no
+    # amount of collision-mesh preparation removes them. Such a package ships an engine model whose
+    # <contact><exclude> set is the declaration itself, so both the private queries and the engine
+    # ignore exactly the declared pairs. See engine_model.engine_mjcf.
+    engine_model_required = bool(declared) and not declaration['covers_adjacent_pairs']
     declaration['adjacent_pair_count'] = len(collidable)
     declaration['non_collidable_adjacent_pairs'] = len(adjacent) - len(collidable)
     from backend.app.robots.actuators import apply_actuator_configuration
@@ -226,8 +221,9 @@ def import_robot(folder):
                         '(%d pairs) and the private queries exclude the same pairs; non-adjacent self-collision stays on.'
                         % len(declared))
     elif declaration['runtime_excluded_adjacent_pairs']:
-        warnings.append('Declared adjacent-pair overlaps are partial (%d of %d): the private queries exclude them, '
-                        'the engine keeps adjacent collision on for the undeclared rest.'
+        warnings.append('Declared adjacent-pair overlaps are partial (%d of %d): the private queries '
+                        'exclude them and the package ships an engine model that excludes exactly the '
+                        'same pairs, so collision stays on for the undeclared rest.'
                         % (len(declared), declaration['adjacent_pair_count']))
     if len(candidates) > 2:
         warnings.append("Longest distinct chains selected; all candidate chains are recorded for configuration.")
@@ -268,7 +264,21 @@ def import_robot(folder):
     scene['physics_dt']=min(IMPORTED_ROBOT_POLICY['physics_dt_max_s'],max(IMPORTED_ROBOT_POLICY['physics_dt_min_s'],
         scene['cube_size']*IMPORTED_ROBOT_POLICY['physics_dt_per_cube_meter']))
     profile['cube_size'] = scene['cube_size']
+    # The private model reads the declaration from the profile, so it must be recorded before the
+    # engine model is built from it.
     profile['collision_config'] = declaration
+    if engine_model_required:
+        # Both the private queries and the engine must ignore the same pairs; the URDF cannot express
+        # them, so the package carries an MJCF engine model built from the private collision model.
+        from backend.app.robots.collision_planner import PrivateCollisionQueries
+        from backend.app.robots.engine_model import engine_mjcf
+        queries = PrivateCollisionQueries(profile, scene['table_top'])
+        xml, restored_ranges = engine_mjcf(queries.xml, normalized)
+        engine_file = target / 'engine_model.xml'
+        engine_file.write_text(xml + '\n')
+        profile['engine_model'] = {'morph': 'mjcf', 'file': str(engine_file),
+                                   'excluded_adjacent_pairs': declaration['runtime_excluded_adjacent_pairs'],
+                                   'restored_joint_ranges': restored_ranges}
     (target / 'gripper_analysis.json').write_text(json.dumps(analysis, indent=2) + '\n')
     seeds = {}
     for side, chain in chains.items():
@@ -311,6 +321,7 @@ def import_robot(folder):
          'adjacent_collision': not declaration['covers_adjacent_pairs'],
          **({'runtime_excluded_adjacent_pairs': declaration['runtime_excluded_adjacent_pairs']}
             if declaration['runtime_excluded_adjacent_pairs'] else {}),
+         **({'engine_morph': profile['engine_model']['morph']} if profile.get('engine_model') else {}),
          'chains': chains, 'grippers': profile['grippers'], 'cube_size': scene['cube_size'],
          'home': home, 'root': profile['root_transform']}, sort_keys=True).encode()).hexdigest()
     # The catalog sees only complete registrations, after all IK/setup files exist.
