@@ -127,9 +127,10 @@ def import_robot(folder):
         raise ValueError('runtime_excluded_adjacent_pairs names unknown links: ' + ', '.join(unknown))
     if any(pair[0] == pair[1] for pair in declared):
         raise ValueError('runtime_excluded_adjacent_pairs pairs two identical links')
-    if [pair for pair in declared if pair not in adjacent]:
-        raise ValueError('A URDF path cannot filter non-adjacent link pairs: '
-                         + json.dumps(sorted(pair for pair in declared if pair not in adjacent)))
+    # A URDF path cannot filter a pair that does not share a joint, but an engine model can exclude
+    # any pair. A coupled linkage whose parts overlap across branches needs exactly that - the pair
+    # does not overlap at one hinge, so no amount of collision-mesh preparation separates it.
+    non_adjacent = sorted(pair for pair in declared if pair not in adjacent)
     # Only pairs whose two links both carry collision geometry can ever collide; a virtual
     # frame (world, end_effector) cannot, so it needs no declaration. Coverage means every
     # such pair is declared - the engine can only turn adjacent collision off wholesale, and
@@ -143,7 +144,7 @@ def import_robot(folder):
     # amount of collision-mesh preparation removes them. Such a package ships an engine model whose
     # <contact><exclude> set is the declaration itself, so both the private queries and the engine
     # ignore exactly the declared pairs. See engine_model.engine_mjcf.
-    engine_model_required = bool(declared) and not declaration['covers_adjacent_pairs']
+    engine_model_required = bool(declared) and (bool(non_adjacent) or not declaration['covers_adjacent_pairs'])
     declaration['adjacent_pair_count'] = len(collidable)
     declaration['non_collidable_adjacent_pairs'] = len(adjacent) - len(collidable)
     from backend.app.robots.actuators import apply_actuator_configuration
@@ -242,8 +243,9 @@ def import_robot(folder):
              "physics_substeps":IMPORTED_ROBOT_POLICY['physics_substeps'],
              "robot_gravity_compensation": 1., "self_collision": True,
              # URDF cannot filter individual pairs, so the engine expresses only a declaration
-             # that covers every adjacent pair (see collision_declaration).
-             "adjacent_collision": not declaration['covers_adjacent_pairs'],
+             # that covers every adjacent pair (see collision_declaration). A package that ships an
+             # engine model instead relies on that model's own exclusions, which can name any pair.
+             "adjacent_collision": bool(engine_model_required) or not declaration['covers_adjacent_pairs'],
              "runtime_excluded_adjacent_pairs": declaration['runtime_excluded_adjacent_pairs'],
              "default_armature": None,
              "constraint_solver": "Newton", "friction_cone": "elliptic",

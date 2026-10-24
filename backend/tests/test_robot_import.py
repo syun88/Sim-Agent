@@ -127,13 +127,25 @@ def test_a_package_declaring_adjacent_mesh_overlap_does_not_collide_them(tmp_pat
     assert scene['runtime_excluded_adjacent_pairs'] == [['base', 'link1'], ['link1', 'tool']]
 
 
-def test_a_declaration_that_names_a_non_adjacent_pair_is_refused(tmp_path, monkeypatch):
+def test_a_non_adjacent_declaration_ships_an_engine_model(tmp_path, monkeypatch):
+    """Two links that share no joint can still overlap structurally: a coupled linkage does exactly that.
+
+    Measured 2026-10-24 on UR5e + 2F-85: inner_finger against inner_knuckle overlaps 11.51 mm in the
+    open-jaw state a spawn is validated in, and the two sit on different branches of the linkage, so a
+    URDF cannot name the pair while an engine model can exclude any pair. The declaration may therefore
+    name non-adjacent pairs exactly when the package ships one. This test fails if the import starts
+    refusing them again, or stops carrying them into the engine model.
+    """
     source = source_robot(tmp_path)
     (source.parent / 'collision_config.json').write_text(json.dumps(
         {'runtime_excluded_adjacent_pairs': [['base', 'tool']]}))
     monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
-    with pytest.raises(ValueError, match='non-adjacent'):
-        registry.import_robot(source.parent.parent)
+    profile = registry.import_robot(source.parent.parent)
+    engine = profile.get('engine_model') or {}
+    assert engine.get('morph') == 'mjcf', 'a non-adjacent declaration needs an engine model'
+    root = ElementTree.parse(engine['file']).getroot()
+    excluded = sorted(tuple(sorted((e.get('body1'), e.get('body2')))) for e in root.iter('exclude'))
+    assert ('base', 'tool') in excluded, 'the engine model must carry the non-adjacent exclude' 
 
 
 def test_documented_overlaps_are_not_a_runtime_request(tmp_path, monkeypatch):
@@ -260,3 +272,4 @@ def test_a_partial_runtime_declaration_ships_an_engine_model(tmp_path, monkeypat
     assert all(body.find('inertial') is not None for body in root.iter('body')), 'every body needs an inertial'
     assert sum(len(body.findall('joint')) for body in root.iter('body')) == 3
     assert profile['collision_config']['covers_adjacent_pairs'] is False
+
