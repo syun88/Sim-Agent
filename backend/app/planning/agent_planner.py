@@ -69,7 +69,9 @@ class AgentPlanner:
             "Use mode actions for the complete requested sequence. Preservation is checked independently from source text and physical state. "
             "Operations: pick (grasp and hold), handover (giver arm + receiver), place (put on table), "
             "approach, move (direction + distance_cm), open, close, home, throw (upward cube toss + height_cm), "
-            "pour (wine_bottle into wine_glass, volume_ml 5 to 35, default 20). "
+            "pour (wine_bottle into wine_glass, volume_ml 5 to 35, default 20), "
+            "navigate (drive the mobile base to a known object, stopping at arm's reach from it; "
+            "only when capabilities.navigation is true). "
             "For imported robots, read capabilities.skills and detected grippers; never invent an unavailable skill or gripper. "
             "When the user omits a hand, prefer the object's admitted_grasp_arm if present: its spawn approach passed IK. "
             "Operation joint uses joint=<exact URDF joint name>,position_deg=<requested rotary angle>. "
@@ -263,7 +265,7 @@ class AgentPlanner:
             'required':['covered','omitted_or_unsupported','reason'],'additionalProperties':False}
         system = ('Judge whether EACH isolated requested clause can be implemented with the listed robot controllers. '
             'Return covered=false if ANY clause requires unsupported physical work. '
-            'Available operations only: pick/hold a known cube, handover, place, approach, move an arm, '
+            'Available operations only: pick/hold a known cube, handover, place, approach, move an arm, navigate the mobile base to a known object, '
             'open/close/home, upward throw, wine pour, named rotary joint. There is no wiping, rubbing, cleaning, '
             'cutting or arbitrary new contact controller. Negated/protected clauses are constraints, not extra actions. '
             'Do not replace an unsupported interaction by grasping or moving an object. '

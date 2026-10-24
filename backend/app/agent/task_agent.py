@@ -21,7 +21,7 @@ RECOVERABLE = {'IK_FAILURE','GRASP_FAILED','COLLISION_PATH','MOTION_BLOCKED','HO
                'GOAL_NOT_SATISFIED','INVALID_PLAN','HANDOVER_FAILED','PARK_COLLISION','GRASP_LOST','GRASP_SLIP',
                'HANDOVER_UNREACHABLE','HANDOVER_APPROACH_COLLISION','HANDOVER_NO_RECEIVER_PINCH',
                'HANDOVER_DONOR_CONTACT','HANDOVER_LOST','HAND_CONTACT'}
-RESTARTABLE = {'pick','handover','place','approach','home'}
+RESTARTABLE = {'pick','handover','place','approach','home','navigate'}
 
 
 def completed_prefix(plan, result):

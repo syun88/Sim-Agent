@@ -10,7 +10,7 @@ SkillName = Literal[
     "handover_object",
     "throw_object", "pour_liquid", "move_to_object", "move_joint",
     "observe_scene",
-    "park_empty_arm",
+    "park_empty_arm", "navigate_to",
 ]
 ArmName = Literal["left", "right"]
 MoveDirection = Literal["up", "down", "left", "right", "forward", "back"]
@@ -36,6 +36,8 @@ class PlanStep(BaseModel):
     volume_ml: float | None = Field(default=None, ge=5, le=35)
     joint: str | None = None
     position_deg: float | None = Field(default=None, allow_inf_nan=False)
+    target_xy: list[float] | None = Field(default=None, min_length=2, max_length=2)
+    target_yaw: float | None = Field(default=None, allow_inf_nan=False)
 
 
 class AgentPlan(BaseModel):
