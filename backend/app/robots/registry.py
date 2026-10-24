@@ -296,6 +296,54 @@ def import_robot(folder):
     (target / 'ik_validation.json').write_text(json.dumps(ik_checks, indent=2) + '\n')
     from backend.app.robots.spawn import ReachableDeskSpawns
     spawn = ReachableDeskSpawns(profile, scene).layout()
+    if not spawn['objects'] and profile['grippers']:
+        # An object shorter than the arm can descend above the desk is unpickable: no position is
+        # reachable, so the layout omits every prop. Measure the height this arm needs and grow the
+        # object to it while it still fits the jaws - a robot whose inferred cube already works never
+        # reaches this branch, so nothing moves for the robots that spawn today. Measured 2026-10-24:
+        # UR5e + 2F-85 places both props at an 84 mm cube and none at the inferred 33.6 mm.
+        # See ReachableDeskSpawns.minimum_pinch_height.
+        inferred_cube = scene['cube_size']
+        side = min(profile['grippers'], key=lambda name: profile['grippers'][name]['cube_size'])
+        gripper = profile['grippers'][side]
+        needed = ReachableDeskSpawns(profile, scene).minimum_pinch_height(side)
+        limit = float(gripper['maximum_aperture']) - .002
+
+        def use_cube(size):
+            scene['cube_size'] = float(size)
+            scene['cube_mass'] = .05 * (scene['cube_size'] / .052) ** 3
+            scene['physics_dt'] = min(IMPORTED_ROBOT_POLICY['physics_dt_max_s'],
+                max(IMPORTED_ROBOT_POLICY['physics_dt_min_s'],
+                    scene['cube_size'] * IMPORTED_ROBOT_POLICY['physics_dt_per_cube_meter']))
+            profile['cube_size'] = scene['cube_size']
+            for entry in profile['grippers'].values():
+                entry['cube_size'] = scene['cube_size']
+
+        # A height that admits some clean posture need not admit a whole layout - placing the second
+        # prop also has to be reachable beside the first - so the layout itself decides, and the
+        # largest object the jaws open to is the last resort (measured: 84 mm places both props for
+        # UR5e + 2F-85 where 60 and 70 mm place one).
+        taller = None
+        for candidate in ([limit] if needed is None else [min(2. * needed, limit), limit]):
+            if candidate <= inferred_cube + .0005:
+                continue
+            use_cube(candidate)
+            attempt = ReachableDeskSpawns(profile, scene).layout()
+            if not attempt['omitted']:
+                spawn, taller = attempt, candidate
+                break
+        if taller is None:
+            use_cube(inferred_cube)
+            warnings.append('No prop can be pinched on this desk: this arm cannot reach an object centre '
+                            'below %s above the surface, and the jaws open to only %.1f mm.'
+                            % ((('%.1f mm' % (2. * needed * 1000.)) if needed is not None else 'the ladder'),
+                               float(gripper['maximum_aperture']) * 1000.))
+        else:
+            warnings.append('The inferred cube (%.1f mm) is shorter than this arm can descend above the '
+                            'desk, so no desk position was reachable; the scene uses %.1f mm%s.'
+                            % (inferred_cube * 1000., scene['cube_size'] * 1000.,
+                               (' (the height it needs is %.1f mm)' % (2. * needed * 1000.)
+                                if needed is not None else ', the largest the jaws hold')))
     scene['objects'] = spawn['objects']
     (target / 'scene.json').write_text(json.dumps(scene, indent=2) + '\n')
     (target / 'spawn_validation.json').write_text(json.dumps(spawn, indent=2) + '\n')

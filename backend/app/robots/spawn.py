@@ -193,7 +193,7 @@ class ReachableDeskSpawns:
         return float(np.degrees(np.arccos(np.clip(cosine, -1., 1.))))
 
 
-    def measured_candidates(self, side, samples=(13, 16)):
+    def measured_candidates(self, side, samples=(13, 16), height=None):
         """Object positions the arm can actually reach, measured at the spawn height.
 
         ``bounds`` is a sphere approximation of reach - measured 2026-10-24 for a 0.3 m arm:
@@ -201,10 +201,14 @@ class ReachableDeskSpawns:
         on positions no IK can reach and the layout then omits the prop. Radii and angles are
         sampled around the base and kept only where the private position-only IK succeeds and
         the posture is free of deep contact; the caller validates them in the normal way.
+
+        ``height`` overrides the object's centre height above the desk; the default is this scene's
+        spawn height. A desk-mounted arm can only work above its own envelope, so a caller asking how
+        tall an object must be passes heights to try (see ``minimum_pinch_height``).
         """
         chain = self.profile['chains'][side]
         root = np.asarray(self.profile['root_transform'])[:3, 3]
-        z = self.scene['table_top'] + self.half_size + self.clearance
+        z = self.scene['table_top'] + (self.half_size + self.clearance if height is None else height)
         half_table = np.asarray(self.scene['table_size'][:2]) / 2.
         snapshot = dict(self.profile['home'])
         for gripper in self.profile.get('grippers', {}).values():
@@ -237,6 +241,24 @@ class ReachableDeskSpawns:
                     continue
                 found.append(point.tolist())
         return found
+
+    def minimum_pinch_height(self, side, ladder=(.02, .025, .03, .035, .045, .055, .07, .09), minimum=3):
+        """Smallest height an object's centre can sit above the desk and still be pinched cleanly.
+
+        A gripper whose arm is mounted on the desk cannot descend below its own envelope, so an object
+        shorter than that cannot be pinched from the desk at all - measured 2026-10-24 on UR5e +
+        Robotiq 2F-85: no posture was clean with the centre 19 mm above the desk, 32 of 38 were at
+        35 mm, and the layout placed nothing at the aperture-inferred 33.6 mm cube but both props at
+        84 mm. The caller grows the object to this height while it still fits the jaws.
+
+        A height is accepted only when ``minimum`` positions are clean: the first height that had any
+        clean position at all left the second prop unplaceable (measured: a 60 mm cube placed one prop
+        of two), because placing the second also has to be reachable beside the first.
+        """
+        for height in ladder:
+            if len(self.measured_candidates(side, samples=(7, 10), height=height)) >= minimum:
+                return float(height)
+        return None
 
     def layout(self, *, randomize=False, object_positions=None, base=None, rng=None,seed=None,
                shuffle_sides=True,stop=lambda:False):
