@@ -328,3 +328,21 @@ def test_the_spawn_sampler_asks_for_the_object_height_it_is_given(tmp_path, monk
     sampler.measured_candidates('left', samples=(3, 4))
     assert set(asked) == {round(scene['table_top'] + sampler.half_size + sampler.clearance, 9)}, \
         'without an override the spawn height stays the default'
+
+
+def test_a_package_can_declare_how_high_it_stands_above_the_desk(tmp_path, monkeypatch):
+    """A gripper mounted directly on the desk cannot descend to an object lying on it.
+
+    Measured 2026-10-24 on UR5e + 2F-85: nothing was reachable with an object centre 19 mm above the
+    surface, and the layout placed only one prop of two until the robot stood 0.30 m higher, at which
+    point both were placed. A package records that height next to its setup posture, and this fails if
+    the import stops applying it to the root transform.
+    """
+    source = overlapping_arm(tmp_path)
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    flat = registry.import_robot(source.parent.parent)
+    (source.parent / 'initial_state.json').write_text(json.dumps({'mount_height': .30}))
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated_raised')
+    raised = registry.import_robot(source.parent.parent)
+    assert raised['root_transform'][2][3] == pytest.approx(flat['root_transform'][2][3] + .30, abs=1e-9)
+    assert raised['home'] == flat['home'], 'the mount must not disturb the joint values'

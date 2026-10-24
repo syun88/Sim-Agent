@@ -204,7 +204,14 @@ def import_robot(folder):
         minimum_z = float(np.concatenate(vertices)[:, 2].min())
     root_transform = np.eye(4)
     root_transform[:3, :3] = Rotation.from_euler("z", yaw).as_matrix()
-    root_transform[:3, 3] = [-.25, 0., .76 - minimum_z + .001]
+    # A package may record how high it stands above the desk (a pedestal), separately from its setup
+    # posture. A gripper mounted directly on the desk cannot descend to an object lying on it: measured
+    # 2026-10-24 on UR5e + 2F-85, no desk position was reachable with an object centre 19 mm above the
+    # surface and only one prop of two could be placed, until the robot stood 0.30 m higher.
+    setup_file = source.with_name("initial_state.json")
+    mount_height = (float(json.loads(setup_file.read_text()).get('mount_height', 0.))
+                    if setup_file.is_file() else 0.)
+    root_transform[:3, 3] = [-.25, 0., .76 + mount_height - minimum_z + .001]
     initial = {}
     initial_file = source.with_name("initial_state.json")
     if initial_file.is_file():
