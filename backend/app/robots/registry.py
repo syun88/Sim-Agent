@@ -137,6 +137,18 @@ def import_robot(folder):
     collidable = {pair for pair in adjacent
                   if all(len(model.links[link].findall('collision')) for link in pair)}
     declaration['covers_adjacent_pairs'] = bool(declared) and declared >= collidable
+    if declared and not declaration['covers_adjacent_pairs']:
+        # The engine can only turn adjacent collision off wholesale, so a partial runtime
+        # declaration leaves the private queries ignoring pairs the engine still collides.
+        # Measured 2026-10-24: with one of two overlapping adjacent pairs declared, the engine was
+        # told adjacent_collision=True while the private model was silent on the declared pair, so a
+        # posture colliding only there passes validation and then collides in physics. A partial set
+        # belongs in the documentation-only key.
+        raise ValueError(
+            'runtime_excluded_adjacent_pairs must declare every collidable adjacent pair (%d of %d '
+            'declared), because the engine turns adjacent collision off wholesale and cannot match a '
+            'partial set; use excluded_adjacent_pairs to document an overlap instead.'
+            % (len(declared & collidable), len(collidable)))
     declaration['adjacent_pair_count'] = len(collidable)
     declaration['non_collidable_adjacent_pairs'] = len(adjacent) - len(collidable)
     from backend.app.robots.actuators import apply_actuator_configuration

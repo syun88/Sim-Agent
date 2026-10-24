@@ -208,3 +208,42 @@ def test_spawn_validation_resolves_one_jaw_frame_for_the_whole_pinch(tmp_path, m
         # is how many times the jaw frame is decided, not whether this fixture can grasp.
         pass
     assert resolutions == ['left'], resolutions
+
+
+def overlapping_arm(tmp_path):
+    """A package whose source meshes overlap at two adjacent joints, both with collision geometry."""
+    root = tmp_path / 'overlap_source' / 'genesis'
+    root.mkdir(parents=True)
+    text = ('<robot name="overlap"><link name="base"><collision><geometry>'
+            '<box size=".06 .06 .06"/></geometry></collision></link>'
+            '<link name="link1"><collision><origin xyz="0 0 .02"/><geometry>'
+            '<box size=".06 .06 .06"/></geometry></collision></link>'
+            '<link name="tool"><collision><origin xyz="0 0 .04"/><geometry>'
+            '<box size=".06 .06 .06"/></geometry></collision></link>'
+            '<link name="tip"/>'
+            '<joint name="j1" type="revolute"><parent link="base"/><child link="link1"/>'
+            '<axis xyz="0 0 1"/><limit lower="-.5" upper=".5" effort="3" velocity="1"/></joint>'
+            '<joint name="j2" type="revolute"><parent link="link1"/><child link="tool"/>'
+            '<origin xyz=".1 0 0"/><axis xyz="0 1 0"/><limit lower="-.5" upper=".5" effort="3" velocity="1"/></joint>'
+            '<joint name="j3" type="revolute"><parent link="tool"/><child link="tip"/>'
+            '<axis xyz="0 0 1"/><limit lower="-.5" upper=".5" effort="3" velocity="1"/></joint></robot>')
+    path = root / 'robot.urdf'
+    path.write_text(text)
+    return path
+
+
+def test_a_partial_runtime_declaration_is_refused(tmp_path, monkeypatch):
+    """A partial runtime set would make validation more permissive than the engine.
+
+    Measured 2026-10-24: declaring one of two overlapping adjacent pairs left the engine with
+    adjacent_collision=True while the private queries were silent on the declared pair, so a posture
+    colliding only there passed validation and then collided in physics. The engine can only turn
+    adjacent collision off wholesale, so a partial set cannot be enforced - the documentation-only
+    key is the place for it.
+    """
+    source = overlapping_arm(tmp_path)
+    (source.parent / 'collision_config.json').write_text(json.dumps(
+        {'runtime_excluded_adjacent_pairs': [['base', 'link1']]}))
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    with pytest.raises(ValueError, match='every collidable adjacent pair'):
+        registry.import_robot(source.parent.parent)
