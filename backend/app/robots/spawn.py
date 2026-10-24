@@ -95,23 +95,29 @@ class ReachableDeskSpawns:
         gripper = self.profile.get('grippers',{}).get(side)
         attitude = np.array(gripper['grasp_rotation']) if gripper else None
         joint_limits=self.arm_joint_limits(side)
-        def checked_pose(target, initial):
-            frame = attitude
-            result = solve_profile_ik(self.profile,side,target,frame,model=self.model,q_init=initial,
-                snapshot=snapshot,joint_limits=joint_limits)
-            if mode == 'arm-achieved' and not result['success']:
-                # A fixed jaw frame is a six-constraint request; an arm with fewer joints can
-                # still pinch, holding whatever frame its own joints reach. Re-solve with that
-                # frame fixed, so every offset below stays consistent with what the arm holds.
-                free = solve_profile_ik(self.profile,side,target,None,model=self.model,q_init=initial,
-                    snapshot=snapshot,joint_limits=joint_limits)
+        supported = np.r_[point[:2], self.scene['table_top'] + self.half_size]
+        # One frame for the whole pinch. Execution plans the approach, the closure and the lift
+        # holding a single jaw frame, so resolving it per check would validate a spawn the arm
+        # cannot execute - each check could pass holding a different frame. It is decided once, at
+        # the grasp pose, the way execution decides it: the inferred frame when the arm can hold
+        # it, otherwise the frame the arm's own joints reach.
+        frame_in_use = attitude
+        if mode == 'arm-achieved' and attitude is not None:
+            inferred = solve_profile_ik(self.profile,side,supported,attitude,model=self.model,
+                q_init=None,snapshot=snapshot,joint_limits=joint_limits)
+            if not inferred['success']:
+                free = solve_profile_ik(self.profile,side,supported,None,model=self.model,
+                    q_init=None,snapshot=snapshot,joint_limits=joint_limits)
                 if free['success']:
-                    frame = self.achieved_attitude(side, free['q_rad'], snapshot)
-                    off = self.attitude_offset_deg(frame, attitude, gripper)
+                    candidate = self.achieved_attitude(side, free['q_rad'], snapshot)
+                    off = self.attitude_offset_deg(candidate, attitude, gripper)
                     if off > self.attitude_tolerance_deg:
                         raise ValueError(f'{side}: the arm can only hold a jaw frame {off:.0f} deg off the inferred one')
-                    result = solve_profile_ik(self.profile,side,target,frame,model=self.model,q_init=free['q_rad'],
-                        snapshot=snapshot,joint_limits=joint_limits)
+                    frame_in_use = candidate
+        def checked_pose(target, initial):
+            frame = frame_in_use
+            result = solve_profile_ik(self.profile,side,target,frame,model=self.model,q_init=initial,
+                snapshot=snapshot,joint_limits=joint_limits)
             if not result['success']:
                 raise ValueError(f'{side}: object or approach is outside IK reach')
             q = np.array(result['q_rad'])
@@ -119,9 +125,9 @@ class ReachableDeskSpawns:
             if collisions:
                 if max(c['penetration_m'] for c in collisions)>.003:
                     raise ValueError(f'{side}: spawn IK posture deeply intersects the robot or desk')
-                q = (self.collision_queries.refine_pose(self.profile,side,target,attitude,q,snapshot,
+                q = (self.collision_queries.refine_pose(self.profile,side,target,frame_in_use,q,snapshot,
                         minimum_clearance=.0001,joint_limits=joint_limits)
-                     if attitude is not None else None)
+                     if frame_in_use is not None else None)
                 if q is None:
                     raise ValueError(f'{side}: spawn grasp intersects the robot or desk')
                 kin = URDFKinematics(self.model,self.profile['chains'][side],snapshot,
@@ -136,7 +142,6 @@ class ReachableDeskSpawns:
         # (which sits exactly on the desk) otherwise plans 2mm below it and a marginal pose
         # fails (measured 2026-10-24: blue_cube settled 2.03mm lower and was refused, while
         # the same pose validated at the spawn height).
-        supported = np.r_[point[:2], self.scene['table_top'] + self.half_size]
         if self.collision_queries.box_contact_points(snapshot,supported,np.eye(3),self.half_size*2.,
                 set(self.model.links),distance=.0001):
             raise ValueError(f'{side}: spawn cube intersects the robot in its setup posture')
