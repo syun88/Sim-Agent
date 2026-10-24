@@ -220,6 +220,10 @@ class ImportedRobotSkills(SkillRunner):
         frame = sampler.achieved_attitude(arm, free['q_rad'], snapshot)
         if frame is None or sampler.attitude_offset_deg(frame, nominal, gripper) > sampler.attitude_tolerance_deg:
             return [nominal]
+        if np.allclose(frame, nominal):
+            # A capable arm holds the inferred frame itself, so the free solve reproduces it.
+            # Planning twice with the same frame would only cost time.
+            return [nominal]
         return [nominal, np.asarray(frame)]
 
     def _approach(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
