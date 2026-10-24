@@ -569,6 +569,13 @@ class GenericURDFEnvironment(SimulationBackend):
                                          for name in spec["wheel_joints"]])
             self._wheel_limits = np.array([abs(self.model.by_name[name]["velocity"])
                                            for name in spec["wheel_joints"]])
+            # Optional measured drive model (scripts/calibrate_mobile_base.py):
+            # achieved twist = model @ commanded twist in this engine. When
+            # present, commands are corrected through its inverse.
+            self._drive_model = None
+            calibration_path = Path(self.profile["directory"]) / "drive_calibration.json"
+            if calibration_path.is_file():
+                self._drive_model = np.asarray(json.loads(calibration_path.read_text())["model"], dtype=float)
             # The URDF-derived kv targets the position-controlled arm
             # response and leaves velocity control too weak to break ground
             # friction (measured: commanded wheels stayed at exactly zero).
@@ -609,6 +616,8 @@ class GenericURDFEnvironment(SimulationBackend):
             raise NotImplementedError("This robot has no mobile base")
         drive = self._drive()
         spec = self._mobile_base
+        from backend.app.control.navigation import correct_twist, limit_wheel_speeds
+        vx, vy, omega = correct_twist(self._drive_model, (vx, vy, omega))
         signs = np.asarray(spec.get("wheel_signs", [1] * len(spec["wheel_joints"])), dtype=float)
         if spec["drive"] == "kiwi":
             # KiwiDrive returns linear rolling speeds; the joints want rad/s,
@@ -618,5 +627,5 @@ class GenericURDFEnvironment(SimulationBackend):
             if abs(vy) > 1e-9:
                 raise ValueError("A differential-drive base cannot move sideways")
             angular = signs * np.array(drive.wheel_speeds(vx, omega))
-        angular = np.clip(angular, -self._wheel_limits, self._wheel_limits)
+        angular = limit_wheel_speeds(angular, self._wheel_limits)
         self._entity.control_dofs_velocity(angular.astype(np.float32), self._wheel_dofs)

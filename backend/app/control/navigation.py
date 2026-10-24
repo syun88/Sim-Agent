@@ -172,6 +172,35 @@ class KiwiDrive:
         )
 
 
+def correct_twist(calibration: np.ndarray, twist) -> np.ndarray:
+    """Map a desired body twist through the inverse of a measured drive model.
+
+    ``calibration`` is the measured 3x3 matrix A of a real base in its
+    physics engine (achieved twist = A @ commanded twist), obtained by
+    system identification: CAD omni wheels scrub, loads are asymmetric, and
+    the open-loop response leaks between axes (on LeKiwi a forward command
+    yaws at -2.3 rad per m). Commanding A^-1 @ desired cancels the leak to
+    first order. Returns the twist unchanged when no calibration is given.
+    """
+    desired = np.asarray(twist, dtype=float)
+    if calibration is None:
+        return desired
+    return np.linalg.solve(np.asarray(calibration, dtype=float), desired)
+
+
+def limit_wheel_speeds(angular: np.ndarray, limits: np.ndarray) -> np.ndarray:
+    """Scale wheel speeds uniformly so none exceeds its limit.
+
+    Clipping each wheel separately bends the body twist (the wheels no
+    longer agree on the motion); scaling the whole vector preserves the
+    twist direction and only slows it down.
+    """
+    angular = np.asarray(angular, dtype=float)
+    limits = np.asarray(limits, dtype=float)
+    ratio = np.max(np.abs(angular) / limits) if np.any(limits > 0) else 0.0
+    return angular / ratio if ratio > 1.0 else angular
+
+
 def clearance_to_aabbs(pose: BasePose, radius: float, aabbs: np.ndarray) -> float:
     """Minimum distance from a circular footprint to axis-aligned boxes.
 

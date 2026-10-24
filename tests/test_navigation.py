@@ -15,6 +15,8 @@ from backend.app.control.navigation import (
     KiwiDrive,
     WaypointController,
     clearance_to_aabbs,
+    correct_twist,
+    limit_wheel_speeds,
     wrap_angle,
 )
 
@@ -61,6 +63,20 @@ def test_kiwi_drive_integrate_lateral():
     # Pure lateral body velocity at yaw 0 moves the base sideways.
     pose = drive.integrate(BasePose(0.0, 0.0, 0.0), 0.0, 0.4, 0.0, 0.5)
     assert abs(pose.x) < 1e-12 and abs(pose.y - 0.2) < 1e-12
+
+
+def test_correct_twist_inverts_measured_model():
+    # A leaky drive model like LeKiwi's: forward leaks into yaw.
+    a = np.array([[0.15, 0.04, 0.0], [0.05, 0.24, 0.0], [-2.29, -0.42, 0.87]])
+    cmd = correct_twist(a, [0.1, 0.0, 0.0])
+    assert np.allclose(a @ cmd, [0.1, 0.0, 0.0])
+    assert np.allclose(correct_twist(None, [0.1, 0.2, 0.3]), [0.1, 0.2, 0.3])
+
+
+def test_limit_wheel_speeds_scales_uniformly():
+    out = limit_wheel_speeds(np.array([4.0, -2.0, 1.0]), np.array([2.0, 2.0, 2.0]))
+    assert np.allclose(out, [2.0, -1.0, 0.5])
+    assert np.allclose(limit_wheel_speeds(np.array([1.0, 1.0]), np.array([2.0, 2.0])), [1.0, 1.0])
 
 
 def test_clearance_to_aabbs():

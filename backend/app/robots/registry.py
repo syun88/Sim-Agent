@@ -13,7 +13,7 @@ from backend.app.robots.policy import IMPORTED_ROBOT_POLICY,policy_signature
 GENERATED_ROOT = Path(__file__).resolve().parents[3] / "outputs" / "robots"
 OPENARM = {"id": "openarm_v2", "name": "OpenArm v2", "source": "official openarm-mujoco",
            "builtin": True, "capabilities": ["motion", "physical_grasp", "handover", "stack", "pour"]}
-PROFILE_VERSION = 15
+PROFILE_VERSION = 16
 _file_hash_cache = {}
 
 
@@ -194,6 +194,105 @@ def _detect_mobile_base(model, chains):
             "wheel_radius": wheel_radius}
 
 
+def _rpy_from_matrix(rotation):
+    """URDF rpy (R = Rz @ Ry @ Rx) from a rotation matrix."""
+    pitch = float(np.arcsin(np.clip(-rotation[2, 0], -1., 1.)))
+    if abs(np.cos(pitch)) < 1e-6:
+        return [float(np.arctan2(-rotation[0, 1], rotation[1, 1])), pitch, 0.]
+    return [float(np.arctan2(rotation[2, 1], rotation[2, 2])), pitch,
+            float(np.arctan2(rotation[1, 0], rotation[0, 0]))]
+
+
+def _synthesize_omni_wheels(model, spec):
+    """Rewrite fused CAD omni wheels as hub + free-spinning rollers.
+
+    CAD exports fuse an omni wheel's rollers into one rigid body, so in
+    physics the contact resists sliding along the axle with full friction:
+    a kiwi base then cannot translate (measured: ~15-25% of the commanded
+    speed, the rest lost to scrub). The real wheel's rollers spin freely
+    about tangential axes and make the axle direction nearly free. This
+    rewrite keeps the CAD visual on the hub, drops the hub's collision,
+    and hangs K small roller cylinders around the rim on passive
+    continuous joints, restoring that mechanism in the physics URDF.
+    Only the serialized physics URDF changes; detection and the profile
+    keep describing the source model.
+    """
+    import xml.etree.ElementTree as ET
+
+    def fmt(values):
+        return " ".join(f"{float(v):.6g}" for v in values)
+
+    poses, axes = model.forward({})
+    joints_by_name = {j["name"]: j for j in model.joints}
+    elements = {el.get("name"): el for el in model.xml.findall("joint")}
+    rollers_per_wheel = 8
+    for name in spec["wheel_joints"]:
+        joint = joints_by_name[name]
+        body_name = _wheel_body_link(model, joint)
+        body = model.links[body_name]
+        radius = _link_wheel_radius(model, body_name) or spec["wheel_radius"]
+        # Width = smallest mesh extent of the wheel body (its thickness).
+        width = 0.6 * radius
+        for element in body.findall("visual"):
+            mesh = element.find("geometry/mesh")
+            if mesh is not None:
+                import trimesh
+                geometry = trimesh.load(mesh_path(mesh.get("filename"), model.path), force="mesh", process=False)
+                scale = vector(mesh.get("scale"), [1., 1., 1.])
+                width = float(((np.asarray(geometry.bounds[1]) - np.asarray(geometry.bounds[0])) * scale).min())
+                break
+        # Axle direction in the body frame, from the measured world axis.
+        world_axis = np.asarray(axes[name][1], dtype=float)
+        axle = poses[body_name][:3, :3].T @ world_axis
+        axle = axle / np.linalg.norm(axle)
+        helper = np.array([0., 0., 1.]) if abs(axle[2]) < 0.9 else np.array([1., 0., 0.])
+        u = np.cross(axle, helper)
+        u = u / np.linalg.norm(u)
+        v = np.cross(axle, u)
+        # Keep the measured mass on the hub, light rollers.
+        inertial = body.find("inertial")
+        mass_el0 = inertial.find("mass") if inertial is not None else None
+        total_mass = float(mass_el0.get("value")) if mass_el0 is not None and mass_el0.get("value") else 0.1
+        if inertial is not None:
+            mass_el0.set("value", fmt([total_mass * 0.65]))
+            inertia_el = inertial.find("inertia")
+            if inertia_el is not None:
+                for attr in ("ixx", "ixy", "ixz", "iyy", "iyz", "izz"):
+                    if inertia_el.get(attr):
+                        inertia_el.set(attr, fmt([float(inertia_el.get(attr)) * 0.65]))
+        for collision in body.findall("collision"):
+            body.remove(collision)
+        roller_radius = float(np.clip(radius * 0.22, 0.006, 0.016))
+        ring = radius - roller_radius
+        roller_length = max(width * 0.92, 0.01)
+        roller_mass = total_mass * 0.35 / rollers_per_wheel
+        # Phase the rollers so one sits at the contact patch at spawn.
+        down = poses[body_name][:3, :3].T @ np.array([0., 0., -1.])
+        phase = float(np.arctan2(down @ v, down @ u))
+        for k in range(rollers_per_wheel):
+            theta = phase + 2 * np.pi * k / rollers_per_wheel
+            radial = np.cos(theta) * u + np.sin(theta) * v
+            tangent = -np.sin(theta) * u + np.cos(theta) * v
+            rotation = np.column_stack([radial, axle, tangent])
+            rpy = _rpy_from_matrix(rotation)
+            roller_name = f"{body_name}_roller_{k}"
+            link_el = ET.SubElement(model.xml, "link", {"name": roller_name})
+            inertial_el = ET.SubElement(link_el, "inertial")
+            ET.SubElement(inertial_el, "mass", {"value": fmt([roller_mass])})
+            ixx = roller_mass * (3 * roller_radius ** 2 + roller_length ** 2) / 12.
+            ET.SubElement(inertial_el, "inertia", {
+                "ixx": fmt([ixx]), "ixy": "0", "ixz": "0",
+                "iyy": fmt([ixx]), "iyz": "0", "izz": fmt([0.5 * roller_mass * roller_radius ** 2])})
+            collision_el = ET.SubElement(link_el, "collision")
+            geometry_el = ET.SubElement(collision_el, "geometry")
+            ET.SubElement(geometry_el, "cylinder", {"radius": fmt([roller_radius]), "length": fmt([roller_length])})
+            joint_el = ET.SubElement(model.xml, "joint", {"name": roller_name, "type": "continuous"})
+            ET.SubElement(joint_el, "parent", {"link": body_name})
+            ET.SubElement(joint_el, "child", {"link": roller_name})
+            ET.SubElement(joint_el, "origin", {"xyz": fmt(ring * radial), "rpy": fmt(rpy)})
+            ET.SubElement(joint_el, "axis", {"xyz": "0 0 1"})
+
+
 def import_robot(folder):
     root = Path(folder).expanduser().resolve()
     if root.is_file() and root.suffix.lower() == ".urdf":
@@ -324,6 +423,8 @@ def import_robot(folder):
         initial = json.loads(initial_file.read_text())
     home = {j["name"]: float(initial.get(j["name"], 0. if j["lower"] is None else np.clip(0., j["lower"], j["upper"])))
             for j in model.active}
+    if mobile_base and mobile_base.get("drive") == "kiwi":
+        _synthesize_omni_wheels(model, mobile_base)
     normalized = target / "robot.urdf"
     import xml.etree.ElementTree as ET
     ET.indent(model.xml)
