@@ -40,6 +40,7 @@ next step; this script stages and reports only.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -135,7 +136,13 @@ def _derive_home(destination: Path) -> dict | None:
 
 
 def _collision_declaration(destination: Path, threshold_mm: float) -> dict | None:
-    """Declare the adjacent link pairs whose source meshes overlap in the setup posture.
+    """Declare every adjacent link pair whose source meshes overlap in the setup posture.
+
+    The threshold defaults to the query tolerance: an adjacent pair whose shells interpenetrate
+    at all is a source-mesh artifact (clean adjacent links do not), and adjacency is the only
+    lever a URDF-loaded engine has, so a pair that merely grazes must not be left out
+    (measured 2026-10-24: a 4.98 mm overlap missed a 5 mm threshold and the grasp check
+    refused every candidate).
 
     These meshes are visual-quality parts: they overlap at every joint by design, so the
     runtime must be told which adjacent pairs not to collide (the URDF cannot say it).
@@ -174,13 +181,111 @@ def _collision_declaration(destination: Path, threshold_mm: float) -> dict | Non
             'measured_threshold_mm': threshold_mm}
 
 
+
+#: Distal jaws keep their authored pads: skinning them would move the aperture and the cube
+#: size the inference measured, and their mutual contact at the closed command is the
+#: intended pinch contact rather than a collision.
+JAW_LINKS = {"gripper_left_link", "gripper_right_link"}
+
+
+def _clean(mesh):
+    """A manifold, consistently wound solid for decomposition."""
+    import trimesh
+    solid = mesh.copy()
+    solid.merge_vertices()
+    solid.update_faces(solid.nondegenerate_faces())
+    solid.update_faces(solid.unique_faces())
+    trimesh.repair.fix_winding(solid)
+    trimesh.repair.fix_inversion(solid)
+    trimesh.repair.fix_normals(solid)
+    return solid
+
+
+def _collision_proxies(destination: Path, concavity: float, skin_mm: float, max_pieces: int) -> dict | None:
+    """Replace the arm's collision meshes with inset convex pieces.
+
+    The source meshes are visual-quality parts: link1 and link3 overlap by 0.5-0.6 mm in
+    every posture (measured), and the neighbouring links overlap by 21-43 mm. One whole-link
+    convex hull cannot fix that (hulling a concave link adds volume: link3 grew 4.3x), and
+    a URDF cannot filter individual pairs. CoACD (MIT, SIGGRAPH 2022) splits each authored
+    mesh into collision-aware convex pieces, and each piece is then clipped against the
+    authored visual's inset halfspaces by the repo's own primitive - the piece-level shape of
+    this repo's prepared collision geometry. The jaws are left authored.
+    """
+    import xml.etree.ElementTree as ET
+    import numpy as np
+    import trimesh
+    import coacd
+    from backend.app.robots.collision_geometry import inset_authored_boundary
+    from backend.app.robots.urdf import URDFModel, mesh_path
+    urdf = destination / "genesis" / "open_manipulator_x.urdf"
+    tree = ET.parse(urdf)
+    model = URDFModel(urdf)
+    source_dir = destination / "source" / "meshes" / "open_manipulator_x"
+    proxy_dir = destination / "meshes" / "open_manipulator_x_proxy"
+    proxy_dir.mkdir(parents=True, exist_ok=True)
+    distance = skin_mm / 1000.
+    record, pieces_total = {}, 0
+    for link, body in model.links.items():
+        if link in JAW_LINKS or not body.findall("collision"):
+            continue
+        visual_element = body.find("visual/geometry/mesh")
+        visual = trimesh.load(mesh_path(visual_element.get("filename"), model.path), force="mesh", process=False)
+        pieces = []
+        for collision in body.findall("collision"):
+            mesh_element = collision.find("geometry/mesh")
+            authored = source_dir / Path(mesh_element.get("filename")).name
+            solid = _clean(trimesh.load(authored, force="mesh", process=False))
+            decomposed = coacd.run_coacd(
+                coacd.Mesh(np.asarray(solid.vertices, np.float64), np.asarray(solid.faces, np.int32)),
+                threshold=concavity, max_convex_hull=max_pieces, preprocess_mode="auto",
+                preprocess_resolution=50, resolution=1000, mcts_iterations=60, seed=0)
+            kept = 0
+            for vertices, faces in decomposed:
+                piece = trimesh.Trimesh(np.asarray(vertices, float), np.asarray(faces, np.int64), process=True)
+                inset = inset_authored_boundary(piece, visual, distance)
+                if inset is None or not len(inset.faces):
+                    continue
+                inset.export(proxy_dir / f"{link}_{kept}.stl")
+                pieces.append(proxy_dir / f"{link}_{kept}.stl")
+                kept += 1
+            if not kept:
+                raise SystemExit(f"{link}: no collision piece survived a {skin_mm:g} mm skin")
+        element = next(e for e in tree.getroot().findall("link") if e.get("name") == link)
+        # The authored collision carries the mm->m scale and a per-collision origin; a proxy
+        # written without them is a thousand times too large and offset (measured: the
+        # declaration then read a 16 m "overlap"). Clone it and swap only the mesh.
+        template = element.find("collision")
+        for existing in element.findall("collision"):
+            element.remove(existing)
+        for path in pieces:
+            collision = copy.deepcopy(template)
+            collision.find("geometry/mesh").set(
+                "filename", f"package://open_manipulator_description/meshes/open_manipulator_x_proxy/{path.name}")
+            element.append(collision)
+        pieces_total += len(pieces)
+        record[link] = {"pieces": [path.name for path in pieces], "skin_mm": skin_mm,
+                        "concavity_threshold": concavity,
+                        "volume_authored_mm3": round(float(_clean(trimesh.load(source_dir / (link + '.stl'), force='mesh', process=False)).volume), 1),
+                        "volume_proxy_mm3": round(sum(float(trimesh.load(path, force='mesh').volume) for path in pieces), 1)}
+    ET.indent(tree)
+    tree.write(urdf, encoding="utf-8", xml_declaration=True)
+    print(f"collision proxies: {pieces_total} convex pieces over {len(record)} links, jaws authored", flush=True)
+    return {"method": "CoACD (MIT) convex pieces, each clipped by inset_authored_boundary",
+            "skin_mm": skin_mm, "concavity_threshold": concavity, "max_pieces": max_pieces,
+            "jaw_links_kept_authored": sorted(JAW_LINKS), "links": record}
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dest", type=Path,
                         default=Path("~/.cache/sim-agent/open_manipulator_x").expanduser())
     parser.add_argument("--refresh", action="store_true", help="re-download and re-record the hashes")
     parser.add_argument("--check", action="store_true", help="verify the recorded hashes only")
-    parser.add_argument("--overlap-threshold-mm", type=float, default=5.,
+    parser.add_argument("--concavity", type=float, default=.01, help="CoACD concavity threshold")
+    parser.add_argument("--max-pieces", type=int, default=64, help="Cap on convex collision pieces per link")
+    parser.add_argument("--collision-skin-mm", type=float, default=.7,
+                        help="clip each collision piece this far inside the authored visual")
+    parser.add_argument("--overlap-threshold-mm", type=float, default=.1,
                         help="declare an adjacent pair whose setup-posture meshes overlap by at least this")
     args = parser.parse_args()
     destination = args.dest.expanduser()
@@ -196,6 +301,13 @@ def main() -> int:
         state = _derive_home(destination)
         if state:
             initial.write_text(json.dumps(state, indent=2) + "\n")
+    # Derived from the pinned originals every run: _publish restores the authored URDF, so a
+    # cached proxy record would leave the import reading the authored meshes again (measured:
+    # the declaration then read the 21-43 mm authored overlaps). Deterministic, so re-deriving
+    # is the same measurement.
+    proxies = _collision_proxies(destination, args.concavity, args.collision_skin_mm, args.max_pieces)
+    if proxies:
+        (destination / "collision_proxies.json").write_text(json.dumps(proxies, indent=2) + "\n")
     declaration = destination / "genesis" / "collision_config.json"
     if not declaration.is_file():
         settings = _collision_declaration(destination, args.overlap_threshold_mm)
