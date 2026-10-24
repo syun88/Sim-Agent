@@ -298,7 +298,8 @@ class SkillRunner:
             return self._move_relative(arm, DIRECTION_VECTORS[direction] * distance_cm / 100.0)
         return self._skill("move_relative", run, started)
 
-    def navigate_to(self, target, target_yaw: float | None = None, timeout: float = 60.) -> dict:
+    def navigate_to(self, target, target_yaw: float | None = None, timeout: float = 60.,
+                    exclude_object: str | None = None) -> dict:
         """Drive the scene's mobile base to a world (x, y) target.
 
         The base moves only through its wheel actuators; arrival is decided
@@ -307,9 +308,9 @@ class SkillRunner:
         driven forward-only in this slice (no strafing yet).
         """
         started = time.perf_counter()
-        return self._skill("navigate_to", lambda: self._navigate_to(target, target_yaw, timeout), started)
+        return self._skill("navigate_to", lambda: self._navigate_to(target, target_yaw, timeout, exclude_object), started)
 
-    def _navigate_to(self, target, target_yaw, timeout) -> dict:
+    def _navigate_to(self, target, target_yaw, timeout, exclude_object=None) -> dict:
         try:
             self.env.base_pose()
         except NotImplementedError:
@@ -327,6 +328,9 @@ class SkillRunner:
             pose = BasePose(float(measured[0]), float(measured[1]), float(measured[2]))
             aabbs = []
             for name in self.env.frame().objects:
+                if name == exclude_object:
+                    # The destination itself is not an obstacle to avoid.
+                    continue
                 try:
                     bounds = np.asarray(self.env.object_bounds(name), dtype=float)
                 except NotImplementedError:
@@ -672,6 +676,9 @@ class SkillRunner:
                 result = self.throw_object(arm, step["object"], float(step.get("height_cm") or 3.))
             elif skill == "pour_liquid":
                 result = self.pour_liquid(arm, step["object"], step.get("target") or "wine_glass", float(step.get("volume_ml") or 20.))
+            elif skill == "navigate_to":
+                result = self.navigate_to(step["target_xy"], step.get("target_yaw"),
+                                          exclude_object=step.get("object"))
             else:
                 result = {"skill": skill, "success": False, "duration": 0.0, "error": "INVALID_PLAN", "detail": "Unknown skill"}
             results.append(result)

@@ -8,6 +8,7 @@ pose always comes from the physics engine.
 import math
 
 import numpy as np
+import pytest
 
 from backend.app.control.navigation import (
     BasePose,
@@ -77,6 +78,49 @@ def test_limit_wheel_speeds_scales_uniformly():
     out = limit_wheel_speeds(np.array([4.0, -2.0, 1.0]), np.array([2.0, 2.0, 2.0]))
     assert np.allclose(out, [2.0, -1.0, 0.5])
     assert np.allclose(limit_wheel_speeds(np.array([1.0, 1.0]), np.array([2.0, 2.0])), [1.0, 1.0])
+
+
+def _agent_state(navigation=True):
+    return {
+        "objects": [{"id": "red_cube", "position": [0.6, 0.0, 0.014]}],
+        "targets": [],
+        "robot": {"available_arms": ["left"], "base_pose": [0.0, 0.0, 0.0],
+                  "left_arm": {"held_object": None}, "right_arm": {"held_object": None}},
+        "capabilities": {"skills": ["navigate_to", "approach_object", "grasp_object"],
+                         "navigation": navigation},
+        "discourse": {},
+    }
+
+
+def test_compile_navigate_action_to_standoff_step():
+    from backend.app.planning.task_program import TaskAction, TaskProgram, compile_program
+
+    plan = compile_program(TaskProgram(actions=[TaskAction(op="navigate", object="red_cube")]),
+                           _agent_state())
+    assert len(plan.steps) == 1
+    step = plan.steps[0]
+    assert step.skill == "navigate_to"
+    # Standoff 0.32 m from the cube, on the base's side of it, facing it.
+    assert np.allclose(step.target_xy, [0.28, 0.0])
+    assert abs(step.target_yaw) < 1e-9
+
+
+def test_compile_navigate_requires_navigation_capability():
+    from backend.app.planning.task_program import GroundingError, TaskAction, TaskProgram, compile_program
+
+    with pytest.raises(GroundingError):
+        compile_program(TaskProgram(actions=[TaskAction(op="navigate", object="red_cube")]),
+                        _agent_state(navigation=False))
+
+
+def test_execute_plan_dispatches_navigate_to():
+    from backend.app.skills.robot_skills import SkillRunner
+
+    env = _FakeNavEnv()
+    runner = SkillRunner(env, None)
+    results = runner.execute_plan([{"skill": "navigate_to", "arm": "left",
+                                    "target_xy": [0.3, 0.0], "target_yaw": None}])
+    assert results[0]["success"]
 
 
 def test_clearance_to_aabbs():

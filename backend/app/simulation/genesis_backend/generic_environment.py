@@ -48,7 +48,11 @@ class GenericURDFEnvironment(SimulationBackend):
         self.cube_size = scene_config.get("cube_size", .052)
         self.cube_mass = scene_config.get("cube_mass", .05)
         self._spawn_sampler = None if self._mobile_base else ReachableDeskSpawns(self.profile, scene_config)
-        self.spawn_validation = {"objects": {}} if self._mobile_base else self._spawn_sampler.layout()
+        # A mobile scene's props are the floor objects authored in
+        # scene.json (registry imports them from floor_objects.json);
+        # a desk scene samples them from the reachable-spawn layout.
+        self.spawn_validation = ({"objects": scene_config.get("objects") or {}}
+                                 if self._mobile_base else self._spawn_sampler.layout())
         self._adjacent_collision = bool(scene_config.get('adjacent_collision', True))
         self._dt = float(scene_config["physics_dt"])
         if self._mobile_base:
@@ -185,7 +189,7 @@ class GenericURDFEnvironment(SimulationBackend):
 
     def reset(self, randomize=False, object_positions=None, seed=None,shuffle_sides=True):
         self._resolved_zones = {}
-        placements = {"objects": {}} if self._mobile_base else self._spawn_sampler.layout(randomize=randomize, object_positions=object_positions,
+        placements = {"objects": dict(self._object_start)} if self._mobile_base else self._spawn_sampler.layout(randomize=randomize, object_positions=object_positions,
             base=self._object_start,seed=seed,shuffle_sides=shuffle_sides,
             stop=getattr(self,'planning_pulse',lambda:False))
         self.spawn_validation = placements

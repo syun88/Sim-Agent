@@ -24,6 +24,10 @@ def build_world_state(env: SimulationBackend) -> dict:
     frame = env.frame()
     holds = physical_holds(env)
     contacts = env.contact_names()
+    try:
+        base_pose = [float(v) for v in env.base_pose()]
+    except (NotImplementedError, AttributeError):
+        base_pose = None
     available = getattr(env,'available_arms',['left','right'])
     objects = []
     for name, position in frame.objects.items():
@@ -50,8 +54,11 @@ def build_world_state(env: SimulationBackend) -> dict:
     for name, position in frame.zones.items():
         targets.append({"id": name, "color": name.split("_")[0], "position": position})
     imported = getattr(env, "robot_id", "openarm_v2") != "openarm_v2"
-    targets.extend({"id": name, "position": env.zone_position(name).tolist() if imported else list(position),
-                    "type": "table_region"} for name, position in TABLE_TARGETS.items())
+    if base_pose is None:
+        # Table regions belong to desk scenes; a mobile base's world has
+        # floor objects and no table targets to resolve.
+        targets.extend({"id": name, "position": env.zone_position(name).tolist() if imported else list(position),
+                        "type": "table_region"} for name, position in TABLE_TARGETS.items())
     relations = []
     from backend.app.agent.scene_relations import support_relations
     supports = support_relations(objects,contacts)
@@ -89,6 +96,7 @@ def build_world_state(env: SimulationBackend) -> dict:
                 "model_summary": env.model_summary(),
                 "joints": [{key: joint[key] for key in ("name", "type", "lower", "upper", "effort", "velocity")}
                            for joint in env.profile["joints"]], "grasp_calibrated": env.profile.get("grasp_calibrated", False), "grippers": {side: {k: g[k] for k in ("joint", "type", "status", "cube_size")} for side, g in env.profile.get("grippers", {}).items()}} if imported else {}),
+            "base_pose": base_pose,
             "active_arm": next((side for side, obj in holds.items() if obj), None),
             "left_arm": {"ee": frame.ee["left"], "gripper": frame.grippers["left"], "held_object": holds["left"]},
             "right_arm": {"ee": frame.ee["right"], "gripper": frame.grippers["right"], "held_object": holds["right"]},
@@ -98,12 +106,13 @@ def build_world_state(env: SimulationBackend) -> dict:
         "spatial_relations": relations,
         "support_relations": supports,
         "workspace": {"table_height_m":env.table_height,"position_unit":"m","rotation":"world_from_object"},
-        "capabilities": {"relative_placement": ["on", "left_of", "right_of", "front_of", "behind", "near"],
-                         "skills": ["observe_scene", "park_empty_arm", "move_relative", "return_home", "move_joint"] if imported and not env.profile.get("grippers") else
+        "capabilities": {"navigation": base_pose is not None,
+                         "relative_placement": ["on", "left_of", "right_of", "front_of", "behind", "near"],
+                         "skills": ["observe_scene", "park_empty_arm", "move_relative", "return_home", "move_joint", *(["navigate_to"] if base_pose is not None else [])] if imported and not env.profile.get("grippers") else
                          ["observe_scene", "park_empty_arm", "approach_object", "grasp_object", "lift_object", "move_to_target", "move_to_object",
                           "release_object", "retreat", "return_home", "open_gripper", "close_gripper",
                           "move_relative", "handover_object", *([] if imported else ["throw_object", "pour_liquid"]),
-                          *(["move_joint"] if imported else [])],
+                          *(["move_joint"] if imported else []), *(["navigate_to"] if base_pose is not None else [])],
                          "geometry_source": "Genesis collision bounds", "grasp": env.grasp_mode},
         "grasp_mode": env.grasp_mode,
         "spawn_validation": getattr(env, "spawn_validation", None),

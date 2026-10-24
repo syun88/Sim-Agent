@@ -508,9 +508,21 @@ def import_robot(folder):
                  for side, seed in seeds.items()}
     (target / 'ik_validation.json').write_text(json.dumps(ik_checks, indent=2) + '\n')
     from backend.app.robots.spawn import ReachableDeskSpawns
-    # Desk spawn validation measures desk reach; a floor robot has no desk
-    # props in this slice, so its scene starts empty.
-    spawn = {"objects": {}} if mobile_base else ReachableDeskSpawns(profile, scene).layout()
+    if mobile_base:
+        # A floor robot's props are authored, not desk-sampled: an optional
+        # floor_objects.json next to the URDF maps object names to floor
+        # positions ([x, y] or [x, y, z]; z defaults to half the scene's
+        # cube size, i.e. resting on the floor).
+        spawn = {"objects": {}}
+        authored = source.parent / "floor_objects.json"
+        if authored.is_file():
+            for name, entry in json.loads(authored.read_text()).get("objects", {}).items():
+                position = [float(v) for v in entry["position"]]
+                if len(position) == 2:
+                    position.append(scene["cube_size"] / 2)
+                spawn["objects"][name] = {"position": position}
+    else:
+        spawn = ReachableDeskSpawns(profile, scene).layout()
     scene['objects'] = spawn['objects']
     (target / 'scene.json').write_text(json.dumps(scene, indent=2) + '\n')
     (target / 'spawn_validation.json').write_text(json.dumps(spawn, indent=2) + '\n')
