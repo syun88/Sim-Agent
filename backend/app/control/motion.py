@@ -97,41 +97,12 @@ class OpenArmV2Controller:
     def cancel(self) -> None:
         self.cancelled = True
 
-    def solve_ik(
-        self,
-        side: str,
-        target_position: np.ndarray,
-        target_rotation: np.ndarray | None = None,
-        q_init: np.ndarray | None = None,
-        max_iterations: int = 500,
-    ) -> tuple[np.ndarray | None, float, float]:
-        limits = self.env.arm_limits(side)
-        # A robot with fewer than six joints cannot hold an arbitrary attitude, so its attitude is not
-        # asked for. Solving *with* one makes the least-squares task spend its freedom on a term it can
-        # never satisfy, and the iterate the mixed error keeps can be tens of millimetres off in
-        # position: measured 2026-10-25 on the four-joint OpenManipulator-X, every carry was refused
-        # with a 40-90 mm residual - including a carry to the very pose the arm was already holding -
-        # while the planner's IK, which asks for the position alone below six joints, solved the same
-        # poses with zero error. Six-joint arms still hold the attitude they are given.
-        under_actuated = len(limits) < 6
-        if q_init is None:
-            q = self.env.arm_qpos(side)
-        else:
-            q = np.clip(np.asarray(q_init, float), limits[:, 0], limits[:, 1])
-        if under_actuated:
-            # Not merely "do not substitute one": an arm that cannot hold an attitude must not be
-            # asked for one even when the caller passes it, because the least-squares task then spends
-            # its freedom on a term it can never satisfy and the iterate the mixed error keeps is tens
-            # of millimetres off in position. Measured 2026-10-25 on the four-joint
-            # OpenManipulator-X: carries were refused with 40-90 mm residuals for targets the
-            # planner's position-only IK solved with zero error, including the pose the arm was
-            # already holding. Calls that want an attitude on such an arm still get the position.
-            target_rotation = None
-        elif target_rotation is None:
-            target_rotation = self.env.ee_pose(side)[1]
-        kinematics = self.env.arm_kinematics(side)
-        best_q = q.copy()
-        best_error = np.inf
+    def _solve_from_seed(self, kinematics, limits, target_position, target_rotation, seed, max_iterations):
+        """One damped least-squares solve from one seed, with joint-limit avoidance."""
+        rotation_tolerance_ok = getattr(self.env, "ik_rotation_tolerance", .015)
+        position_tolerance_ok = getattr(self.env, "ik_position_tolerance", .002)
+        q = np.clip(np.asarray(seed, float), limits[:, 0], limits[:, 1])
+        best_q, best_error = q.copy(), np.inf
         for _ in range(max_iterations):
             position, rotation, linear_jacobian, angular_jacobian = kinematics.evaluate(q)
             perr = np.asarray(target_position, float) - position
@@ -140,7 +111,7 @@ class OpenArmV2Controller:
             if error < best_error:
                 best_error = error
                 best_q = q.copy()
-            if np.linalg.norm(perr) < getattr(self.env, "ik_position_tolerance", .002) and np.linalg.norm(oerr) < getattr(self.env, "ik_rotation_tolerance", .015):
+            if np.linalg.norm(perr) < position_tolerance_ok and np.linalg.norm(oerr) < rotation_tolerance_ok:
                 break
             J = np.vstack([linear_jacobian, angular_jacobian])
             # Weighted task vector matching the official openarm_control cost ratio
@@ -167,24 +138,89 @@ class OpenArmV2Controller:
                     scale = max(0.0, (upper_dist / braking_distance) ** 2)
                     dq[j] *= scale
             q = np.clip(q + dq, limits[:, 0], limits[:, 1])
-        # Judge the solution by the task that was actually asked for. The error above mixes position
-        # with a weighted orientation term, and an arm with fewer than six joints cannot drive that
-        # orientation term to zero at all: measured 2026-10-25, every carry of the four-joint
-        # OpenManipulator-X failed here with the same ~90 mm residual because a full six-degree-of-
-        # freedom pose was demanded, while the planner's IK - which already falls back to the position
-        # below six joints - solved the very same pose with zero error. Six-joint arms are unchanged.
         best_position, best_rotation, _, _ = kinematics.evaluate(best_q)
-        position_error = float(np.linalg.norm(np.asarray(target_position, float) - best_position))
-        attitude_error = 0. if target_rotation is None else float(np.linalg.norm(orientation_error(best_rotation, target_rotation)))
+        return {"q": best_q, "error": float(best_error),
+                "position_error": float(np.linalg.norm(np.asarray(target_position, float) - best_position)),
+                "attitude_error": (0. if target_rotation is None else
+                                   float(np.linalg.norm(orientation_error(best_rotation, target_rotation))))}
+
+    def _ik_seeds(self, side, limits, count=12):
+        """Deterministic alternative seeds for an arm that has fewer joints than the task needs.
+
+        A damped local solve stalls wherever its Jacobian is flat for the requested task - measured
+        2026-10-25 on the four-joint OpenManipulator-X, where a 2 cm residual persisted for targets the
+        planner's IK solved exactly. The home posture alone does not cover the joint space, so the sweep
+        adds the middle of the range plus a fixed pseudo-random sample: fixed so a failure is
+        reproducible, sampled so the sweep does not depend on which posture the arm happens to be in.
+        """
+        seeds = [np.asarray(self.env.home_arm_qpos(side), float),
+                 (limits[:, 0] + limits[:, 1]) / 2.]
+        rng = np.random.default_rng(0)
+        for _ in range(count):
+            unit = rng.random(len(limits))
+            seeds.append(limits[:, 0] + unit * (limits[:, 1] - limits[:, 0]))
+        return seeds
+
+    def solve_ik(
+        self,
+        side: str,
+        target_position: np.ndarray,
+        target_rotation: np.ndarray | None = None,
+        q_init: np.ndarray | None = None,
+        max_iterations: int = 500,
+    ) -> tuple[np.ndarray | None, float, float]:
+        limits = self.env.arm_limits(side)
+        # A robot with fewer than six joints cannot hold an arbitrary attitude, so its attitude is not
+        # asked for. Solving *with* one makes the least-squares task spend its freedom on a term it can
+        # never satisfy, and the iterate the mixed error keeps can be tens of millimetres off in
+        # position: measured 2026-10-25 on the four-joint OpenManipulator-X, every carry was refused
+        # with a 40-90 mm residual - including a carry to the very pose the arm was already holding -
+        # while the planner's IK, which asks for the position alone below six joints, solved the same
+        # poses with zero error. Six-joint arms still hold the attitude they are given.
+        under_actuated = len(limits) < 6
+        if under_actuated:
+            target_rotation = None
+        elif target_rotation is None:
+            target_rotation = self.env.ee_pose(side)[1]
+        kinematics = self.env.arm_kinematics(side)
         position_tolerance = getattr(self.env, "ik_position_tolerance", .002)
-        attitude_tolerance = getattr(self.env, "ik_rotation_tolerance", .015)
-        if best_error > 0.02 and not (under_actuated and position_error <= position_tolerance):
-            if q_init is None:
-                # A successful handover leaves a very different redundant-arm posture.
-                # Retry the official spawn posture before calling a reachable goal impossible.
-                return self.solve_ik(side, target_position, target_rotation, q_init=self.env.home_arm_qpos(side), max_iterations=max_iterations)
-            return None, best_error, float(best_error)
-        return best_q, best_error, float(best_error)
+
+        def accepted(result):
+            # The mixed error still decides, except that an arm which cannot hold the attitude is not
+            # failed for it: its position is the task.
+            if result["error"] <= .02:
+                return True
+            return bool(under_actuated and result["position_error"] <= position_tolerance)
+
+        attempts = []
+        seed = self.env.arm_qpos(side) if q_init is None else q_init
+        first = self._solve_from_seed(kinematics, limits, target_position, target_rotation, seed, max_iterations)
+        if accepted(first):
+            return first["q"], first["error"], first["error"]
+        attempts.append(first)
+        if q_init is None:
+            # A successful handover leaves a very different redundant-arm posture.
+            # Retry the official spawn posture before calling a reachable goal impossible.
+            home = self._solve_from_seed(kinematics, limits, target_position, target_rotation,
+                                         self.env.home_arm_qpos(side), max_iterations)
+            if accepted(home):
+                return home["q"], home["error"], home["error"]
+            attempts.append(home)
+            if not under_actuated:
+                return None, home["error"], home["error"]
+        elif not under_actuated:
+            return None, first["error"], first["error"]
+        # Fewer joints than the task asks for: a local solve is one basin among many, so search the
+        # others. This is the one owner for every skill - approach, lift, move, carry and the throw all
+        # reach the arm through this method.
+        for alternative in self._ik_seeds(side, limits):
+            attempt = self._solve_from_seed(kinematics, limits, target_position, target_rotation,
+                                            alternative, max_iterations)
+            if accepted(attempt):
+                return attempt["q"], attempt["error"], attempt["error"]
+            attempts.append(attempt)
+        best = min(attempts, key=lambda attempt: attempt["position_error"])
+        return None, best["error"], best["error"]
 
     def execute_joint_path(
         self,
