@@ -56,7 +56,8 @@ def program_signature(plan) -> list:
     already-held pick may be an explicit no-op, so raw action text cannot be compared directly.
     """
     return [(s.skill, s.object, s.arm, s.receiver, s.target, s.direction, s.distance_cm,
-             s.height_cm, s.volume_ml, s.relation, s.joint, s.position_deg) for s in plan.steps]
+             s.height_cm, s.volume_ml, s.relation, s.joint, s.position_deg,
+             s.stroke_cm, s.release_speed_m_s) for s in plan.steps]
 
 
 class AgentPlanner:
@@ -105,6 +106,10 @@ class AgentPlanner:
             "Use mode actions for the complete requested sequence. Preservation is checked independently from source text and physical state. "
             "Operations: pick (grasp and hold), handover (giver arm + receiver), place (put on table), "
             "approach, move (direction + distance_cm), open, close, home, throw (upward cube toss + height_cm), "
+            "For throw you also design the launch: optional stroke_cm (2-30, how far the arm travels before "
+            "release) and release_speed_m_s (0.2-3.0). A free rise of h metres needs about sqrt(2*9.81*h) m/s "
+            "at release; short ramp with a long stroke is how to reach it. The skill returns the design and the "
+            "measured release speed, so if a throw falls short, raise release_speed_m_s (or stroke_cm) and retry. "
             "pour (wine_bottle into wine_glass, volume_ml 5 to 35, default 20). "
             "For imported robots, read capabilities.skills and detected grippers; never invent an unavailable skill or gripper. "
             "When the user omits a hand, prefer the object's admitted_grasp_arm if present: its spawn approach passed IK. "
@@ -266,11 +271,61 @@ class AgentPlanner:
             content = response.choices[0].message.content or ""
         return content
 
+    def _monitor_recovery(self, instruction, state, failure, legal_actions):
+        """Ask the local decision model which legal recovery fits, with typed answers.
+
+        A decision model reads a distribution over named options instead of writing prose, so its answer
+        cannot be malformed - only illegal, which the caller checks. Measured on d1-omni-600M
+        (2026-10-25, CPU): 3.8 s for two questions over a scene state. Deliberately advisory: an
+        unavailable or low-confidence judgement returns None and the caller keeps its deterministic path.
+        """
+        from backend.app.planning import decision_model
+
+        criteria = {
+            'resume': 'Continue the uncompleted operations from the observed state; meaningful progress exists.',
+            'recover_in_place': 'Open or retreat the empty contacting gripper, return the free arm home, '
+                                'then replan from the SAME scene.',
+            'alternate_arm': 'Use the other hand because the requested hand cannot do it.',
+            'reset_and_retry': 'Restart the whole scene and retry, discarding all progress.',
+        }
+        criteria = {name: criteria[name] for name in legal_actions if name in criteria}
+        # A monitor that is not asked must say so, for the same reason a skipped model does: "no
+        # judgement" and "judged and overruled" are different facts about a recovery.
+        if len(criteria) < 2:
+            return {'provider': 'local_decision', 'asked': False, 'used': False,
+                    'skipped_because': 'fewer_than_two_legal_options', 'legal_actions': legal_actions}
+        occupancy = {s: state.get('robot', {}).get(s + '_arm', {}).get('held_object') for s in ('left', 'right')}
+        arms = state.get('robot', {}).get('available_arms', [])
+        objects = ', '.join(f"{o['id']} at {[round(v, 3) for v in o.get('position', [])]}"
+                            f"{' held by ' + str(o['held_by']) if o.get('held_by') else ''}"
+                            for o in state.get('objects', []))
+        text = (f"Robot arms available: {arms}. Hand occupancy: {occupancy}. Objects: {objects}. "
+                f"Instruction: {instruction}. Failure: {failure.get('category')} - {failure.get('detail')}")
+        questions = {'next': {'type': 'choice', 'instructions': 'Which legal recovery best fits this failure?',
+                              'criteria': criteria}}
+        answer = decision_model.ask(text, questions, timeout=15.)
+        if not answer:
+            return {'provider': 'local_decision', 'asked': False, 'used': False,
+                    'skipped_because': 'no_answer' if decision_model.available() else 'not_configured'}
+        result = answer['answers'].get('next') or {}
+        decision, confidence = result.get('choice'), float(result.get('confidence') or 0.)
+        return {'asked': True, 'decision': decision, 'confidence': confidence, 'provider': 'local_decision',
+                'probabilities': result.get('probabilities'),
+                'reason': f'local_decision: {decision} ({confidence:.2f})'}
+
     def assess_failure(self, instruction, state, failure, legal_actions):
         """Choose among physically admitted recovery operations, never a new goal."""
+        verdict = self._monitor_recovery(instruction, state, failure, legal_actions)
+        if verdict and verdict.get('asked'):
+            # A judgement that was considered and NOT used must stay visible. "The monitor said
+            # recover_in_place at 0.49 and was overruled" is provenance; dropping it makes an unused
+            # monitor indistinguishable from an absent one.
+            verdict['used'] = bool(verdict['decision'] in legal_actions and verdict['confidence'] >= .5)
+            if verdict['used']:
+                return verdict
         if not self.enabled:
             return {'decision':legal_actions[0], 'reason':'現在の状態で実行可能な復旧手順を選びます。',
-                    'provider':'deterministic_fallback'}
+                    'provider':'deterministic_fallback', 'monitor':verdict}
         schema = {'type':'object','properties':{
             'decision':{'enum':legal_actions},'reason':{'type':'string'},
             'requirements':{'type':'array','items':{'type':'string'},'maxItems':5}},
@@ -292,10 +347,11 @@ class AgentPlanner:
             assessment = self._extract_json(self._complete(messages,schema,timeout=12.,max_tokens=450))
             if assessment.get('decision') not in legal_actions or not isinstance(assessment.get('reason'),str):
                 raise ValueError('Invalid recovery choice')
-            return {**assessment,'provider':self.configured_provider}
+            return {**assessment,'provider':self.configured_provider,'monitor':verdict}
         except Exception:
             return {'decision':legal_actions[0],'reason':'モデルによる復旧案を検証できないため、観測状態と実行条件から復旧します。',
-                    'provider':'deterministic_fallback','provider_error':'RECOVERY_REASONING_UNAVAILABLE'}
+                    'provider':'deterministic_fallback','provider_error':'RECOVERY_REASONING_UNAVAILABLE',
+                    'monitor':verdict}
 
     def _check_coverage(self, instruction, candidate, state):
         """Independent semantic audit for compound clauses the grammar could not cover."""

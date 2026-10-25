@@ -31,6 +31,11 @@ class TaskAction(BaseModel):
     distance_cm: float | None = Field(default=None, ge=1, le=30)
     height_cm: float | None = Field(default=None, ge=1, le=10)
     volume_ml: float | None = Field(default=None, ge=5, le=35)
+    # The throw's own design, decided by the planner instead of by a constant in the skill: how far the
+    # arm travels before release, and how fast the object leaves it. The engine still measures the
+    # flight, so a weak design cannot be reported as a successful throw.
+    stroke_cm: float | None = Field(default=None, ge=2, le=30)
+    release_speed_m_s: float | None = Field(default=None, ge=.2, le=3.)
     joint: str | None = None
     position_deg: float | None = Field(default=None, allow_inf_nan=False)
 
@@ -330,7 +335,8 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             acquire(obj, arm, index)
             action.direction = "up"
             action.height_cm = action.height_cm or 3.
-            emit("throw_object", arm, index, object=obj, height_cm=action.height_cm)
+            emit("throw_object", arm, index, object=obj, height_cm=action.height_cm,
+                 stroke_cm=action.stroke_cm, release_speed_m_s=action.release_speed_m_s)
             held[arm] = None
             checks.pop(obj, None)
             checks[f"throw:{index}"] = {"type": "throw", "object": obj, "arm": arm,

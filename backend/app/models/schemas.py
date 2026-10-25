@@ -34,6 +34,8 @@ class PlanStep(BaseModel):
     grasp_offset_x: float = Field(default=0., ge=-.02, le=.02)
     height_cm: float | None = Field(default=None, ge=1, le=10)
     volume_ml: float | None = Field(default=None, ge=5, le=35)
+    stroke_cm: float | None = Field(default=None, ge=2, le=30)
+    release_speed_m_s: float | None = Field(default=None, ge=.2, le=3.)
     joint: str | None = None
     position_deg: float | None = Field(default=None, allow_inf_nan=False)
 

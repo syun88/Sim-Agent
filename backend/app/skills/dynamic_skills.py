@@ -96,40 +96,74 @@ def launch_ready(runner, arm, obj, windup, attitude, stroke=.14):
     return False, "", "unreachable with either the held or the arm's own attitude"
 
 
-def throw_up(runner, arm: str, obj: str, height_cm: float = 3.) -> dict:
+def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
+             stroke_cm: float | None = None, release_speed_m_s: float | None = None) -> dict:
+    """Throw upward. The *design* is computed; the *measurement* is the engine's.
+
+    Three things determine whether a pinch throw leaves the hand at all, and all three are physics rather
+    than constants:
+
+    * **Speed.** A free rise of ``h`` metres needs ``v = sqrt(2*g*h)`` at release (0.767 m/s for 3 cm).
+    * **Contact time.** The cube is accelerated by friction, so ``dv <= mu*g*T``: a short, violent stroke
+      cannot reach a high speed because there is no time to transfer momentum. Measured 2026-10-25 on
+      OpenManipulator-X: a 7 cm stroke over 0.06 s released at 0.45 m/s, and asking for a faster stroke
+      *lowered* the release speed to 0.22 of the design - the calibration-stroke correction made it
+      worse, which is what proves the limit is contact time and not command tracking.
+    * **Release while ascending.** A cube let go at the end of a stroke has stopped accelerating, and one
+      let go after it has stopped moving; release therefore happens at ``RELEASE_PHASE`` of the ramp.
+
+    So the design is a long stroke with the ramp that yields the needed speed, ``ramp = 2*p*stroke/v``,
+    and the stroke is as long as the arm can still hold and swing (searched from long to short). The
+    engine measures the flight, so a design that does not clear the requested rise fails honestly and
+    its numbers travel with the failure for the planner to revise.
+    """
     from backend.app.skills.robot_skills import SkillError
 
     env, control = runner.env, runner.controller
     runner._require_hold(arm, obj)
-    # The stroke is part of the task, not a constant measured from the official cell: a throw of 3 cm
-    # does not need 14 cm of travel, and asking for it makes the wind-up search reject every pose a
-    # short arm can carry. The launch is measured from the engine either way (``evaluate_throw``), so a
-    # stroke that is too short cannot be reported as a successful throw.
-    stroke = max(.05, height_cm / 100. + .04)
-    # Raise the object into a pose this arm can hold and stroke up from. The official wind-up is tried
-    # first and is what the official arms keep; a robot that cannot reach it gets one derived from the
-    # object's own position, because the launch only needs headroom above a held pose, not a constant.
+    needed = (2. * 9.81 * max(height_cm / 100., .001)) ** .5
+    # What the pinch transmits of the commanded speed, measured on this robot with long strokes:
+    # 0.65/0.806 and 0.652/0.806 on two runs at 16 cm and 20 cm (2026-10-25). Asking for the speed the
+    # flight needs therefore releases ~19% slower than needed, so the command is raised by that measured
+    # ratio. It is a measurement, not a fudge: at short strokes the same pinch transmitted only 0.42 and
+    # 0.22, which is why the stroke length is chosen first.
+    PINCH_TRANSMISSION = .81
+    # A margin on top of the transmission: the flight is sampled every other step, so the recorded apex
+    # is quantised by about v*dt = 13 mm and a design that aims exactly at the requirement lands either
+    # side of it. Measured 2026-10-25: aiming exactly produced 29.4 mm of rise for a 30 mm request.
+    SPEED_MARGIN = 1.10
+    speed = (float(release_speed_m_s) if release_speed_m_s
+             else needed * SPEED_MARGIN / PINCH_TRANSMISSION)
+    RELEASE_PHASE = .9
+    # Long first: a short stroke cannot transfer the momentum, however fast it is commanded.
+    strokes = ([float(stroke_cm) / 100.] if stroke_cm else
+               [max(.20, height_cm / 100. + .16), .16, .12, .07])
+    windup = mode = None
     rejected = []
-    for windup, label, mode in windup_candidates(runner, arm, obj, stroke=stroke):
-        attitude = _attitude_in_use(runner, arm)
-        ok, mode, reason = launch_ready(runner, arm, obj, windup, attitude)
-        if not ok:
-            rejected.append(f'{label} ({reason})')
-            continue
-        try:
-            runner._carry_to(arm, obj, windup, attitude="free" if mode == "arm-achieved" else "pinned")
-        except (SkillError,) as error:
-            if getattr(error, 'category', '') in ('GRASP_LOST', 'GRASP_SLIP'):
-                raise
-            # Keep the controller's own words: the category alone hid the reason the carry was refused.
-            rejected.append(f'{label} (carry {getattr(error, "category", type(error).__name__)}: {error})')
-            continue
-        env.step(200)
-        runner._require_hold(arm, obj)
-        break
+    for stroke in strokes:
+        for candidate, label, candidate_mode in windup_candidates(runner, arm, obj, stroke=stroke):
+            attitude = _attitude_in_use(runner, arm)
+            ok, candidate_mode, reason = launch_ready(runner, arm, obj, candidate, attitude, stroke=stroke)
+            if not ok:
+                rejected.append(f'{label} @{stroke * 100:.0f}cm ({reason})')
+                continue
+            try:
+                runner._carry_to(arm, obj, candidate, attitude="free" if candidate_mode == "arm-achieved" else "pinned")
+            except (SkillError,) as error:
+                if getattr(error, 'category', '') in ('GRASP_LOST', 'GRASP_SLIP'):
+                    raise
+                # Keep the controller's own words: the category alone hid why the carry was refused.
+                rejected.append(f'{label} @{stroke * 100:.0f}cm (carry '
+                                f'{getattr(error, "category", type(error).__name__)}: {error})')
+                continue
+            env.step(200)
+            runner._require_hold(arm, obj)
+            windup, mode = np.asarray(candidate, float), candidate_mode
+            break
+        if windup is not None:
+            break
     else:
-        raise SkillError('IK_FAILURE', 'No wind-up this arm can hold and stroke from: ' + '; '.join(rejected))
-    launch_from = np.asarray(windup, float)
+        raise SkillError('IK_FAILURE', 'No wind-up this arm can hold and stroke from: ' + '; '.join(rejected[:6]))
     initial_contacts = env.object_contacts(obj, arm)
     position, rotation = env.ee_pose(arm)
     start = env.arm_qpos(arm)
@@ -144,42 +178,50 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3.) -> dict:
     end = env.model.nearest_continuous(env.profile['chains'][arm]['joints'], planned['q_rad'], start)
     if mode == "strict":
         control.target_rotations[arm] = rotation.copy()
+    ramp = max(.05, min(.6, 2. * RELEASE_PHASE * stroke / speed))
+    release_at = RELEASE_PHASE * ramp
     trace = []
-    # Wind-up/transport use the fast trajectory. Preserve the calibrated launch
-    # response and release timing that define the requested free-flight height.
     env.configure_motion_response(1.)
     try:
-        for step in range(int(.95 / env.timestep)):
+        for step in range(int((ramp + .67) / env.timestep)):
             if control.stop_requested():
                 raise SkillError("STOPPED", "Throw stopped")
             t = step * env.timestep
-            phase = min(t / .28, 1.)
+            phase = min(t / ramp, 1.)
             env.set_arm(arm, start + (end - start) * phase ** 2)
-            if t >= .24:
+            if t >= release_at:
                 control.set_gripper(arm, False)
             env.step()
-            if t >= .20:
-                contacts = env.object_contact_links(obj)
-                if step % 2 == 0:
-                    trace.append({"t": t, "position": env.object_pose(obj)[0].tolist(),
-                                  "velocity": env.object_velocity(obj).tolist(), "contacts": contacts})
-            if t < .235 and not runner._pinch_established(obj, arm):
+            if t >= max(0., release_at - .06) and step % 2 == 0:
+                trace.append({"t": t, "position": env.object_pose(obj)[0].tolist(),
+                              "velocity": env.object_velocity(obj).tolist(),
+                              "contacts": env.object_contact_links(obj)})
+            if t < release_at - .005 and not runner._pinch_established(obj, arm):
                 raise SkillError("GRASP_LOST", "The cube slipped before commanded release")
     finally:
         env.set_arm(arm, env.arm_qpos(arm))
         env.configure_motion_response(control.motion_speed)
-    evidence = evaluate_throw(trace, height_cm / 100.)
+    evidence = evaluate_throw(trace, height_cm / 100., release_after=release_at)
+    design = {"stroke_cm": round(stroke * 100., 1), "ramp_seconds": round(ramp, 3),
+              "release_phase": RELEASE_PHASE, "release_after": round(release_at, 3),
+              "needed_release_speed_m_s": round(needed, 3),
+              "designed_release_speed_m_s": round(2. * RELEASE_PHASE * stroke / ramp, 3),
+              "requested_release_speed_m_s": release_speed_m_s,
+              "measured_release_speed_m_s": round(float((evidence.get("release_velocity") or [0, 0, 0])[2]), 3)}
     if not evidence["success"]:
-        raise SkillError("THROW_FAILED", f"Measured upward free flight did not reach {height_cm:g} cm: {evidence}")
-    return {"object": obj, "arm": arm, "requested_free_rise": height_cm / 100.,
+        # The design and the measurement travel with the failure: "measured 0.45 m/s where 0.767 was
+        # needed" is a value the planner can revise, while "the throw failed" is not.
+        raise SkillError("THROW_FAILED", f"Measured upward free flight did not reach {height_cm:g} cm "
+                         f"(design {design}): {evidence}")
+    return {"object": obj, "arm": arm, "requested_free_rise": height_cm / 100., "design": design,
             "pinch_contacts_before_launch": initial_contacts, "trajectory": trace, **evidence,
             "grasp_mode": env.grasp_mode}
 
 
-def evaluate_throw(trace: list[dict], minimum_rise: float) -> dict:
+def evaluate_throw(trace: list[dict], minimum_rise: float, release_after: float = .24) -> dict:
     """Recompute launch and apex from recorded engine samples, independent of skill success."""
     release = next((i for i, sample in enumerate(trace)
-                    if sample["t"] >= .24 and not sample["contacts"] and sample["velocity"][2] > .1), None)
+                    if sample["t"] >= release_after and not sample["contacts"] and sample["velocity"][2] > .1), None)
     if release is None:
         return {"success": False, "failure_category": "NO_UPWARD_FREE_FLIGHT"}
     flight = []
