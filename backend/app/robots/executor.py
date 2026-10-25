@@ -1,11 +1,22 @@
 """Motor-driven manipulation using gripper frames inferred from URDF geometry."""
 import copy
 import time
+from contextlib import contextmanager
+
 import numpy as np
 
 from backend.app.execution.task_executor import TaskExecutor
 from backend.app.skills.robot_skills import SkillRunner, SkillError
 from backend.app.control.motion import OpenArmV2Controller
+from backend.app.robots.gravity import GRAVITY_TORQUE_RATIO_LIMIT, gravity_report
+
+
+#: How many candidate placements the relocation search evaluates (in
+#: preference order) while collecting placements with a collision-free
+#: grasp seed. Evaluation is planning-only; at most three of the collected
+#: placements are actually driven to. The bound keeps a hopeless search
+#: from enumerating the whole grid after a failed approach.
+_PLACEMENT_EVALUATION_BUDGET = 64
 
 
 class ImportedRobotController(OpenArmV2Controller):
@@ -245,6 +256,95 @@ class ImportedRobotSkills(SkillRunner):
             return [nominal]
         return [nominal, np.asarray(frame)]
 
+    @contextmanager
+    def _base_hold(self):
+        """Servo the wheels on the measured base pose while the arm works.
+
+        A mobile base left in zero-velocity wheel control still walks
+        under the arm's reaction torques (measured on LeKiwi: +0.081 rad
+        of yaw during one approach transit, and the sagging arm shoved the
+        target cube 0.11 m). The env's base hold closes the loop on the
+        measured pose for the duration of a manipulation skill; navigation
+        suspends the hold itself and re-anchors it on arrival. Envs
+        without a mobile base have no hold to engage.
+        """
+        engage = getattr(self.env, 'engage_base_hold', None)
+        if not callable(engage) or not self.env.profile.get('mobile_base'):
+            yield
+            return
+        engage()
+        try:
+            yield
+        finally:
+            self.env.release_base_hold()
+
+    def _gravity_margin(self, arm, q, snapshot=None):
+        """Gravity-torque report for one arm posture, or None if unscored.
+
+        Planning on a mobile base cannot assume the posture can be held:
+        the servos' peak effort is finite and gravity is not compensated
+        (see backend/app/robots/gravity.py). A None report (profile
+        without effort data, stub envs in tests) never gates a seed.
+        """
+        try:
+            return gravity_report(self.env.profile, self.env.model, arm, q, snapshot)
+        except Exception:
+            return None
+
+    def _path_gravity(self, arm, corridor, closure, snapshot, seed_report):
+        """Worst gravity-torque ratio over a planned approach, for evidence.
+
+        Scores the grasp seed, every closure-sweep sample and every
+        corridor waypoint, so the reported margin covers the poses the
+        arm will actually be commanded through, not only the seed.
+        """
+        worst = None if seed_report is None else seed_report['worst_ratio']
+        postures = [row['arm_q'] for row in (closure or [])] + list(corridor or [])
+        for q in postures:
+            report = self._gravity_margin(arm, q, snapshot)
+            if report is not None:
+                worst = report['worst_ratio'] if worst is None else max(worst, report['worst_ratio'])
+        return {'seed_worst_ratio': None if seed_report is None else seed_report['worst_ratio'],
+                'path_worst_ratio': worst, 'limit': GRAVITY_TORQUE_RATIO_LIMIT,
+                'over_limit': bool(worst is not None and worst > GRAVITY_TORQUE_RATIO_LIMIT)}
+
+    def _plan_corridor(self, arm, rotation, seed, closure, insertion, standoff,
+                       snapshot, names, seed_key):
+        """Back-plan the approach corridor from a closure-checked seed.
+
+        Returns (corridor, high_point) or None. Identical planning to the
+        original inline code: insertion chain back from the grasp seed,
+        then a high transit seed with a direct, edge-clear path from the
+        current arm pose.
+        """
+        corridor = [seed]
+        for point in reversed(insertion[:-1]):
+            seed, _, _ = self.controller.solve_ik(arm, point, rotation, q_init=seed)
+            if seed is None:
+                return None
+            corridor.append(seed)
+        high_seed = None
+        high = None
+        for height in (.08, .05, max(.025, self.env.cube_size)):
+            candidate_high = standoff + [0., 0., height]
+            high_seed, _, _ = self.controller.solve_ik(arm, candidate_high, rotation, q_init=seed,
+                                                       path_start=self.env.arm_qpos(arm), require_direct=True)
+            if high_seed is None:
+                high_seed, _, _ = self.controller.solve_ik(arm, candidate_high, rotation,
+                                                           path_start=self.env.arm_qpos(arm), require_direct=True)
+            if high_seed is not None and self.env.collision_queries.edge_clear(
+                    names, high_seed, seed, snapshot, minimum_clearance=.0001):
+                high = candidate_high
+                break
+            high_seed = None
+        if high_seed is None:
+            return None
+        corridor.append(high_seed)
+        self._closure_plans = {**getattr(self, '_closure_plans', {}), arm: closure}
+        self.controller._approach_seeds[seed_key] = [corridor[0],
+                                                     *self.controller._approach_seeds.get(seed_key, [])][:4]
+        return corridor, high
+
     def _approach_planned(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
         if arm not in self.env.grippers:
             raise SkillError('ROBOT_CAPABILITY', 'This arm has no detected opposed jaws')
@@ -267,9 +367,20 @@ class ImportedRobotSkills(SkillRunner):
         guesses = [*self.controller._approach_seeds.get(seed_key,[]), self.env.arm_qpos(arm), home]
         guesses.extend(np.clip(home+axis*shift,*limits.T) for axis in np.eye(len(home)) for shift in [-.5,.5,-1.,1.])
         reverse_seeds = None
+        chosen_gravity = None
         snapshot = self.env.joint_snapshot()
         names = self.env.profile['chains'][arm]['joints']
         rotations = self._approach_rotations(arm, before, snapshot)
+        # Gravity margin orders the candidates; it does not veto them. A
+        # collision-free seed whose holding torque exceeds the margin is
+        # remembered and planned only when no in-margin seed yields a
+        # corridor, best margin first, with the excess reported in the
+        # result. The gate matters on mobile bases, where gravity is not
+        # compensated: on LeKiwi the first clear seed at every placement
+        # the search found demanded 2.4-3.7x the shoulder servo's peak
+        # effort just to stand still, and the executed transit sagged to
+        # the floor (MOTION_BLOCKED, tool at 0.006 m).
+        over_limit = []
         for rotation in rotations:
             for guess in guesses:
                 if self.controller.stop_requested():raise SkillError('STOPPED','Approach planning stopped')
@@ -279,37 +390,34 @@ class ImportedRobotSkills(SkillRunner):
                 if not goal['success']:continue
                 seed = self.env.model.nearest_continuous(names,goal['q_rad'],self.env.arm_qpos(arm))
                 if not self.env.collision_queries.clear({**snapshot,**dict(zip(names,seed))}):continue
+                margin = self._gravity_margin(arm, seed, snapshot)
+                if margin is not None and margin['over_limit']:
+                    over_limit.append((margin['worst_ratio'], rotation, seed))
+                    continue
                 closure = self.controller.plan_closure(arm,before,rotation,seed)
                 if closure is None:continue
-                seed = closure[0]['arm_q']
-                corridor = [seed]
-                for point in reversed(insertion[:-1]):
-                    seed, _, _ = self.controller.solve_ik(arm, point, rotation, q_init=seed)
-                    if seed is None:break
-                    corridor.append(seed)
-                if seed is not None:
-                    # Reconfiguration is allowed in the high, empty-hand transit.
-                    # Only the final insertion needs a single Cartesian branch.
-                    high_seed = None
-                    for height in (.08,.05,max(.025,self.env.cube_size)):
-                        candidate_high = standoff+[0.,0.,height]
-                        high_seed,_,_ = self.controller.solve_ik(arm,candidate_high,rotation,q_init=seed,
-                            path_start=self.env.arm_qpos(arm),require_direct=True)
-                        if high_seed is None:
-                            high_seed,_,_ = self.controller.solve_ik(arm,candidate_high,rotation,
-                                path_start=self.env.arm_qpos(arm),require_direct=True)
-                        if high_seed is not None and self.env.collision_queries.edge_clear(
-                                names,high_seed,seed,snapshot,minimum_clearance=.0001):
-                            high = candidate_high
-                            break
-                        high_seed = None
-                    if high_seed is None:continue
-                    corridor.append(high_seed)
-                    reverse_seeds = corridor
-                    self._closure_plans = {**getattr(self,'_closure_plans',{}),arm:closure}
-                    self.controller._approach_seeds[seed_key] = [corridor[0],*self.controller._approach_seeds.get(seed_key,[])][:4]
-                    break
+                planned = self._plan_corridor(arm, rotation, closure[0]['arm_q'], closure,
+                                              insertion, standoff, snapshot, names, seed_key)
+                if planned is None:continue
+                reverse_seeds, high = planned
+                chosen_gravity = self._path_gravity(arm, reverse_seeds, closure, snapshot, margin)
+                break
             if reverse_seeds is not None:break
+        if reverse_seeds is None:
+            attempted = set()
+            for ratio, rotation, seed in sorted(over_limit, key=lambda row: row[0]):
+                key = tuple(np.round(seed, 6))
+                if key in attempted:continue
+                attempted.add(key)
+                closure = self.controller.plan_closure(arm,before,rotation,seed)
+                if closure is None:continue
+                planned = self._plan_corridor(arm, rotation, closure[0]['arm_q'], closure,
+                                              insertion, standoff, snapshot, names, seed_key)
+                if planned is None:continue
+                reverse_seeds, high = planned
+                chosen_gravity = self._path_gravity(arm, reverse_seeds, closure, snapshot,
+                                                    self._gravity_margin(arm, seed, snapshot))
+                break
         if reverse_seeds is None:
             raise SkillError('COLLISION_PATH','No grasp posture has a continuous collision-free approach corridor')
         # The frame that planned the corridor is the frame this arm pinches with from now on.
@@ -323,7 +431,8 @@ class ImportedRobotSkills(SkillRunner):
         if disturbance > self.env.cube_size * .12:
             raise SkillError('APPROACH_COLLISION', f'Approach displaced the cube by {disturbance:.6f}m')
         return {'target': before.tolist(), 'final': result.final_position,
-                'object_displacement': disturbance, 'cube_size': self.env.cube_size}
+                'object_displacement': disturbance, 'cube_size': self.env.cube_size,
+                'gravity_torque': chosen_gravity}
 
     # -- mobile base placement search --------------------------------------
     #
@@ -337,6 +446,10 @@ class ImportedRobotSkills(SkillRunner):
     # there. Desk robots and non-collision failures are untouched.
 
     def _approach(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
+        with self._base_hold():
+            return self._approach_attempt(arm, obj, progress, fault_offset, grasp_offset_x)
+
+    def _approach_attempt(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
         try:
             return self._approach_planned(arm, obj, progress, fault_offset, grasp_offset_x)
         except SkillError as exc:
@@ -360,10 +473,16 @@ class ImportedRobotSkills(SkillRunner):
         original_root = copy.deepcopy(self.env.profile['root_transform'])
         evidence = {'evaluated_candidates': 0, 'clear_seed_placements': [], 'drives': []}
         self._placement_search_evidence = evidence
-        driven = 0
         try:
+            # Collect first (planning only), then drive. Placements whose
+            # grasp seed the arm can actually hold - gravity-torque ratio
+            # within the margin - are driven to before placements whose
+            # seeds exceed it, which are ordered by margin; driving is the
+            # physical, expensive step, so the ordering is settled while
+            # changing it is still free.
+            clear = []
             for placement in candidate_base_placements(target[:2], current[:2]):
-                if driven >= 3:
+                if len(clear) >= 3 or evidence['evaluated_candidates'] >= _PLACEMENT_EVALUATION_BUDGET:
                     break
                 if (np.linalg.norm(np.asarray(placement.target_xy) - current[:2]) < .03
                         and abs(wrap_angle(placement.target_yaw - float(current[2]))) < .08):
@@ -372,8 +491,20 @@ class ImportedRobotSkills(SkillRunner):
                 seed = self._grasp_seed_at_placement(arm, target, snapshot, placement, original_root)
                 if seed is None:
                     continue
+                clear.append((placement, seed))
                 evidence['clear_seed_placements'].append(
-                    {**placement.as_dict(), 'arm_q': seed['arm_q'], 'closure_planned': seed['closure_planned']})
+                    {**placement.as_dict(), 'arm_q': seed['arm_q'],
+                     'closure_planned': seed['closure_planned'],
+                     'gravity_worst_ratio': seed.get('gravity_worst_ratio')})
+
+            def over_limit(seed):
+                ratio = seed.get('gravity_worst_ratio')
+                return ratio is not None and ratio > GRAVITY_TORQUE_RATIO_LIMIT
+
+            ordered = ([entry for entry in clear if not over_limit(entry[1])]
+                       + sorted((entry for entry in clear if over_limit(entry[1])),
+                                key=lambda entry: entry[1]['gravity_worst_ratio']))
+            for placement, seed in ordered[:3]:
                 # The placement was evaluated at this exact pose and the
                 # grasp margins beyond it are millimetric, so drive with
                 # tight arrival tolerances: at the default 50 mm / 0.05 rad
@@ -383,7 +514,6 @@ class ImportedRobotSkills(SkillRunner):
                 # than the one that was evaluated (measured on LeKiwi).
                 move = self.navigate_to(placement.target_xy, placement.target_yaw, exclude_object=obj,
                                         arrive_tolerance=.01, yaw_tolerance=.02)
-                driven += 1
                 evidence['drives'].append({**placement.as_dict(), 'navigate_success': bool(move.get('success'))})
                 if not move.get('success'):
                     continue
@@ -393,6 +523,8 @@ class ImportedRobotSkills(SkillRunner):
                     continue
                 result['base_placement'] = {**placement.as_dict(), 'arm_q': seed['arm_q'],
                                             'closure_planned': seed['closure_planned'],
+                                            'gravity_worst_ratio': seed.get('gravity_worst_ratio'),
+                                            'gravity_over_limit': over_limit(seed),
                                             'evaluated_candidates': evidence['evaluated_candidates']}
                 return result
             return None
@@ -416,7 +548,14 @@ class ImportedRobotSkills(SkillRunner):
         Also reports whether the jaw-closure plan succeeds for the found
         seed - diagnostic only: closure planning runs again inside the
         retried approach, so it does not gate selection. Returns
-        {"arm_q": ..., "closure_planned": bool} or None.
+        {"arm_q": ..., "closure_planned": bool, "gravity_worst_ratio":
+        float | None} or None.
+
+        Seed choice within the placement is gravity-aware, like the
+        approach itself: the first in-margin clear seed wins; when every
+        clear seed exceeds the holding-torque margin, the best-margin one
+        is returned (its ratio travels with it, so the caller's drive
+        ordering and the result evidence can surface the excess).
         """
         from backend.app.robots.urdf import solve_profile_ik
         profile = self.env.profile
@@ -435,6 +574,7 @@ class ImportedRobotSkills(SkillRunner):
             guesses = [*self.controller._approach_seeds.get(seed_key, []), self.env.arm_qpos(arm), home]
             guesses.extend(np.clip(home + axis * shift, *limits.T)
                            for axis in np.eye(len(home)) for shift in [-.5, .5, -1., 1.])
+            best_over = None  # (gravity ratio, rotation, seed)
             for rotation in self._approach_rotations(arm, target, snapshot):
                 for guess in guesses:
                     if self.controller.stop_requested():
@@ -446,8 +586,19 @@ class ImportedRobotSkills(SkillRunner):
                     seed = self.env.model.nearest_continuous(names, goal['q_rad'], self.env.arm_qpos(arm))
                     if not self.env.collision_queries.clear({**snapshot, **dict(zip(names, seed))}):
                         continue
+                    margin = self._gravity_margin(arm, seed, snapshot)
+                    if margin is not None and margin['over_limit']:
+                        if best_over is None or margin['worst_ratio'] < best_over[0]:
+                            best_over = (margin['worst_ratio'], rotation, seed)
+                        continue
                     closure = self.controller.plan_closure(arm, target, rotation, seed, snapshot=snapshot)
-                    return {'arm_q': np.asarray(seed).tolist(), 'closure_planned': closure is not None}
+                    return {'arm_q': np.asarray(seed).tolist(), 'closure_planned': closure is not None,
+                            'gravity_worst_ratio': None if margin is None else margin['worst_ratio']}
+            if best_over is not None:
+                ratio, rotation, seed = best_over
+                closure = self.controller.plan_closure(arm, target, rotation, seed, snapshot=snapshot)
+                return {'arm_q': np.asarray(seed).tolist(), 'closure_planned': closure is not None,
+                        'gravity_worst_ratio': ratio}
             return None
         finally:
             profile['root_transform'] = copy.deepcopy(original_root)
@@ -545,6 +696,10 @@ class ImportedRobotSkills(SkillRunner):
         return contacts
 
     def _grasp(self, arm, obj):
+        with self._base_hold():
+            return self._grasp_attempt(arm, obj)
+
+    def _grasp_attempt(self, arm, obj):
         before = self.env.object_pose(obj)[0].copy()
         contacts = self._close_pinch(arm,obj)
         position, rotation = self.env.ee_pose(arm)
@@ -610,6 +765,10 @@ class ImportedRobotSkills(SkillRunner):
         return self._skill('lift_object',run,time.perf_counter())
 
     def _move_relative(self, arm, delta):
+        with self._base_hold():
+            return self._move_relative_attempt(arm, delta)
+
+    def _move_relative_attempt(self, arm, delta):
         start,rotation = self.env.ee_pose(arm)
         rotation = self.controller.target_rotations.get(arm,rotation)
         obj = self.held_object(arm)
@@ -912,6 +1071,10 @@ class ImportedRobotSkills(SkillRunner):
         return evidence
 
     def _joint_trajectory(self, arm, target, duration=1.):
+        with self.skills._base_hold():
+            return self._joint_trajectory_attempt(arm, target, duration)
+
+    def _joint_trajectory_attempt(self, arm, target, duration=1.):
         start = self.env.arm_qpos(arm)
         specs = {j['name']: j for j in self.env.profile['joints']}
         velocities = np.asarray([max(.01, specs[name]['velocity']) for name in self.env.profile['chains'][arm]['joints']])

@@ -322,6 +322,18 @@ class SkillRunner:
             self.env.base_pose()
         except NotImplementedError:
             raise SkillError("NAVIGATION_UNSUPPORTED", "This scene's robot has no mobile base")
+        # A base hold (engaged by a surrounding manipulation skill) servos
+        # the wheels on the measured pose and would fight this drive; the
+        # drive suspends it and resumes on exit, which re-anchors the hold
+        # to the pose the base was deliberately driven to.
+        suspend = getattr(self.env, "suspend_base_hold", None)
+        if callable(suspend):
+            suspend()
+
+        def resume_hold():
+            resume = getattr(self.env, "resume_base_hold", None)
+            if callable(resume):
+                resume()
         limits = getattr(self.env, "base_speed_limits", None)
         max_v, max_omega = limits() if callable(limits) else (0.5, 1.2)
         controller = WaypointController(
@@ -351,17 +363,20 @@ class SkillRunner:
             final = pose
             if command.status == "arrived":
                 self.env.command_base_velocity(0., 0., 0.)
+                resume_hold()
                 return {"target": target.tolist(),
                         "final_pose": [pose.x, pose.y, pose.yaw],
                         "final_distance_m": float(np.linalg.norm(target - pose.position()))}
             if command.status == "blocked":
                 self.env.command_base_velocity(0., 0., 0.)
+                resume_hold()
                 raise SkillError("NAVIGATION_BLOCKED",
                                  f"Obstacle stopped the base {float(np.linalg.norm(target - pose.position())):.2f} m short of the target")
             self.env.command_base_velocity(command.v, 0., command.omega)
             self.env.step(chunk)
             elapsed += chunk * self.env.timestep
         self.env.command_base_velocity(0., 0., 0.)
+        resume_hold()
         raise SkillError("NAVIGATION_TIMEOUT",
                          f"Base did not reach the target within {timeout:.0f} s of simulation time"
                          + (f"; last pose {final}" if final else ""))

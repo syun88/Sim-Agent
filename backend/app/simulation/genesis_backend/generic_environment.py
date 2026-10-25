@@ -16,6 +16,13 @@ from backend.app.simulation.genesis_backend.environment import _ensure_genesis_i
 #: Velocity-loop gain for wheel joints under velocity control (see _drive).
 WHEEL_VELOCITY_KV = 8.
 
+#: Base-hold servo gains (see engage_base_hold): a proportional loop on the
+#: measured base pose, re-commanded every physics step while the hold is
+#: engaged. The position gain turns a 5 cm error into a 0.125 m/s command;
+#: the yaw gain turns the 0.08 rad drift measured on LeKiwi into 0.28 rad/s.
+BASE_HOLD_POSITION_GAIN = 2.5
+BASE_HOLD_YAW_GAIN = 3.5
+
 
 class GenericURDFEnvironment(SimulationBackend):
     name = "genesis"
@@ -152,6 +159,9 @@ class GenericURDFEnvironment(SimulationBackend):
                 'transit_effort_limit': float(transit), 'kp': float(kp[index]), 'kv': float(kv[index]), 'damping': damping}
             self.set_gripper_effort(side, holding=False)
         self._gripper_commands, self._gripper_goals = {}, {}
+        self._base_hold_pose = None
+        self._base_hold_suspended = False
+        self._base_hold_depth = 0
         self._sim_step = 0
         self._contact_evidence_cache, self._contact_visuals = {}, {}
         from backend.app.robots.contacts import PinchContactTracker
@@ -233,6 +243,9 @@ class GenericURDFEnvironment(SimulationBackend):
             stop=getattr(self,'planning_pulse',lambda:False))
         self.spawn_validation = placements
         self._sim_step = 0
+        self._base_hold_pose = None
+        self._base_hold_suspended = False
+        self._base_hold_depth = 0
         self._contact_evidence_cache.clear()
         self._pinch_tracker.reset()
         q = np.array([self.profile["home"][name] for name in self._all_names])
@@ -258,6 +271,8 @@ class GenericURDFEnvironment(SimulationBackend):
 
     def step(self, steps=1):
         for _ in range(steps):
+            if self._base_hold_pose is not None and not self._base_hold_suspended:
+                self._command_base_hold()
             for side, target in self._gripper_goals.items():
                 g = self.grippers[side]
                 multipliers = {g['joint']: 1., **g['followers']}
@@ -698,3 +713,79 @@ class GenericURDFEnvironment(SimulationBackend):
             angular = signs * np.array(drive.wheel_speeds(vx, omega))
         angular = limit_wheel_speeds(angular, self._wheel_limits)
         self._entity.control_dofs_velocity(angular.astype(np.float32), self._wheel_dofs)
+
+    # -- base hold -----------------------------------------------------------
+    #
+    # Arm work on a wheeled base pushes the base around. Between drives the
+    # wheels sit in velocity control at a zero command, which resists
+    # rolling only through the wheel velocity gain; an arm swinging several
+    # kilograms of CAD links walks the base anyway (measured on LeKiwi:
+    # +0.081 rad of yaw and 5 mm of translation during one approach
+    # transit - enough to move the tool out of its planned frame and shove
+    # the target cube 0.11 m). While manipulation skills run, the hold
+    # closes the loop on the *measured* base pose instead: every physics
+    # step it commands the twist that reduces the pose error. It only ever
+    # commands wheel velocities; the base pose itself is never written
+    # outside reset, per the project rule.
+
+    def engage_base_hold(self):
+        """Hold the base at its current measured pose during arm motion.
+
+        Re-entrant (nested skills share the first captured pose); a no-op
+        for robots without a mobile base.
+        """
+        if not self._mobile_base:
+            return
+        self._base_hold_depth += 1
+        if self._base_hold_depth == 1:
+            self._base_hold_pose = self.base_pose().copy()
+            self._base_hold_suspended = False
+
+    def release_base_hold(self):
+        if not self._mobile_base:
+            return
+        self._base_hold_depth = max(0, self._base_hold_depth - 1)
+        if self._base_hold_depth == 0 and self._base_hold_pose is not None:
+            self._base_hold_pose = None
+            self._base_hold_suspended = False
+            self.command_base_velocity(0., 0., 0.)
+
+    def suspend_base_hold(self):
+        """Pause the hold while the base is deliberately driven.
+
+        The drive commands the wheels itself; resume_base_hold re-anchors
+        the target to wherever the base was driven to.
+        """
+        if self._base_hold_pose is not None:
+            self._base_hold_suspended = True
+
+    def resume_base_hold(self):
+        if self._base_hold_pose is not None:
+            self._base_hold_pose = self.base_pose().copy()
+            self._base_hold_suspended = False
+
+    @property
+    def base_hold_active(self):
+        return self._base_hold_pose is not None and not self._base_hold_suspended
+
+    def _command_base_hold(self):
+        from backend.app.control.navigation import wrap_angle
+        target = self._base_hold_pose
+        measured = self.base_pose()
+        error_xy = target[:2] - measured[:2]
+        error_yaw = wrap_angle(float(target[2] - measured[2]))
+        if np.linalg.norm(error_xy) < .002 and abs(error_yaw) < .002:
+            self.command_base_velocity(0., 0., 0.)
+            return
+        yaw = float(measured[2])
+        forward = np.cos(yaw) * error_xy[0] + np.sin(yaw) * error_xy[1]
+        lateral = -np.sin(yaw) * error_xy[0] + np.cos(yaw) * error_xy[1]
+        max_v, max_omega = self.base_speed_limits()
+        vx = float(np.clip(BASE_HOLD_POSITION_GAIN * forward, -.6 * max_v, .6 * max_v))
+        # A differential-drive base cannot strafe; its lateral error is
+        # corrected through the yaw term instead of a sideways command
+        # (command_base_velocity would refuse the sideways component).
+        vy = float(np.clip(BASE_HOLD_POSITION_GAIN * lateral, -.6 * max_v, .6 * max_v)) \
+            if self._mobile_base["drive"] == "kiwi" else 0.
+        omega = float(np.clip(BASE_HOLD_YAW_GAIN * error_yaw, -.6 * max_omega, .6 * max_omega))
+        self.command_base_velocity(vx, vy, omega)

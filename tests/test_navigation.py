@@ -404,3 +404,200 @@ def test_controller_arrive_tolerance_is_configurable():
     tight = WaypointController(arrive_tolerance=0.01, yaw_tolerance=0.02)
     assert tight.update(pose, target).status == "running"
     assert tight.update(pose, np.array([0.005, 0.0])).status == "arrived"
+
+
+# -- base hold during arm motion ---------------------------------------------
+
+
+def _hold_env(drive="kiwi"):
+    from backend.app.simulation.genesis_backend.generic_environment import (
+        GenericURDFEnvironment,
+    )
+
+    env = GenericURDFEnvironment.__new__(GenericURDFEnvironment)
+    env._mobile_base = {"drive": drive}
+    env._base_hold_pose = None
+    env._base_hold_suspended = False
+    env._base_hold_depth = 0
+    env._pose = np.array([0.1, 0.2, 0.3])
+    env.commands = []
+    env.base_pose = lambda: env._pose.copy()
+    env.base_speed_limits = lambda: (0.3, 2.0)
+    env.command_base_velocity = lambda vx, vy, omega: env.commands.append(
+        (float(vx), float(vy), float(omega)))
+    return env
+
+
+def test_base_hold_engage_release_nesting():
+    env = _hold_env()
+    env.engage_base_hold()
+    assert env.base_hold_active
+    assert np.allclose(env._base_hold_pose, [0.1, 0.2, 0.3])
+    env._pose = np.array([0.4, 0.5, 0.6])
+    env.engage_base_hold()  # nested: the first captured pose is kept
+    assert np.allclose(env._base_hold_pose, [0.1, 0.2, 0.3])
+    env.release_base_hold()
+    assert env.base_hold_active  # still held by the outer engagement
+    env.release_base_hold()
+    assert env._base_hold_pose is None
+    assert env.commands[-1] == (0.0, 0.0, 0.0)  # wheels stopped on release
+
+
+def test_base_hold_servo_corrects_pose_error():
+    env = _hold_env()
+    env._base_hold_pose = np.array([0.0, 0.0, 0.0])
+    env._pose = np.array([0.05, 0.0, 0.1])  # drifted +x and +yaw
+    env._command_base_hold()
+    vx, vy, omega = env.commands[-1]
+    # The command opposes the measured error on every axis.
+    assert vx < 0 and omega < 0
+    assert abs(vx - 2.5 * -0.0498) < 0.01
+    assert abs(omega - 3.5 * -0.1) < 1e-9
+    # Within the deadband the hold commands a stop instead of jittering.
+    env._pose = np.array([0.001, 0.0, 0.001])
+    env._command_base_hold()
+    assert env.commands[-1] == (0.0, 0.0, 0.0)
+
+
+def test_base_hold_diff_drive_never_commands_strafe():
+    env = _hold_env(drive="diff")
+    env._base_hold_pose = np.array([0.0, 0.0, 0.0])
+    env._pose = np.array([0.0, 0.08, 0.0])  # pure lateral drift
+    env._command_base_hold()
+    _, vy, _ = env.commands[-1]
+    assert vy == 0.0
+
+
+def test_base_hold_suspend_and_resume_reanchors():
+    env = _hold_env()
+    env.engage_base_hold()
+    env.suspend_base_hold()
+    assert not env.base_hold_active
+    env._pose = np.array([0.9, 0.9, 1.0])  # deliberately driven elsewhere
+    env.resume_base_hold()
+    assert env.base_hold_active
+    assert np.allclose(env._base_hold_pose, [0.9, 0.9, 1.0])
+
+
+def test_navigate_suspends_and_resumes_the_hold():
+    from backend.app.skills.robot_skills import SkillRunner
+
+    class HoldNavEnv(_FakeNavEnv):
+        def __init__(self):
+            super().__init__()
+            self.events = []
+
+        def suspend_base_hold(self):
+            self.events.append("suspend")
+
+        def resume_base_hold(self):
+            self.events.append("resume")
+
+        def command_base_velocity(self, vx, vy, omega):
+            self.events.append("cmd")
+            super().command_base_velocity(vx, vy, omega)
+
+    env = HoldNavEnv()
+    result = SkillRunner(env, None).navigate_to((0.5, 0.3), timeout=30.)
+    assert result["success"] is True
+    assert env.events[0] == "suspend"
+    assert env.events[-1] == "resume"
+    assert "cmd" in env.events
+
+
+# -- gravity-ordered placement drives -----------------------------------------
+
+
+def _retry_skills(seed_outcomes, approach_outcomes):
+    """ImportedRobotSkills stubbed at the planning/driving seams.
+
+    seed_outcomes: gravity ratios (or None) handed out in candidate order.
+    approach_outcomes: booleans per drive (True = the retried approach
+    succeeds there).
+    """
+    from types import SimpleNamespace
+
+    from backend.app.robots.executor import ImportedRobotSkills
+
+    skills = ImportedRobotSkills.__new__(ImportedRobotSkills)
+    skills.env = SimpleNamespace(
+        profile={"mobile_base": {"drive": "kiwi"},
+                 "root_transform": np.eye(4).tolist()},
+        object_pose=lambda obj: (np.array([0.55, 0.30, 0.014]), None),
+        base_pose=lambda: np.array([0.0, 0.0, 0.0]),
+        joint_snapshot=lambda: {},
+    )
+    calls = {"seeds": [], "drives": [], "approaches": 0}
+    outcomes = list(seed_outcomes)
+
+    def seed_at(arm, target, snapshot, placement, original_root):
+        ratio = outcomes.pop(0) if outcomes else None
+        calls["seeds"].append((placement, ratio))
+        if ratio is None:
+            return None
+        return {"arm_q": [0.0] * 5, "closure_planned": True,
+                "gravity_worst_ratio": ratio}
+
+    def navigate(target_xy, target_yaw, **kwargs):
+        calls["drives"].append(tuple(target_xy))
+        return {"success": True}
+
+    def planned(arm, obj, *args):
+        from backend.app.skills.robot_skills import SkillError
+
+        index = calls["approaches"]
+        calls["approaches"] += 1
+        if approach_outcomes[index]:
+            return {"target": [0.55, 0.30, 0.014]}
+        raise SkillError("COLLISION_PATH", "still blocked")
+
+    skills._grasp_seed_at_placement = seed_at
+    skills.navigate_to = navigate
+    skills._approach_planned = planned
+    return skills, calls
+
+
+def _placement_for_ratio(calls, ratio):
+    return next(p for p, r in calls["seeds"] if r == ratio)
+
+
+def test_retry_drives_to_in_margin_placement_first():
+    # Candidate order finds an over-margin seed (3.0) before an in-margin
+    # one (0.5); the drive must go to the in-margin placement, and the
+    # over-margin one must not be driven to at all once it succeeds.
+    skills, calls = _retry_skills([3.0, 0.5], [True])
+    result = skills._retry_approach_from_searched_placements("left", "red_cube", None, None, 0.)
+    assert result is not None
+    assert result["base_placement"]["gravity_worst_ratio"] == 0.5
+    assert result["base_placement"]["gravity_over_limit"] is False
+    good = _placement_for_ratio(calls, 0.5)
+    assert calls["drives"] == [tuple(good.target_xy)]
+    # The evidence keeps candidate (preference) order even though the
+    # drive order differed.
+    evidence = skills._placement_search_evidence
+    assert [row["gravity_worst_ratio"] for row in evidence["clear_seed_placements"]] == [3.0, 0.5]
+
+
+def test_retry_orders_over_margin_drives_by_margin():
+    # Every seed is over the margin: drives go best-margin first, the
+    # excess is surfaced on the result, and a failed approach falls
+    # through to the next placement.
+    skills, calls = _retry_skills([3.0, 2.0], [False, True])
+    result = skills._retry_approach_from_searched_placements("left", "red_cube", None, None, 0.)
+    assert result is not None
+    assert result["base_placement"]["gravity_worst_ratio"] == 3.0
+    assert result["base_placement"]["gravity_over_limit"] is True
+    best = _placement_for_ratio(calls, 2.0)
+    worst = _placement_for_ratio(calls, 3.0)
+    assert calls["drives"] == [tuple(best.target_xy), tuple(worst.target_xy)]
+
+
+def test_retry_bounded_evaluation_when_nothing_is_clear():
+    from backend.app.robots.executor import _PLACEMENT_EVALUATION_BUDGET
+
+    skills, calls = _retry_skills([], [])
+    assert skills._retry_approach_from_searched_placements(
+        "left", "red_cube", None, None, 0.) is None
+    evidence = skills._placement_search_evidence
+    assert evidence["evaluated_candidates"] == _PLACEMENT_EVALUATION_BUDGET
+    assert evidence["drives"] == []
