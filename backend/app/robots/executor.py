@@ -607,14 +607,31 @@ class ImportedRobotSkills(SkillRunner):
         return self._skill('move_to_object',run,time.perf_counter())
 
     def _release(self, arm, obj):
+        from backend.app.robots.gripper_envelope import release_command
         self.env.set_gripper_effort(arm, holding=False)
         before = self.env.object_pose(obj)[0].copy()
         # Hold the already-checked arm pose and withdraw the moving jaw. Keeping
         # an empty aperture centred would add an unnecessary wrist translation
         # and could drive a root joint into its mechanical contact limit.
-        self.controller.wait_gripper(arm,False,.6)
+        # Open only as far as the object needs: a full-aperture release sweeps the jaw into whatever sits
+        # beside it, which is what made an adjacent placement need 71.5 mm of clearance.
+        target = release_command(self.env, arm, obj)
+        self.env.set_gripper(arm, target)
+        # Settle without re-commanding: controller.wait_gripper() would send its own full-open target and
+        # undo the partial opening that this release depends on. Wait for the TARGET, not for the motion
+        # to look small: a jaw that has not started moving yet looks settled, and breaking on that left
+        # the cube still pinched (measured 2026-10-25).
+        quantum = max(1, int(round(.01 / self.env.timestep)))
+        budget = max(1, int(round(.8 / self.env.timestep)))
+        for _ in range(budget // quantum):
+            self.env.step(quantum)
+            if abs(self.env.gripper_position(arm) - target) < .02:
+                break
         self.env.step(round(.15 / self.env.timestep))
-        if abs(self.env.gripper_position(arm))>.05 or self.env.pinch_established(obj,arm):
+        # Judge against the opening that was COMMANDED, not against a full-open zero: with a partial
+        # release the jaw legitimately stops at ~0.45 of the stroke, and the old absolute test read that
+        # as "did not open" (measured 2026-10-25, every partial release reported GRIPPER_BLOCKED).
+        if self.env.gripper_position(arm) > target + .05 or self.env.pinch_established(obj,arm):
             raise SkillError('GRIPPER_BLOCKED','The jaws did not open and release the object')
         return {'position_before': before.tolist(), 'position_after': self.env.object_pose(obj)[0].tolist(),
                 'contacts': self.env.object_contacts(obj, arm)}
