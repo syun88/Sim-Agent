@@ -106,11 +106,19 @@ class OpenArmV2Controller:
         max_iterations: int = 500,
     ) -> tuple[np.ndarray | None, float, float]:
         limits = self.env.arm_limits(side)
+        # A robot with fewer than six joints cannot hold an arbitrary attitude, so its attitude is not
+        # asked for. Solving *with* one makes the least-squares task spend its freedom on a term it can
+        # never satisfy, and the iterate the mixed error keeps can be tens of millimetres off in
+        # position: measured 2026-10-25 on the four-joint OpenManipulator-X, every carry was refused
+        # with a 40-90 mm residual - including a carry to the very pose the arm was already holding -
+        # while the planner's IK, which asks for the position alone below six joints, solved the same
+        # poses with zero error. Six-joint arms still hold the attitude they are given.
+        under_actuated = len(limits) < 6
         if q_init is None:
             q = self.env.arm_qpos(side)
         else:
             q = np.clip(np.asarray(q_init, float), limits[:, 0], limits[:, 1])
-        if target_rotation is None:
+        if target_rotation is None and not under_actuated:
             target_rotation = self.env.ee_pose(side)[1]
         kinematics = self.env.arm_kinematics(side)
         best_q = q.copy()
@@ -118,7 +126,7 @@ class OpenArmV2Controller:
         for _ in range(max_iterations):
             position, rotation, linear_jacobian, angular_jacobian = kinematics.evaluate(q)
             perr = np.asarray(target_position, float) - position
-            oerr = orientation_error(rotation, target_rotation)
+            oerr = np.zeros(3) if target_rotation is None else orientation_error(rotation, target_rotation)
             error = float(np.linalg.norm(perr) + np.linalg.norm(oerr) * 0.2)
             if error < best_error:
                 best_error = error
@@ -150,7 +158,18 @@ class OpenArmV2Controller:
                     scale = max(0.0, (upper_dist / braking_distance) ** 2)
                     dq[j] *= scale
             q = np.clip(q + dq, limits[:, 0], limits[:, 1])
-        if best_error > 0.02:
+        # Judge the solution by the task that was actually asked for. The error above mixes position
+        # with a weighted orientation term, and an arm with fewer than six joints cannot drive that
+        # orientation term to zero at all: measured 2026-10-25, every carry of the four-joint
+        # OpenManipulator-X failed here with the same ~90 mm residual because a full six-degree-of-
+        # freedom pose was demanded, while the planner's IK - which already falls back to the position
+        # below six joints - solved the very same pose with zero error. Six-joint arms are unchanged.
+        best_position, best_rotation, _, _ = kinematics.evaluate(best_q)
+        position_error = float(np.linalg.norm(np.asarray(target_position, float) - best_position))
+        attitude_error = 0. if target_rotation is None else float(np.linalg.norm(orientation_error(best_rotation, target_rotation)))
+        position_tolerance = getattr(self.env, "ik_position_tolerance", .002)
+        attitude_tolerance = getattr(self.env, "ik_rotation_tolerance", .015)
+        if best_error > 0.02 and not (under_actuated and position_error <= position_tolerance):
             if q_init is None:
                 # A successful handover leaves a very different redundant-arm posture.
                 # Retry the official spawn posture before calling a reachable goal impossible.
@@ -208,6 +227,10 @@ class OpenArmV2Controller:
         planned_joints: list[np.ndarray] | None = None,
     ) -> MotionResult:
         if rotation is None:
+            # The official cell's grasp frame. An imported robot's own attitude is passed in explicitly by
+            # the caller that knows the robot (see ``RobotSkills._carry_aim``) rather than substituted
+            # here: measured 2026-10-25, changing this default broke the official handover, whose right
+            # arm is mirrored and depends on exactly this constant.
             rotation = GRASP_ROTATION.copy()
         self.env.configure_motion_response(self.motion_speed if scale_speed else 1.)
         joint_waypoints = [self.env.arm_qpos(side)]

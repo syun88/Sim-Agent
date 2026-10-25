@@ -6,7 +6,7 @@ import numpy as np
 OFFICIAL_WINDUP = np.array([.50, .18, 1.075])
 
 
-def windup_candidates(runner, arm, obj):
+def windup_candidates(runner, arm, obj, stroke=.14):
     """Poses to raise the object into before the launch stroke, best first.
 
     The official wind-up is a constant and is tried first, so the arms it was measured for keep exactly
@@ -32,7 +32,7 @@ def windup_candidates(runner, arm, obj):
         passing = []
         for height in np.arange(0., .46, .02):
             pose = center + shift + np.array([0., 0., float(height)])
-            ok, mode, _ = launch_ready(runner, arm, obj, pose, attitude)
+            ok, mode, _ = launch_ready(runner, arm, obj, pose, attitude, stroke=stroke)
             if not ok:
                 continue
             passing.append((pose, float(height), mode))
@@ -101,11 +101,16 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3.) -> dict:
 
     env, control = runner.env, runner.controller
     runner._require_hold(arm, obj)
+    # The stroke is part of the task, not a constant measured from the official cell: a throw of 3 cm
+    # does not need 14 cm of travel, and asking for it makes the wind-up search reject every pose a
+    # short arm can carry. The launch is measured from the engine either way (``evaluate_throw``), so a
+    # stroke that is too short cannot be reported as a successful throw.
+    stroke = max(.05, height_cm / 100. + .04)
     # Raise the object into a pose this arm can hold and stroke up from. The official wind-up is tried
     # first and is what the official arms keep; a robot that cannot reach it gets one derived from the
     # object's own position, because the launch only needs headroom above a held pose, not a constant.
     rejected = []
-    for windup, label, mode in windup_candidates(runner, arm, obj):
+    for windup, label, mode in windup_candidates(runner, arm, obj, stroke=stroke):
         attitude = _attitude_in_use(runner, arm)
         ok, mode, reason = launch_ready(runner, arm, obj, windup, attitude)
         if not ok:
@@ -129,9 +134,14 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3.) -> dict:
     position, rotation = env.ee_pose(arm)
     start = env.arm_qpos(arm)
     launch_rotation = rotation if mode == "strict" else None
-    end, error, _ = control.solve_ik(arm, position + [0, 0, .14], launch_rotation)
-    if end is None:
-        raise SkillError("IK_FAILURE", f"Upward launch stroke is unreachable ({error:.4f})")
+    # Solved by the planner's IK, for the same reason the wind-up is: the controller's own IK is a
+    # local, damped solve that a four-joint arm cannot satisfy a full six-degree-of-freedom pose with.
+    from backend.app.robots.urdf import solve_profile_ik
+    planned = solve_profile_ik(env.profile, arm, np.asarray(position, float) + np.array([0., 0., stroke]),
+                               launch_rotation, model=env.model, q_init=start, snapshot=env.joint_snapshot())
+    if not planned['success']:
+        raise SkillError("IK_FAILURE", f"Upward launch stroke is unreachable ({planned['position_error']:.4f})")
+    end = env.model.nearest_continuous(env.profile['chains'][arm]['joints'], planned['q_rad'], start)
     if mode == "strict":
         control.target_rotations[arm] = rotation.copy()
     trace = []
