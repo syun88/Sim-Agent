@@ -38,6 +38,17 @@ PROVENANCE_FIELDS = ('provider', 'model', 'provider_error', 'model_called', 'ski
                      'capability_mode', 'fallback_verdict', 'model_verdict', 'agree', 'shadow')
 
 
+#: Words by which a model states that something *happened*, rather than what it decided. An
+#: assumption is a recorded choice; an outcome claim is unobserved evidence and is discarded.
+_OUTCOME_WORDS = re.compile(r'\b(?:success(?:ful(?:ly)?)?|succeeded|completed?|accomplished|verified|'
+                            r'achieved|done|finished)\b|成功|完了|できました|済み', re.I)
+
+
+def _is_choice_not_outcome(text: str) -> bool:
+    """Keep an assumption that records a decision; drop one that claims an observed result."""
+    return not _OUTCOME_WORDS.search(text)
+
+
 def program_signature(plan) -> list:
     """The physical intentions a compiled program carries, for comparing two of them.
 
@@ -121,7 +132,14 @@ class AgentPlanner:
             "Return only operations requested in the CURRENT instruction. Do not add a second object's pick, "
             "an extra handover, or a destination absent from it. Resolve each clause independently, in order. "
             "A single place action automatically acquires its object; a handover automatically acquires if needed. "
-            "If the FULL task is unsupported or ambiguous, return mode error with empty items and a short error; never guess a partial task."
+            "Refuse with mode error ONLY when the requested action is physically unsupported: an object "
+            "not in world_state, a skill this robot does not have, or impossible geometry. Never refuse "
+            "because the instruction is vague. If objects, hands or destinations are unspecified but the "
+            "observed scene admits a sensible interpretation, choose concrete ones from world_state and "
+            "record EVERY choice you made in assumptions, one short Japanese line each (which object, "
+            "which destination, which hand, and why the scene admits it). 'Tidy up' means place each "
+            "graspable cube on a distinct free destination. An assumption on the record is required; a "
+            "silent guess is not allowed, and neither is inventing an object that is not observed."
         )
         # Setup diagnostics include many numerical IK candidates. They belong in the
         # evidence API, not the language context where they waste the model budget.
@@ -158,11 +176,16 @@ class AgentPlanner:
                 'Do not reduce requested ordered actions to their final states. '
                 'keep_in_place lists objects explicitly required to stay where they are. '
                 'Return the minimum requested goals. Registered objects are available references, not a list of tasks. '
-                'Never add a holding or placement goal for an object the user did not ask to manipulate. '
+                'Never add a holding or placement goal for an object the user did not ask to manipulate, EXCEPT when '
+                'the user asks for the scene to be arranged, tidied or cleaned: then include each graspable object and '
+                'record the choice. '
                 'A negative clause adds a constraint, never a positive goal. '
                 'Use only registered objects and targets. A reference cube is a target, not another manipulated subject. '
-                'Simultaneously grasping two cubes in one hand, arbitrary new physical skills, unknown objects '
-                'and unclear desired outcomes are unsupported: return interpretation unsupported with a short error. '
+                'An unspecified but feasible outcome is NOT unsupported. If the instruction does not say which objects, '
+                'which destinations or which hands, choose concrete ones from objects and targets (for tidying, one '
+                'distinct free target per graspable object) and write EVERY choice into assumptions, one short Japanese '
+                'line each. Unsupported means the physical action cannot be done by this robot: an unknown object, a '
+                'skill it does not have, or impossible geometry - never mere vagueness. '
                 'Return JSON matching the supplied schema, no invented object poses or successful outcomes.'
             )
             user = {'instruction': strip_preservation(instruction,state), 'objects': [
@@ -466,12 +489,20 @@ class AgentPlanner:
                         for action in program.actions:
                             if action.op == "place" and action.relation:
                                 action.arm = None
-                    # Only the grounding compiler can explain concrete choices. Model
-                    # statements such as "blue is held" are not observed scene facts.
+                    # The compiler explains concrete choices from the scene; the model's own choices are
+                    # kept and labelled, because they are the record of what it assumed. They were
+                    # previously discarded outright, which left an ambiguous instruction either refused
+                    # or executed with no trace of the interpretation behind it.
+                    model_assumptions = [a.strip() for a in (program.assumptions or [])
+                                         if isinstance(a, str) and a.strip() and _is_choice_not_outcome(a)][:5]
                     program.assumptions = []
                     # Revalidate anchored quantities, including the supported range.
                     program = TaskProgram.model_validate(program.model_dump())
                     candidate = compile_prepared_program(program, state)
+                    if model_assumptions:
+                        candidate.assumptions = [f'モデルが選んだ前提: {a}' for a in model_assumptions] + candidate.assumptions
+                        candidate.planning_evidence = {**(candidate.planning_evidence or {}),
+                            'model_assumptions': model_assumptions}
                     if binding_repairs:
                         candidate.planning_evidence = {**(candidate.planning_evidence or {}),
                             'semantic_binding_repairs': binding_repairs}
@@ -519,9 +550,19 @@ class AgentPlanner:
         if plan is None:
             plan = fallback
         if plan is None:
-            detail = str(fallback_error or provider_error)
-            category = "ROBOT_CAPABILITY" if "ROBOT_CAPABILITY:" in detail else "INSTRUCTION_NOT_UNDERSTOOD"
-            raise PlannerProviderError(category, f"Cannot ground the full instruction: {detail}")
+            # Report the failure of the path that actually ran. When the model was asked, its own
+            # validation error is why there is no plan - the grammar's parse error is background, kept in
+            # fallback_verdict. Without this a scene the solver could not satisfy was reported as
+            # "instruction not understood", which points a reader at the wrong component.
+            model_detail = self._repair_feedback if use_ai else None
+            detail = str(model_detail or fallback_error or provider_error)
+            if "ROBOT_CAPABILITY:" in detail:
+                category = "ROBOT_CAPABILITY"
+            elif detail.startswith("GOAL_UNREACHABLE"):
+                category = "GOAL_UNREACHABLE"
+            else:
+                category = "INSTRUCTION_NOT_UNDERSTOOD"
+            raise PlannerProviderError(category, f"Cannot ground the full instruction: {detail[:600]}")
         plan.provider_error = provider_error
         if observed_binding.decisions:
             plan.planning_evidence = {**(plan.planning_evidence or {}),'scene_bindings':observed_binding.decisions}

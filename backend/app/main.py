@@ -276,9 +276,16 @@ def reconnect_memory():
 
 @app.get('/api/config/status')
 def config_status():
+    # Report the planner's own switches. Without them an operator cannot tell a request that used the
+    # model from one the grammar answered: both used to report the same provider.
+    planner = AgentPlanner()
     return {'simulation_engine': 'genesis', 'ai_provider': health()['provider'],
             'ai_model': app.state.viewer.get('model'), 'viewer_online': _online(),
-            'neo4j': 'Connected' if app.state.memory.available else 'Fallback'}
+            'neo4j': 'Connected' if app.state.memory.available else 'Fallback',
+            'planner': {'provider': planner.configured_provider, 'enabled': planner.enabled,
+                        'model': planner.local_model if planner.local_enabled else planner.model,
+                        'capability_mode': planner.capability_mode, 'shadow_mode': planner.shadow_mode,
+                        'fast_language': planner.exact_grammar_fast_path}}
 
 
 @app.websocket('/ws')

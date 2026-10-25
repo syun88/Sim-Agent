@@ -292,6 +292,12 @@ class GenericURDFEnvironment(SimulationBackend):
         if name == 'center' and positions:
             point = np.mean(list(positions.values()), axis=0)
         point[0] += .06
+        # Distinct slots must be distinct places. Keying them by arm collapsed every slot onto one
+        # point for a single-arm robot whose props were all sampled by that arm - measured 2026-10-25
+        # on OpenManipulator-X: left_side, right_side and center all reported [0.11, 0.0, 0.76], so a
+        # request to place two cubes on separate destinations could never be satisfied, and the plan
+        # that failed was attributed to the language model rather than to this state.
+        point[1] += {'left_side': .10, 'blue_zone': .10, 'right_side': -.10, 'green_zone': -.10}.get(name, 0.)
         point[2] = self.table_height
         return point
 

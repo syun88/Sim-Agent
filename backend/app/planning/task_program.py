@@ -113,6 +113,9 @@ class InstructionMeaning(BaseModel):
     interpretation: Literal['final_state', 'ordered_actions', 'unsupported']
     goals: list[TaskGoal] = Field(default_factory=list, max_length=12)
     keep_in_place: list[str] = Field(default_factory=list, max_length=12)
+    # The model has to be able to state what it assumed when the instruction leaves a choice open;
+    # without a field for it, an ambiguous instruction could only be refused or executed silently.
+    assumptions: list[str] = Field(default_factory=list, max_length=12)
     error: str | None = Field(default=None, max_length=300)
 
     @model_validator(mode='after')
