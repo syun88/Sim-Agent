@@ -121,7 +121,9 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
 
     env, control = runner.env, runner.controller
     runner._require_hold(arm, obj)
-    needed = (2. * 9.81 * max(height_cm / 100., .001)) ** .5
+    from backend.app.physics import ramp_for_release_speed, release_speed_for_rise
+
+    needed = release_speed_for_rise(max(height_cm / 100., .001))
     # What the pinch transmits of the commanded speed, measured on this robot with long strokes:
     # 0.65/0.806 and 0.652/0.806 on two runs at 16 cm and 20 cm (2026-10-25). Asking for the speed the
     # flight needs therefore releases ~19% slower than needed, so the command is raised by that measured
@@ -178,7 +180,7 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
     end = env.model.nearest_continuous(env.profile['chains'][arm]['joints'], planned['q_rad'], start)
     if mode == "strict":
         control.target_rotations[arm] = rotation.copy()
-    ramp = max(.05, min(.6, 2. * RELEASE_PHASE * stroke / speed))
+    ramp = max(.05, min(.6, ramp_for_release_speed(stroke, speed, RELEASE_PHASE)))
     release_at = RELEASE_PHASE * ramp
     trace = []
     env.configure_motion_response(1.)
@@ -206,6 +208,7 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
               "release_phase": RELEASE_PHASE, "release_after": round(release_at, 3),
               "needed_release_speed_m_s": round(needed, 3),
               "designed_release_speed_m_s": round(2. * RELEASE_PHASE * stroke / ramp, 3),
+              "physics": ["release_speed_for_rise", "ramp_for_release_speed"],
               "requested_release_speed_m_s": release_speed_m_s,
               "measured_release_speed_m_s": round(float((evidence.get("release_velocity") or [0, 0, 0])[2]), 3)}
     if not evidence["success"]:

@@ -153,7 +153,11 @@ def _pour_wine(runner, arm: str, obj: str, target: str, volume_ml: float, contex
         if elapsed > 1e-6:
             previous_flow[2] = max(0., (previous_flow[1] - measured["bottle_ml"]) / elapsed)
             previous_flow[0:2] = [now, measured["bottle_ml"]]
-        reserve = min(volume_ml * .4, max(.5, previous_flow[2] * .18))
+        from backend.app.physics import closing_reserve
+        # The stream keeps arriving while the bottle is brought upright. The cap is the task's tolerance
+        # (40% of the request, floored) and the rate is the flow measured from this pour, so the reserve
+        # is a physical relation rather than a private constant.
+        reserve = max(.5, closing_reserve(previous_flow[2], .18, volume_ml * .4))
         return arriving_volume(measured) >= volume_ml - reserve
     target_reached = False
     final_angle = 0.
