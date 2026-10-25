@@ -281,8 +281,15 @@ class GenericURDFEnvironment(SimulationBackend):
     def _default_zone_position(self, name):
         positions = {entry['arm']: np.asarray(entry['position']) for entry in self._object_start.values()}
         side = 'left' if name in ('left_side', 'blue_zone') else 'right'
-        point = positions.get(side, next(iter(positions.values()))).copy()
-        if name == 'center':
+        # The fallback for an arm with no prop of its own must not be evaluated eagerly: with an empty
+        # layout - a single-arm imported robot whose sampler placed nothing, measured 2026-10-24 on
+        # UR5e + 2F-85 - a plain default argument raises StopIteration inside the caller's generator,
+        # which surfaces as "generator raised StopIteration" and takes the whole world state with it.
+        fallback = next(iter(positions.values()), None)
+        if fallback is None:
+            fallback = np.array([0., 0., self.table_height])
+        point = positions.get(side, fallback).copy()
+        if name == 'center' and positions:
             point = np.mean(list(positions.values()), axis=0)
         point[0] += .06
         point[2] = self.table_height
