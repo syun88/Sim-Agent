@@ -250,3 +250,144 @@ def test_controller_stops_for_obstacle():
     assert status == "blocked"
     # The footprint never penetrated the wall.
     assert clearance_to_aabbs(pose, 0.25, aabbs) >= 0.05 - 1e-9
+
+
+# -- base placement search (reverse-computed standoff) ----------------------
+
+def _placement_key(placement):
+    return (placement.distance_m, placement.bearing_offset_deg, placement.yaw_offset_deg)
+
+
+def test_base_placement_default_candidate_matches_legacy_standoff():
+    from backend.app.skills.base_placement import candidate_base_placements
+
+    candidates = candidate_base_placements((0.6, 0.0), (0.0, 0.0))
+    first = candidates[0]
+    # The legacy navigate standoff: 0.32 m from the cube, on the base's side
+    # of it, facing it - the search must prefer exactly this placement.
+    assert _placement_key(first) == (0.32, 0.0, 0.0)
+    assert np.allclose(first.target_xy, [0.28, 0.0])
+    assert abs(first.target_yaw) < 1e-9
+    assert len(candidates) == 6 * 8 * 7
+    assert len({_placement_key(c) for c in candidates}) == len(candidates)
+
+
+def test_base_placement_bearing_and_yaw_offsets():
+    from backend.app.skills.base_placement import candidate_base_placements
+
+    candidates = candidate_base_placements((0.6, 0.0), (0.0, 0.0))
+    by_key = {_placement_key(c): c for c in candidates}
+    # A +90 deg bearing offset places the base perpendicular to the default
+    # side (default bearing from the target toward the reference is +x here
+    # seen from the target: the reference sits at angle pi), still facing it.
+    side = by_key[(0.32, 90.0, 0.0)]
+    assert np.allclose(side.target_xy, [0.6, -0.32])
+    assert abs(side.target_yaw - math.pi / 2) < 1e-9
+    # A yaw offset leaves the position unchanged and rotates the final yaw.
+    turned = by_key[(0.32, 0.0, -40.0)]
+    assert np.allclose(turned.target_xy, [0.28, 0.0])
+    assert abs(turned.target_yaw - math.radians(-40.0)) < 1e-9
+
+
+def test_base_placement_preference_expands_from_default():
+    from backend.app.skills.base_placement import candidate_base_placements
+
+    candidates = candidate_base_placements((0.6, 0.0), (0.0, 0.0))
+    order = {_placement_key(c): i for i, c in enumerate(candidates)}
+    # One step in any single dimension comes before two steps in one
+    # dimension or a 180 deg flip.
+    assert order[(0.32, 0.0, -20.0)] < order[(0.32, 0.0, -40.0)]
+    assert order[(0.32, 0.0, -20.0)] < order[(0.32, 180.0, 0.0)]
+    assert order[(0.28, 0.0, 0.0)] < order[(0.32, 180.0, 0.0)]
+    assert order[(0.32, -30.0, 0.0)] < order[(0.32, -60.0, 0.0)]
+
+
+def test_search_base_placement_returns_first_accepted_and_stops():
+    from backend.app.skills.base_placement import candidate_base_placements, search_base_placement
+
+    expected = candidate_base_placements((0.6, 0.0), (0.0, 0.0))
+    calls = []
+
+    def evaluate(placement):
+        calls.append(placement)
+        return {"arm_q": [0.0]} if len(calls) == 3 else None
+
+    placement, result = search_base_placement((0.6, 0.0), (0.0, 0.0), evaluate)
+    assert placement == expected[2]
+    assert result == {"arm_q": [0.0]}
+    assert calls == expected[:3]
+
+
+def test_search_base_placement_none_when_all_rejected():
+    from backend.app.skills.base_placement import candidate_base_placements, search_base_placement
+
+    calls = []
+    outcome = search_base_placement((0.6, 0.0), (0.0, 0.0),
+                                    lambda placement: calls.append(placement) or None)
+    assert outcome is None
+    assert len(calls) == len(candidate_base_placements((0.6, 0.0), (0.0, 0.0)))
+
+
+def _stub_imported_skills(mobile, planned, retry_result=None):
+    from types import SimpleNamespace
+
+    from backend.app.robots.executor import ImportedRobotSkills
+
+    skills = ImportedRobotSkills.__new__(ImportedRobotSkills)
+    skills.env = SimpleNamespace(profile={"mobile_base": {"drive": "kiwi"} if mobile else None})
+    skills._approach_planned = planned
+    calls = {"retry": 0}
+
+    def retry(*args):
+        calls["retry"] += 1
+        skills._placement_search_evidence = {"evaluated_candidates": 5}
+        return retry_result
+
+    skills._retry_approach_from_searched_placements = retry
+    return skills, calls
+
+
+def test_approach_wrapper_passes_through_success():
+    from backend.app.skills.robot_skills import SkillError  # noqa: F401
+
+    skills, calls = _stub_imported_skills(True, lambda *a: {"target": [0.0]})
+    assert skills._approach("left", "red_cube") == {"target": [0.0]}
+    assert calls["retry"] == 0
+
+
+def test_approach_wrapper_relocates_only_mobile_collision_path():
+    from backend.app.skills.robot_skills import SkillError
+
+    def collide(*a):
+        raise SkillError("COLLISION_PATH", "no corridor")
+
+    # Desk robot: the original failure propagates, no search is attempted.
+    skills, calls = _stub_imported_skills(False, collide)
+    with pytest.raises(SkillError):
+        skills._approach("left", "red_cube")
+    assert calls["retry"] == 0
+
+    # Mobile base, searched retry succeeds: its result is the approach result.
+    skills, calls = _stub_imported_skills(True, collide, retry_result={"base_placement": {"distance_m": 0.32}})
+    assert skills._approach("left", "red_cube") == {"base_placement": {"distance_m": 0.32}}
+    assert calls["retry"] == 1
+
+    # Mobile base, search finds nothing: the original error is re-raised
+    # with the search evidence attached.
+    skills, calls = _stub_imported_skills(True, collide, retry_result=None)
+    with pytest.raises(SkillError) as caught:
+        skills._approach("left", "red_cube")
+    assert caught.value.category == "COLLISION_PATH"
+    assert caught.value.evidence["base_placement_search"] == {"evaluated_candidates": 5}
+
+
+def test_approach_wrapper_ignores_other_errors():
+    from backend.app.skills.robot_skills import SkillError
+
+    def fail(*a):
+        raise SkillError("IK_FAILURE", "unreachable")
+
+    skills, calls = _stub_imported_skills(True, fail)
+    with pytest.raises(SkillError):
+        skills._approach("left", "red_cube")
+    assert calls["retry"] == 0

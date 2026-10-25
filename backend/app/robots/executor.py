@@ -1,4 +1,5 @@
 """Motor-driven manipulation using gripper frames inferred from URDF geometry."""
+import copy
 import time
 import numpy as np
 
@@ -228,7 +229,7 @@ class ImportedRobotSkills(SkillRunner):
             return [nominal]
         return [nominal, np.asarray(frame)]
 
-    def _approach(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
+    def _approach_planned(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
         if arm not in self.env.grippers:
             raise SkillError('ROBOT_CAPABILITY', 'This arm has no detected opposed jaws')
         if self.held_object(arm):
@@ -307,6 +308,125 @@ class ImportedRobotSkills(SkillRunner):
             raise SkillError('APPROACH_COLLISION', f'Approach displaced the cube by {disturbance:.6f}m')
         return {'target': before.tolist(), 'final': result.final_position,
                 'object_displacement': disturbance, 'cube_size': self.env.cube_size}
+
+    # -- mobile base placement search --------------------------------------
+    #
+    # A mobile base arrives at the navigate compiler's fixed standoff, but
+    # for an imported arm that placement can leave only self-colliding grasp
+    # postures (see backend/app/skills/base_placement.py). When the approach
+    # fails with COLLISION_PATH on a mobile base, search other placements -
+    # planning only, against hypothetical root transforms - drive to each
+    # placement that admits a collision-free grasp seed (through the normal
+    # navigate skill, so the motion stays physical), and retry the approach
+    # there. Desk robots and non-collision failures are untouched.
+
+    def _approach(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
+        try:
+            return self._approach_planned(arm, obj, progress, fault_offset, grasp_offset_x)
+        except SkillError as exc:
+            if exc.category != 'COLLISION_PATH' or not self.env.profile.get('mobile_base'):
+                raise
+            result = self._retry_approach_from_searched_placements(
+                arm, obj, progress, fault_offset, grasp_offset_x)
+            if result is None:
+                evidence = getattr(self, '_placement_search_evidence', None)
+                if evidence:
+                    exc.evidence = {**(exc.evidence or {}), 'base_placement_search': evidence}
+                raise
+            return result
+
+    def _retry_approach_from_searched_placements(self, arm, obj, progress, fault_offset, grasp_offset_x):
+        from backend.app.control.navigation import wrap_angle
+        from backend.app.skills.base_placement import candidate_base_placements
+        target = self.env.object_pose(obj)[0].copy()
+        current = self.env.base_pose()
+        snapshot = self.env.joint_snapshot()
+        original_root = copy.deepcopy(self.env.profile['root_transform'])
+        evidence = {'evaluated_candidates': 0, 'clear_seed_placements': [], 'drives': []}
+        self._placement_search_evidence = evidence
+        driven = 0
+        try:
+            for placement in candidate_base_placements(target[:2], current[:2]):
+                if driven >= 3:
+                    break
+                if (np.linalg.norm(np.asarray(placement.target_xy) - current[:2]) < .03
+                        and abs(wrap_angle(placement.target_yaw - float(current[2]))) < .08):
+                    continue  # The base already sits there; the approach just failed there.
+                evidence['evaluated_candidates'] += 1
+                seed = self._grasp_seed_at_placement(arm, target, snapshot, placement, original_root)
+                if seed is None:
+                    continue
+                evidence['clear_seed_placements'].append(
+                    {**placement.as_dict(), 'arm_q': seed['arm_q'], 'closure_planned': seed['closure_planned']})
+                move = self.navigate_to(placement.target_xy, placement.target_yaw, exclude_object=obj)
+                driven += 1
+                evidence['drives'].append({**placement.as_dict(), 'navigate_success': bool(move.get('success'))})
+                if not move.get('success'):
+                    continue
+                try:
+                    result = self._approach_planned(arm, obj, progress, fault_offset, grasp_offset_x)
+                except SkillError:
+                    continue
+                result['base_placement'] = {**placement.as_dict(), 'arm_q': seed['arm_q'],
+                                            'closure_planned': seed['closure_planned'],
+                                            'evaluated_candidates': evidence['evaluated_candidates']}
+                return result
+            return None
+        finally:
+            # Re-anchor the planner's root to wherever the base physically is
+            # (the pre-search pose when nothing was driven, the driven pose
+            # otherwise); a fresh snapshot would do the same on next use.
+            try:
+                self.env.base_pose()
+            except Exception:
+                self.env.profile['root_transform'] = original_root
+
+    def _grasp_seed_at_placement(self, arm, target, snapshot, placement, original_root):
+        """Planning-only grasp check at a hypothetical base placement.
+
+        Mirrors the goal-seed stage of _approach_planned (same rotations,
+        same IK guesses, same private-collision gate) with the profile's
+        root transform temporarily anchored at the candidate placement; the
+        caller's snapshot is reused throughout, because a fresh
+        joint_snapshot would re-anchor the root to the base's real pose.
+        Also reports whether the jaw-closure plan succeeds for the found
+        seed - diagnostic only: closure planning runs again inside the
+        retried approach, so it does not gate selection. Returns
+        {"arm_q": ..., "closure_planned": bool} or None.
+        """
+        from backend.app.robots.urdf import solve_profile_ik
+        profile = self.env.profile
+        yaw = placement.target_yaw
+        transform = np.eye(4)
+        transform[:3, :3] = [[np.cos(yaw), -np.sin(yaw), 0.], [np.sin(yaw), np.cos(yaw), 0.], [0., 0., 1.]]
+        transform[:3, 3] = [placement.target_xy[0], placement.target_xy[1],
+                            float(np.asarray(original_root, dtype=float)[2, 3])]
+        profile['root_transform'] = transform.tolist()
+        try:
+            names = profile['chains'][arm]['joints']
+            home = self.env.home_arm_qpos(arm)
+            limits = self.env.arm_limits(arm)
+            ik_limits = self.env.ik_joint_limits(arm) if hasattr(self.env, 'ik_joint_limits') else None
+            seed_key = (arm, *np.round(target / .002).astype(int))
+            guesses = [*self.controller._approach_seeds.get(seed_key, []), self.env.arm_qpos(arm), home]
+            guesses.extend(np.clip(home + axis * shift, *limits.T)
+                           for axis in np.eye(len(home)) for shift in [-.5, .5, -1., 1.])
+            for rotation in self._approach_rotations(arm, target, snapshot):
+                for guess in guesses:
+                    if self.controller.stop_requested():
+                        return None
+                    goal = solve_profile_ik(profile, arm, target, rotation, model=self.env.model,
+                                            q_init=guess, snapshot=snapshot, joint_limits=ik_limits)
+                    if not goal['success']:
+                        continue
+                    seed = self.env.model.nearest_continuous(names, goal['q_rad'], self.env.arm_qpos(arm))
+                    if not self.env.collision_queries.clear({**snapshot, **dict(zip(names, seed))}):
+                        continue
+                    closure = self.controller.plan_closure(arm, target, rotation, seed, snapshot=snapshot)
+                    return {'arm_q': np.asarray(seed).tolist(), 'closure_planned': closure is not None}
+            return None
+        finally:
+            profile['root_transform'] = copy.deepcopy(original_root)
 
     def _close_pinch(self, arm, obj, *, rotation=None, grasp_bias=None, monitor=None):
         rotation = self._attitude(arm) if rotation is None else np.asarray(rotation)
