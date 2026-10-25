@@ -53,6 +53,15 @@ class AgentPlan(BaseModel):
     goal_program: dict[str, Any] | None = None
     planning_evidence: dict[str, Any] | None = None
     assumptions: list[str] = Field(default_factory=list)
+    # Provenance ledger. Which path actually answered a request, and why, must be readable per request:
+    # a provider name alone cannot tell "the model agreed" from "the model was never consulted".
+    model_called: bool = False
+    skipped_because: str | None = None
+    capability_mode: bool = False
+    fallback_verdict: dict[str, Any] | None = None
+    model_verdict: dict[str, Any] | None = None
+    agree: bool | None = None
+    shadow: dict[str, Any] | None = None
 
 
 class TaskRequest(BaseModel):

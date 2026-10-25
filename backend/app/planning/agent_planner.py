@@ -28,6 +28,26 @@ def _credential(name: str) -> str:
     return "" if value.startswith("replace-") else value
 
 
+#: What a re-planned continuation must carry over from the plan it continues. A recovery that rebuilds
+#: the steps through ``compile_prepared_program`` constructs a fresh ``AgentPlan``, so without this the
+#: ledger of a model-planned task reads as "no model was consulted" the moment it recovers - measured
+#: 2026-10-25, where the top-level plan of a task the model had planned showed ``model_called=False``
+#: while the attempt's own plan showed ``True``. One list, so a new provenance field cannot be
+#: half-wired.
+PROVENANCE_FIELDS = ('provider', 'model', 'provider_error', 'model_called', 'skipped_because',
+                     'capability_mode', 'fallback_verdict', 'model_verdict', 'agree', 'shadow')
+
+
+def program_signature(plan) -> list:
+    """The physical intentions a compiled program carries, for comparing two of them.
+
+    After compilation: 'pick then hand over' and an auto-acquiring handover are equivalent, and an
+    already-held pick may be an explicit no-op, so raw action text cannot be compared directly.
+    """
+    return [(s.skill, s.object, s.arm, s.receiver, s.target, s.direction, s.distance_cm,
+             s.height_cm, s.volume_ml, s.relation, s.joint, s.position_deg) for s in plan.steps]
+
+
 class AgentPlanner:
     """Language -> typed intentions -> grounded/validated skills, without fine tuning.
 
@@ -43,6 +63,11 @@ class AgentPlanner:
         self.local_enabled = os.getenv("OPENARM_LOCAL_PLANNER", "").lower() in {"1", "true", "yes"} and bool(self.local_model)
         self.enabled = bool(self.api_key and self.base_url and self.model) or self.local_enabled
         self.exact_grammar_fast_path = os.getenv("OPENARM_FAST_LANGUAGE", "0").strip() == "1"
+        # Capability mode stops the planner from answering out of the deterministic grammar: the model is
+        # asked even when the sentence parses, and the rules are demoted to a labelled fallback. Shadow
+        # mode asks the model anyway after the deterministic path has answered, and records only.
+        self.capability_mode = os.getenv("OPENARM_CAPABILITY_MODE", "0").strip() == "1"
+        self.shadow_mode = os.getenv("OPENARM_SHADOW_PLAN", "0").strip() == "1"
         self._repair_feedback: str | None = None
         self._ollama_raw_chatml: bool | None = None
         self._interpret_meaning = False
@@ -280,6 +305,31 @@ class AgentPlanner:
             raise GroundingError('INCOMPLETE_SEMANTIC_COVERAGE: '+str(output.get('reason','uncovered requested work')))
         return output
 
+    def _shadow_plan(self, instruction, state, memory, fallback):
+        """Ask the model what it would have said, on a request the rules already answered. Record only.
+
+        The deterministic plan is what runs: this cannot change a step, a hand, or a verdict. That is
+        the point - it measures the model's contribution on requests that never used it, which is the
+        only way to see whether rules and model agree where the rules were confident.
+        """
+        saved = (self._interpret_meaning, self._repair_feedback)
+        try:
+            self._interpret_meaning = False
+            self._repair_feedback = None
+            response = self._ai_plan(instruction, state, memory)
+            if response.get('needs_actions'):
+                return {'attempted': True, 'ok': False, 'error': 'PROVIDER_REQUESTED_ACTIONS'}
+            shadow_plan = compile_prepared_program(TaskProgram.model_validate(response['payload']), state)
+            return {'attempted': True, 'ok': True, 'steps': len(shadow_plan.steps),
+                    'deterministic_steps': None if fallback is None else len(fallback.steps),
+                    'agree': (program_signature(shadow_plan) == program_signature(fallback)
+                              if fallback is not None else None)}
+        except Exception as exc:
+            # A shadow call must never fail the request it is shadowing.
+            return {'attempted': True, 'ok': False, 'error': f'{type(exc).__name__}: {str(exc)[:200]}'}
+        finally:
+            self._interpret_meaning, self._repair_feedback = saved
+
     def plan(self, instruction: str, state: dict, memory: list[dict] | None = None) -> AgentPlan:
         started = time.perf_counter()
         try:
@@ -306,6 +356,7 @@ class AgentPlanner:
             if fallback_error.startswith("This scene has only"):
                 raise PlannerProviderError("UNKNOWN_OBJECT", fallback_error) from None
         plan = None
+        model_plan = None
         provider_error = None
         raw = None
         self._repair_feedback = None
@@ -317,11 +368,25 @@ class AgentPlanner:
         procedural = (temporal and len(verbs)>1) or ('move' in verbs and motion_distance_cm(instruction) is not None)
         self._interpret_meaning = not ((fallback_source and fallback_source.actions) or procedural)
         language_stages = []
+        # Why the model is not asked, stated rather than left implicit. The previous behaviour answered a
+        # single direct command from the grammar and recorded nothing, so a request that used no model at
+        # all looked exactly like one where the model agreed.
+        if not self.enabled:
+            skipped_because = "provider_not_configured"
+        elif fallback and self.exact_grammar_fast_path:
+            skipped_because = "exact_grammar_fast_path"
+        elif fallback and len(fallback.program["actions"]) == 1 and fallback.goal["type"] == "direct_command":
+            skipped_because = "single_direct_command"
+        else:
+            skipped_because = None
+        fallback_verdict = {"ok": fallback is not None, "actions": len(fallback.program["actions"]) if fallback else 0,
+                            "goal": fallback.goal["type"] if fallback else None, "error": fallback_error}
         # The launcher can immediately execute a fully parsed/grounded request.
         # Unrecognised language still uses the model and the same validation.
         # This avoids a model round trip just to reconfirm an identical program.
-        use_ai = self.enabled and not (fallback and (self.exact_grammar_fast_path or (
-            len(fallback.program["actions"]) == 1 and fallback.goal["type"] == "direct_command")))
+        use_ai = self.enabled and (self.capability_mode or skipped_because is None)
+        shadow = self._shadow_plan(instruction, state, memory, fallback) if (self.shadow_mode and self.enabled
+                                                                              and not use_ai) else None
         if use_ai:
             for _ in range(3 if self._interpret_meaning else 2):
                 try:
@@ -423,14 +488,14 @@ class AgentPlanner:
                             # Compare physical intentions after compilation. 'Pick then
                             # hand over' and an auto-acquiring handover are equivalent;
                             # an already-held pick may also be an explicit no-op.
-                            return [(s.skill, s.object, s.arm, s.receiver, s.target, s.direction, s.distance_cm,
-                                     s.height_cm, s.volume_ml, s.relation, s.joint, s.position_deg) for s in p.steps]
+                            return program_signature(p)
                         if signature(candidate) != signature(fallback):
                             raise GroundingError("Program changes explicit actions/hands in instruction. Expected: " + json.dumps(fallback.program, ensure_ascii=False))
                     valid, errors = validate_plan(candidate, state)
                     if not valid:
                         raise GroundingError("; ".join(errors))
                     plan = candidate
+                    model_plan = candidate
                     plan.provider = self.configured_provider
                     provider_error = None
                     raw = response["raw"]
@@ -462,6 +527,17 @@ class AgentPlanner:
             plan.planning_evidence = {**(plan.planning_evidence or {}),'scene_bindings':observed_binding.decisions}
             plan.assumptions += [d['explanation'] for d in observed_binding.decisions]
         plan.raw_response = raw
+        plan.model_called = bool(use_ai)
+        # 'skipped_because' answers one question only: why the model was not called.
+        plan.skipped_because = None if use_ai else skipped_because
+        plan.capability_mode = self.capability_mode
+        plan.fallback_verdict = fallback_verdict
+        plan.model_verdict = {"ok": model_plan is not None,
+                              "actions": len(model_plan.steps) if model_plan is not None else 0,
+                              "error": provider_error}
+        plan.agree = (program_signature(model_plan) == program_signature(fallback)
+                      if model_plan is not None and fallback is not None else None)
+        plan.shadow = shadow
         plan.model = (self.model if plan.provider == "ai&" else
                       self.local_model if plan.provider == "local_ollama" else None)
         plan.memory_used = memory[-3:]
