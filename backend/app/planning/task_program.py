@@ -156,7 +156,8 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
     def emit(skill: str, arm: str, index: int, **kwargs):
         allowed = state.get("capabilities", {}).get("skills")
         if allowed is not None and skill not in allowed:
-            raise GroundingError(f"The selected robot does not support {skill}; its physical gripper is not calibrated")
+            raise GroundingError(f"The selected robot does not offer {skill}; it offers "
+                                 f"{', '.join(sorted(allowed)) if allowed else 'nothing yet'}")
         available = state.get("robot", {}).get("available_arms")
         if available is not None and arm not in available:
             raise GroundingError(f"The selected robot has arms {available}, not {arm}")

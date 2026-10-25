@@ -356,17 +356,26 @@ class SkillRunner:
                     "support_bounds": self.env.object_bounds(target).tolist()}
         return self._skill("move_to_object", run, time.perf_counter())
 
-    def _carry_to(self, arm: str, obj: str, desired: np.ndarray) -> dict:
+    def _carry_to(self, arm: str, obj: str, desired: np.ndarray, *, attitude: str = "pinned") -> dict:
+        """Carry the held object to a pose. ``attitude="free"`` lets the arm choose its orientation.
+
+        A six-joint arm carries the attitude its pinch was validated in, and that is the default. An arm
+        whose pinch frame is only achievable near the object cannot carry it any higher while keeping
+        that frame - measured 2026-10-25 on OpenManipulator-X, whose wind-up arrived but whose carry was
+        refused with the held attitude. Free travel still requires the verified hold at every waypoint,
+        the same fallback the grasp planning already uses below six joints.
+        """
         self._require_hold(arm, obj)
         ee, rotation = self.env.ee_pose(arm)
         start = self.env.object_pose(obj)[0].copy()
         offset = rotation.T @ (start - ee)
-        commanded_rotation = self.controller.target_rotations.get(arm, rotation)
-        target = np.asarray(desired) - commanded_rotation @ offset
+        commanded_rotation = None if attitude == "free" else self.controller.target_rotations.get(arm, rotation)
+        aim = rotation if commanded_rotation is None else commanded_rotation
+        target = np.asarray(desired) - aim @ offset
         # Keep the carried cube on a Cartesian clearance path. A joint interpolation
         # between two high endpoints can still dip the palm through a table object.
         count = max(1, int(np.ceil(np.linalg.norm(np.asarray(desired) - start) / .025)))
-        via = [(1 - alpha) * start + alpha * np.asarray(desired) - commanded_rotation @ offset
+        via = [(1 - alpha) * start + alpha * np.asarray(desired) - aim @ offset
                for alpha in np.linspace(0., 1., count + 1)[1:-1]]
         if self.controller.motion_speed == 1.:
             for waypoint in via:
