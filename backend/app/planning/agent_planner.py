@@ -175,7 +175,12 @@ class AgentPlanner:
         proposal = ActionProposal.model_validate(payload)
         return {"payload": proposal.task_program().model_dump(), "raw": content}
 
-    def _complete(self, messages, schema, *, timeout=60., max_tokens=1600):
+    def _complete(self, messages, schema, *, timeout=20., max_tokens=1600):
+        # Timeouts measured on this host, 2026-10-25, with the local model on the Radeon RX 7800 XT
+        # through ROCm: a one-word reply takes 1.8 s cold (including loading 3.6 GB) and 0.12 s warm,
+        # and a 220-token planning-shaped generation takes 2.8 s. The previous 60 s and 25 s were sized
+        # for CPU inference, where the same one-word reply took 43 s. 20 s and 12 s keep several times
+        # the measured margin while a stalled provider falls back faster instead of stalling a task.
         if self.configured_provider == "local_ollama":
             # Ollama's native schema decoder constrains the entire program, rather than just
             # asking a small local model to produce something JSON-shaped.
@@ -236,7 +241,7 @@ class AgentPlanner:
             {'role':'user','content':json.dumps({'instruction':instruction,'observed':facts,'failure':failure,
                 'legal_recoveries':legal_actions,'output_schema':schema},ensure_ascii=False)}]
         try:
-            assessment = self._extract_json(self._complete(messages,schema,timeout=25.,max_tokens=450))
+            assessment = self._extract_json(self._complete(messages,schema,timeout=12.,max_tokens=450))
             if assessment.get('decision') not in legal_actions or not isinstance(assessment.get('reason'),str):
                 raise ValueError('Invalid recovery choice')
             return {**assessment,'provider':self.configured_provider}
@@ -270,7 +275,7 @@ class AgentPlanner:
             'List each unsupported clause verbatim in omitted_or_unsupported. Return JSON only.')
         output = self._extract_json(self._complete([{'role':'system','content':system},
             {'role':'user','content':json.dumps({'isolated_clauses':unknown,'capabilities':state.get('capabilities',{}),
-                'output_schema':schema},ensure_ascii=False)}],timeout=25.,max_tokens=450))
+                'output_schema':schema},ensure_ascii=False)}],timeout=12.,max_tokens=450))
         if output.get('covered') is not True or output.get('omitted_or_unsupported') != []:
             raise GroundingError('INCOMPLETE_SEMANTIC_COVERAGE: '+str(output.get('reason','uncovered requested work')))
         return output
