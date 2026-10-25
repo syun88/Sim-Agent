@@ -47,7 +47,11 @@ class GenericURDFEnvironment(SimulationBackend):
         self.table_height = scene_config["table_top"]
         self.cube_size = scene_config.get("cube_size", .052)
         self.cube_mass = scene_config.get("cube_mass", .05)
-        self._spawn_sampler = None if self._mobile_base else ReachableDeskSpawns(self.profile, scene_config)
+        # The sampler's desk layout is never used for a floor robot (the
+        # mobile branches below supply floor objects instead), but its
+        # model-based helpers - IK joint limits, collision queries and the
+        # arm-achieved attitude the approach planner needs - are shared.
+        self._spawn_sampler = ReachableDeskSpawns(self.profile, scene_config)
         # A mobile scene's props are the floor objects authored in
         # scene.json (registry imports them from floor_objects.json);
         # a desk scene samples them from the reachable-spawn layout.
@@ -116,8 +120,18 @@ class GenericURDFEnvironment(SimulationBackend):
         response=np.asarray([POLICY['arm_response_rad_s'] if name in arm_names else POLICY['finger_response_rad_s']
                              for name in self._all_names])
         kp = np.clip(inertia * response**2,POLICY['kp_min'],POLICY['kp_max'])
-        self._entity.set_dofs_kp(kp, self._all_dofs)
         kv = 2. * np.sqrt(kp * inertia)
+        if self._mobile_base:
+            # Desk scenes cancel gravity for the whole entity; a mobile
+            # base cannot (it must rest on its wheels), so gains sized for
+            # a weightless arm let it fold under gravity while driving
+            # (measured on LeKiwi: elbow drifted -0.66 rad in one drive).
+            # Floor the arm gains at values that hold against gravity
+            # within the joints' effort limits.
+            arm_mask = np.array([name in arm_names for name in self._all_names])
+            kp = np.where(arm_mask, np.maximum(kp, 60.), kp)
+            kv = np.where(arm_mask, np.maximum(kv, 4.), kv)
+        self._entity.set_dofs_kp(kp, self._all_dofs)
         self._entity.set_dofs_kv(kv, self._all_dofs)
         effort = np.asarray([max(0., j["effort"]) for j in self.profile["joints"]])
         self._entity.set_dofs_force_range(-effort, effort, self._all_dofs)
@@ -152,10 +166,35 @@ class GenericURDFEnvironment(SimulationBackend):
         return self._private_collisions
 
     def joint_snapshot(self):
-        return dict(zip(self._all_names, self._entity.get_dofs_position(self._all_dofs).cpu().numpy().astype(float)))
+        snapshot = dict(zip(self._all_names, self._entity.get_dofs_position(self._all_dofs).cpu().numpy().astype(float)))
+        if self._mobile_base:
+            self._sync_root_transform()
+            # Planning snapshots describe the arm's problem in the root
+            # frame; the base's own joints (wheels, synthesized rollers)
+            # belong to navigation, so pin them at their home values or
+            # their spin phase leaks phantom contacts into arm planning.
+            home = self.profile.get("home") or {}
+            for name in self._mobile_base["wheel_joints"]:
+                snapshot[name] = float(home.get(name, 0.))
+            for name in snapshot:
+                if "_roller_" in name:
+                    snapshot[name] = 0.
+        return snapshot
 
     def ik_joint_limits(self,side):
-        return self._spawn_sampler.arm_joint_limits(side)
+        limits = np.array(self._spawn_sampler.arm_joint_limits(side), dtype=float)
+        # A continuous arm joint in a CAD export declares no range at all,
+        # and when every adjacent pair is declaration-excluded the interval
+        # computation has nothing to bound it with either - the IK then
+        # wanders into multi-turn contortions no servo performs. Clamp the
+        # unbounded ends to a half-turn: the widest envelope a positional
+        # servo joint is ever planned through.
+        types = {j["name"]: j["type"] for j in self.profile["joints"]}
+        for row, name in zip(limits, self.profile["chains"][side]["joints"]):
+            if types.get(name) in ("revolute", "continuous"):
+                row[0] = -np.pi if not np.isfinite(row[0]) else row[0]
+                row[1] = np.pi if not np.isfinite(row[1]) else row[1]
+        return limits
 
     def plan_joint_waypoints(self, side, waypoints, stop=lambda: False):
         names = self.profile['chains'][side]['joints']
@@ -606,6 +645,21 @@ class GenericURDFEnvironment(SimulationBackend):
             return fastest_wheel, fastest_wheel / longest_lever
         return fastest_wheel, 2. * fastest_wheel / self._mobile_base["track_width"]
 
+    def _sync_root_transform(self):
+        # The profile's root_transform is where every planner believes the
+        # robot stands. A desk robot never moves, so the import-time value
+        # stays true; a mobile base must re-anchor it to the driven pose,
+        # or IK keeps solving for a robot that is still at the origin.
+        if not self._mobile_base:
+            return
+        link = self._entity.get_link(self.profile["root_link"])
+        position = link.get_pos().cpu().numpy().astype(float)
+        quat = link.get_quat().cpu().numpy()
+        transform = np.eye(4)
+        transform[:3, :3] = Rotation.from_quat(quat[[1, 2, 3, 0]]).as_matrix()
+        transform[:3, 3] = position
+        self.profile["root_transform"] = transform.tolist()
+
     def base_pose(self):
         if not self._mobile_base:
             raise NotImplementedError("This robot has no mobile base")
@@ -613,6 +667,7 @@ class GenericURDFEnvironment(SimulationBackend):
         position = link.get_pos().cpu().numpy().astype(float)
         quat = link.get_quat().cpu().numpy()
         rotation = Rotation.from_quat(quat[[1, 2, 3, 0]]).as_matrix()
+        self._sync_root_transform()
         return np.array([position[0], position[1], np.arctan2(rotation[1, 0], rotation[0, 0])])
 
     def command_base_velocity(self, vx, vy, omega):

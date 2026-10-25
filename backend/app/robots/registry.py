@@ -271,7 +271,7 @@ def _synthesize_omni_wheels(model, spec):
             body.remove(collision)
         roller_radius = float(np.clip(radius * 0.22, 0.006, 0.016))
         ring = radius - roller_radius
-        roller_length = max(width * 0.92, 0.01)
+        roller_length = max(width * 0.55, 0.01)
         roller_mass = total_mass * 0.35 / rollers_per_wheel
         # Phase the rollers so one sits at the contact patch at spawn.
         down = poses[body_name][:3, :3].T @ np.array([0., 0., -1.])
@@ -493,6 +493,34 @@ def import_robot(folder):
     scene['physics_dt']=min(IMPORTED_ROBOT_POLICY['physics_dt_max_s'],max(IMPORTED_ROBOT_POLICY['physics_dt_min_s'],
         scene['cube_size']*IMPORTED_ROBOT_POLICY['physics_dt_per_cube_meter']))
     profile['cube_size'] = scene['cube_size']
+    if mobile_base and mobile_base.get("drive") == "kiwi":
+        # The private collision model must not report this package's own
+        # resting contacts. The CAD nests parts inside each other across
+        # the whole robot (servos inside brackets, plates through the arm's
+        # root path, the synthesized rollers against the chassis), so at
+        # the home pose the model reports dozens of structural penetrations
+        # and no posture can ever be certified clear. Measure the resting
+        # contacts with the same queries the planner uses and exclude
+        # exactly those pairs, privately: the engine-facing declaration
+        # rules are untouched, and every pair not in contact at rest stays
+        # checked in every pose.
+        from backend.app.robots.collision_planner import PrivateCollisionQueries
+        probe_profile = {**profile, "grippers": profile["grippers"],
+                         "collision_config": {**declaration, "private_excluded_pairs": []}}
+        resting = PrivateCollisionQueries(probe_profile, 0.).contacts(home, tolerance=-.0001)
+        pairs = {tuple(sorted(contact["links"])) for contact in resting}
+        # A roller's contact depends on the wheel's spin phase, which the
+        # arm planner does not control: generalize any pair involving one
+        # roller to every roller of the same wheel, or a spun wheel would
+        # report fresh "collisions" against the chassis forever.
+        generalized = set(pairs)
+        for first, second in pairs:
+            for roller, other in ((first, second), (second, first)):
+                body, _, index = roller.rpartition("_roller_")
+                if index.isdigit():
+                    generalized.update(tuple(sorted((f"{body}_roller_{k}", other)))
+                                         for k in range(8))
+        declaration["private_excluded_pairs"] = sorted(generalized)
     profile['collision_config'] = declaration
     (target / 'gripper_analysis.json').write_text(json.dumps(analysis, indent=2) + '\n')
     seeds = {}

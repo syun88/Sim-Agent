@@ -83,7 +83,14 @@ class PrivateCollisionQueries:
         ET.SubElement(world,'geom',name='grasp_probe',type='box',size='.01 .01 .01',contype='0',conaffinity='0')
         # A robot whose source meshes overlap at adjacent joints declares those pairs and the
         # queries must not collide them either, or the planner and the engine disagree.
-        excluded = (profile.get('collision_config') or {}).get('runtime_excluded_adjacent_pairs') or []
+        collision_config = profile.get('collision_config') or {}
+        excluded = list(collision_config.get('runtime_excluded_adjacent_pairs') or [])
+        # Private-model-only exclusions: resting contacts inside a synthesized
+        # assembly (e.g. omni-wheel rollers against the chassis plates) that
+        # the engine never collides either (mobile scenes run with self
+        # collision off). They never involve arm or gripper links, so arm
+        # planning keeps every check that can affect it.
+        excluded += [list(pair) for pair in collision_config.get('private_excluded_pairs') or []]
         if excluded:
             contact = ET.SubElement(root, 'contact')
             for first, second in excluded:

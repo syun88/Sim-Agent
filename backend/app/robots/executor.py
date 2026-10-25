@@ -214,7 +214,9 @@ class ImportedRobotSkills(SkillRunner):
             return [nominal]
         from backend.app.robots.urdf import solve_profile_ik
         free = solve_profile_ik(self.env.profile, arm, target, None, model=self.env.model,
-                                q_init=self.env.home_arm_qpos(arm), snapshot=snapshot)
+                                q_init=self.env.home_arm_qpos(arm), snapshot=snapshot,
+                                joint_limits=(self.env.ik_joint_limits(arm) if hasattr(self.env, 'ik_joint_limits') else None
+                                              ))
         if not free['success']:
             return [nominal]
         frame = sampler.achieved_attitude(arm, free['q_rad'], snapshot)
@@ -254,7 +256,9 @@ class ImportedRobotSkills(SkillRunner):
         for rotation in rotations:
             for guess in guesses:
                 if self.controller.stop_requested():raise SkillError('STOPPED','Approach planning stopped')
-                goal = solve_profile_ik(self.env.profile,arm,before,rotation,model=self.env.model,q_init=guess,snapshot=snapshot)
+                goal = solve_profile_ik(self.env.profile,arm,before,rotation,model=self.env.model,q_init=guess,snapshot=snapshot,
+                                        joint_limits=(self.env.ik_joint_limits(arm) if hasattr(self.env, 'ik_joint_limits') else None
+                                                      ))
                 if not goal['success']:continue
                 seed = self.env.model.nearest_continuous(names,goal['q_rad'],self.env.arm_qpos(arm))
                 if not self.env.collision_queries.clear({**snapshot,**dict(zip(names,seed))}):continue
