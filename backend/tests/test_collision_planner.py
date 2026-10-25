@@ -89,3 +89,34 @@ def test_pose_refinement_uses_redundancy_to_avoid_collision_without_changing_too
     assert not query.contacts(values,tolerance=-.0001)
     point = URDFKinematics(URDFModel(source),chain).evaluate(separated)[0]
     np.testing.assert_allclose(point,goal,atol=1e-7)
+
+
+def test_mobile_base_wheel_subtree_resting_on_the_support_is_not_a_collision(tmp_path):
+    source = tmp_path/'wheeled.urdf'
+    source.write_text('''<robot name="wheeled"><link name="chassis"/>
+      <link name="mount"/><link name="hub"/>
+      <link name="roller"><collision><geometry><sphere radius=".005"/></geometry></collision></link>
+      <link name="arm_link"><collision><geometry><box size=".02 .02 .02"/></geometry></collision></link>
+      <joint name="wheel_spin" type="continuous"><parent link="chassis"/><child link="mount"/>
+        <origin xyz="0 0 -.05"/><axis xyz="0 1 0"/><limit effort="1" velocity="1"/></joint>
+      <joint name="mount_hub" type="fixed"><parent link="mount"/><child link="hub"/></joint>
+      <joint name="hub_roller" type="continuous"><parent link="hub"/><child link="roller"/>
+        <origin xyz="0 0 -.046"/><axis xyz="0 1 0"/><limit effort="1" velocity="1"/></joint>
+      <joint name="arm_swing" type="revolute"><parent link="chassis"/><child link="arm_link"/>
+        <origin xyz=".1 0 -.1"/><axis xyz="0 1 0"/>
+        <limit lower="-1" upper="1" effort="1" velocity="1"/></joint></robot>''')
+    root = np.eye(4)
+    root[2, 3] = .10
+    profile = {'urdf': str(source), 'root_transform': root.tolist()}
+    # The desk top is z=0 (table_top=0): the roller rests 1 mm into it and
+    # the arm box hangs 10 mm into it. Both are contacts for a desk robot.
+    desk = PrivateCollisionQueries(profile, table_top=0.)
+    pairs = {tuple(c['links']) for c in desk.contacts({}, tolerance=-.0001)}
+    assert ('roller', 'world') in pairs and ('arm_link', 'world') in pairs
+    # For a mobile base the wheel subtree (joint -> mount -> hub -> roller)
+    # stands on that plane by design, so its support contact is intended;
+    # the arm's penetration is still reported.
+    mobile = PrivateCollisionQueries({**profile, 'mobile_base': {'wheel_joints': ['wheel_spin']}},
+                                     table_top=0.)
+    pairs = {tuple(c['links']) for c in mobile.contacts({}, tolerance=-.0001)}
+    assert ('roller', 'world') not in pairs and ('arm_link', 'world') in pairs

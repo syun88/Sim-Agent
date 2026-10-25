@@ -105,6 +105,22 @@ class ImportedRobotController(OpenArmV2Controller):
             if seed is None:return None
             if samples:
                 previous = samples[-1]
+                # Follow is judged against the segment between the two
+                # accepted endpoint poses, not against the fixed frame.
+                # An endpoint is an IK solution, and on an arm with fewer
+                # joints than the frame's six constraints its attitude
+                # residual against the frame can reach the solver's own
+                # acceptance (0.03 rad); comparing the interpolated attitude
+                # against the frame then rejects a continuous sweep at its
+                # first step (measured on LeKiwi: endpoints up to 0.020 rad
+                # off frame, midpoints 0.000 rad off the endpoint slerp and
+                # 0.04 mm off the endpoint segment). A branch jump still
+                # fails: it throws the midpoint off the segment, and the
+                # position check below keeps the absolute frame reference.
+                from scipy.spatial.transform import Rotation, Slerp
+                _, previous_attitude, _, _ = self.env.arm_kinematics(side).evaluate(previous['arm_q'])
+                _, seed_attitude, _, _ = self.env.arm_kinematics(side).evaluate(seed)
+                attitude_path = Slerp([0.,1.],Rotation.from_matrix([previous_attitude,seed_attitude]))
                 for alpha in (.25,.5,.75):
                     q = previous['arm_q']+(seed-previous['arm_q'])*alpha
                     j = previous['jaw_q']+(jaw_q-previous['jaw_q'])*alpha
@@ -115,7 +131,7 @@ class ImportedRobotController(OpenArmV2Controller):
                     point,attitude,_,_ = self.env.arm_kinematics(side).evaluate(q)
                     expected = object_position-rotation@normal*(np.interp(j,qs,centers)-initial_center)
                     from backend.app.simulation.transform import orientation_error
-                    if np.linalg.norm(point-expected)>.0008 or np.linalg.norm(orientation_error(attitude,rotation))>.01:
+                    if np.linalg.norm(point-expected)>.0008 or np.linalg.norm(orientation_error(attitude,attitude_path([alpha]).as_matrix()[0]))>.01:
                         return None
             samples.append({'jaw_q':float(jaw_q),'arm_q':seed.copy()})
         if check_lift and g.get('cube_size'):
@@ -358,7 +374,15 @@ class ImportedRobotSkills(SkillRunner):
                     continue
                 evidence['clear_seed_placements'].append(
                     {**placement.as_dict(), 'arm_q': seed['arm_q'], 'closure_planned': seed['closure_planned']})
-                move = self.navigate_to(placement.target_xy, placement.target_yaw, exclude_object=obj)
+                # The placement was evaluated at this exact pose and the
+                # grasp margins beyond it are millimetric, so drive with
+                # tight arrival tolerances: at the default 50 mm / 0.05 rad
+                # a candidate 45 mm from the current pose was accepted as
+                # "arrived" without the base translating at all, and the
+                # retried approach then planned from a different robot
+                # than the one that was evaluated (measured on LeKiwi).
+                move = self.navigate_to(placement.target_xy, placement.target_yaw, exclude_object=obj,
+                                        arrive_tolerance=.01, yaw_tolerance=.02)
                 driven += 1
                 evidence['drives'].append({**placement.as_dict(), 'navigate_success': bool(move.get('success'))})
                 if not move.get('success'):

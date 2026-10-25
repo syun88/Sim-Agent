@@ -391,3 +391,16 @@ def test_approach_wrapper_ignores_other_errors():
     with pytest.raises(SkillError):
         skills._approach("left", "red_cube")
     assert calls["retry"] == 0
+
+
+def test_controller_arrive_tolerance_is_configurable():
+    # The grasp-placement retry evaluates a base pose exactly and drives to
+    # it with tight tolerances: 45 mm short of the target counts as arrived
+    # at the default 50 mm tolerance but must keep driving at 10 mm
+    # (measured on LeKiwi: the base "relocated" without translating).
+    pose = BasePose(0.0, 0.0, 0.0)
+    target = np.array([0.045, 0.0])
+    assert WaypointController().update(pose, target).status == "arrived"
+    tight = WaypointController(arrive_tolerance=0.01, yaw_tolerance=0.02)
+    assert tight.update(pose, target).status == "running"
+    assert tight.update(pose, np.array([0.005, 0.0])).status == "arrived"

@@ -515,8 +515,18 @@ class GenericURDFEnvironment(SimulationBackend):
 
     def arm_kinematics(self, side):
         actual = self._entity.get_dofs_position(self._all_dofs).cpu().numpy()
+        # The planning frame is the profile's root transform, read live:
+        # IK (solve_profile_ik) and the collision queries anchor on it, a
+        # mobile base re-anchors it to the driven pose, and the placement
+        # search swaps it for a hypothetical one. The construction-time
+        # copy (self._root_transform, still the spawn anchor for reset)
+        # froze FK at the spawn pose instead, so after a 0.32 m drive
+        # plan_closure's follow check compared world targets against
+        # origin-frame FK and failed with a phantom ~0.3 m error at the
+        # second sweep sample even though the IK solution had moved by
+        # ~0.001 rad. Desk robots never re-anchor, so they are unaffected.
         return URDFKinematics(self.model, self.profile['chains'][side], dict(zip(self._all_names, actual)),
-                              self._root_transform, self.profile['chains'][side]['tool_offset'])
+                              np.asarray(self.profile["root_transform"]), self.profile['chains'][side]['tool_offset'])
 
     def ee_pose(self, side):
         link = self._entity.get_link(self.profile['chains'][side]['end_link'])

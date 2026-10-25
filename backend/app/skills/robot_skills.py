@@ -299,25 +299,35 @@ class SkillRunner:
         return self._skill("move_relative", run, started)
 
     def navigate_to(self, target, target_yaw: float | None = None, timeout: float = 60.,
-                    exclude_object: str | None = None) -> dict:
+                    exclude_object: str | None = None,
+                    arrive_tolerance: float | None = None, yaw_tolerance: float | None = None) -> dict:
         """Drive the scene's mobile base to a world (x, y) target.
 
         The base moves only through its wheel actuators; arrival is decided
         from the measured base pose, and an obstacle the guard cannot pass
         fails the skill instead of being driven through. Holonomic bases are
         driven forward-only in this slice (no strafing yet).
+
+        Callers whose target pose was *evaluated* at an exact placement
+        (the grasp-placement retry) can tighten the arrival tolerances;
+        the defaults are the waypoint controller's.
         """
         started = time.perf_counter()
-        return self._skill("navigate_to", lambda: self._navigate_to(target, target_yaw, timeout, exclude_object), started)
+        return self._skill("navigate_to", lambda: self._navigate_to(
+            target, target_yaw, timeout, exclude_object, arrive_tolerance, yaw_tolerance), started)
 
-    def _navigate_to(self, target, target_yaw, timeout, exclude_object=None) -> dict:
+    def _navigate_to(self, target, target_yaw, timeout, exclude_object=None,
+                     arrive_tolerance=None, yaw_tolerance=None) -> dict:
         try:
             self.env.base_pose()
         except NotImplementedError:
             raise SkillError("NAVIGATION_UNSUPPORTED", "This scene's robot has no mobile base")
         limits = getattr(self.env, "base_speed_limits", None)
         max_v, max_omega = limits() if callable(limits) else (0.5, 1.2)
-        controller = WaypointController(max_v=float(max_v), max_omega=float(max_omega))
+        controller = WaypointController(
+            max_v=float(max_v), max_omega=float(max_omega),
+            **({"arrive_tolerance": float(arrive_tolerance)} if arrive_tolerance is not None else {}),
+            **({"yaw_tolerance": float(yaw_tolerance)} if yaw_tolerance is not None else {}))
         target = np.asarray(target, dtype=float)
         # Command at ~50 Hz of simulation time, like the motor cadence.
         chunk = max(1, round(0.02 / self.env.timestep))

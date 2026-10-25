@@ -36,6 +36,33 @@ class PrivateCollisionQueries:
         self.intended_contacts = {frozenset(self.body_names.get(link, link) for group in
             (gripper.get('contact_groups') or []) for link in group)
             for gripper in (profile.get('grippers') or {}).values()}
+        # A mobile base stands on its wheels: the wheel bodies (the hubs and
+        # the synthesized free rollers around them) rest on the support plane
+        # by design, so their contact with the world body - the desk geom's
+        # parent, and for a floor scene that geom is a slab whose top is the
+        # floor itself - is the support interface, not a collision. Without
+        # this, a base that settles a fraction of a millimetre under its own
+        # weight reports a permanent wheel/floor contact (measured on LeKiwi
+        # after driving: roller 0.06 mm from the plane, penetration 0) that
+        # fails every IK collision gate for every arm posture. Arm and
+        # gripper links keep their world checks, so an arm reaching into
+        # the desk or floor is still caught.
+        mobile = profile.get('mobile_base') or {}
+        wheel_joints = set(mobile.get('wheel_joints') or [])
+        # The whole subtree below a wheel joint is wheel: on LeKiwi the
+        # joint drives a mount, a fixed joint carries the hub, and the
+        # synthesized rollers hang off the hub.
+        wheel_bodies = {joint['child'] for joint in self.urdf.joints
+                        if joint['name'] in wheel_joints}
+        grew = True
+        while grew:
+            grew = False
+            for joint in self.urdf.joints:
+                if joint['parent'] in wheel_bodies and joint['child'] not in wheel_bodies:
+                    wheel_bodies.add(joint['child'])
+                    grew = True
+        self.intended_contacts |= {frozenset((self.body_names.get(link, link), 'world'))
+                                   for link in wheel_bodies}
         if table_top is not None:
             ET.SubElement(world, 'geom', name='desk', type='box', size='.8 .7 .025',
                           pos=f'0 0 {table_top-.025}')
