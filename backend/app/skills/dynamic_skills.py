@@ -29,15 +29,22 @@ def windup_candidates(runner, arm, obj):
                np.array([.04 * side, -.04 * side, 0.]), np.array([0., 0., 0.])]
     found = []
     for shift in outward:
-        highest = None
-        for height in np.arange(.10, .46, .02):
+        passing = []
+        for height in np.arange(0., .46, .02):
             pose = center + shift + np.array([0., 0., float(height)])
-            ok, mode, _ = launch_ready(runner, arm, pose, attitude)
+            ok, mode, _ = launch_ready(runner, arm, obj, pose, attitude)
             if not ok:
                 continue
-            highest = (pose, float(height), mode)
-        if highest is not None:
-            found.append((highest[1], highest[0], highest[2]))
+            passing.append((pose, float(height), mode))
+        # Highest first, but keep every height that passed rather than only the best one: a wind-up
+        # the planner's IK accepts can still be outside what a carrying arm will actually do, and the
+        # carry is the ground truth. Measured 2026-10-25 on OpenManipulator-X: the highest pose passed
+        # the IK check and its carry stopped 92 mm short, while the arm alone reached that same pose
+        # with zero error - so the search has to be able to walk down from a refused wind-up instead
+        # of giving up with one candidate rejected. The search also starts at the object's own level,
+        # not 10 cm above it, because a wind-up high in a short arm's reach leaves no room to stroke.
+        for pose, height, mode in reversed(passing):
+            found.append((height, pose, mode))
     for height, pose, mode in sorted(found, key=lambda row: -row[0]):
         yield pose, f"searched {height * 100:.0f} cm above the object ({mode})", mode
 
@@ -61,8 +68,14 @@ def reachable(env, arm, pose, rotation):
     return bool(result['success'])
 
 
-def launch_ready(runner, arm, windup, attitude, stroke=.14):
+def launch_ready(runner, arm, obj, windup, attitude, stroke=.14):
     """Whether this arm can hold ``windup`` and stroke up from it, and with which attitude.
+
+    ``windup`` is the *object's* pose, and it is asked about through the same grasp-offset arithmetic
+    the carry will command (``runner._carry_aim``), for the end effector. Asking the IK directly about
+    the object's column is a different question with a different answer: measured 2026-10-25 on
+    OpenManipulator-X, that check passed for a pose the carry then could not reach, stopping 92 mm
+    short - the length of the grasp offset the carry commands the end effector away by.
 
     ``strict`` keeps the attitude the cube is held in, which is what a six-joint arm does and what the
     official cell always did. An arm whose pinch frame is only achievable near the object cannot keep
@@ -74,9 +87,10 @@ def launch_ready(runner, arm, windup, attitude, stroke=.14):
     """
     env = runner.env
     for mode, rotation in (("strict", attitude), ("arm-achieved", None)):
-        if not reachable(env, arm, windup, rotation):
+        ee, _, _ = runner._carry_aim(arm, obj, windup, attitude="pinned" if rotation is not None else "free")
+        if not reachable(env, arm, ee, rotation):
             continue
-        if not reachable(env, arm, np.asarray(windup, float) + [0., 0., stroke], rotation):
+        if not reachable(env, arm, ee + np.array([0., 0., stroke]), rotation):
             continue
         return True, mode, ""
     return False, "", "unreachable with either the held or the arm's own attitude"
@@ -93,7 +107,7 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3.) -> dict:
     rejected = []
     for windup, label, mode in windup_candidates(runner, arm, obj):
         attitude = _attitude_in_use(runner, arm)
-        ok, mode, reason = launch_ready(runner, arm, windup, attitude)
+        ok, mode, reason = launch_ready(runner, arm, obj, windup, attitude)
         if not ok:
             rejected.append(f'{label} ({reason})')
             continue

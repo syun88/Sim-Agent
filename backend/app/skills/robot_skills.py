@@ -356,6 +356,21 @@ class SkillRunner:
                     "support_bounds": self.env.object_bounds(target).tolist()}
         return self._skill("move_to_object", run, time.perf_counter())
 
+    def _carry_aim(self, arm: str, obj: str, desired, *, attitude: str = "pinned"):
+        """The end-effector pose a carry to ``desired`` (the object's pose) commands, and its rotation.
+
+        One owner for the grasp-offset arithmetic, because everything that asks whether a carry is
+        possible must ask the same question the carry itself will command. Measured 2026-10-25 on
+        OpenManipulator-X: the wind-up search asked the IK for the end effector to be at the *object*'s
+        column, while the carry commanded the end effector held off from it by the grasp offset, so a
+        wind-up passed the search and the carry stopped 92 mm short - the offset's own length.
+        """
+        ee, rotation = self.env.ee_pose(arm)
+        offset = rotation.T @ (self.env.object_pose(obj)[0].copy() - ee)
+        commanded_rotation = None if attitude == "free" else self.controller.target_rotations.get(arm, rotation)
+        aim = rotation if commanded_rotation is None else commanded_rotation
+        return np.asarray(desired) - aim @ offset, commanded_rotation, offset
+
     def _carry_to(self, arm: str, obj: str, desired: np.ndarray, *, attitude: str = "pinned") -> dict:
         """Carry the held object to a pose. ``attitude="free"`` lets the arm choose its orientation.
 
@@ -368,10 +383,8 @@ class SkillRunner:
         self._require_hold(arm, obj)
         ee, rotation = self.env.ee_pose(arm)
         start = self.env.object_pose(obj)[0].copy()
-        offset = rotation.T @ (start - ee)
-        commanded_rotation = None if attitude == "free" else self.controller.target_rotations.get(arm, rotation)
+        target, commanded_rotation, offset = self._carry_aim(arm, obj, desired, attitude=attitude)
         aim = rotation if commanded_rotation is None else commanded_rotation
-        target = np.asarray(desired) - aim @ offset
         # Keep the carried cube on a Cartesian clearance path. A joint interpolation
         # between two high endpoints can still dip the palm through a table object.
         count = max(1, int(np.ceil(np.linalg.norm(np.asarray(desired) - start) / .025)))
