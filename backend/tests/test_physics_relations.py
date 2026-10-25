@@ -70,3 +70,24 @@ def test_evaluate_returns_the_relation_that_produced_the_number():
     assert result["relation"] == "release_speed_for_rise"
     assert result["unit"] == "m/s"
     assert result["inputs"] == {"rise_m": .03}
+
+
+def test_an_aimed_launch_points_at_the_target():
+    """10 cm away, 0.30 s of flight: the velocity must land on the target, not merely go up."""
+    from backend.app.physics import launch_for_target
+    aim = launch_for_target((.10, 0., 0.), .30)
+    vz, vx = aim["velocity"][2], aim["velocity"][0]
+    # Reconstruct the flight and check it passes through the requested point.
+    travel = [vx * t for t in (0., .15, .30)]
+    height = [vz * t - .5 * 9.81 * t * t for t in (0., .15, .30)]
+    assert travel[-1] == pytest.approx(.10, abs=1e-6)
+    assert height[-1] == pytest.approx(0., abs=1e-6)
+    assert aim["direction"][2] > .9, "a 10 cm throw at 0.3 s is mostly upward"
+
+
+def test_closest_approach_measures_the_trajectory_not_the_plan():
+    from backend.app.skills.dynamic_skills import closest_approach
+    trace = [{"position": [0., 0., 0.]}, {"position": [.05, 0., .02]}, {"position": [.10, 0., 0.]}]
+    assert closest_approach(trace, [.04, 0., 0.]) == pytest.approx(.0005 ** .5, abs=1e-6)
+    assert closest_approach(trace, [.05, 0., .021]) == pytest.approx(.001, abs=.001)
+    assert closest_approach([], [0., 0., 0.]) is None

@@ -49,6 +49,22 @@ def _is_choice_not_outcome(text: str) -> bool:
     return not _OUTCOME_WORDS.search(text)
 
 
+#: A requested operation the plan must actually contain, with the words that ask for it. A placement is
+#: not a throw and a pour is not a place: substituting one for the other satisfies the compiled goal
+#: checks while doing a different task, so the plan is refused instead.
+_OBLIGATIONS = (
+    ("throw_object", re.compile(r"投げ|放り投げ|ほうり|\bthrow\b|\btoss\b", re.I)),
+    ("pour_liquid", re.compile(r"注い|ついで|そそい|\bpour\b", re.I)),
+    ("handover_object", re.compile(r"渡し|わたし|\bhand\s*(?:it|over)\b|\bhandover\b", re.I)),
+)
+
+
+def missing_obligations(instruction: str, plan) -> list[str]:
+    """Operations the instruction asks for that the compiled plan does not perform."""
+    skills = {step.skill for step in plan.steps}
+    return [skill for skill, pattern in _OBLIGATIONS if pattern.search(instruction) and skill not in skills]
+
+
 def program_signature(plan) -> list:
     """The physical intentions a compiled program carries, for comparing two of them.
 
@@ -106,6 +122,10 @@ class AgentPlanner:
             "Use mode actions for the complete requested sequence. Preservation is checked independently from source text and physical state. "
             "Operations: pick (grasp and hold), handover (giver arm + receiver), place (put on table), "
             "approach, move (direction + distance_cm), open, close, home, throw (upward cube toss + height_cm), "
+            "A throw that must HIT an object (投げて当てて, ぶつけて) is op throw with target=<that object id>: "
+            "the cube is aimed so that it reaches it, and the engine verifies the closest approach. Never "
+            "replace an aimed throw by a placement or a drop onto the object - that is a different task and "
+            "it is judged differently. "
             "For throw you also design the launch: optional stroke_cm (2-30, how far the arm travels before "
             "release) and release_speed_m_s (0.2-3.0). A free rise of h metres needs about sqrt(2*9.81*h) m/s "
             "at release; short ramp with a long stroke is how to reach it. The skill returns the design and the "
@@ -445,7 +465,14 @@ class AgentPlanner:
         temporal = bool(re.search(r'\b(?:after|then|before)\b|てから|た後|渡して|その後', instruction, re.I))
         verbs = [m.lastgroup for m in VERBS.finditer(instruction)]
         procedural = (temporal and len(verbs)>1) or ('move' in verbs and motion_distance_cm(instruction) is not None)
-        self._interpret_meaning = not ((fallback_source and fallback_source.actions) or procedural)
+        # A final-state interpretation cannot express a primitive action: its goals are holding, placement
+        # and relative placement, so an instruction that names a throw, a pour or a joint has no goal to
+        # describe it with and comes back as a placement. Measured 2026-10-25: "throw the blue cube up and
+        # hit the red one" produced a carry-and-drop plan, which the goal checks then passed. When the
+        # instruction names a primitive, the ordered-actions path is the one that can express it.
+        primitive = bool(re.search(r'投げ|放り|\bthrow\b|\btoss\b|注い|ついで|\bpour\b|関節|度に|'
+                                   r'開けて|閉じて|\bopen\b|\bclose\b', instruction, re.I))
+        self._interpret_meaning = not ((fallback_source and fallback_source.actions) or procedural or primitive)
         language_stages = []
         # Why the model is not asked, stated rather than left implicit. The previous behaviour answered a
         # single direct command from the grammar and recorded nothing, so a request that used no model at
@@ -564,6 +591,11 @@ class AgentPlanner:
                             'semantic_binding_repairs': binding_repairs}
                         candidate.assumptions.append('文章で指定された物体・保持者・支持物の対応を優先しました。補正内容は実行ログに記録します。')
                     validate_instruction_relations(candidate, instruction, state)
+                    missing = missing_obligations(instruction, candidate)
+                    if missing:
+                        raise GroundingError("The program omits an operation the instruction asks for: "
+                                             + ", ".join(missing) + ". A placement or a handover does not "
+                                             "stand in for it; perform the requested operation.")
                     if not fallback_source:
                         audit = self._check_coverage(instruction,candidate,state)
                         if audit:

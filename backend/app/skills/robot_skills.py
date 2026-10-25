@@ -637,11 +637,16 @@ class SkillRunner:
         return {**self.park_empty_arm(arm),'skill':'return_home'}
 
     def throw_object(self, arm: str, obj: str, height_cm: float = 3.,
-                     stroke_cm: float | None = None, release_speed_m_s: float | None = None) -> dict:
+                     stroke_cm: float | None = None, release_speed_m_s: float | None = None,
+                     target: str | None = None) -> dict:
         from backend.app.skills.dynamic_skills import throw_up
+        # An aimed throw names its target; the skill needs the point, and it reads it from the engine
+        # rather than from the language.
+        point = None if target is None else self.env.object_pose(target)[0]
         return self._skill("throw_object", lambda: throw_up(self, arm, obj, height_cm,
                                                            stroke_cm=stroke_cm,
-                                                           release_speed_m_s=release_speed_m_s),
+                                                           release_speed_m_s=release_speed_m_s,
+                                                           target_point=point),
                            time.perf_counter())
 
     def pour_liquid(self, arm: str, obj: str, target: str, volume_ml: float) -> dict:
@@ -691,7 +696,8 @@ class SkillRunner:
             elif skill == "throw_object":
                 result = self.throw_object(arm, step["object"], float(step.get("height_cm") or 3.),
                                            stroke_cm=step.get("stroke_cm"),
-                                           release_speed_m_s=step.get("release_speed_m_s"))
+                                           release_speed_m_s=step.get("release_speed_m_s"),
+                                           target=step.get("target"))
             elif skill == "pour_liquid":
                 result = self.pour_liquid(arm, step["object"], step.get("target") or "wine_glass", float(step.get("volume_ml") or 20.))
             else:

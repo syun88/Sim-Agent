@@ -245,8 +245,12 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
         if action.op != "approach":
             checks.pop(f"approach:{arm}", None)
         action.object, action.arm = obj, arm
-        if action.relation and action.op != "place":
+        if action.relation and action.op not in {"place", "throw"}:
             raise GroundingError("An object-relative relation belongs to a placement action")
+        if action.op == "throw" and action.relation is not None:
+            # "throw it at the red cube" is an aimed throw, not a placement predicate: the relation has no
+            # meaning once the object leaves the hand, and the target is what carries the intent.
+            action.relation = None
         if action.op == "pick":
             previous_owner = owner(obj)
             acquire(obj, arm, index)
@@ -335,12 +339,24 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             acquire(obj, arm, index)
             action.direction = "up"
             action.height_cm = action.height_cm or 3.
+            aim = action.target
+            if aim is not None:
+                if aim == obj:
+                    raise GroundingError("A thrown cube cannot be its own target")
+                if aim not in objects:
+                    raise GroundingError(f"The throw target {aim} is not in this scene")
             emit("throw_object", arm, index, object=obj, height_cm=action.height_cm,
-                 stroke_cm=action.stroke_cm, release_speed_m_s=action.release_speed_m_s)
+                 stroke_cm=action.stroke_cm, release_speed_m_s=action.release_speed_m_s, target=aim)
             held[arm] = None
             checks.pop(obj, None)
-            checks[f"throw:{index}"] = {"type": "throw", "object": obj, "arm": arm,
-                                       "min_height": action.height_cm / 100., "action_index": index}
+            if aim is None:
+                checks[f"throw:{index}"] = {"type": "throw", "object": obj, "arm": arm,
+                                           "min_height": action.height_cm / 100., "action_index": index}
+            else:
+                # An aimed throw is judged by whether it reaches the target. A height check would pass a
+                # cube that arcs past it, and fail one that hits it without clearing the rise.
+                checks[f"hit:{index}"] = {"type": "hit", "object": obj, "target": aim,
+                                          "action_index": index}
         elif action.op == "move":
             if not action.direction or action.distance_cm is None:
                 raise GroundingError("Relative motion requires a direction and distance (1–30 cm)")

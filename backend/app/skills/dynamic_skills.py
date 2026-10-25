@@ -2,6 +2,9 @@
 import numpy as np
 
 
+#: How close the cube must come to the target's centre to count as a hit: two 5 cm cubes plus a margin.
+HIT_TOLERANCE_M = .07
+
 #: The official cell's wind-up, measured for its seven-joint arms.
 OFFICIAL_WINDUP = np.array([.50, .18, 1.075])
 
@@ -97,7 +100,8 @@ def launch_ready(runner, arm, obj, windup, attitude, stroke=.14):
 
 
 def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
-             stroke_cm: float | None = None, release_speed_m_s: float | None = None) -> dict:
+             stroke_cm: float | None = None, release_speed_m_s: float | None = None,
+             target_point=None, flight_time_s: float = .30) -> dict:
     """Throw upward. The *design* is computed; the *measurement* is the engine's.
 
     Three things determine whether a pinch throw leaves the hand at all, and all three are physics rather
@@ -121,7 +125,7 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
 
     env, control = runner.env, runner.controller
     runner._require_hold(arm, obj)
-    from backend.app.physics import ramp_for_release_speed, release_speed_for_rise
+    from backend.app.physics import launch_for_target, ramp_for_release_speed, release_speed_for_rise
 
     needed = release_speed_for_rise(max(height_cm / 100., .001))
     # What the pinch transmits of the commanded speed, measured on this robot with long strokes:
@@ -173,10 +177,22 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
     # Solved by the planner's IK, for the same reason the wind-up is: the controller's own IK is a
     # local, damped solve that a four-joint arm cannot satisfy a full six-degree-of-freedom pose with.
     from backend.app.robots.urdf import solve_profile_ik
-    planned = solve_profile_ik(env.profile, arm, np.asarray(position, float) + np.array([0., 0., stroke]),
+    aim = None
+    direction = np.array([0., 0., 1.])
+    if target_point is not None:
+        # Aimed throw: the physics substrate says which velocity carries the cube through the target
+        # after a chosen flight time, and the stroke is made along that direction so the release
+        # velocity points at it. The engine still measures whether it actually got there.
+        delta = np.asarray(target_point, float) - (np.asarray(position, float) + np.array([0., 0., stroke * .5]))
+        aim = launch_for_target(delta, flight_time_s)
+        direction = np.asarray(aim['direction'], float)
+        speed = float(aim['speed']) / PINCH_TRANSMISSION
+        ramp = max(.05, min(.6, ramp_for_release_speed(stroke, speed, RELEASE_PHASE)))
+        release_at = RELEASE_PHASE * ramp
+    planned = solve_profile_ik(env.profile, arm, np.asarray(position, float) + direction * stroke,
                                launch_rotation, model=env.model, q_init=start, snapshot=env.joint_snapshot())
     if not planned['success']:
-        raise SkillError("IK_FAILURE", f"Upward launch stroke is unreachable ({planned['position_error']:.4f})")
+        raise SkillError("IK_FAILURE", f"Launch stroke is unreachable ({planned['position_error']:.4f})")
     end = env.model.nearest_continuous(env.profile['chains'][arm]['joints'], planned['q_rad'], start)
     if mode == "strict":
         control.target_rotations[arm] = rotation.copy()
@@ -204,6 +220,9 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
         env.set_arm(arm, env.arm_qpos(arm))
         env.configure_motion_response(control.motion_speed)
     evidence = evaluate_throw(trace, height_cm / 100., release_after=release_at)
+    if target_point is not None:
+        evidence['closest_approach_m'] = closest_approach(trace, target_point)
+        evidence['aim'] = aim
     design = {"stroke_cm": round(stroke * 100., 1), "ramp_seconds": round(ramp, 3),
               "release_phase": RELEASE_PHASE, "release_after": round(release_at, 3),
               "needed_release_speed_m_s": round(needed, 3),
@@ -211,7 +230,19 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
               "physics": ["release_speed_for_rise", "ramp_for_release_speed"],
               "requested_release_speed_m_s": release_speed_m_s,
               "measured_release_speed_m_s": round(float((evidence.get("release_velocity") or [0, 0, 0])[2]), 3)}
-    if not evidence["success"]:
+    if target_point is not None:
+        # An aimed throw is judged by whether it hits, not by how high it went: a cube that arcs past the
+        # target satisfies a height check and misses the task, and a cube that hits it need not clear any
+        # particular height. ``height_cm`` is only a design input here.
+        hit = evidence['closest_approach_m'] is not None and evidence['closest_approach_m'] <= HIT_TOLERANCE_M
+        evidence['success'] = bool(hit and (evidence.get('free_flight_duration') or 0.) > .02)
+        evidence['hit'] = bool(hit)
+        evidence['hit_tolerance_m'] = HIT_TOLERANCE_M
+        if not evidence['success']:
+            raise SkillError("THROW_FAILED", f"The throw did not hit the target "
+                             f"(closest {evidence['closest_approach_m']} m, tolerance {HIT_TOLERANCE_M} m, "
+                             f"design {design}): {evidence}")
+    elif not evidence["success"]:
         # The design and the measurement travel with the failure: "measured 0.45 m/s where 0.767 was
         # needed" is a value the planner can revise, while "the throw failed" is not.
         raise SkillError("THROW_FAILED", f"Measured upward free flight did not reach {height_cm:g} cm "
@@ -219,6 +250,13 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
     return {"object": obj, "arm": arm, "requested_free_rise": height_cm / 100., "design": design,
             "pinch_contacts_before_launch": initial_contacts, "trajectory": trace, **evidence,
             "grasp_mode": env.grasp_mode}
+
+
+def closest_approach(trace: list[dict], point) -> float | None:
+    """Closest a recorded trajectory came to ``point``, in metres."""
+    target = np.asarray(point, float)
+    distances = [float(np.linalg.norm(np.asarray(sample["position"], float) - target)) for sample in trace]
+    return min(distances) if distances else None
 
 
 def evaluate_throw(trace: list[dict], minimum_rise: float, release_after: float = .24) -> dict:

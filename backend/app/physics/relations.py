@@ -63,6 +63,21 @@ def closing_reserve(flow_ml_s: float, closing_time_s: float, cap_ml: float) -> f
     return min(max(float(cap_ml), 0.), max(float(flow_ml_s), 0.) * max(float(closing_time_s), 0.))
 
 
+def launch_for_target(delta_m, flight_time_s, gravity: float = GRAVITY) -> dict:
+    """Release velocity that carries a projectile through ``delta_m`` after ``flight_time_s``.
+
+    Gravity acts on z only, so the horizontal part is constant and the vertical part carries the whole
+    of ``0.5*g*T^2``. The flight time is the caller's choice: a short time needs a fast, flat throw and a
+    long one needs a high, slow arc, and which is reachable is the robot's question, not physics'.
+    """
+    dx, dy, dz = (float(value) for value in delta_m)
+    time = max(float(flight_time_s), 1e-6)
+    velocity = (dx / time, dy / time, (dz + .5 * gravity * time ** 2) / time)
+    speed = sum(component ** 2 for component in velocity) ** .5
+    direction = tuple(component / speed for component in velocity) if speed > 1e-9 else (0., 0., 1.)
+    return {"velocity": velocity, "speed": speed, "direction": direction, "flight_time_s": time}
+
+
 #: name -> (callable, unit of the result, arguments, what the relation assumes)
 RELATIONS = {
     "release_speed_for_rise": (
@@ -83,6 +98,10 @@ RELATIONS = {
     "pour_time_for_volume": (
         pour_time_for_volume, "s", {"volume_ml": "ml", "flow_ml_s": "ml/s"},
         "Constant stream; the measured flow rate of the running pour is the right input."),
+    "launch_for_target": (
+        launch_for_target, "m/s and -, -, m", {"delta_m": "m", "flight_time_s": "s"},
+        "Projectile through a point after a chosen flight time; horizontal part constant, z carries "
+        "0.5*g*T^2. Returns velocity, speed and unit direction."),
     "closing_reserve": (
         closing_reserve, "ml", {"flow_ml_s": "ml/s", "closing_time_s": "s", "cap_ml": "ml"},
         "The stream keeps flowing while the vessel is returned upright; capped by the caller."),
@@ -107,5 +126,10 @@ def evaluate(name: str, **arguments) -> dict:
     if missing:
         raise KeyError(f"{name} needs {missing}")
     value = function(**{arg: arguments[arg] for arg in expected})
-    return {"relation": name, "value": float(value), "unit": unit,
-            "inputs": {arg: arguments[arg] for arg in expected}, "assumes": doc}
+    result = {"relation": name, "unit": unit,
+              "inputs": {arg: arguments[arg] for arg in expected}, "assumes": doc}
+    # Some relations answer with a vector (a launch velocity has a direction as well as a size); those
+    # keep their structure, everything else is a scalar a caller can use directly.
+    if isinstance(value, dict):
+        return {**result, "value": value, "vector": True}
+    return {**result, "value": float(value), "vector": False}

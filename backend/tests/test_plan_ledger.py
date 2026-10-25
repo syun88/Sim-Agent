@@ -10,6 +10,8 @@ new modes (capability, shadow) cannot silently change what runs.
 
 from __future__ import annotations
 
+import pytest
+
 from backend.app.models.schemas import AgentPlan
 from backend.app.planning.agent_planner import PROVENANCE_FIELDS, AgentPlanner, program_signature
 
@@ -136,3 +138,19 @@ def test_a_replanned_continuation_carries_the_whole_ledger():
     """A recovery rebuilds the steps through the compiler; it must not lose who planned the task."""
     assert LEDGER_FIELDS <= set(PROVENANCE_FIELDS), "a provenance field was left out of the carry-over list"
     assert LEDGER_FIELDS <= set(AgentPlan.model_fields), "a provenance field is missing from the response model"
+
+
+def test_a_placement_cannot_stand_in_for_a_requested_throw(monkeypatch):
+    """The model proposed carrying the cube onto the other one for '投げて当てて' and it passed as success."""
+    from backend.app.planning.agent_planner import missing_obligations
+
+    _local(monkeypatch)
+    monkeypatch.setenv("OPENARM_CAPABILITY_MODE", "1")
+    placement = AgentPlanner().plan("青いキューブを赤いキューブの上に置いて", WORLD_STATE)
+    assert missing_obligations("青いキューブを赤いキューブの上に置いて", placement) == []
+    assert missing_obligations("青いキューブを上に投げて赤いキューブに当てて", placement) == ["throw_object"]
+
+    monkeypatch.setattr(AgentPlanner, "_ai_plan",
+                        lambda self, i, s, m: {"payload": placement.program, "raw": "model"})
+    with pytest.raises(Exception):
+        AgentPlanner().plan("青いキューブを上に投げて赤いキューブに当てて", WORLD_STATE)
