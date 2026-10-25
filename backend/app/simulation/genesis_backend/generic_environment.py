@@ -250,6 +250,18 @@ class GenericURDFEnvironment(SimulationBackend):
     def object_bounds(self, name):
         return self._objects[name].get_link(name).get_AABB().cpu().numpy().astype(float).reshape(2, 3)
 
+    def link_bounds(self, name):
+        """World AABB of one robot link, or None when the link carries no collision geometry.
+
+        The jaw envelope needs this: how far a jaw reaches from the object's centre is a property of the
+        gripper that has to be measured, and the same AABB the renderer and the collision model use is the
+        honest source.
+        """
+        link = self._entity.get_link(name)
+        if link is None or not link.n_geoms:
+            return None
+        return link.get_AABB().cpu().numpy().astype(float).reshape(2, 3)
+
     def record_grasp_verification(self, side, evidence):
         import time
         path = Path(self.profile['directory']) / 'gripper_runtime.json'

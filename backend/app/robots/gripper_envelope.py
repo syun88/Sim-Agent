@@ -9,6 +9,8 @@ which is the number both the release and the placement clearance should use.
 """
 from __future__ import annotations
 
+import numpy as np
+
 
 def maximum_aperture(env, arm: str) -> float:
     """The gripper's full opening, as measured when the robot was prepared (metres)."""
@@ -37,6 +39,35 @@ def release_command(env, arm: str, obj: str, margin: float = .010) -> float:
     return max(0., min(1., 1. - release_aperture(env, arm, obj, margin) / aperture))
 
 
+def jaw_reach(env, arm: str, obj: str) -> float:
+    """How far any jaw reaches laterally from the object's centre, in the object's own frame - measured.
+
+    "Laterally" matters: a world-axis AABB of a jaw includes its length along the approach direction, and
+    taking that as the sideways reach reserved 115 mm for a 25.5 mm cube. The reach is therefore measured
+    in the object's frame, perpendicular to the gripper's approach axis, from the links' own AABBs - the
+    same geometry the collision model uses.
+    """
+    gripper = (getattr(env, "grippers", {}) or {}).get(arm, {}) or {}
+    links = {name for group in (gripper.get("contact_groups") or []) for name in group}
+    if not links or not hasattr(env, "link_bounds"):
+        return 0.
+    centre, rotation = env.object_pose(obj)
+    centre = np.asarray(centre, float)
+    rotation = np.asarray(rotation, float)
+    approach = rotation.T @ np.asarray(gripper.get("approach_axis") or [0., 0., -1.], float)
+    approach = approach / max(float(np.linalg.norm(approach)), 1e-9)
+    reach = 0.
+    for name in links:
+        bounds = env.link_bounds(name)
+        if bounds is None:
+            continue
+        corners = np.array([[x, y, z] for x in bounds[:, 0] for y in bounds[:, 1] for z in bounds[:, 2]])
+        local = (corners - centre) @ rotation
+        perpendicular = local - np.outer(local @ approach, approach)
+        reach = max(reach, float(np.max(np.linalg.norm(perpendicular, axis=1))))
+    return reach
+
+
 def reference_gap(env, arm: str, obj: str, margin: float = .020) -> float:
     """Gap between the placed object and a reference so the jaws can still let go of it.
 
@@ -49,4 +80,8 @@ def reference_gap(env, arm: str, obj: str, margin: float = .020) -> float:
     """
     half = object_width(env, obj) / 2.
     aperture = maximum_aperture(env, arm) or release_aperture(env, arm, obj)
+    # The aperture bound, which is the one measured to separate cleanly (71.5 mm on OpenManipulator-X).
+    # jaw_reach() is available and measured, but its axis convention is not settled yet: taking the max
+    # with it inflated the reserved distance to 116 mm, and the verification of that placement failed, so
+    # it is a diagnostic until the frame question is answered rather than a bound in this formula.
     return max(0., aperture / 2. + margin - half)
