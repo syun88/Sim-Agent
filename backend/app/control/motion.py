@@ -118,7 +118,16 @@ class OpenArmV2Controller:
             q = self.env.arm_qpos(side)
         else:
             q = np.clip(np.asarray(q_init, float), limits[:, 0], limits[:, 1])
-        if target_rotation is None and not under_actuated:
+        if under_actuated:
+            # Not merely "do not substitute one": an arm that cannot hold an attitude must not be
+            # asked for one even when the caller passes it, because the least-squares task then spends
+            # its freedom on a term it can never satisfy and the iterate the mixed error keeps is tens
+            # of millimetres off in position. Measured 2026-10-25 on the four-joint
+            # OpenManipulator-X: carries were refused with 40-90 mm residuals for targets the
+            # planner's position-only IK solved with zero error, including the pose the arm was
+            # already holding. Calls that want an attitude on such an arm still get the position.
+            target_rotation = None
+        elif target_rotation is None:
             target_rotation = self.env.ee_pose(side)[1]
         kinematics = self.env.arm_kinematics(side)
         best_q = q.copy()

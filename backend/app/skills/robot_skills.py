@@ -371,6 +371,37 @@ class SkillRunner:
         aim = rotation if commanded_rotation is None else commanded_rotation
         return np.asarray(desired) - aim @ offset, commanded_rotation, offset
 
+    def _planned_carry(self, arm: str, obj: str, desired: np.ndarray, rotation):
+        """A planner-solved joint path that carries the held object to ``desired``, and its attitude.
+
+        Only for arms with fewer than six joints, where the controller's own damped local solver stops
+        tens of millimetres short of poses the planner's IK solves with zero error: measured
+        2026-10-25 on the four-joint OpenManipulator-X, the solver's position error on the wind-up
+        candidates was 90-118 mm while ``launch_ready`` had already accepted the same targets below
+        2 mm through the planner. The decision stays with ``move_to_site``, which validates the path it
+        is handed (start continuity, joint limits, final pose) and refuses a plan that does not hold.
+        """
+        from backend.app.robots.urdf import solve_profile_ik
+
+        env = self.env
+        names = env.profile['chains'][arm]['joints']
+        ee, held = env.ee_pose(arm)
+        offset = held.T @ (env.object_pose(obj)[0].copy() - ee)
+        aim = held if rotation is None else np.asarray(rotation, float)
+        start = env.object_pose(obj)[0].copy()
+        goal = np.asarray(desired, float)
+        seed = env.arm_qpos(arm)
+        path = [seed]
+        count = max(1, int(np.ceil(np.linalg.norm(goal - start) / .025)))
+        for alpha in np.linspace(0., 1., count + 1)[1:]:
+            solution = solve_profile_ik(env.profile, arm, (1 - alpha) * start + alpha * goal - aim @ offset,
+                                        None, model=env.model, q_init=seed, snapshot=env.joint_snapshot())
+            if not solution['success']:
+                return None
+            seed = env.model.nearest_continuous(names, solution['q_rad'], seed)
+            path.append(seed)
+        return path, np.asarray(env.arm_kinematics(arm).evaluate(seed)[1], float)
+
     def _carry_to(self, arm: str, obj: str, desired: np.ndarray, *, attitude: str = "pinned") -> dict:
         """Carry the held object to a pose. ``attitude="free"`` lets the arm choose its orientation.
 
@@ -397,10 +428,28 @@ class SkillRunner:
                     raise SkillError(result.error or "IK_FAILURE", "Cartesian carry was blocked")
                 self._require_hold(arm, obj)
             via = []
+        # An imported arm with fewer than six joints is carried along a planner-solved path: its own
+        # solver cannot reach the wind-up candidates the planner accepts (see ``_planned_carry``).
+        # Six-joint arms - the official cell - keep exactly the motion they had, and so does an
+        # environment that does not expose a profile at all: an unknown arm must not be assumed to be
+        # the short one, or the official environment is silently handed a plan it never had.
+        profile = getattr(self.env, 'profile', None)
+        chain_joints = profile.get('chains', {}).get(arm, {}).get('joints') if isinstance(profile, dict) else None
+        planned = (self._planned_carry(arm, obj, np.asarray(desired, float), commanded_rotation)
+                   if chain_joints is not None and len(chain_joints) < 6 else None)
         for attempt in range(3):
-            result = self.controller.move_to_site(arm, target, commanded_rotation,
-                via=via if attempt == 0 else None, on_sample=lambda: self._require_hold(arm, obj))
+            if attempt == 1 and planned is not None:
+                result = self.controller.move_to_site(arm, target, planned[1], planned_joints=planned[0],
+                                                      on_sample=lambda: self._require_hold(arm, obj))
+            else:
+                result = self.controller.move_to_site(arm, target, commanded_rotation,
+                    via=via if attempt == 0 else None, on_sample=lambda: self._require_hold(arm, obj))
             if not result.success:
+                # The controller's own solve failing is what the planner-solved path is for: without this
+                # the fallback sits behind a raise that never lets it run (measured: the residuals were
+                # bit-identical with and without the plan, which is how the dead path was found).
+                if attempt == 0 and planned is not None:
+                    continue
                 raise SkillError(result.error or "IK_FAILURE", f"Cannot carry {obj} to {np.round(desired, 4).tolist()} (EE {np.round(target, 4).tolist()}, position residual {result.position_error}, rotation residual {result.rotation_error})")
             self._require_hold(arm, obj)
             actual = self.env.object_pose(obj)[0]
