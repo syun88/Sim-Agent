@@ -216,7 +216,7 @@ class TaskAgent:
                 return finish(result)
             announce({'kind':assessment['decision'],'explanation':assessment.get('reason','復旧します。'),
                 'assessment':assessment,'completed_action_prefix':prefix,'reset_evidence':certificate})
-            recovery={'decision':assessment['decision'],'before':observed}
+            recovery={'decision':assessment['decision'],'assessment':assessment,'before':observed}
             recoveries.append(recovery)
             if assessment['decision']=='resume':
                 plan = continuation
