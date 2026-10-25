@@ -18,7 +18,9 @@ permissions:
 jobs:
   backend:
     name: Backend (ruff + pytest)
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moves to Ubuntu 26.04 in Nov 2026 and the apt/mesa set below was
+    # verified on 24.04.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -43,6 +45,17 @@ jobs:
           grep -viE '^(torch|triton|nvidia-|cuda-)' /tmp/locked.txt > /tmp/locked-no-torch.txt
           uv pip install -r /tmp/locked-no-torch.txt
           uv pip install "$TORCH" --torch-backend cpu
+
+      # Genesis renders offscreen through EGL (PYOPENGL_PLATFORM defaults to "egl" on Linux), and the
+      # runner has no GPU and no libEGL: without this, 28 tests error with "EGL is required to create
+      # an offscreen OpenGL context". libegl1 -> libegl-mesa0 + mesa-libgallium gives the llvmpipe
+      # software rasterizer; no env vars are needed. libgl1 / libxrender1 are for pyglet and pygel3d
+      # imports; the runner run got past those imports, so they are probably preinstalled (kept so a bare
+      # image works too).
+      - name: Install EGL / Mesa software rendering libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libegl1 libgl1 libgl1-mesa-dri libxrender1
 
       # --no-sync: `uv run` would otherwise re-sync the env back to the CUDA torch from uv.lock.
       # The first Genesis scene build compiles kernels (~1 min); the whole suite takes ~2-3 min.
