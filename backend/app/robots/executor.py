@@ -490,6 +490,10 @@ class ImportedRobotSkills(SkillRunner):
     # there. Desk robots and non-collision failures are untouched.
 
     def _approach(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0., grasp_offset=None):
+        # A pinch frame belongs to the approach that plans it, so a new approach starts from the nominal frame. Holding
+        # a frame from an earlier attempt made later attempts plan with a stale rotation: measured 2026-10-27, the
+        # app's second attempt refused 18 of 18 postures while the first succeeded.
+        getattr(self, '_pinch_frames', {}).pop(arm, None)
         with self._base_hold():
             return self._approach_attempt(arm, obj, progress, fault_offset, grasp_offset_x, grasp_offset)
 
