@@ -57,6 +57,9 @@ def jaw_reach(env, arm: str, obj: str, direction=None) -> float:
     centre = np.asarray(env.object_pose(obj)[0], float)
     aim = None if direction is None else np.asarray(direction, float)
     if aim is not None:
+        # Callers describe a placement direction in the table plane; the AABBs are three-dimensional.
+        if aim.shape == (2,):
+            aim = np.array([aim[0], aim[1], 0.])
         aim = aim / max(float(np.linalg.norm(aim)), 1e-9)
     reach = 0.
     for name in links:
@@ -96,8 +99,9 @@ def reference_gap(env, arm: str, obj: str, margin: float = .020, direction=None)
         print(f'[gripper] {arm}/{obj} aperture_half={aperture / 2.:.4f} jaw_reach={measured:.4f} '
               f'object_half={half:.4f} measured_gap={max(aperture / 2., measured) + margin - half:.4f} '
               f'-> using_aperture={aperture / 2. + margin - half:.4f}', flush=True)
-    # The aperture bound is still what runs, because it is the value measured to separate cleanly
-    # (71.5 mm centre-to-centre on OpenManipulator-X). The measured reach is a diagnostic until a live
-    # run shows it separates too: switching a clearance on a number nobody has tested is how a retreat
-    # starts moving a placed object. OPENARM_GRIPPER_DEBUG prints both so the next run can decide.
-    return max(0., aperture / 2. + margin - half)
+    # Both are measured, and they agree on the robot this was checked on: jaw_reach 0.0400 against
+    # aperture/2 0.0410, a placement at 74.0 mm centre-to-centre that separated cleanly (2026-10-26,
+    # OpenManipulator-X, measured without the GUI viewer). The larger wins, so a gripper whose jaw reaches
+    # further than half its aperture is no longer under-reserved, and the number is derived per robot
+    # instead of being inherited from whichever one was measured first.
+    return max(0., max(aperture / 2., measured) + margin - half)
