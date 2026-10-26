@@ -380,5 +380,10 @@ fluid       SPH / 8 particles / 51.2 mL / glass 0 / spilled 0
   **`goal_pose_clear: true` / `rrt: searched_and_failed`** —— 把持姿勢そのものは衝突していない ✓ のに
   コネクタが繋げない ✗。探索範囲（`spread`, 既定 1.2 rad）を **2.0 / 2.8 rad** に広げても
   `corridor_none: 24` は**まったく同じ**（否定）。次は**反復予算**と `edge_clear` の分解能（.06 rad）を疑う。
+**測定（2026-10-27）**: 分解能 0.06→0.02、予算 80→400、探索範囲 1.2→2.0 のいずれでも
+`corridor_none: 24` は**同じ**（すべて否定 ✗）。ただし `edge_clear` は環境変数で切り替わるが、
+`OPENARM_RRT_ITERS` は**内側の connect ループ**に当てており、探索全体の反復数は別（`for iteration in range(...)`）。
+さらに、始点の姿勢は clear で、始点から ±0.01/0.05/0.15/0.4 rad の辺は**すべて通る**（＝始点由来の閉塞ではない）。
+残る容疑は**外側の反復数**。
 - したがって順序は: ①UR5e の接近経路を通す（`COLLISION_PATH` の内訳を読む）→ ②把持成功で `grasp_calibrated` が付く
   → ③wine シーンが許可され、ボトルは既に可達域配置。流体側は準備済み。

@@ -290,7 +290,12 @@ class PrivateCollisionQueries:
         return None
 
     def edge_clear(self, names, start, end, snapshot, resolution=.06, minimum_clearance=0.):
-        steps = max(2, int(np.ceil(np.max(abs(np.asarray(end)-start))/resolution)) + 1)
+        # ``resolution`` is how far apart the sampled poses on an edge are. A coarse step can judge a real corridor
+        # blocked, or a real collision clear; the default was never measured, so it is overridable for an experiment:
+        #   OPENARM_EDGE_RESOLUTION=0.02
+        import os
+        resolution = float(os.getenv('OPENARM_EDGE_RESOLUTION', resolution))
+        steps = max(2, int(np.ceil(np.max(abs(np.asarray(end) - start)) / resolution)) + 1)
         return all((not self.contacts({**snapshot, **dict(zip(names,q))},tolerance=-minimum_clearance)
                     if minimum_clearance else self.clear({**snapshot, **dict(zip(names, q))}))
                    for q in np.linspace(start, end, steps))
@@ -332,7 +337,8 @@ class PrivateCollisionQueries:
             a = extend(first, target)
             if a is None:
                 continue
-            for _ in range(80):
+            import os as _os
+            for _ in range(int(_os.getenv('OPENARM_RRT_ITERS', '80'))):
                 b = extend(second, first[0][a])
                 if b is None:
                     break
