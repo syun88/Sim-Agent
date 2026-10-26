@@ -294,3 +294,28 @@ bf16 の 5GB に合わせて `MemoryMax=12G`。**3件/2件という標本の小�
 - **配置オフセット**は `_approach_planned` の `aim = before + shift` に一本化。`before` は物体の実姿勢（変位検査用）、
   `aim` は顎を向ける先（計画用）。レビューで「配線だけして無視していた」ことが判明したため、計画座標が実際に `aim` を使う。
 - **投げの弧**は振り上げ後に1回だけ選ぶ（`_throw_once`）。ラダーや事前スキャンは実測で否定済み（前節）。
+
+## 汎用化の残件: 流体（ワイン注ぎ）を imported 機体でも使えるようにする（2026-10-27 実測）
+
+現状は**シーン生成の入口で拒否**される:
+```
+create_backend('wine', robot_id='open_manipulator_x-…')
+  -> ValueError: Wine manipulation needs a calibrated physical gripper profile
+```
+理由は**能力不足ではなく配置**にある（実測）:
+
+- `WineWorld(scene, gs, *, fixed_bottle=False, async_surface=True)` は **`scene` と `gs` だけ**を受け取り、
+  OpenArm に依存しない（ボトル・グラス・SPH 液体・表面レンダラを作るだけ）。
+- ただし**配線が公式 env にしかない**: `generic_environment.py` には `fluid`/`wine` の記述が **0 件**、
+  `environment.py` 側に `WineWorld(...)` と `fluid_state()` がある。
+- `pour_liquid` スキル・計画の `pour` op・物理基盤（`pour_time_for_volume` / `closing_reserve`）は**すでに汎用**。
+
+移植の手順（次の実装単位）:
+1. `GenericURDFEnvironment` に `scene_profile == 'wine'` の分岐を足し、`WineWorld(scene, gs, …)` を生成。
+2. ボトル/グラスを `_objects` に登録し、`fluid_state()`・`fluid` フレーム・`object_contacts` を公式 env と同じ形で公開。
+3. `create_backend` の `robot_id != 'openarm_v2' and profile == 'wine'` の**無条件拒否**を、
+   「グリッパが物理検証済み（`grasp_calibrated`）で、口径がボトルを掴める」場合に許可する条件に置き換える。
+4. 受入: imported 機体で `approach → grasp → lift → pour_liquid(20 mL)` が通り、`spilled_ml` と
+   `poured_ml` が engine から出る（公式セルと同じ検証経路）。
+
+**d1 も VLM もこの作業には不要**（判断ではなく配線だから）。モデルは `pour` op を計画し、engine が量を測る。
