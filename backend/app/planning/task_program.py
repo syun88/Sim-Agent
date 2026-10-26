@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import field_validator, BaseModel, ConfigDict, Field, model_validator
 
 from backend.app.models.schemas import AgentPlan, PlanStep
 
@@ -38,6 +38,26 @@ class TaskAction(BaseModel):
     release_speed_m_s: float | None = Field(default=None, ge=.2, le=3.)
     joint: str | None = None
     position_deg: float | None = Field(default=None, allow_inf_nan=False)
+
+    @field_validator('distance_cm', 'height_cm', 'stroke_cm', 'release_speed_m_s', 'volume_ml',
+                     mode='before')
+    @classmethod
+    def drop_unusable_number(cls, value, info):
+        """Treat an out-of-range optional number as "unspecified" instead of failing the whole plan.
+
+        A model that returns the right actions with 0 for a distance has told us what to do; rejecting the
+        program over that number loses the plan and reports nothing useful. Measured 2026-10-26 with a 3B
+        planner: the aimed-throw actions were correct and the plan was dropped for distance_cm=0.
+        """
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        low, high = {'distance_cm': (1., 30.), 'height_cm': (1., 10.), 'stroke_cm': (2., 30.),
+                     'release_speed_m_s': (.2, 3.), 'volume_ml': (5., 35.)}[info.field_name]
+        return number if low <= number <= high else None
 
 
 class TaskGoal(BaseModel):

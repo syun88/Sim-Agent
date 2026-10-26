@@ -65,6 +65,35 @@ def missing_obligations(instruction: str, plan) -> list[str]:
     return [skill for skill, pattern in _OBLIGATIONS if pattern.search(instruction) and skill not in skills]
 
 
+def compact_scene(state: dict) -> dict:
+    """The part of a world state a planner needs: what exists, where it is, what the hands hold, what the
+    robot can do. Everything else is evidence for verification, not context for choosing a skill."""
+    def r3(values):
+        return [round(float(v), 3) for v in (values or [])]
+
+    objects = [{k: value for k, value in {
+        'id': obj.get('id'), 'type': obj.get('type'), 'color': obj.get('color'),
+        'position': r3(obj.get('position')), 'graspable': obj.get('graspable', True),
+        'held_by': obj.get('held_by') or [], 'admitted_grasp_arm': obj.get('admitted_grasp_arm'),
+    }.items() if value is not None} for obj in (state.get('objects') or [])]
+    robot = state.get('robot') or {}
+    compact = {
+        'objects': objects,
+        'targets': [{'id': target.get('id'), 'position': r3(target.get('position'))}
+                    for target in (state.get('targets') or [])],
+        'robot': {'available_arms': robot.get('available_arms'),
+                  'held': {side: (robot.get(f'{side}_arm') or {}).get('held_object')
+                           for side in ('left', 'right')}},
+        'skills': (state.get('capabilities') or {}).get('skills') or [],
+        'workspace': {'table_height_m': (state.get('workspace') or {}).get('table_height_m')},
+        'grasp_mode': state.get('grasp_mode'),
+    }
+    for key in ('fluid', 'discourse'):
+        if state.get(key):
+            compact[key] = state[key]
+    return {key: value for key, value in compact.items() if value not in (None, [], {})}
+
+
 def program_signature(plan) -> list:
     """The physical intentions a compiled program carries, for comparing two of them.
 
@@ -168,7 +197,11 @@ class AgentPlanner:
         )
         # Setup diagnostics include many numerical IK candidates. They belong in the
         # evidence API, not the language context where they waste the model budget.
-        language_state = {key: value for key, value in state.items() if key != 'spawn_validation'}
+        # A compact scene, not the whole world: the full state is 24,845 characters of bounds,
+        # rotations, contacts and IK diagnostics, and a 3B planner answers a plan in under a second when
+        # the context is the ids, the positions, the hands and the skills. Measured 2026-10-26: with the
+        # full state the same instruction produced a pour for a two-cube throw scene, or nothing at all.
+        language_state = compact_scene(state)
         user = {"instruction": instruction, "world_state": language_state, "relevant_experience": memory[-3:]}
         user["literal_spatial_constraints"] = [{"target": item["target"], "relation": item["relation"],
                                                 "source": instruction[slice(*item["span"])]}

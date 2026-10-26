@@ -173,3 +173,34 @@ def test_a_model_failure_is_not_reported_as_a_grammar_failure(monkeypatch):
     assert "after the model was asked" in message
     assert "the model returned nothing usable" in message
     assert "Unrecognised" not in message
+
+
+def test_an_out_of_range_number_is_unspecified_not_a_rejected_plan():
+    """A model that returns the right actions with distance_cm=0 has told us what to do."""
+    from backend.app.planning.task_program import TaskAction
+
+    assert TaskAction(op="move", direction="up", distance_cm=0).distance_cm is None
+    assert TaskAction(op="move", direction="up", distance_cm=99).distance_cm is None
+    assert TaskAction(op="move", direction="up", distance_cm=5).distance_cm == 5.
+    assert TaskAction(op="throw", height_cm=0).height_cm is None
+    assert TaskAction(op="throw", stroke_cm=200).stroke_cm is None
+
+
+def test_the_planner_context_is_a_compact_scene_not_the_whole_world():
+    """24,845 characters of bounds and rotations is not context a small planner can use."""
+    from backend.app.planning.agent_planner import compact_scene
+
+    state = {"objects": [{"id": "red_cube", "type": "cube", "position": [1e-17, .5, .7],
+                          "bounds": [[0, 0, 0], [.02, .02, .02]], "rotation": [[1, 0, 0]] * 3,
+                          "touching": ["desk"], "linear_speed_m_s": 1e-9, "graspable": True}],
+             "targets": [{"id": "left_side", "position": [.1, .1, .76], "type": "table_region"}],
+             "robot": {"available_arms": ["left"], "left_arm": {"held_object": None},
+                       "right_arm": {"held_object": None}},
+             "capabilities": {"skills": ["grasp_object"]},
+             "workspace": {"table_height_m": .755},
+             "spawn_validation": {"objects": {"red_cube": {"checks": [{"q_rad": [0.] * 6}]}}}}
+    compact = compact_scene(state)
+    assert compact["objects"][0]["position"] == [0., 0.5, 0.7]
+    assert "bounds" not in compact["objects"][0] and "rotation" not in compact["objects"][0]
+    assert "spawn_validation" not in compact
+    assert len(__import__("json").dumps(compact)) < 600
