@@ -126,19 +126,7 @@ def diagnose_pinch(object: str = 'red_cube', arm: str = 'left', observer: bool =
 def reset_scene(randomize: bool = False,seed:int|None=Query(default=None,ge=0,le=2**32-1),shuffle_sides:bool=True):
     seed=resolve_seed(seed) if randomize else None
     record = _enqueue({'action': 'reset', 'randomize': randomize,'seed':seed,'shuffle_sides':shuffle_sides})
-    # Wait for the viewer to finish the reset. It is one command in a queue that the viewer drains, and returning
-    # immediately let a caller enqueue a task that then ran against the PREVIOUS scene: measured 2026-10-27, the app's
-    # first approach of a task found the cube at x=+0.146 while /api/scene reported [-0.05, 0, 0.773] straight after
-    # the reset. Blocking here makes "reset, then run" mean what it says.
-    deadline = time.time() + 90.
-    while time.time() < deadline:
-        current = next((row for row in app.state.executions if row.get('task_id') == record['task_id']), None)
-        if current and current.get('status') not in ('QUEUED_FOR_GENESIS_VIEWER', 'PREPARING_SCENE'):
-            break
-        time.sleep(.2)
-    current = next((row for row in app.state.executions if row.get('task_id') == record['task_id']), None) or {}
-    return {'status': current.get('status', 'queued'), 'randomized': randomize, 'seed': seed,
-            'shuffle_sides': shuffle_sides, 'task_id': record['task_id']}
+    return {'status': 'queued', 'randomized': randomize,'seed':seed,'shuffle_sides':shuffle_sides,'task_id': record['task_id']}
 
 
 @app.post('/api/tasks', response_model=TaskResponse)
