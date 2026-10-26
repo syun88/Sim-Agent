@@ -124,7 +124,19 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
     from backend.app.skills.robot_skills import SkillError
 
     env, control = runner.env, runner.controller
-    runner._require_hold(arm, obj)
+    from backend.app.skills.robot_skills import SkillError
+    try:
+        runner._require_hold(arm, obj)
+    except SkillError as error:
+        # The hold can be lost between two skills - measured 2026-10-27 on the cube nearest the base: grasp and
+        # lift both report success, and the throw then finds no pinch. Re-establishing it here is the same
+        # physical retry the lift does, applied where the loss is observed rather than as a plan-level rule.
+        if getattr(error, 'category', '') not in ('GRASP_LOST', 'GRASP_SLIP'):
+            raise
+        runner.controller.wait_gripper(arm, False, .4)
+        runner._approach(arm, obj)
+        runner._close_pinch(arm, obj, grasp_bias=np.asarray([0., 0., .006]))
+        runner._require_hold(arm, obj)
     from backend.app.physics import launch_for_target, ramp_for_release_speed, release_speed_for_rise
 
     needed = release_speed_for_rise(max(height_cm / 100., .001))
