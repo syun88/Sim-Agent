@@ -93,6 +93,27 @@ def main():
             print(record, flush=True)
             if not motion.success or record['actual_position_error'] > .003 or record['actual_travel'] < .007:
                 raise RuntimeError(side + ': physical IK tracking failed')
+            # A centimetre can be tracked by a drive that saturates; a large posture change cannot. Measured
+            # 2026-10-25 on a wheeled six-axis arm: the 1 cm move tracked to 2.9 mm, while a 0.8 rad shoulder
+            # swing stopped 51 mm short at the default motion speed (the controller asks for 6x the nominal
+            # trajectory, and these motors saturate) and tracked to 3 mm at speed 1. Record both, and fail
+            # only when neither reaches the pose: which of the two works is a property of the robot.
+            swing = np.asarray(env.arm_qpos(side), dtype=float)
+            index = 1 if len(swing) > 1 else 0
+            limits = env.arm_limits(side)
+            swing[index] = float(np.clip(swing[index] + .8, limits[index, 0] + .05, limits[index, 1] - .05))
+            swing_point, swing_rotation = env.arm_kinematics(side).evaluate(swing)[:2]
+            swing_rows = {}
+            for label, scale in (('scaled', True), ('unscaled', False)):
+                result = executor.controller.move_to_site(side, swing_point, swing_rotation, duration=2., scale_speed=scale)
+                reached = float(np.linalg.norm(np.asarray(env.ee_pose(side)[0]) - np.asarray(swing_point)))
+                swing_rows[label] = {'success': bool(result.success), 'error': result.error, 'reached_m': reached}
+                print('large travel %s: success=%s error=%s reached=%.4f' % (label, result.success, result.error, reached), flush=True)
+                executor.controller.move_to_site(side, np.asarray(actual), rotation, duration=2., scale_speed=False)
+            result['large_travel'] = swing_rows
+            if not any(row['reached_m'] < .01 for row in swing_rows.values()):
+                raise RuntimeError('%s: a large posture change is not tracked at either motion speed: %s'
+                                   % (side, {k: round(v['reached_m'], 4) for k, v in swing_rows.items()}))
         result['maximum_command_velocity_ratio'] = maximum_velocity_ratio
         if maximum_velocity_ratio > 1.001:
             raise RuntimeError('A motor reference exceeded its source URDF velocity limit')
