@@ -15,6 +15,9 @@ position (for example ds_urdf_v4 at [0.259, 0.003, -0.076]). Two consequences dr
 
 The adjacent-pair declaration is measured, not guessed: `_collision_declaration` from the
 OpenManipulator-X preparation is reused as-is, so the two packages cannot drift apart.
+A supplied initial_state.json is preserved; otherwise a floor-mounted, collision-free setup
+is sampled with terminal-joint apertures unchanged. Non-adjacent collisions stay enabled.
+Preparation does not certify motor tracking or physical grasping; those require runtime checks.
 """
 import argparse
 import copy
@@ -43,9 +46,27 @@ def _clean(mesh):
     return solid
 
 
-def _rigid(extents):
-    """A box that matches the mesh's own extents, for meshes CoACD cannot split."""
-    return trimesh.creation.box(extents=extents)
+def _derive_home(destination, budget=2000):
+    """Choose a collision-free setup without disabling any non-adjacent pair."""
+    from backend.app.robots.registry import import_robot
+    from backend.app.robots.collision_planner import PrivateCollisionQueries
+
+    profile = import_robot(str(destination))
+    queries = PrivateCollisionQueries(profile, table_top=0.)
+    # Preserve terminal-joint apertures: moving them before gripper discovery can fold
+    # the finger out of its inference frame and make both grippers disappear on import.
+    parents = {j['parent'] for j in queries.urdf.joints}
+    movable = [j for j in profile['joints'] if j['child'] in parents]
+    rng = np.random.default_rng(43)
+    for attempt in range(budget + 1):
+        if attempt == 0:
+            candidate = dict(profile['home'])
+        else:
+            candidate = {**profile['home'], **{j['name']: float(rng.uniform(j['lower'], j['upper']))
+                                             for j in movable}}
+        if not queries.contacts(candidate, tolerance=-.0005):
+            return {**candidate, 'mount': 'floor'}
+    raise RuntimeError(f'No collision-free setup in {budget} sampled postures')
 
 
 def main():
@@ -67,7 +88,7 @@ def main():
 
     import coacd
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from backend.app.robots.collision_geometry import inset_authored_boundary
+    from backend.app.robots.collision_geometry import inset_authored_boundary, float32_convex_piece
     import os
     os.environ.setdefault("GENESIS_SHOW_VIEWER", "0")
 
@@ -82,7 +103,7 @@ def main():
 
     tree = ET.parse(source)
     root = tree.getroot()
-    pieces_total, replaced, skipped = 0, 0, []
+    pieces_total, skipped = 0, []
     for link in root.findall("link"):
         visuals = link.findall("visual")
         if not visuals:
@@ -101,7 +122,11 @@ def main():
             if not local.is_file():
                 skipped.append(f"{link.get('name')}:{name}")
                 continue
-            solid = _clean(trimesh.load(local, force="mesh", process=False))
+            # Preserve an already closed solid. Voxel preprocessing can inflate its boundary
+            # (base_link grew ~3 mm at resolution 50), blocking every non-adjacent IK check.
+            solid = trimesh.load(local, force="mesh", process=True)
+            if not solid.is_volume:
+                solid = _clean(solid)
             # The pieces must be expressed in the coordinates the mesh itself uses, because each
             # one is written under the visual's own origin: that is what keeps the collision
             # geometry on the part instead of beside it.
@@ -110,31 +135,30 @@ def main():
                 decomposed = coacd.run_coacd(
                     coacd.Mesh(np.asarray(solid.vertices, np.float64), np.asarray(solid.faces, np.int32)),
                     threshold=args.concavity, max_convex_hull=args.max_pieces,
-                    preprocess_mode="auto", preprocess_resolution=50, resolution=1000,
+                    preprocess_mode="off" if solid.is_volume else "auto",
+                    preprocess_resolution=50, resolution=1000,
                     mcts_iterations=60, seed=0)
             except Exception as error:
-                print(f"  CoACD failed on {link.get('name')}: {type(error).__name__}", flush=True)
+                raise RuntimeError(f"CoACD failed on {link.get('name')}: {error}") from error
             if not decomposed:
-                decomposed = [(np.asarray(solid.vertices, float), np.asarray(solid.faces, np.int64))]
+                raise RuntimeError(f"No collision pieces for {link.get('name')}")
+            kept = 0
             for index, (vertices, faces) in enumerate(decomposed):
-                # Repair before exporting: Genesis computes an SDF wall thickness for every collision
-                # mesh, and a piece that is not closed makes that step fail outright (measured
-                # 2026-10-26: "operands could not be broadcast together with shapes (0,) (0,3)" from
-                # get_wall_thickness, which aborted the whole scene build).
+                # Weld and orient the decomposed solid before clipping its authored boundary.
                 piece = _clean(trimesh.Trimesh(np.asarray(vertices, float), np.asarray(faces, np.int64),
                                                process=True))
                 if not len(piece.faces) or not piece.is_volume:
+                    print(f"  omitted non-volume piece: {link.get('name')}:{index}", flush=True)
                     continue
-                # Pull the piece inside the authored surface by the skin, the same way the
-                # OpenManipulator-X preparation does. Without it, decomposition overshoots: measured
-                # 2026-10-26, two body meshes of the DualScorpion overlapped by 3.3 mm at the setup
-                # posture although they are not connected by a joint, which left one permanent
-                # self-contact and every IK candidate rejected as a collision.
+                # Skin authored faces, not internal partition faces; this is not a cure for
+                # voxel inflation or proof that a concave link's whole convex hull is faithful.
                 inset = inset_authored_boundary(piece, solid, args.skin_mm / 1000.)
                 if inset is None or not len(inset.faces):
+                    print(f"  omitted skin-only piece: {link.get('name')}:{index}", flush=True)
                     continue
-                piece = _clean(inset)
-                if float(piece.volume) <= 0.:
+                piece = float32_convex_piece(inset)
+                if piece is None:
+                    print(f"  omitted zero-volume piece: {link.get('name')}:{index}", flush=True)
                     continue
                 relative = f"{link.get('name')}_proxy_{index}.stl"
                 piece.export(mesh_out / relative)
@@ -144,7 +168,9 @@ def main():
                 geometry = ET.SubElement(collision, "geometry")
                 ET.SubElement(geometry, "mesh", filename=f"meshes/{relative}", scale=scale)
                 pieces_total += 1
-            replaced += 1
+                kept += 1
+            if not kept:
+                raise RuntimeError(f"{link.get('name')}: no collision piece survived")
 
     if skipped:
         raise SystemExit("meshes referenced but not found: " + ", ".join(skipped))
@@ -158,23 +184,34 @@ def main():
 
     sys.path.insert(0, str(pathlib.Path(__file__).parent))
     from prepare_open_manipulator_x import _collision_declaration
+    # A floor mount is independent of wheel support. Keep an authored setup, if supplied;
+    # otherwise derive one only after the adjacent-pair declaration is complete.
+    setup = args.out / 'initial_state.json'
+    derive_home = not setup.is_file()
+    if derive_home:
+        setup.write_text(json.dumps({'mount': 'floor'}) + '\n')
     declaration = args.out / "collision_config.json"
     declaration.unlink(missing_ok=True)
-    settings = _collision_declaration(destination, args.overlap_threshold_mm)
-    if settings:
-        # The runtime request is all-or-nothing: the engine turns adjacent collision off wholesale,
-        # so a partial set would drop a constraint the private queries still honour (the import
-        # refuses a partial declaration outright). Name every adjacent pair that carries collision
-        # geometry, and keep the measured overlaps in the file as the record of why.
-        from backend.app.robots.urdf import URDFModel
-        model = URDFModel(str(destination))
-        adjacent = {tuple(sorted((joint['parent'], joint['child']))) for joint in model.joints}
-        settings["runtime_excluded_adjacent_pairs"] = [list(pair) for pair in sorted(
-            {pair for pair in adjacent
-             if all(len(model.links[link].findall('collision')) for link in pair)})]
-        declaration.write_text(json.dumps(settings, indent=2) + "\n")
-        print("  collision_config.json written (%d pairs)" % len(settings["runtime_excluded_adjacent_pairs"]),
-              flush=True)
+    try:
+        settings = _collision_declaration(destination, args.overlap_threshold_mm)
+        if settings:
+            # The engine disables adjacent collision wholesale, so declare every collidable
+            # adjacent pair. Non-adjacent pairs remain checked, including at the setup posture.
+            from backend.app.robots.urdf import URDFModel
+            model = URDFModel(str(destination))
+            adjacent = {tuple(sorted((joint['parent'], joint['child']))) for joint in model.joints}
+            settings["runtime_excluded_adjacent_pairs"] = [list(pair) for pair in sorted(
+                {pair for pair in adjacent
+                 if all(len(model.links[link].findall('collision')) for link in pair)})]
+            declaration.write_text(json.dumps(settings, indent=2) + "\n")
+            print("  collision_config.json written (%d pairs)" % len(settings["runtime_excluded_adjacent_pairs"]),
+                  flush=True)
+        if derive_home:
+            setup.write_text(json.dumps(_derive_home(destination), indent=2) + '\n')
+    except Exception:
+        if derive_home:
+            setup.unlink(missing_ok=True)
+        raise
     return 0
 
 
