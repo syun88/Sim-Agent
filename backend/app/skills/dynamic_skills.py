@@ -146,6 +146,24 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
                [max(.20, height_cm / 100. + .16), .16, .12, .07])
     windup = mode = None
     rejected = []
+    # A cube close to the shoulder leaves no room for a long stroke, and a short stroke cannot reach throwing
+    # speed (friction needs contact time). Backing the arm away from the base first is a physical remedy the
+    # skill can apply itself: measured 2026-10-27, the near cube could only get a 2 cm stroke where the far one
+    # got 20 cm, and it released at 0.42 m/s against the 0.77 m/s a 3 cm rise needs.
+    back_off_tried = []
+    def back_off(distance_m):
+        margin = np.array([0., 0., 0.])
+        ee, rotation = env.ee_pose(arm)
+        away = np.asarray(env.object_pose(obj)[0], float) - ee
+        away[2] = 0.
+        norm = float(np.linalg.norm(away))
+        if norm < 1e-6:
+            return False
+        target = ee - away / norm * distance_m
+        result = control.move_to_site(arm, target, rotation)
+        back_off_tried.append({'distance_m': round(distance_m, 3), 'success': bool(result.success)})
+        return bool(result.success)
+
     for stroke in strokes:
         for candidate, label, candidate_mode in windup_candidates(runner, arm, obj, stroke=stroke):
             attitude = _attitude_in_use(runner, arm)
@@ -166,6 +184,27 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
             runner._require_hold(arm, obj)
             windup, mode = np.asarray(candidate, float), candidate_mode
             break
+        if windup is not None:
+            break
+        if stroke == strokes[0] and back_off(.06):
+            # Retry the longest stroke once from the new standoff; the search is unchanged.
+            for candidate, label, candidate_mode in windup_candidates(runner, arm, obj, stroke=stroke):
+                attitude = _attitude_in_use(runner, arm)
+                ok, candidate_mode, reason = launch_ready(runner, arm, obj, candidate, attitude, stroke=stroke)
+                if not ok:
+                    rejected.append(f'{label} @{stroke * 100:.0f}cm after backing off ({reason})')
+                    continue
+                try:
+                    runner._carry_to(arm, obj, candidate,
+                                     attitude="free" if candidate_mode == "arm-achieved" else "pinned")
+                except (SkillError,) as error:
+                    rejected.append(f'{label} @{stroke * 100:.0f}cm after backing off (carry '
+                                    f'{getattr(error, "category", type(error).__name__)}: {error})')
+                    continue
+                env.step(200)
+                runner._require_hold(arm, obj)
+                windup, mode = np.asarray(candidate, float), candidate_mode
+                break
         if windup is not None:
             break
     else:
@@ -229,7 +268,8 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
               "designed_release_speed_m_s": round(2. * RELEASE_PHASE * stroke / ramp, 3),
               "physics": ["release_speed_for_rise", "ramp_for_release_speed"],
               "requested_release_speed_m_s": release_speed_m_s,
-              "measured_release_speed_m_s": round(float((evidence.get("release_velocity") or [0, 0, 0])[2]), 3)}
+              "measured_release_speed_m_s": round(float((evidence.get("release_velocity") or [0, 0, 0])[2]), 3),
+              "back_off": back_off_tried}
     if target_point is not None:
         # An aimed throw is judged by whether it hits, not by how high it went: a cube that arcs past the
         # target satisfies a height check and misses the task, and a cube that hits it need not clear any

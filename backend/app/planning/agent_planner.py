@@ -268,6 +268,20 @@ class AgentPlanner:
             user['targets'] = [t for t in state['targets'] if t['id'] in instruction]
         if self._repair_feedback:
             user["previous_validation_error"] = self._repair_feedback
+        # A failed attempt is only useful if the next plan differs. The measurements a skill reports (how far
+        # it could travel, how fast the object left) are given to the model, and this says what they mean:
+        # repeating the same operations would repeat the failure. It states the constraint, not the solution.
+        recent = [row for row in (user.get("relevant_experience") or []) if row.get("recent_failure")]
+        if recent:
+            user["previous_attempt"] = {
+                "failure": recent[-1].get("recent_failure"),
+                "measurements": recent[-1].get("measured"),
+                "note": "The previous plan failed with these measurements. Repeating the same operations will "
+                        "fail again. Different operations, or preparation before them, are allowed and expected.",
+                "action_shapes": {"move": {"direction": "up|down|left|right|forward|back", "distance_cm": "1-30",
+                                           "object": "omit this for arm motion"},
+                                  "home": {"object": "omit"}, "approach": {"object": "<id>"},
+                                  "place": {"object": "<id>", "target": "<zone id or cube id>"}}}
         messages = [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]
         content = self._complete(messages, schema)
         payload = self._extract_json(content)

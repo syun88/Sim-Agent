@@ -345,12 +345,17 @@ class ImportedRobotSkills(SkillRunner):
                                                      *self.controller._approach_seeds.get(seed_key, [])][:4]
         return corridor, high
 
-    def _approach_planned(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
+    def _approach_planned(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.,
+                           grasp_offset=None):
         if arm not in self.env.grippers:
             raise SkillError('ROBOT_CAPABILITY', 'This arm has no detected opposed jaws')
         if self.held_object(arm):
             raise SkillError('HAND_OCCUPIED', 'Place the held object first')
         before = self.env.object_pose(obj)[0].copy()
+        # A caller may ask for a placement shifted by a few millimetres (a missed pinch needs a correction along
+        # the jaws' closing axis, not along world x). ``before`` stays the cube's real pose for the displacement
+        # check; ``aim`` is where the jaws are told to go.
+        shift = np.asarray(grasp_offset, float) if grasp_offset is not None else np.array([grasp_offset_x, 0., 0.])
         direction = np.asarray(self.env.grippers[arm]['approach_axis'])
         standoff = before - direction * .055
         high = standoff + [0., 0., .08]
@@ -445,13 +450,14 @@ class ImportedRobotSkills(SkillRunner):
     # navigate skill, so the motion stays physical), and retry the approach
     # there. Desk robots and non-collision failures are untouched.
 
-    def _approach(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
+    def _approach(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0., grasp_offset=None):
         with self._base_hold():
-            return self._approach_attempt(arm, obj, progress, fault_offset, grasp_offset_x)
+            return self._approach_attempt(arm, obj, progress, fault_offset, grasp_offset_x, grasp_offset)
 
-    def _approach_attempt(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
+    def _approach_attempt(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.,
+                          grasp_offset=None):
         try:
-            return self._approach_planned(arm, obj, progress, fault_offset, grasp_offset_x)
+            return self._approach_planned(arm, obj, progress, fault_offset, grasp_offset_x, grasp_offset)
         except SkillError as exc:
             if exc.category != 'COLLISION_PATH' or not self.env.profile.get('mobile_base'):
                 raise
@@ -704,12 +710,17 @@ class ImportedRobotSkills(SkillRunner):
         contacts = self._close_pinch(arm,obj)
         position, rotation = self.env.ee_pose(arm)
         self.controller.target_rotations[arm] = self._attitude(arm).copy()
-        self._move_relative(arm,[0.,0.,.03])
+        # The verification lift only has to prove the hold, and 30 mm is more than a small cube needs: measured
+        # 2026-10-27, the cube nearest the base lost the pinch during it (grasp reported success, pads on the
+        # cube, and by the next skill one pad was gone). Scale the proof to the object and require most of it.
+        verify = min(.03, max(.015, float(self.env.cube_size) * .6))
+        self._move_relative(arm,[0.,0.,verify])
         self._require_hold(arm, obj)
         after = self.env.object_pose(obj)[0]
         rise = float(after[2] - before[2])
-        if rise < .021:
-            raise SkillError('GRASP_LOST', f'Cube rose only {rise:.6f}m during 30mm verification lift')
+        if rise < verify * .7:
+            raise SkillError('GRASP_LOST', f'Cube rose only {rise:.6f}m during a {verify*1000:.0f}mm '
+                                           f'verification lift')
         start_ee, start_rotation = self.env.ee_pose(arm)
         relative = start_rotation.T @ (after - start_ee)
         samples = []
