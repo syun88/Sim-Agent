@@ -28,6 +28,13 @@ class TaskExecutor:
     def reset_context(self):
         self.discourse.clear()
         self.controller.target_rotations.clear()
+        # A pinch frame belongs to the approach that planned it, so it must not survive a scene reset: the
+        # next task would pinch with the previous task's frame. Measured 2026-10-27 on OpenManipulator-X: the
+        # second task in one process closed its jaws fully with a single pad touching (q=0.999, one pad)
+        # while the first task in the same process pinched normally, with identical object poses.
+        for holder in (self, getattr(self, 'skills', None)):
+            if holder is not None:
+                holder.__dict__.pop('_pinch_frames', None)
 
     def home_empty_arms(self, *, emit=None, should_stop=None, clear_contacts=False):
         """Return free arms to a clear home posture, preserving objects/discourse.
