@@ -5,6 +5,7 @@ Candidate joint positions affect this private data only, never the live robot.
 No pair of adjacent links is excluded. Small CAD assembly residuals are bounded
 by a metric tolerance, rather than ignoring a whole connected link pair.
 """
+import os
 import xml.etree.ElementTree as ET
 import time
 import numpy as np
@@ -293,7 +294,6 @@ class PrivateCollisionQueries:
         # ``resolution`` is how far apart the sampled poses on an edge are. A coarse step can judge a real corridor
         # blocked, or a real collision clear; the default was never measured, so it is overridable for an experiment:
         #   OPENARM_EDGE_RESOLUTION=0.02
-        import os
         resolution = float(os.getenv('OPENARM_EDGE_RESOLUTION', resolution))
         steps = max(2, int(np.ceil(np.max(abs(np.asarray(end) - start)) / resolution)) + 1)
         return all((not self.contacts({**snapshot, **dict(zip(names,q))},tolerance=-minimum_clearance)
@@ -329,7 +329,7 @@ class PrivateCollisionQueries:
                 path.append(nodes[index]);index = parents[index]
             return path[::-1]
         deadline = time.monotonic()+3.
-        for iteration in range(500):
+        for iteration in range(int(os.getenv('OPENARM_RRT_OUTER', '500'))):
             if stop() or time.monotonic()>deadline:
                 break
             side = iteration % 2;first, second = trees[side], trees[1-side]
@@ -337,8 +337,7 @@ class PrivateCollisionQueries:
             a = extend(first, target)
             if a is None:
                 continue
-            import os as _os
-            for _ in range(int(_os.getenv('OPENARM_RRT_ITERS', '80'))):
+            for _ in range(int(os.getenv('OPENARM_RRT_CONNECT', '80'))):
                 b = extend(second, first[0][a])
                 if b is None:
                     break
