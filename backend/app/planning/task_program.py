@@ -39,6 +39,23 @@ class TaskAction(BaseModel):
     joint: str | None = None
     position_deg: float | None = Field(default=None, allow_inf_nan=False)
 
+    @model_validator(mode='before')
+    @classmethod
+    def accept_common_aliases(cls, values):
+        """Read what a model writes: ``object_id``/``target_id`` are the same fields as ``object``/``target``.
+
+        A planner that answers {"op":"throw","target":"blue_cube","object_id":"red_cube"} has said exactly
+        the right thing; rejecting it for the field's name loses the plan. Measured 2026-10-26.
+        """
+        if not isinstance(values, dict):
+            return values
+        for alias, field in (('object_id', 'object'), ('target_id', 'target'), ('receiver_id', 'receiver')):
+            if alias in values and field not in values:
+                values[field] = values.pop(alias)
+            elif alias in values:
+                values.pop(alias, None)
+        return values
+
     @field_validator('distance_cm', 'height_cm', 'stroke_cm', 'release_speed_m_s', 'volume_ml',
                      mode='before')
     @classmethod

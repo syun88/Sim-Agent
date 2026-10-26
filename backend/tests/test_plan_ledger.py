@@ -204,3 +204,13 @@ def test_the_planner_context_is_a_compact_scene_not_the_whole_world():
     assert "bounds" not in compact["objects"][0] and "rotation" not in compact["objects"][0]
     assert "spawn_validation" not in compact
     assert len(__import__("json").dumps(compact)) < 600
+
+
+def test_a_planner_that_names_the_object_id_is_understood(monkeypatch):
+    """The 3B planner answered {"op":"throw","target":"blue_cube","object_id":"red_cube"} - exactly right."""
+    from backend.app.planning.task_program import TaskProgram
+
+    program = TaskProgram.model_validate({"actions": [
+        {"op": "throw", "object_id": "red_cube", "target_id": "blue_cube", "height_cm": 3}]})
+    action = program.actions[0]
+    assert (action.object, action.target, action.height_cm) == ("red_cube", "blue_cube", 3.)
