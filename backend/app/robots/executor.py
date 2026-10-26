@@ -440,7 +440,14 @@ class ImportedRobotSkills(SkillRunner):
                 'No grasp posture has a continuous collision-free approach corridor; rejections: '
                 f'{rejected}')
             error.evidence = {'rejections': rejected, 'rotations_tried': len(rotations),
-                              'guesses': len(guesses)}
+                              'guesses': len(guesses),
+                              # The inputs the planner was handed, so the same call can be reproduced exactly from
+                              # a different process: measured 2026-10-27, the app failed 18 of 18 postures where the
+                              # same executor succeeded in-process, and nothing said what differed.
+                              'object_pose': np.round(np.asarray(before, float), 5).tolist(),
+                              'arm_qpos': np.round(np.asarray(self.env.arm_qpos(arm), float), 4).tolist(),
+                              'snapshot': {key: round(float(value), 4) for key, value in sorted(snapshot.items())},
+                              'grasp_offset': np.round(np.asarray(shift, float), 5).tolist()}
             raise error
         # The frame that planned the corridor is the frame this arm pinches with from now on.
         self._pinch_frames = {**getattr(self, '_pinch_frames', {}), arm: np.asarray(rotation)}
