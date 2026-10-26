@@ -257,7 +257,12 @@ class ImportedRobotSkills(SkillRunner):
                         # them would repeat the same contact geometry.
                         shift = base if direction is None else base + direction * distance
                         self._approach(arm, obj, grasp_offset=shift)
-                    result = super()._grasp(arm, obj)
+                    # Dynamic dispatch, not the base class: this robot's own _grasp is the one that
+                    # closes with the measured pinch (plan_closure/_close_pinch). Calling the base
+                    # implementation bypassed it and made every pinch fail, including the ones that had
+                    # always worked - which is what the "bimodal" pinches of the previous two commits
+                    # actually were.
+                    result = self._grasp(arm, obj)
                     if attempts:
                         result = {**result, 'grasp_retries': attempts}
                     if straddle is not None:
