@@ -35,9 +35,22 @@ def create_backend(scene_profile: str | None = None, *, robot_id: str = "openarm
     gpu = prefer_gpu_from_environment()
     if robot_id != "openarm_v2":
         if profile == "wine":
-            raise ValueError("Wine manipulation needs a calibrated physical gripper profile")
+            # Pouring used to be refused outright for imported robots. The wine world is engine-generic; what it needs
+            # is a gripper that can physically hold the bottle, which the profile records after a verified pinch.
+            from backend.app.robots import registry
+            bottle_profile = registry.get_profile(robot_id)
+            grippers = bottle_profile.get('grippers') or {}
+            aperture = min((g.get('maximum_aperture') or 0.) for g in grippers.values()) if grippers else 0.
+            if not grippers or not bottle_profile.get('grasp_calibrated'):
+                raise ValueError("Wine manipulation needs a calibrated physical gripper profile: this robot has "
+                                 f"grippers={bool(grippers)} grasp_calibrated="
+                                 f"{bool(bottle_profile.get('grasp_calibrated'))}")
+            if aperture < .05:
+                raise ValueError(f"Wine manipulation needs an aperture that can hold a bottle; this gripper opens "
+                                 f"to {aperture * 1000:.1f} mm")
         from backend.app.simulation.genesis_backend.generic_environment import GenericURDFEnvironment
-        return GenericURDFEnvironment(robot_id, show_viewer=os.getenv("GENESIS_SHOW_VIEWER", "") == "1", prefer_gpu=gpu)
+        return GenericURDFEnvironment(robot_id, show_viewer=os.getenv("GENESIS_SHOW_VIEWER", "") == "1",
+                                      prefer_gpu=gpu, scene_profile=profile)
     if profile == "wine" and GPU_ENVIRONMENT_VARIABLE not in os.environ:
         import torch
         gpu = torch.backends.mps.is_available() or torch.cuda.is_available()

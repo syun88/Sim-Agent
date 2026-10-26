@@ -35,7 +35,10 @@ class GenericURDFEnvironment(SimulationBackend):
     motion_rotation_tolerance = .025
     cartesian_motion_limits = POLICY['tool_limits']
 
-    def __init__(self, robot_id, show_viewer=False, prefer_gpu=False):
+    def __init__(self, robot_id, show_viewer=False, prefer_gpu=False, scene_profile=None):
+        # The fluid scene is engine-generic, so an imported arm can host it; the profile decides whether to build it.
+        if scene_profile:
+            self.scene_profile = scene_profile
         self.profile = get_profile(robot_id)
         self.robot_id, self.robot_name = self.profile['id'], self.profile["name"]
         # A profile may declare a wheeled mobile base (registry detects the
@@ -122,8 +125,23 @@ class GenericURDFEnvironment(SimulationBackend):
             point = np.asarray(point['position'])
             color = "0.8 0.08 0.08 1" if name == "red_cube" else "0.08 0.2 0.85 1"
             self._objects[name] = self._scene.add_entity(gs.morphs.MJCF(default_armature=None, file=f'<mujoco><worldbody><body name="{name}" pos="{point[0]} {point[1]} {point[2]}"><freejoint/><geom type="box" size="{self.cube_size/2} {self.cube_size/2} {self.cube_size/2}" mass="{self.cube_mass}" rgba="{color}"/></body></worldbody></mujoco>'))
+        # Fluid scene: the wine world is engine-generic (it takes only the scene and the engine), so an imported arm
+        # can host it too. It must be created before the scene is built and captured after, exactly like the official
+        # environment does; measured 2026-10-27, the only thing keeping pour away from imported robots was this wiring.
+        self._wine = None
+        if getattr(self, 'scene_profile', None) == 'wine':
+            from backend.app.simulation.genesis_backend.wine import WineWorld
+            # Same tabletop height, also a collision boundary for spilled particles.
+            self._scene.add_entity(gs.morphs.MJCF(file='''<mujoco><worldbody>
+                <geom type="plane" size="1 1 .01" pos="0 0 1.006" contype="1073741824" conaffinity="0"/>
+                </worldbody></mujoco>''', visualization=False))
+            self._wine = WineWorld(self._scene, gs, async_surface=False)
         self._camera = self._scene.add_camera(res=(720, 480), pos=(1.1, -1.3, 1.5), lookat=(0., 0., 1.), GUI=False)
         self._scene.build()
+        if self._wine is not None:
+            self._wine.capture_setup()
+            self._objects['wine_bottle'] = self._wine.bottle
+            self._objects['wine_glass'] = self._wine.glass
         self._all_names = [j["name"] for j in self.profile["joints"]]
         self._all_dofs = np.array([self._entity.get_joint(name).dofs_idx_local[0] for name in self._all_names])
         self._dofs = {side: np.array([self._entity.get_joint(name).dofs_idx_local[0] for name in chain["joints"]])
@@ -330,6 +348,12 @@ class GenericURDFEnvironment(SimulationBackend):
         from PIL import Image
         image = np.asarray(self._camera.render(rgb=True)[0])
         return np.asarray(Image.fromarray(image).resize((width, height)))
+
+    def fluid_state(self) -> dict:
+        """The wine world's own measurement: millilitres in the bottle, the glass and on the table."""
+        if getattr(self, '_wine', None) is None:
+            raise ValueError("Wine scene is required")
+        return self._wine.measure()
 
     def object_pose(self, name):
         link = self._objects[name].get_link(name)

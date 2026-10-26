@@ -310,7 +310,19 @@ create_backend('wine', robot_id='open_manipulator_x-…')
   `environment.py` 側に `WineWorld(...)` と `fluid_state()` がある。
 - `pour_liquid` スキル・計画の `pour` op・物理基盤（`pour_time_for_volume` / `closing_reserve`）は**すでに汎用**。
 
-移植の手順（次の実装単位）:
+**実装済み（2026-10-27）**: `GenericURDFEnvironment` が `scene_profile='wine'` を構築できるようになり、
+imported 機体で **液体状態が読める** ことを実測:
+```
+objects: wine_bottle [0.44,0.29,1.091], wine_glass [0.62,0.06,1.006]
+fluid  : SPH / 8 particles / 51.2 mL / glass 0 / spilled 0
+```
+`create_backend` の**無条件拒否**は条件付きに置換（gripper があり `grasp_calibrated` で、口径 ≥ 50mm）。
+
+残る作業:
+- **ボトルとグラスを機体の可達域に置く**: 公式セルの定数（`BOTTLE_START` など）は 0.3 m アームには遠い
+  （実測: ボトル x=0.44、基部 −0.25 → 0.69 m）。キューブと同じく **spawn サンプラの可達帯**から配置する。
+
+元の手順（参考）:
 1. `GenericURDFEnvironment` に `scene_profile == 'wine'` の分岐を足し、`WineWorld(scene, gs, …)` を生成。
 2. ボトル/グラスを `_objects` に登録し、`fluid_state()`・`fluid` フレーム・`object_contacts` を公式 env と同じ形で公開。
 3. `create_backend` の `robot_id != 'openarm_v2' and profile == 'wine'` の**無条件拒否**を、
