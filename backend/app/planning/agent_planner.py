@@ -276,8 +276,11 @@ class AgentPlanner:
             user["previous_attempt"] = {
                 "failure": recent[-1].get("recent_failure"),
                 "measurements": recent[-1].get("measured"),
+                "hands": recent[-1].get("hands"),
                 "note": "The previous plan failed with these measurements. Repeating the same operations will "
-                        "fail again. Different operations, or preparation before them, are allowed and expected.",
+                        "fail again. Different operations, or preparation before them, are allowed and expected. "
+                        "This new plan starts from the observed hands: if an object is not held, include the "
+                        "operations that acquire it, and put any preparation BEFORE the operation it enables.",
                 "action_shapes": {"move": {"direction": "up|down|left|right|forward|back", "distance_cm": "1-30",
                                            "object": "omit this for arm motion"},
                                   "home": {"object": "omit"}, "approach": {"object": "<id>"},

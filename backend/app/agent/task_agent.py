@@ -246,8 +246,14 @@ class TaskAgent:
             elif assessment['decision']=='replan':
                 replan_used=True
                 try:
+                    from backend.app.planning.agent_planner import compact_scene
+                    # A replanned task starts from where the robot actually is: give it the hands and the
+                    # compact scene, not only the failure, so a plan cannot assume an object is already held.
                     replanned=self.plan_call(instruction,observed,
-                        [{'recent_failure':failed.get('detail'),'measured':failed.get('evidence')}])
+                        [{'recent_failure':failed.get('detail'),'measured':failed.get('evidence'),
+                          'hands':{side:(observed.get('robot',{}).get(f'{side}_arm') or {}).get('held_object')
+                                   for side in ('left','right')},
+                          'scene':compact_scene(observed)}])
                 except Exception:
                     replanned=None
                 if replanned is None or not getattr(replanned,'steps',None):
