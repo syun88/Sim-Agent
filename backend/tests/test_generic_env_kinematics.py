@@ -47,6 +47,9 @@ def _env(tmp_path):
     env._all_dofs = [0]
     env._entity = _Entity([0.])
     env._root_transform = np.eye(4)  # the construction-time spawn anchor
+    # A desk robot: arm_kinematics re-anchors through _sync_root_transform, which a real
+    # instance always has and which returns immediately when there is no mobile base.
+    env._mobile_base = None
     return env
 
 

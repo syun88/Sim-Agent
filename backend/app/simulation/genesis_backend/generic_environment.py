@@ -112,6 +112,20 @@ class GenericURDFEnvironment(SimulationBackend):
         for name, point in self._object_start.items():
             point = np.asarray(point['position'])
             color = "0.8 0.08 0.08 1" if name == "red_cube" else "0.08 0.2 0.85 1"
+            # An authored object may name the support it stands on. The support has no free joint,
+            # so it stays where it was placed. Without one, a floor robot's objects sit on the floor
+            # and an arm whose jaws sit behind its tool tip cannot reach them: with the tip pointing
+            # down the jaws are ~55 mm above it (measured 2026-10-26 on the Lime), so a floor object
+            # would need the tip through the floor.
+            support = self._object_start[name].get('support')
+            if support:
+                half = [float(v) / 2. for v in support['size']]
+                centre = [float(v) for v in support['position']]
+                self._scene.add_entity(gs.morphs.MJCF(default_armature=None, file=(
+                    '<mujoco><worldbody><body name="%s_support" pos="%.6f %.6f %.6f">'
+                    '<geom type="box" size="%.6f %.6f %.6f" rgba="0.35 0.35 0.40 1" friction="1 0.02 0.001"/>'
+                    '</body></worldbody></mujoco>')
+                    % (name, centre[0], centre[1], centre[2], half[0], half[1], half[2])))
             self._objects[name] = self._scene.add_entity(gs.morphs.MJCF(default_armature=None, file=f'<mujoco><worldbody><body name="{name}" pos="{point[0]} {point[1]} {point[2]}"><freejoint/><geom type="box" size="{self.cube_size/2} {self.cube_size/2} {self.cube_size/2}" mass="{self.cube_mass}" rgba="{color}"/></body></worldbody></mujoco>'))
         self._camera = self._scene.add_camera(res=(720, 480), pos=(1.1, -1.3, 1.5), lookat=(0., 0., 1.), GUI=False)
         self._scene.build()
@@ -540,6 +554,12 @@ class GenericURDFEnvironment(SimulationBackend):
         # origin-frame FK and failed with a phantom ~0.3 m error at the
         # second sweep sample even though the IK solution had moved by
         # ~0.001 rad. Desk robots never re-anchor, so they are unaffected.
+        # Re-anchor before reading it. joint_snapshot already does this for planning, but
+        # this getter is also read directly (the FK/Jacobian checks and the swing solver),
+        # and the profile's root carries the spawn clearance until the body settles.
+        # Measured on a wheeled robot that settles 1.0 mm: the URDF/Genesis FK check
+        # failed by exactly that much. Re-anchoring is cheap: one link lookup.
+        self._sync_root_transform()
         return URDFKinematics(self.model, self.profile['chains'][side], dict(zip(self._all_names, actual)),
                               np.asarray(self.profile["root_transform"]), self.profile['chains'][side]['tool_offset'])
 

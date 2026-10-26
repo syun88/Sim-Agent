@@ -5,6 +5,14 @@ import numpy as np
 
 
 PRESETS={
+    'xm430_w210':{
+        'manufacturer':'ROBOTIS','model':'XM430-W210-T','voltage_V':12.0,
+        'peak_effort_Nm':3.0,'no_load_velocity_rad_s':8.063,
+        'source_url':'https://emanual.robotis.com/docs/en/dxl/x/xm430-w210/',
+        # Both numbers come from the official turtlebot3_lime description, which names
+        # this motor in a comment right above the limit it sets (bigwheel_orin xacro,
+        # wheel_left/right joints). 8.063 rad/s is 77.0 rpm, the no-load figure at 12 V.
+        'limit_semantics':'Peak stall torque and no-load speed are separate limits; not a measured torque-speed curve.'},
     'sts3215_c001_7_4v':{
         'manufacturer':'FEETECH','model':'STS3215-C001','voltage_V':7.4,
         'peak_effort_Nm':19.5*.0980665,'rated_effort_Nm':5.*.0980665,

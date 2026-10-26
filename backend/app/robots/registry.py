@@ -464,7 +464,10 @@ def import_robot(folder):
         profile['capabilities'] += ['navigation']
     if actuator_configuration:
         profile['actuator_configuration']=actuator_configuration
-        profile['warnings']=["Source masses, geometry and joint frames are preserved. Explicit actuators.json supplies motor effort and no-load speed limits."]
+        # Append, never replace: a package that supplies actuators is exactly the one whose
+        # adjacent-overlap warning below is worth reading (measured 2026-10-25: replacing it
+        # dropped that warning from a package that had both files).
+        profile['warnings'].append("Source masses, geometry and joint frames are preserved. Explicit actuators.json supplies motor effort and no-load speed limits.")
     scene = {"robot_id": robot_id, "openarm_cell": False,
              "table_top": 0. if mobile_base else .76, "table_size": [0., 0., 0.] if mobile_base else [1.6, 1.4, .05],
              "robot_root_transform": root_transform.tolist(), "physics_dt": IMPORTED_ROBOT_POLICY['physics_dt_max_s'],
@@ -522,6 +525,35 @@ def import_robot(folder):
                                          for k in range(8))
         declaration["private_excluded_pairs"] = sorted(generalized)
     profile['collision_config'] = declaration
+    if not declaration['runtime_excluded_adjacent_pairs']:
+        # A manufacturer's CAD often has adjacent links overlapping at their own joints and the
+        # URDF cannot say so. Without a declaration the private queries read those overlaps as
+        # collisions, so every posture that keeps them - which is every posture - is rejected:
+        # measured 2026-10-25 on a wheeled six-axis arm, solve_profile_ik returned success with a
+        # 0.2 mm residual in five directions and the collision filter dropped all five, so the arm
+        # never moved anywhere. Measure it here, where the person attaching the package still
+        # sees the output, and name the file that fixes it.
+        try:
+            from backend.app.robots.collision_planner import PrivateCollisionQueries
+            probe = PrivateCollisionQueries({**profile, 'grippers': profile['grippers']}, 0.)
+            adjacent_pairs = {tuple(sorted((joint['parent'], joint['child']))) for joint in model.joints}
+            overlaps = {}
+            for contact in probe.contacts(home, tolerance=-.0001):
+                pair = tuple(sorted(probe.link_names.get(name, name) for name in contact['links']))
+                if pair in adjacent_pairs:
+                    overlaps[pair] = max(overlaps.get(pair, 0.), float(contact['penetration_m']))
+            if overlaps:
+                message = ('Adjacent links overlap at the source posture (up to %.1f mm over %d pair(s): %s) '
+                           'and nothing declares them, so the private queries reject every posture that keeps '
+                           'the overlap. Supply collision_config.json with runtime_excluded_adjacent_pairs - '
+                           'scripts/prepare_open_manipulator_x.py shows the measurement - or the arm will not move.'
+                           % (max(overlaps.values()) * 1000., len(overlaps),
+                              ', '.join('%s|%s' % pair for pair in sorted(overlaps)[:4])))
+                profile['warnings'].append(message)
+                print('WARNING: ' + message, flush=True)
+        except Exception:
+            # An advisory must never be the reason an import fails; the package still loads.
+            pass
     (target / 'gripper_analysis.json').write_text(json.dumps(analysis, indent=2) + '\n')
     seeds = {}
     for side, chain in chains.items():
@@ -549,6 +581,18 @@ def import_robot(folder):
                 if len(position) == 2:
                     position.append(scene["cube_size"] / 2)
                 spawn["objects"][name] = {"position": position}
+                # An object may stand on its own support, which is the only way a tool whose jaws
+                # sit behind its tip can reach something on a floor: with the tip pointing down the
+                # jaws are ~55 mm above it, so a floor object needs the tip through the floor
+                # (measured 2026-10-26 on the Lime). `size` is the support's full extent; the
+                # default centres it under the object with its top at the object's underside.
+                support = entry.get("support")
+                if support:
+                    size = [float(v) for v in support["size"]]
+                    centre = support.get("position") or [
+                        position[0], position[1], position[2] - scene["cube_size"] / 2. - size[2] / 2.]
+                    spawn["objects"][name]["support"] = {"size": size,
+                                                          "position": [float(v) for v in centre]}
     else:
         spawn = ReachableDeskSpawns(profile, scene).layout()
     scene['objects'] = spawn['objects']

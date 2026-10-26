@@ -1,6 +1,7 @@
 """URDF + desk runtime, private FK/Jacobian agreement and motor-driven IK travel."""
 import argparse
 import json
+import time
 import os
 from pathlib import Path
 import sys
@@ -36,6 +37,9 @@ def main():
     env.set_arm = observe_command
     result = {'robot_id': profile['id'], 'robot_links': env._entity.n_links, 'robot_dofs': env._entity.n_dofs,
               'collision_geoms': env._entity.n_geoms, 'native': args.native, 'phases': [], 'success': False,
+              # The run stamps itself, so a reader can tell whether this file is the result of the run
+              # it just started or a leftover from an earlier one. A missing stamp means it predates this.
+              'started_at': time.time(),
               'openarm_cell': False, 'physics': 'Genesis', 'grasp_calibrated': False}
     try:
         env.step(200)
@@ -62,21 +66,54 @@ def main():
             if error > .0001:
                 raise RuntimeError(f'{side}: URDF/Genesis FK differ by {error:.6f}m')
             print(side, 'FK error', error, flush=True)
-            target = actual + [0., 0., .01]
-            solution, _, _ = executor.controller.solve_ik(side, target, rotation)
+            # Ask for a centimetre of travel in a direction this arm can actually reach. A pose at
+            # the top of its own workspace cannot rise, but this stage is about holding the arm to
+            # what it was commanded, not about the rise; a desk arm reaches the first direction, so
+            # nothing changes for it.
+            solution = None
+            for delta in ([0., 0., .01], [.01, 0., 0.], [0., .01, 0.], [-.01, 0., 0.], [0., -.01, 0.], [0., 0., -.01]):
+                target = actual + delta
+                solution, _, _ = executor.controller.solve_ik(side, target, rotation)
+                if solution is not None:
+                    break
             if solution is None:
-                raise RuntimeError(side + ': IK goal is unreachable')
+                raise RuntimeError(side + ': IK goal is unreachable in every direction')
+            command = np.asarray(delta, dtype=float)
+            command /= float(np.linalg.norm(command))
             motion = executor.controller.move_to_site(side, target, rotation, duration=1., scale_speed=True)
             measured = env.ee_pose(side)[0]
             record = {'arm': side, 'fk_error': error, 'ik_solution_rad': solution.tolist(),
                       'initial_position': actual.tolist(), 'target_position': target.tolist(), 'actual_position': measured.tolist(),
                       'actual_position_error': float(np.linalg.norm(measured - target)), 'motion_success': motion.success,
+              'command': command.tolist(), 'actual_travel': float(np.dot(np.asarray(measured) - np.asarray(actual), command)),
                       'actual_rise': float(measured[2] - actual[2])}
             result['phases'].append(record)
+            result['finished_at'] = time.time()
             output.write_text(json.dumps(result, indent=2))
             print(record, flush=True)
-            if not motion.success or record['actual_position_error'] > .003 or record['actual_rise'] < .007:
+            if not motion.success or record['actual_position_error'] > .003 or record['actual_travel'] < .007:
                 raise RuntimeError(side + ': physical IK tracking failed')
+            # A centimetre can be tracked by a drive that saturates; a large posture change cannot. Measured
+            # 2026-10-25 on a wheeled six-axis arm: the 1 cm move tracked to 2.9 mm, while a 0.8 rad shoulder
+            # swing stopped 51 mm short at the default motion speed (the controller asks for 6x the nominal
+            # trajectory, and these motors saturate) and tracked to 3 mm at speed 1. Record both, and fail
+            # only when neither reaches the pose: which of the two works is a property of the robot.
+            swing = np.asarray(env.arm_qpos(side), dtype=float)
+            index = 1 if len(swing) > 1 else 0
+            limits = env.arm_limits(side)
+            swing[index] = float(np.clip(swing[index] + .8, limits[index, 0] + .05, limits[index, 1] - .05))
+            swing_point, swing_rotation = env.arm_kinematics(side).evaluate(swing)[:2]
+            swing_rows = {}
+            for label, scale in (('scaled', True), ('unscaled', False)):
+                result = executor.controller.move_to_site(side, swing_point, swing_rotation, duration=2., scale_speed=scale)
+                reached = float(np.linalg.norm(np.asarray(env.ee_pose(side)[0]) - np.asarray(swing_point)))
+                swing_rows[label] = {'success': bool(result.success), 'error': result.error, 'reached_m': reached}
+                print('large travel %s: success=%s error=%s reached=%.4f' % (label, result.success, result.error, reached), flush=True)
+                executor.controller.move_to_site(side, np.asarray(actual), rotation, duration=2., scale_speed=False)
+            result['large_travel'] = swing_rows
+            if not any(row['reached_m'] < .01 for row in swing_rows.values()):
+                raise RuntimeError('%s: a large posture change is not tracked at either motion speed: %s'
+                                   % (side, {k: round(v['reached_m'], 4) for k, v in swing_rows.items()}))
         result['maximum_command_velocity_ratio'] = maximum_velocity_ratio
         if maximum_velocity_ratio > 1.001:
             raise RuntimeError('A motor reference exceeded its source URDF velocity limit')
