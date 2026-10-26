@@ -187,51 +187,95 @@ class ImportedRobotSkills(SkillRunner):
                               'close_trace': getattr(self, '_close_trace', [])}
             raise error
 
-    #: Lateral offsets, in meters, tried in order when a pinch does not take. The first attempt is the
-    #: plan's own offset, so an ordinary grasp costs exactly what it did.
-    GRASP_RETRY_OFFSETS = (0., .005, -.005, .010, -.010)
+    #: Corrections tried, in meters, along the jaws' closing axis when a pinch does not take. The first
+    #: attempt is the plan's own placement, so an ordinary grasp costs exactly what it did.
+    GRASP_RETRY_OFFSETS = (0., .004, -.004, .008, -.008)
+
+    @staticmethod
+    def _group_links(env, arm):
+        groups = [list(group) for group in (env.grippers[arm].get('contact_groups') or [])]
+        return [group[0] for group in groups if group]
+
+    def closing_axis(self, arm):
+        """Unit world vector along which the jaws approach each other, measured from their own links.
+
+        The axis is not a convention to assume: it is the direction between the two jaw bodies, read from
+        the same link geometry the collision model uses. A pinch that touches with one pad while the jaws
+        are fully closed is a cube sitting beside this axis, so the correction has to be along it.
+        """
+        links = self._group_links(self.env, arm)
+        if len(links) < 2 or not hasattr(self.env, 'link_bounds'):
+            return None
+        centres = []
+        for name in links[:2]:
+            bounds = self.env.link_bounds(name)
+            if bounds is None:
+                return None
+            centres.append(np.asarray(bounds, float).mean(axis=0))
+        axis = centres[1] - centres[0]
+        norm = float(np.linalg.norm(axis))
+        return None if norm < 1e-6 else axis / norm
+
+    def pinch_straddle(self, arm, obj):
+        """How far the cube centre is from the jaws' midline, along and across the closing axis."""
+        axis = self.closing_axis(arm)
+        if axis is None:
+            return None
+        links = self._group_links(self.env, arm)
+        centres = [np.asarray(self.env.link_bounds(name), float).mean(axis=0) for name in links[:2]]
+        midline = (centres[0] + centres[1]) / 2.
+        offset = np.asarray(self.env.object_pose(obj)[0], float) - midline
+        along = float(offset @ axis)
+        across = float(np.linalg.norm(offset - along * axis))
+        return {'along_m': along, 'across_m': across, 'axis': axis.tolist(),
+                'straddles': across < float(self.env.cube_size) * .75}
 
     def grasp_object(self, arm, obj, grasp_offset_x=0.):
-        """Close on the object, and if the pinch does not take, move the jaws and try again.
+        """Close on the object; if a pad misses, move along the CLOSING AXIS and try again.
 
         A pinch that misses is a contact problem, and repeating the same posture repeats the same miss:
         measured 2026-10-26 on OpenManipulator-X, the cube nearest the base gripped in 1 of 3 attempts
-        while the far cube gripped every time, with identical plans. The offsets are already a declared
-        part of the grasp language (``grasp_offset_x``, +-2 cm), so retrying with them moves the gripper
-        by millimetres and re-verifies on physical contacts rather than on the plan.
+        while the far cube gripped every time, with identical plans. Instrumenting it showed the jaws fully
+        closed with only ONE pad touching, i.e. the cube beside the closing axis rather than between the
+        pads - so the correction is along that axis, measured from the jaw links, not along world x.
         """
         started = time.perf_counter()
         return self._skill("grasp_object",
                            lambda: self._grasp_with_offsets(arm, obj, grasp_offset_x), started)
 
     def _grasp_with_offsets(self, arm, obj, grasp_offset_x=0.):
-        offsets = [grasp_offset_x] + [o for o in self.GRASP_RETRY_OFFSETS if abs(o - grasp_offset_x) > 1e-9]
+        base = np.array([grasp_offset_x, 0., 0.])
+        axis = self.closing_axis(arm)
+        straddle = self.pinch_straddle(arm, obj)
         attempts = []
-        for offset in offsets:
-            try:
-                if abs(offset - grasp_offset_x) > 1e-9 or attempts:
-                    # Re-place the jaws at the new offset before closing again; closing where the previous
-                    # attempt left them would repeat the same contact geometry.
-                    self._approach(arm, obj, grasp_offset_x=offset)
-                result = super()._grasp(arm, obj)
-                if attempts:
-                    result = {**result, 'grasp_retries': attempts}
-                return result
-            except SkillError as error:
-                if error.category not in ('GRASP_LOST', 'GRASP_FAILED', 'GRASP_SLIP'):
-                    raise
-                attempts.append({'offset_x': offset, 'error': error.category, 'detail': str(error)[:160]})
+        directions = [None] + ([] if axis is None else [axis])
+        for direction in directions:
+            for distance in self.GRASP_RETRY_OFFSETS:
                 try:
-                    self.controller.wait_gripper(arm, False, .4)
-                except Exception:
-                    pass
-        raise self._grasp_failure(obj, attempts)
-
-    @staticmethod
-    def _grasp_failure(obj, attempts):
+                    if attempts:
+                        # Re-place the jaws before closing again: closing where the previous attempt left
+                        # them would repeat the same contact geometry.
+                        shift = base if direction is None else base + direction * distance
+                        self._approach(arm, obj, grasp_offset=shift)
+                    result = super()._grasp(arm, obj)
+                    if attempts:
+                        result = {**result, 'grasp_retries': attempts}
+                    if straddle is not None:
+                        result = {**result, 'pinch_straddle': straddle}
+                    return result
+                except SkillError as error:
+                    if error.category not in ('GRASP_LOST', 'GRASP_FAILED', 'GRASP_SLIP'):
+                        raise
+                    attempts.append({'direction': 'world_x' if direction is None else 'closing_axis',
+                                     'offset_m': round(distance, 3), 'error': error.category,
+                                     'detail': str(error)[:120]})
+                    try:
+                        self.controller.wait_gripper(arm, False, .4)
+                    except Exception:
+                        pass
         error = SkillError('GRASP_LOST', f'No pinch on {obj} after {len(attempts)} placements: {attempts}')
-        error.evidence = {'attempts': attempts}
-        return error
+        error.evidence = {'attempts': attempts, 'pinch_straddle': straddle}
+        raise error
 
     def _nominal_attitude(self, arm):
         return np.asarray(self.env.grippers[arm]['grasp_rotation'])
@@ -288,21 +332,26 @@ class ImportedRobotSkills(SkillRunner):
             return [nominal]
         return [nominal, np.asarray(frame)]
 
-    def _approach(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
+    def _approach(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0., grasp_offset=None):
         if arm not in self.env.grippers:
             raise SkillError('ROBOT_CAPABILITY', 'This arm has no detected opposed jaws')
         if self.held_object(arm):
             raise SkillError('HAND_OCCUPIED', 'Place the held object first')
         before = self.env.object_pose(obj)[0].copy()
+        # The placement may be shifted, and the shift matters: a pinch that closes with one pad touching
+        # needs millimetres along the jaws' closing axis, not along world x. ``before`` stays the cube's
+        # real pose for the displacement check; ``aim`` is where the jaws are told to go.
+        shift = np.asarray(grasp_offset, float) if grasp_offset is not None else np.array([grasp_offset_x, 0., 0.])
+        aim = before + shift
         direction = np.asarray(self.env.grippers[arm]['approach_axis'])
-        standoff = before - direction * .055
+        standoff = aim - direction * .055
         high = standoff + [0., 0., .08]
         self.controller.wait_gripper(arm, False, .6)
         # Plan back from the insertion pose. Choosing a redundant elbow posture
         # for the high point in isolation can force a several-radian posture
         # change beside the cube, even for the last millimetres of approach.
         # All these poses and edges are checked on the private collision model.
-        insertion = [standoff + (before-standoff)*a for a in np.linspace(0.,1.,9)]
+        insertion = [standoff + (aim-standoff)*a for a in np.linspace(0.,1.,9)]
         # The insertion is a straight push along the approach axis, so its intermediate poses are transit:
         # the final grasp pose is what must hold the jaw frame exactly, and the closure plan is checked on
         # its own. Measured 2026-10-24 on UR5e + 2F-85: the strict acceptance refuses one of these
@@ -311,21 +360,21 @@ class ImportedRobotSkills(SkillRunner):
         from backend.app.robots.urdf import solve_profile_ik
         home = self.env.home_arm_qpos(arm)
         limits = self.env.arm_limits(arm)
-        seed_key = (arm,*np.round(before/.002).astype(int))
+        seed_key = (arm,*np.round(aim/.002).astype(int))
         guesses = [*self.controller._approach_seeds.get(seed_key,[]), self.env.arm_qpos(arm), home]
         guesses.extend(np.clip(home+axis*shift,*limits.T) for axis in np.eye(len(home)) for shift in [-.5,.5,-1.,1.])
         reverse_seeds = None
         snapshot = self.env.joint_snapshot()
         names = self.env.profile['chains'][arm]['joints']
-        rotations = self._approach_rotations(arm, before, snapshot)
+        rotations = self._approach_rotations(arm, aim, snapshot)
         for rotation in rotations:
             for guess in guesses:
                 if self.controller.stop_requested():raise SkillError('STOPPED','Approach planning stopped')
-                goal = solve_profile_ik(self.env.profile,arm,before,rotation,model=self.env.model,q_init=guess,snapshot=snapshot)
+                goal = solve_profile_ik(self.env.profile,arm,aim,rotation,model=self.env.model,q_init=guess,snapshot=snapshot)
                 if not goal['success']:continue
                 seed = self.env.model.nearest_continuous(names,goal['q_rad'],self.env.arm_qpos(arm))
                 if not self.env.collision_queries.clear({**snapshot,**dict(zip(names,seed))}):continue
-                closure = self.controller.plan_closure(arm,before,rotation,seed)
+                closure = self.controller.plan_closure(arm,aim,rotation,seed)
                 if closure is None:continue
                 seed = closure[0]['arm_q']
                 corridor = [seed]
@@ -369,13 +418,13 @@ class ImportedRobotSkills(SkillRunner):
         self._pinch_frames = {**getattr(self, '_pinch_frames', {}), arm: np.asarray(rotation)}
         self._move(arm, high, rotation=rotation, q_init=reverse_seeds[-1], progress=progress)
         self._move(arm, standoff, rotation=rotation, q_init=reverse_seeds[-2], progress=progress)
-        result = self._move(arm,before,rotation=rotation,progress=progress,planned_joints=[
+        result = self._move(arm,aim,rotation=rotation,progress=progress,planned_joints=[
             self.env.arm_qpos(arm),*reversed(reverse_seeds[:-2])])
         after = self.env.object_pose(obj)[0]
         disturbance = float(np.linalg.norm(after - before))
         if disturbance > self.env.cube_size * .12:
             raise SkillError('APPROACH_COLLISION', f'Approach displaced the cube by {disturbance:.6f}m')
-        return {'target': before.tolist(), 'final': result.final_position,
+        return {'target': aim.tolist(), 'grasp_offset': shift.tolist(), 'final': result.final_position,
                 'object_displacement': disturbance, 'cube_size': self.env.cube_size}
 
     def _close_pinch(self, arm, obj, *, rotation=None, grasp_bias=None, monitor=None):

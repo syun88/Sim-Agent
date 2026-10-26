@@ -125,22 +125,28 @@ class SkillRunner:
 
     # -- skills ------------------------------------------------------------------
 
-    def approach_object(self, arm: str, obj: str, progress=None, fault_offset: float | None = None, grasp_offset_x: float = 0.) -> dict:
+    def approach_object(self, arm: str, obj: str, progress=None, fault_offset: float | None = None,
+                        grasp_offset_x: float = 0., grasp_offset=None) -> dict:
         started = time.perf_counter()
         return self._skill(
             "approach_object",
-            lambda: self._approach(arm, obj, progress, fault_offset, grasp_offset_x),
+            lambda: self._approach(arm, obj, progress, fault_offset, grasp_offset_x, grasp_offset),
             started,
         )
 
-    def _approach(self, arm: str, obj: str, progress=None, fault_offset: float | None = None, grasp_offset_x: float = 0.) -> dict:
+    def _approach(self, arm: str, obj: str, progress=None, fault_offset: float | None = None,
+                  grasp_offset_x: float = 0., grasp_offset=None) -> dict:
         if self.held_object(arm):
             raise SkillError("HAND_OCCUPIED", f"Place the object held by {arm} before approaching another cube")
         other = "right" if arm == "left" else "left"
         if self._pinch_established(obj, other):
             raise SkillError("HANDOVER_REQUIRED", f"{obj} is held by {other}; use a handover")
         obj_pos, _ = self.env.object_pose(obj)
-        pinch = self._pinch_site_target(arm, obj_pos + [grasp_offset_x, 0., 0.], fault_offset)
+        # The offset may be given along any world direction (``grasp_offset``), because the correction a
+        # missed pinch needs is along the jaws' closing axis, which is not world x. The scalar x form stays
+        # for the plan language, which has always expressed the offset that way.
+        shift = np.asarray(grasp_offset, float) if grasp_offset is not None else np.array([grasp_offset_x, 0., 0.])
+        pinch = self._pinch_site_target(arm, obj_pos + shift, fault_offset)
         finger_direction = GRASP_ROTATION @ np.array([0.0, 0.0, -1.0])
         standoff = pinch - APPROACH_STANDOFF * finger_direction
         high = standoff + np.array([0.0, 0.0, APPROACH_OVERFLY])
@@ -200,7 +206,7 @@ class SkillRunner:
             "final": result.final_position,
             "fingertip_midpoint_error": midpoint_error,
             "object_displacement": disturbance,
-            "grasp_offset_x": grasp_offset_x,
+            "grasp_offset_x": grasp_offset_x, "grasp_offset": shift.tolist(),
             "planning":approach_evidence,
         }
 
