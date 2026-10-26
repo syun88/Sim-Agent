@@ -153,10 +153,15 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
         # physical retry the lift does, applied where the loss is observed rather than as a plan-level rule.
         if getattr(error, 'category', '') not in ('GRASP_LOST', 'GRASP_SLIP'):
             raise
-        runner.controller.wait_gripper(arm, False, .4)
-        runner._approach(arm, obj)
-        runner._close_pinch(arm, obj, grasp_bias=np.asarray([0., 0., .006]))
-        runner._require_hold(arm, obj)
+        # One owner for re-establishing a pinch: the executor's _regrasp, which applies the bias a sweep measured
+        # to hold. Runners without it (the official cell) keep the plain path below.
+        if hasattr(runner, '_regrasp'):
+            runner._regrasp(arm, obj)
+        else:
+            runner.controller.wait_gripper(arm, False, .4)
+            runner._approach(arm, obj)
+            runner._close_pinch(arm, obj, grasp_bias=np.asarray([0., 0., .006]))
+            runner._require_hold(arm, obj)
     from backend.app.physics import launch_for_target, ramp_for_release_speed, release_speed_for_rise
 
     needed = release_speed_for_rise(max(height_cm / 100., .001))

@@ -356,26 +356,30 @@ class ImportedRobotSkills(SkillRunner):
         # the jaws' closing axis, not along world x). ``before`` stays the cube's real pose for the displacement
         # check; ``aim`` is where the jaws are told to go.
         shift = np.asarray(grasp_offset, float) if grasp_offset is not None else np.array([grasp_offset_x, 0., 0.])
+        # ``before`` is the cube's real pose (needed for the displacement check); ``aim`` is where the jaws are told
+        # to go. The planner's poses use ``aim`` so an offset actually reaches them - review finding, 2026-10-27: the
+        # parameter was threaded through and then ignored, which looks like a working feature and is not one.
+        aim = np.asarray(before, float) + shift
         direction = np.asarray(self.env.grippers[arm]['approach_axis'])
-        standoff = before - direction * .055
+        standoff = aim - direction * .055
         high = standoff + [0., 0., .08]
         self.controller.wait_gripper(arm, False, .6)
         # Plan back from the insertion pose. Choosing a redundant elbow posture
         # for the high point in isolation can force a several-radian posture
         # change beside the cube, even for the last millimetres of approach.
         # All these poses and edges are checked on the private collision model.
-        insertion = [standoff + (before-standoff)*a for a in np.linspace(0.,1.,9)]
+        insertion = [standoff + (aim-standoff)*a for a in np.linspace(0.,1.,9)]
         from backend.app.robots.urdf import solve_profile_ik
         home = self.env.home_arm_qpos(arm)
         limits = self.env.arm_limits(arm)
-        seed_key = (arm,*np.round(before/.002).astype(int))
+        seed_key = (arm,*np.round(aim/.002).astype(int))
         guesses = [*self.controller._approach_seeds.get(seed_key,[]), self.env.arm_qpos(arm), home]
         guesses.extend(np.clip(home+axis*shift,*limits.T) for axis in np.eye(len(home)) for shift in [-.5,.5,-1.,1.])
         reverse_seeds = None
         chosen_gravity = None
         snapshot = self.env.joint_snapshot()
         names = self.env.profile['chains'][arm]['joints']
-        rotations = self._approach_rotations(arm, before, snapshot)
+        rotations = self._approach_rotations(arm, aim, snapshot)
         rejected = {}
 
         def note(reason):
@@ -393,7 +397,7 @@ class ImportedRobotSkills(SkillRunner):
         for rotation in rotations:
             for guess in guesses:
                 if self.controller.stop_requested():raise SkillError('STOPPED','Approach planning stopped')
-                goal = solve_profile_ik(self.env.profile,arm,before,rotation,model=self.env.model,q_init=guess,snapshot=snapshot,
+                goal = solve_profile_ik(self.env.profile,arm,aim,rotation,model=self.env.model,q_init=guess,snapshot=snapshot,
                                         joint_limits=(self.env.ik_joint_limits(arm) if hasattr(self.env, 'ik_joint_limits') else None
                                                       ))
                 if not goal['success']:
@@ -407,7 +411,7 @@ class ImportedRobotSkills(SkillRunner):
                 if margin is not None and margin['over_limit']:
                     over_limit.append((margin['worst_ratio'], rotation, seed))
                     continue
-                closure = self.controller.plan_closure(arm,before,rotation,seed)
+                closure = self.controller.plan_closure(arm,aim,rotation,seed)
                 if closure is None:
                     note('closure_none')
                     continue
@@ -756,13 +760,7 @@ class ImportedRobotSkills(SkillRunner):
         for index, bias in enumerate(self.GRASP_BIASES):
             try:
                 if index:
-                    # Re-place the jaws before closing again: closing where the previous attempt left them would
-                    # repeat the same contact geometry.
-                    with self._base_hold():
-                        self.controller.wait_gripper(arm, False, .4)
-                        self._approach(arm, obj)
-                        self._close_pinch(arm, obj, grasp_bias=np.asarray(bias))
-                        self._require_hold(arm, obj)
+                    self._regrasp(arm, obj, bias)
                     result = {'object': obj, 'arm': arm, 'reclosed': True, 'bias': bias}
                 else:
                     result = self._grasp(arm, obj, grasp_bias=np.asarray(bias))
@@ -776,6 +774,22 @@ class ImportedRobotSkills(SkillRunner):
         error = SkillError('GRASP_LOST', f'No pinch on {obj} after {len(attempts)} placements: {attempts}')
         error.evidence = {'attempts': attempts}
         raise error
+
+    #: The bias a sweep measured to hold (0 and +6 mm held, -6 mm did not). The first attempt uses it too.
+    REGRASP_BIAS = (0., 0., .006)
+
+    def _regrasp(self, arm, obj, bias=REGRASP_BIAS):
+        """The one place a pinch is re-established: open, re-place the jaws, close with a bias, verify.
+
+        Three call sites had their own copy of these four lines (the grasp retry, the lift retry and the throw's
+        entry check). One owner means the bias that was measured to hold, the settle wait and the verification cannot
+        drift apart.
+        """
+        with self._base_hold():
+            self.controller.wait_gripper(arm, False, .4)
+            self._approach(arm, obj)
+            self._close_pinch(arm, obj, grasp_bias=np.asarray(bias))
+            self._require_hold(arm, obj)
 
     def _grasp(self, arm, obj, grasp_bias=None):
         with self._base_hold():
@@ -859,10 +873,8 @@ class ImportedRobotSkills(SkillRunner):
         attempts = []
         for bias in self.LIFT_RETRY_BIASES:
             try:
+                self._regrasp(arm, obj, bias)
                 with self._base_hold():
-                    self.controller.wait_gripper(arm, False, .4)
-                    self._approach(arm, obj)
-                    self._close_pinch(arm, obj, grasp_bias=np.asarray(bias))
                     result = self._lift_once(arm, obj, height)
                 return {**result, 'lift_retry': {**first, 'bias': bias, 'attempts': attempts}}
             except SkillError as error:
