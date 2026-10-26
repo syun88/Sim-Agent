@@ -25,9 +25,10 @@ QUESTIONS = {
         "type": "noul",
         "instructions": "Has the instruction's requested outcome been achieved, according to these facts?",
         "why": "Interpreting the instruction against observed end state is a language judgement, not geometry.",
-        # 600M: 3/6 (chance). d1-3B: 4/6, missing "stacked" and "hands empty". Records only until a bigger
-        # sample says otherwise.
-        "trusted": False, "measured": "d1-3B 4/6, omni-600M 3/6 (2026-10-27)",
+        # Twelve labelled outcomes with d1-3B: 7/12, and every miss is spatial - "stacked", "left of",
+        # "right of", and a held-versus-placed confusion. Those facts are derived from the state anyway, so
+        # this question is both unreliable and redundant. Records only.
+        "trusted": False, "measured": "d1-3B 7/12 with all misses spatial, omni-600M 3/6 (2026-10-27)",
     },
     "next_step_blocked": {
         "type": "choice",
