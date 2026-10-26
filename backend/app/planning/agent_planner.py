@@ -399,6 +399,9 @@ class AgentPlanner:
             'reset_and_retry means visibly restart the simulation scene and retry the SAME bound object/task, discarding progress. '
             'Reset is a last resort; it is legal only after in-place alternatives are exhausted and the caller records an unrecoverable scene condition. '
             'Prefer resume if meaningful progress exists and its remaining plan is valid; ordinary grasp, IK or path failures do not justify resetting the scene. '
+            'Choose replan when the failure reported measurements that a different plan can respect - a skill '
+            'that could only travel a short distance, or that left the object too slowly to reach its target. '
+            'resume would repeat that same plan, and recover_in_place only clears the arms. '
             'Explain the observed obstacle and required next preparation in Japanese. Reasons for failure are hypotheses; do not invent observations, tools, successful grasps or capabilities.'},
             {'role':'user','content':json.dumps({'instruction':instruction,'observed':facts,'failure':failure,
                 'legal_recoveries':legal_actions,'output_schema':schema},ensure_ascii=False)}]
