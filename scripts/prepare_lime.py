@@ -18,7 +18,9 @@ Two steps:
            xacro /lime/turtlebot3_lime_description/urdf/turtlebot3_lime.urdf.xacro \\
              > /lime/lime_full.urdf'
 
-2. drop the camera's visual. It references `realsense2_description`, which is not
+2. drop the camera's visual, and write the actuators.json that names the wheel
+   motors (the arm has no motor named in that description, so it keeps its URDF
+   limits). It references `realsense2_description`, which is not
    part of the Lime repository (it ships in the ROS/sim image), and no scene needs
    the robot's own camera — the viewer's camera is separate (see
    `simulation/genesis_backend/environment.py`). The link and joint stay.
@@ -30,6 +32,7 @@ not care, but probes do, and one file that satisfies both is cheaper than rememb
 Usage:  uv run python scripts/prepare_lime.py [--raw PATH] [--out PATH]
 """
 import argparse
+import json
 import pathlib
 import xml.etree.ElementTree as ET
 
@@ -62,6 +65,15 @@ def main():
                     dropped += 1
     left = [element.get("filename") for element in root.findall(".//mesh")
             if CAMERA_PACKAGE in (element.get("filename") or "")]
+
+    # The wheels' motor is named in the description's own comment ("<!--XM430-W210-->"
+    # above the wheel limits in bigwheel_orin.urdf.xacro), so record that identity here.
+    # The preset's numbers live in backend/app/robots/actuators.py beside the other
+    # motors, and a joint with no entry keeps its URDF limit, which is what the arm does.
+    wheels = {"wheel_left_joint": {"preset": "xm430_w210"},
+              "wheel_right_joint": {"preset": "xm430_w210"}}
+    (args.out.parent / "actuators.json").write_text(
+        json.dumps({"joints": wheels}, indent=2) + "\n")
 
     ET.ElementTree(root).write(args.out, encoding="utf-8", xml_declaration=False)
     print(f"{args.out}: {len(root.findall('link'))} links, {len(root.findall('joint'))} joints, "
