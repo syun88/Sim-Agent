@@ -581,6 +581,18 @@ def import_robot(folder):
                 if len(position) == 2:
                     position.append(scene["cube_size"] / 2)
                 spawn["objects"][name] = {"position": position}
+                # An object may stand on its own support, which is the only way a tool whose jaws
+                # sit behind its tip can reach something on a floor: with the tip pointing down the
+                # jaws are ~55 mm above it, so a floor object needs the tip through the floor
+                # (measured 2026-10-26 on the Lime). `size` is the support's full extent; the
+                # default centres it under the object with its top at the object's underside.
+                support = entry.get("support")
+                if support:
+                    size = [float(v) for v in support["size"]]
+                    centre = support.get("position") or [
+                        position[0], position[1], position[2] - scene["cube_size"] / 2. - size[2] / 2.]
+                    spawn["objects"][name]["support"] = {"size": size,
+                                                          "position": [float(v) for v in centre]}
     else:
         spawn = ReachableDeskSpawns(profile, scene).layout()
     scene['objects'] = spawn['objects']

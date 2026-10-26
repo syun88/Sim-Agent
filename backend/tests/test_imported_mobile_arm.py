@@ -10,6 +10,7 @@ shape is what matters: a floor robot with two continuous wheels, a three-joint a
 collision declaration a manufacturer's CAD requires.
 """
 import json
+import pathlib
 
 import numpy as np
 import pytest
@@ -69,6 +70,8 @@ def wheeled(tmp_path_factory):
     (source.parent / 'collision_config.json').write_text(json.dumps({'runtime_excluded_adjacent_pairs': [
         ['base_link', 'link1'], ['base_link', 'wheel_left_link'], ['base_link', 'wheel_right_link'],
         ['link1', 'link2'], ['link2', 'link3']]}))
+    (source.parent / 'floor_objects.json').write_text(json.dumps({'objects': {
+        'cube': {'position': [.22, 0., .16], 'support': {'size': [.08, .08, .12]}}}}))
     (source.parent / 'actuators.json').write_text(json.dumps({'joints': {
         'wheel_left_joint': {'preset': 'xm430_w210'}, 'wheel_right_joint': {'preset': 'xm430_w210'},
         'joint1': {'preset': 'xm430_w210'}, 'joint2': {'preset': 'xm430_w210'},
@@ -127,3 +130,14 @@ def test_the_arms_fk_follows_the_driven_body(wheeled):
     now = env.arm_qpos('left')
     assert float(np.linalg.norm(np.asarray(env.ee_pose('left')[0])
                                 - np.asarray(env.arm_kinematics('left').evaluate(now)[0]))) < .001
+
+
+def test_an_authored_object_stands_on_its_support(wheeled):
+    """An object placed above the floor needs a support, or it falls and nothing can reach it."""
+    profile, env = wheeled
+    entry = json.loads((pathlib.Path(profile['directory']) / 'spawn_validation.json').read_text())['objects']['cube']
+    assert entry['support']['size'] == [.08, .08, .12], entry
+    env.reset()
+    env.step(120)
+    z = float(np.asarray(env.object_pose('cube')[0])[2])
+    assert z > .10, 'the cube fell to %.3f m: the support was not created' % z
