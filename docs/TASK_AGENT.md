@@ -318,9 +318,16 @@ fluid  : SPH / 8 particles / 51.2 mL / glass 0 / spilled 0
 ```
 `create_backend` の**無条件拒否**は条件付きに置換（gripper があり `grasp_calibrated` で、口径 ≥ 50mm）。
 
-残る作業:
-- **ボトルとグラスを機体の可達域に置く**: 公式セルの定数（`BOTTLE_START` など）は 0.3 m アームには遠い
-  （実測: ボトル x=0.44、基部 −0.25 → 0.69 m）。キューブと同じく **spawn サンプラの可達帯**から配置する。
+**配置も実装済み（2026-10-27）**: ボトル/グラスを**その機体のテーブル上・可達域内**に置けるようにした
+（`WineWorld(..., bottle_position=, glass_position=)`）。imported 4自由度機体で実測:
+```
+wine_bottle [-0.05, 0.04, 0.845]  (テーブル 0.755 + ボトル高)
+wine_glass  [-0.05, -0.07, 0.761]
+fluid       SPH / 8 particles / 51.2 mL / glass 0 / spilled 0
+```
+残る阻害は**高さ**（実測）: ボトルの注ぎ口は z=0.97 で、4自由度機体はその把持姿勢に **MOTION_BLOCKED**
+（`Cannot reach [-0.06, 0.04, 0.978]`）。選択肢は ①機体を高く据える ②低いボトル形状 ③**6自由度機体（UR5e）**で行う。
+流体側は問題なし（状態は読めている）。
 
 元の手順（参考）:
 1. `GenericURDFEnvironment` に `scene_profile == 'wine'` の分岐を足し、`WineWorld(scene, gs, …)` を生成。

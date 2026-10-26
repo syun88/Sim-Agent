@@ -135,7 +135,16 @@ class GenericURDFEnvironment(SimulationBackend):
             self._scene.add_entity(gs.morphs.MJCF(file='''<mujoco><worldbody>
                 <geom type="plane" size="1 1 .01" pos="0 0 1.006" contype="1073741824" conaffinity="0"/>
                 </worldbody></mujoco>''', visualization=False))
-            self._wine = WineWorld(self._scene, gs, async_surface=False)
+            # Place the vessels on THIS robot's table, inside its reach, rather than at the official cell's constants:
+            # an imported arm has a lower table and a shorter arm, and the official positions are 0.69 m away from a
+            # 0.3 m reach. The bottle sits at the front of the table, the glass beside it, both within a hand's span of
+            # the base, which is where the cube spawner already looks for reachable props.
+            base_x = float(self._root_transform[0, 3])
+            table = float(self.table_height)
+            bottle = [base_x + .20, .04, table + .085]
+            glass = [base_x + .20, -.07, table + .001]
+            self._wine = WineWorld(self._scene, gs, async_surface=False,
+                                   bottle_position=bottle, glass_position=glass)
         self._camera = self._scene.add_camera(res=(720, 480), pos=(1.1, -1.3, 1.5), lookat=(0., 0., 1.), GUI=False)
         self._scene.build()
         if self._wine is not None:

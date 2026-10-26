@@ -114,12 +114,18 @@ def vessel_xml(name: str, fixed: bool) -> str:
 
 
 class WineWorld:
-    def __init__(self, scene, gs, *, fixed_bottle=False, async_surface=True):
+    def __init__(self, scene, gs, *, fixed_bottle=False, async_surface=True,
+                 bottle_position=None, glass_position=None):
+        # The vessel positions are the official cell's constants by default. An imported arm has its own table height
+        # and its own reach, so the caller may place them: measured 2026-10-27, the official bottle sits 0.69 m from a
+        # 0.3 m arm and every approach posture is rejected for want of reach, not for want of a fluid model.
+        self.bottle_start = np.asarray(BOTTLE_START if bottle_position is None else bottle_position, float)
+        self.glass_start = np.asarray(GLASS_START if glass_position is None else glass_position, float)
         self.scene = scene
         self.solver = "SPH"
         material = gs.materials.Rigid(needs_coup=True, coup_friction=.2, coup_softness=.0003,
                                      sdf_cell_size=.0004, sdf_min_res=128, sdf_max_res=512)
-        self.bottle = scene.add_entity(gs.morphs.MJCF(file=vessel_xml("wine_bottle", fixed_bottle), pos=tuple(BOTTLE_START),
+        self.bottle = scene.add_entity(gs.morphs.MJCF(file=vessel_xml("wine_bottle", fixed_bottle), pos=tuple(self.bottle_start),
                                                     convexify=False, watertighten=None), material=material,
                                       surface=gs.surfaces.Default(vis_mode="visual", roughness=.15, double_sided=False))
         # One physical bottle, with convex grip/support contacts and a hollow SDF
@@ -127,12 +133,12 @@ class WineWorld:
         for geom in self.bottle.geoms:
             if geom.type != gs.GEOM_TYPE.MESH:
                 geom._needs_coup = False
-        self.glass = scene.add_entity(gs.morphs.MJCF(file=vessel_xml("wine_glass", True), pos=tuple(GLASS_START),
+        self.glass = scene.add_entity(gs.morphs.MJCF(file=vessel_xml("wine_glass", True), pos=tuple(self.glass_start),
                                                    convexify=False, watertighten=None),
                                       material=material.model_copy(update={"coup_friction": .8}),
                                       surface=gs.surfaces.Default(vis_mode="visual", roughness=.12, double_sided=False))
         self.liquid = scene.add_entity(
-            gs.morphs.Cylinder(pos=tuple(BOTTLE_START + [0, 0, -.085 + .012 + .020]), radius=.021, height=.040),
+            gs.morphs.Cylinder(pos=tuple(self.bottle_start + [0, 0, -.085 + .012 + .020]), radius=.021, height=.040),
             material=gs.materials.SPH.Liquid(rho=990., mu=LIQUID_MU, gamma=LIQUID_GAMMA,
                                               stiffness=LIQUID_STIFFNESS, sampler="regular"),
             surface=gs.surfaces.Default(color=(.42, .008, .025, 1.), roughness=.12,
@@ -143,14 +149,14 @@ class WineWorld:
         self.ml_per_particle = 0.
 
     def capture_setup(self):
-        self.initial_particles = self.liquid.get_particles_pos().cpu().numpy().copy() - BOTTLE_START
+        self.initial_particles = self.liquid.get_particles_pos().cpu().numpy().copy() - self.bottle_start
         # Genesis assigns each SPH particle 0.8 * spacing^3 reference volume,
         # not a full spacing cube. Use the engine's actual mass/volume model.
         self.ml_per_particle = float(self.scene.sph_solver.particle_volume) * 1e6
 
     def reset(self, *, tilt_degrees=0., bottle_position=None):
         self.surface_renderer.reset()
-        position = BOTTLE_START if bottle_position is None else np.asarray(bottle_position, float)
+        position = self.bottle_start if bottle_position is None else np.asarray(bottle_position, float)
         rotation = Rotation.from_euler("y", tilt_degrees, degrees=True)
         q = rotation.as_quat()
         # Explicit scene setup only. No skill calls these setters.
