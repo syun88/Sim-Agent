@@ -25,6 +25,37 @@ class TaskExecutor:
     def world_state(self):
         return {**build_world_state(self.env), "discourse": self.discourse.copy()}
 
+    def _monitor_step(self, step, result):
+        """Ask the local decision model one closed question about this step, if it is running."""
+        from backend.app.planning import decision_model
+
+        if not decision_model.available() or step.get("skill") not in {
+                "grasp_object", "lift_object", "move_to_object", "move_to_target", "release_object",
+                "throw_object", "handover_object"}:
+            return None
+        obj = step.get("object")
+        if not obj:
+            return None
+        try:
+            held = bool(self.skills.held_object(step.get("arm", "left")))
+        except Exception:
+            held = None
+        state = (f"Robot step just finished: {step.get('skill')} on {obj}. Reported success: "
+                 f"{bool(result.get('success'))}. The arm reports holding an object: {held}. "
+                 f"Failure category from the skill, if any: {result.get('error') or 'none'}.")
+        questions = {"consistent": {
+            "type": "noul",
+            "instructions": "Does the skill's reported outcome agree with the robot's own report that it holds "
+                            "an object after this step?"}}
+        answer = decision_model.ask(state, questions, timeout=6.)
+        if not answer:
+            return None
+        judgement = (answer.get("answers") or {}).get("consistent") or {}
+        if "noul" not in judgement:
+            return None
+        return {"step": step.get("skill"), "agrees": bool(float(judgement["noul"]) < .5),
+                "p_agree": round(float(judgement["noul"]), 3), "advisory": True}
+
     def reset_context(self):
         self.discourse.clear()
         self.controller.target_rotations.clear()
@@ -129,6 +160,12 @@ class TaskExecutor:
                     attempts.append(retry)
             result = {**result, "step_index": index, "action_index": step.get("action_index"), "arm": step["arm"],
                       "object": step.get("object"), "attempts": attempts, "world_state": build_world_state(self.env)}
+            # System 1, per step: a fast typed judgement about whether the hold is still there, recorded next
+            # to the outcome. Advisory only - it cannot turn a failure into a success or the reverse; a
+            # monitor that is absent, slow or wrong simply leaves the field out.
+            monitored = self._monitor_step(step, result)
+            if monitored is not None:
+                result["monitor"] = monitored
             results.append(result)
             if result["success"] and step.get("action_index") is not None and plan.program:
                 action = plan.program["actions"][step["action_index"]]

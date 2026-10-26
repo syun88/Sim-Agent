@@ -78,3 +78,30 @@ def test_a_single_legal_option_does_not_ask_the_monitor(monkeypatch):
     planner.enabled = planner.local_enabled = False
     planner.assess_failure("置いて", STATE, FAILURE, ["recover_in_place"])
     assert seen == [], "a question with one possible answer costs a forward pass and teaches nothing"
+
+
+def test_a_per_step_judgement_is_advisory_and_absence_is_silent(monkeypatch):
+    """The monitor may annotate a step; it must never decide the step's outcome."""
+    import numpy as np
+    from backend.app.execution.task_executor import TaskExecutor
+
+    class _Skills:
+        def held_object(self, arm):
+            return "red_cube"
+
+    executor = TaskExecutor.__new__(TaskExecutor)
+    executor.skills = _Skills()
+    step = {"skill": "lift_object", "arm": "left", "object": "red_cube"}
+
+    monkeypatch.delenv("OPENARM_DECISION_URL", raising=False)
+    assert executor._monitor_step(step, {"success": True}) is None    # not configured -> silent
+    monkeypatch.setenv("OPENARM_DECISION_URL", "http://monitor.invalid")
+    monkeypatch_payload = {"answers": {"consistent": {"type": "noul", "noul": .12}}}
+    original = decision_model.ask
+    try:
+        decision_model.ask = lambda *a, **k: monkeypatch_payload
+        recorded = executor._monitor_step(step, {"success": True})
+        assert recorded["agrees"] is True and recorded["advisory"] is True
+        assert recorded["p_agree"] == pytest.approx(.12)
+    finally:
+        decision_model.ask = original
