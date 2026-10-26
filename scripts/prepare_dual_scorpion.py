@@ -16,7 +16,8 @@ position (for example ds_urdf_v4 at [0.259, 0.003, -0.076]). Two consequences dr
 The adjacent-pair declaration is measured, not guessed: `_collision_declaration` from the
 OpenManipulator-X preparation is reused as-is, so the two packages cannot drift apart.
 A supplied initial_state.json is preserved; otherwise a floor-mounted, collision-free setup
-is sampled with terminal-joint apertures unchanged. Non-adjacent collisions stay enabled.
+is sampled with terminal-joint apertures unchanged for discovery, but also checked with the
+runtime's opened grippers. Non-adjacent collisions stay enabled.
 Preparation does not certify motor tracking or physical grasping; those require runtime checks.
 """
 import argparse
@@ -53,6 +54,10 @@ def _derive_home(destination, budget=2000):
 
     profile = import_robot(str(destination))
     queries = PrivateCollisionQueries(profile, table_top=0.)
+    opened = {}
+    for gripper in profile['grippers'].values():
+        opened.update({gripper['joint']: float(gripper['open_q']),
+                       **{name: float(gripper['open_q'] * k) for name, k in gripper['followers'].items()}})
     # Preserve terminal-joint apertures: moving them before gripper discovery can fold
     # the finger out of its inference frame and make both grippers disappear on import.
     parents = {j['parent'] for j in queries.urdf.joints}
@@ -64,7 +69,10 @@ def _derive_home(destination, budget=2000):
         else:
             candidate = {**profile['home'], **{j['name']: float(rng.uniform(j['lower'], j['upper']))
                                              for j in movable}}
-        if not queries.contacts(candidate, tolerance=-.0005):
+        # reset() opens the jaws, independently of their authored discovery posture. A setup
+        # clear only with the authored aperture can start in collision (measured: 8 mm).
+        if (not queries.contacts(candidate, tolerance=-.0005)
+                and not queries.contacts({**candidate, **opened}, tolerance=-.0005)):
             return {**candidate, 'mount': 'floor'}
     raise RuntimeError(f'No collision-free setup in {budget} sampled postures')
 
@@ -208,6 +216,9 @@ def main():
                   flush=True)
         if derive_home:
             setup.write_text(json.dumps(_derive_home(destination), indent=2) + '\n')
+        else:
+            # An authored setup is preserved, but must satisfy the same execution clearance.
+            _derive_home(destination, budget=0)
     except Exception:
         if derive_home:
             setup.unlink(missing_ok=True)

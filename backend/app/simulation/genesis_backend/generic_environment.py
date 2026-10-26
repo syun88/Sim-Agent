@@ -139,12 +139,38 @@ class GenericURDFEnvironment(SimulationBackend):
                       for side, chain in self.profile["chains"].items()}
         self._limits = {j["name"]: [-np.inf if j["lower"] is None else j["lower"],
                                    np.inf if j["upper"] is None else j["upper"]] for j in self.profile["joints"]}
-        self._entity.set_dofs_position(np.array([self.profile["home"][name] for name in self._all_names]), self._all_dofs)
-        inertia = np.maximum(np.diag(self._entity.get_mass_mat().cpu().numpy())[self._all_dofs], 1e-6)
+        initial = np.array([self.profile["home"][name] for name in self._all_names])
+        if not self._mobile_base:
+            # Size the fixed-robot servo at the same opened-jaw posture reset() will use.
+            for gripper in self.grippers.values():
+                for name, multiplier in {gripper['joint']: 1., **gripper['followers']}.items():
+                    initial[self._all_names.index(name)] = gripper['open_q'] * multiplier
+        self._entity.set_dofs_position(initial, self._all_dofs)
+        if not self._mobile_base:
+            # get_mass_mat() reads a cache: setting q updates FK, not the mass matrix. Ask
+            # Genesis to assemble the undamped matrix at this pose, without stepping physics.
+            # A stale zero-pose diagonal differed by 10.7x at one imported wrist joint.
+            from genesis.engine.solvers.rigid.abd.forward_dynamics import kernel_compute_mass_matrix
+            solver = self._scene.rigid_solver
+            kernel_compute_mass_matrix(self._scene._envs_idx, solver.dyn_state, solver.dyn_info,
+                                       solver.rigid_info, solver.rigid_config, False)
+        inertia = np.diag(self._entity.get_mass_mat().cpu().numpy())[self._all_dofs]
+        invalid = ~np.isfinite(inertia) | (inertia <= 0.)
+        if np.any(invalid):
+            raise ValueError('Non-positive or non-finite joint inertia: ' +
+                             ', '.join(name for name, bad in zip(self._all_names, invalid) if bad))
         arm_names={name for chain in self.profile['chains'].values() for name in chain['joints']}
         response=np.asarray([POLICY['arm_response_rad_s'] if name in arm_names else POLICY['finger_response_rad_s']
                              for name in self._all_names])
-        kp = np.clip(inertia * response**2,POLICY['kp_min'],POLICY['kp_max'])
+        if self._mobile_base:
+            # Mobile arms must hold their weight; retain their existing loaded-servo gains.
+            inertia = np.maximum(inertia, 1e-6)
+            kp = np.clip(inertia * response**2, POLICY['kp_min'], POLICY['kp_max'])
+        else:
+            # Gravity is cancelled for fixed robots. Keep the requested response as inertia
+            # shrinks: a fixed kp floor drove a 5e-8 kg m² wrist past 250 rad/s under a
+            # sub-1 rad/s reference. Flooring the inertia in kv also over-damps tiny joints.
+            kp = np.minimum(inertia * response**2, POLICY['kp_max'])
         kv = 2. * np.sqrt(kp * inertia)
         if self._mobile_base:
             # Desk scenes cancel gravity for the whole entity; a mobile
