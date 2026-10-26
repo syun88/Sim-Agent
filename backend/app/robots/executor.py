@@ -529,12 +529,18 @@ class ImportedRobotSkills(SkillRunner):
         contacts = self._close_pinch(arm,obj)
         position, rotation = self.env.ee_pose(arm)
         self.controller.target_rotations[arm] = self._attitude(arm).copy()
-        self._move_relative(arm,[0.,0.,.03])
+        # The verification lift only has to prove the hold, and 30 mm is more than a small cube needs: on a
+        # 25.5 mm cube the near posture loses the pinch during it (measured 2026-10-27 - grasp reports
+        # success, the pads are on the cube, and by the next skill one pad is gone and the jaws have closed
+        # a further 0.006). Scale the proof to the object, and require most of it back.
+        verify = min(.03, max(.015, float(self.env.cube_size) * .6))
+        self._move_relative(arm,[0.,0.,verify])
         self._require_hold(arm, obj)
         after = self.env.object_pose(obj)[0]
         rise = float(after[2] - before[2])
-        if rise < .021:
-            raise SkillError('GRASP_LOST', f'Cube rose only {rise:.6f}m during 30mm verification lift')
+        if rise < verify * .7:
+            raise SkillError('GRASP_LOST', f'Cube rose only {rise:.6f}m during a {verify*1000:.0f}mm '
+                                           f'verification lift')
         start_ee, start_rotation = self.env.ee_pose(arm)
         relative = start_rotation.T @ (after - start_ee)
         samples = []
