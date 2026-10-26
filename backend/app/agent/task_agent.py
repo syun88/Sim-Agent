@@ -22,7 +22,12 @@ RECOVERABLE = {'IK_FAILURE','GRASP_FAILED','COLLISION_PATH','MOTION_BLOCKED','HO
                'HANDOVER_UNREACHABLE','HANDOVER_APPROACH_COLLISION','HANDOVER_NO_RECEIVER_PINCH',
                'HANDOVER_DONOR_CONTACT','HANDOVER_LOST','HAND_CONTACT',
                'THROW_FAILED'}
-RESTARTABLE = {'pick','handover','place','approach','home','navigate'}
+#: Operations a task may retry from the observed scene. All table-safe and re-derivable from world state. The
+#: model writes approach/grasp/lift/throw as separate actions, so anything missing here makes whole plans
+#: unrestartable - measured 2026-10-27: a plan containing a throw never offered a recovery because `lift` was
+#: absent from this set.
+RESTARTABLE = {'pick', 'handover', 'place', 'approach', 'home', 'navigate', 'throw', 'pour', 'lift',
+               'retreat', 'move'}
 
 
 def completed_prefix(plan, result):
