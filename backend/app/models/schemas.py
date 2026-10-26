@@ -34,6 +34,8 @@ class PlanStep(BaseModel):
     grasp_offset_x: float = Field(default=0., ge=-.02, le=.02)
     height_cm: float | None = Field(default=None, ge=1, le=10)
     volume_ml: float | None = Field(default=None, ge=5, le=35)
+    stroke_cm: float | None = Field(default=None, ge=2, le=30)
+    release_speed_m_s: float | None = Field(default=None, ge=.2, le=3.)
     joint: str | None = None
     position_deg: float | None = Field(default=None, allow_inf_nan=False)
     target_xy: list[float] | None = Field(default=None, min_length=2, max_length=2)
@@ -55,6 +57,15 @@ class AgentPlan(BaseModel):
     goal_program: dict[str, Any] | None = None
     planning_evidence: dict[str, Any] | None = None
     assumptions: list[str] = Field(default_factory=list)
+    # Provenance ledger. Which path actually answered a request, and why, must be readable per request:
+    # a provider name alone cannot tell "the model agreed" from "the model was never consulted".
+    model_called: bool = False
+    skipped_because: str | None = None
+    capability_mode: bool = False
+    fallback_verdict: dict[str, Any] | None = None
+    model_verdict: dict[str, Any] | None = None
+    agree: bool | None = None
+    shadow: dict[str, Any] | None = None
 
 
 class TaskRequest(BaseModel):

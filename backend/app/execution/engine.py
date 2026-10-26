@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from typing import Callable
 
@@ -94,6 +95,10 @@ class ExecutionEngine:
             self.emit("task_finished", status=self.state, record=record)
         except Exception as exc:
             self.state = "FAILED"
-            self.emit("task_error", error=f"Execution stopped: {type(exc).__name__}")
+            # Keep the message, not just the type: a swallowed TypeError tells a reader nothing and
+            # hides the one line that names the defect.
+            import traceback
+            self.emit("task_error", error=f"Execution stopped: {type(exc).__name__}: {str(exc)[:400]}",
+                      traceback=traceback.format_exc()[-2000:])
         finally:
             self.controller.cancelled = False

@@ -51,7 +51,15 @@ def main() -> None:
     # Register before constructing a scene: a second launch cannot open a second viewer.
     response = client.post('/api/genesis/register', json={'viewer_id': viewer_id, 'provider': planner.configured_provider})
     response.raise_for_status()
-    os.environ['GENESIS_SHOW_VIEWER'] = '0' if args.headless else '1'
+    # The native window needs a working GL context, and on this host it does not get one: measured
+    # 2026-10-26, the native path sat at "Building ... on Genesis" for minutes at ~26-58% CPU while the
+    # identical scene built in 20 s with the viewer off (the same 14 s the test suite sees). So an
+    # explicit decision in the environment is kept - GENESIS_SHOW_VIEWER=0 runs the same scene through
+    # the web UI - and only an unset value follows --headless.
+    if args.headless:
+        os.environ['GENESIS_SHOW_VIEWER'] = '0'
+    else:
+        os.environ.setdefault('GENESIS_SHOW_VIEWER', '1')
     robot_id = get_profile(args.robot or selected_robot())['id']
     print(f'Building {robot_id} on Genesis...', flush=True)
     env = create_backend(args.scene if robot_id == 'openarm_v2' else 'cubes', robot_id=robot_id)
@@ -220,6 +228,31 @@ def main() -> None:
                     env.step(200)
                     body.update(success=True, verification={'success': True, 'goal_type': 'scene_reset',
                         'randomization':env.spawn_validation.get('randomization')}, final_world_state=build_world_state(env))
+                elif command['action'] == 'diagnose_pinch':
+                    # Run the same skills the task path runs, inside this process, and report the contact
+                    # numbers instead of a verdict: q, the pinch verdict, the pad links and the candidate
+                    # contacts. This is the measurement that separates world state from agent path.
+                    arm = command.get('arm', 'left'); obj = command.get('object', 'red_cube')
+                    saved_observer = env.step_observer
+                    if command.get('observer') is False:
+                        env.step_observer = None
+                    rows = []
+                    for skill in ('approach_object', 'grasp_object', 'lift_object'):
+                        out = getattr(executor.skills, skill)(arm, obj)
+                        evidence = env.pinch_evidence(obj, arm) if hasattr(env, 'pinch_evidence') else {}
+                        rows.append({'skill': skill, 'success': out.get('success'), 'error': out.get('error'),
+                                     'gripper_position': float(env.gripper_position(arm)),
+                                     'pinch_established': bool(evidence.get('established')),
+                                     'pads': sorted({c.get('robot_link') for c in
+                                                     (evidence.get('candidate_contacts') or [])}),
+                                     'object_position': [round(float(v), 5) for v in env.object_pose(obj)[0]],
+                                     'raw_contacts': sorted(env.object_contacts(obj, arm))})
+                        if not out.get('success'):
+                            break
+                    env.step_observer = saved_observer
+                    body.update(success=all(row['success'] for row in rows), verification={'success': True,
+                        'goal_type': 'pinch_diagnostic', 'observer': command.get('observer') is not False,
+                        'rows': rows}, final_world_state=build_world_state(env))
                 elif command['action'] == 'select_robot':
                     prepare_robot(command['robot_id'])
                     body.update(success=True, verification={'success': True, 'goal_type': 'robot_selection', 'robot_id': command['robot_id']},

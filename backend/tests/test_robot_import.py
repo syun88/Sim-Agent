@@ -1,5 +1,6 @@
 """URDF import, private Jacobians and broker-only selection are separate gates."""
 import json
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
 import numpy as np
@@ -126,13 +127,25 @@ def test_a_package_declaring_adjacent_mesh_overlap_does_not_collide_them(tmp_pat
     assert scene['runtime_excluded_adjacent_pairs'] == [['base', 'link1'], ['link1', 'tool']]
 
 
-def test_a_declaration_that_names_a_non_adjacent_pair_is_refused(tmp_path, monkeypatch):
+def test_a_non_adjacent_declaration_ships_an_engine_model(tmp_path, monkeypatch):
+    """Two links that share no joint can still overlap structurally: a coupled linkage does exactly that.
+
+    Measured 2026-10-24 on UR5e + 2F-85: inner_finger against inner_knuckle overlaps 11.51 mm in the
+    open-jaw state a spawn is validated in, and the two sit on different branches of the linkage, so a
+    URDF cannot name the pair while an engine model can exclude any pair. The declaration may therefore
+    name non-adjacent pairs exactly when the package ships one. This test fails if the import starts
+    refusing them again, or stops carrying them into the engine model.
+    """
     source = source_robot(tmp_path)
     (source.parent / 'collision_config.json').write_text(json.dumps(
         {'runtime_excluded_adjacent_pairs': [['base', 'tool']]}))
     monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
-    with pytest.raises(ValueError, match='non-adjacent'):
-        registry.import_robot(source.parent.parent)
+    profile = registry.import_robot(source.parent.parent)
+    engine = profile.get('engine_model') or {}
+    assert engine.get('morph') == 'mjcf', 'a non-adjacent declaration needs an engine model'
+    root = ElementTree.parse(engine['file']).getroot()
+    excluded = sorted(tuple(sorted((e.get('body1'), e.get('body2')))) for e in root.iter('exclude'))
+    assert ('base', 'tool') in excluded, 'the engine model must carry the non-adjacent exclude' 
 
 
 def test_documented_overlaps_are_not_a_runtime_request(tmp_path, monkeypatch):
@@ -232,18 +245,104 @@ def overlapping_arm(tmp_path):
     return path
 
 
-def test_a_partial_runtime_declaration_is_refused(tmp_path, monkeypatch):
-    """A partial runtime set would make validation more permissive than the engine.
+def test_a_partial_runtime_declaration_ships_an_engine_model(tmp_path, monkeypatch):
+    """A partial declaration is allowed exactly when the package ships a model that excludes those pairs.
 
-    Measured 2026-10-24: declaring one of two overlapping adjacent pairs left the engine with
-    adjacent_collision=True while the private queries were silent on the declared pair, so a posture
-    colliding only there passed validation and then collided in physics. The engine can only turn
-    adjacent collision off wholesale, so a partial set cannot be enforced - the documentation-only
-    key is the place for it.
+    Measured 2026-10-24: declaring one of two overlapping adjacent pairs used to be refused, because a
+    URDF cannot filter individual pairs and telling the engine to drop adjacent collision wholesale
+    while the private queries were silent on the declared pair left validation more permissive than
+    physics. A package whose overlaps live in its authored visuals has no complete set to declare - no
+    amount of collision-mesh preparation removes them - so the import shapes the private collision
+    model into an engine model whose exclusions are the declaration itself. This test fails if that
+    model stops carrying exactly the declared pairs.
     """
     source = overlapping_arm(tmp_path)
     (source.parent / 'collision_config.json').write_text(json.dumps(
         {'runtime_excluded_adjacent_pairs': [['base', 'link1']]}))
     monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
-    with pytest.raises(ValueError, match='every collidable adjacent pair'):
-        registry.import_robot(source.parent.parent)
+    profile = registry.import_robot(source.parent.parent)
+    engine = profile.get('engine_model') or {}
+    assert engine.get('morph') == 'mjcf', 'a partial declaration must force an engine model'
+    root = ElementTree.parse(engine['file']).getroot()
+    excluded = sorted(tuple(sorted((e.get('body1'), e.get('body2')))) for e in root.iter('exclude'))
+    assert excluded == [('base', 'link1')], 'the engine model must exclude exactly the declared pairs'
+    assert not any(geometry.get('name') == 'desk' for geometry in root.iter('geom'))
+    bodies = {body.get('name') for body in root.iter('body')}
+    assert {'base', 'link1', 'tool', 'tip'} <= bodies
+    assert all(body.find('inertial') is not None for body in root.iter('body')), 'every body needs an inertial'
+    assert sum(len(body.findall('joint')) for body in root.iter('body')) == 3
+    assert profile['collision_config']['covers_adjacent_pairs'] is False
+
+
+
+def reachable_arm(tmp_path):
+    """A small arm whose tool reaches well above the desk, for spawn-sampling questions."""
+    root = tmp_path / 'reach_source' / 'genesis'
+    root.mkdir(parents=True)
+    text = ('<robot name="reach">'
+            '<link name="base"><collision><geometry><box size=".08 .08 .08"/></geometry></collision></link>'
+            '<link name="link1"><collision><origin xyz="0 0 .1"/><geometry>'
+            '<box size=".06 .06 .2"/></geometry></collision></link>'
+            '<link name="tool"><collision><origin xyz=".1 0 0"/><geometry>'
+            '<box size=".2 .06 .06"/></geometry></collision></link>'
+            '<link name="tip"/>'
+            '<joint name="j1" type="revolute"><parent link="base"/><child link="link1"/><origin xyz="0 0 .08"/>'
+            '<axis xyz="0 0 1"/><limit lower="-3.1" upper="3.1" effort="10" velocity="1"/></joint>'
+            '<joint name="j2" type="revolute"><parent link="link1"/><child link="tool"/><origin xyz="0 0 .2"/>'
+            '<axis xyz="0 1 0"/><limit lower="-1.5" upper="1.5" effort="10" velocity="1"/></joint>'
+            '<joint name="j3" type="revolute"><parent link="tool"/><child link="tip"/><origin xyz=".2 0 0"/>'
+            '<axis xyz="0 1 0"/><limit lower="-1.5" upper="1.5" effort="10" velocity="1"/></joint></robot>')
+    path = root / 'robot.urdf'
+    path.write_text(text)
+    # Its boxes overlap at both hinges, like any manufacturer's visual-quality parts, so it has to
+    # declare the pairs - without that every candidate is rejected as a deep self-contact.
+    (root / 'collision_config.json').write_text(json.dumps(
+        {'runtime_excluded_adjacent_pairs': [['base', 'link1'], ['link1', 'tool']]}))
+    return path
+
+
+def test_the_spawn_sampler_asks_for_the_object_height_it_is_given(tmp_path, monkeypatch):
+    """A desk-mounted arm can only work above its own envelope, so callers ask for a height.
+
+    ``minimum_pinch_height`` answers "how tall must an object be" by asking ``measured_candidates``
+    for positions at heights it supplies. An ignored override would make that answer meaningless and
+    the caller would grow the object to a height nothing was ever measured at, so this pins the height
+    the sampler actually asks its IK about - which needs no particular reachability to be meaningful.
+    """
+    from backend.app.robots import spawn as spawn_module
+    source = reachable_arm(tmp_path)
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    profile = registry.import_robot(source.parent.parent)
+    scene = json.loads((Path(profile['directory']) / 'scene.json').read_text())
+    sampler = spawn_module.ReachableDeskSpawns(profile, scene)
+    asked = []
+    real = spawn_module.solve_profile_ik
+    def spy(profile_, side, position, rotation=None, **kwargs):
+        asked.append(round(float(np.asarray(position)[2]), 9))
+        return real(profile_, side, position, rotation, **kwargs)
+    monkeypatch.setattr(spawn_module, 'solve_profile_ik', spy)
+    sampler.measured_candidates('left', samples=(3, 4), height=.15)
+    assert asked, 'the sampler must ask its IK about something'
+    assert set(asked) == {round(scene['table_top'] + .15, 9)}, 'an explicit height must reach the IK target'
+    asked.clear()
+    sampler.measured_candidates('left', samples=(3, 4))
+    assert set(asked) == {round(scene['table_top'] + sampler.half_size + sampler.clearance, 9)}, \
+        'without an override the spawn height stays the default'
+
+
+def test_a_package_can_declare_how_high_it_stands_above_the_desk(tmp_path, monkeypatch):
+    """A gripper mounted directly on the desk cannot descend to an object lying on it.
+
+    Measured 2026-10-24 on UR5e + 2F-85: nothing was reachable with an object centre 19 mm above the
+    surface, and the layout placed only one prop of two until the robot stood 0.30 m higher, at which
+    point both were placed. A package records that height next to its setup posture, and this fails if
+    the import stops applying it to the root transform.
+    """
+    source = overlapping_arm(tmp_path)
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    flat = registry.import_robot(source.parent.parent)
+    (source.parent / 'initial_state.json').write_text(json.dumps({'mount_height': .30}))
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated_raised')
+    raised = registry.import_robot(source.parent.parent)
+    assert raised['root_transform'][2][3] == pytest.approx(flat['root_transform'][2][3] + .30, abs=1e-9)
+    assert raised['home'] == flat['home'], 'the mount must not disturb the joint values'

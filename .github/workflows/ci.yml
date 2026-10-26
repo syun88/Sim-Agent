@@ -1,0 +1,80 @@
+# Small CI for Sim-Agent (issue #7). Plain GitHub-hosted Linux runners, no secrets, no GPU.
+# Genesis runs on its CPU backend by default and the whole suite passes there.
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (ruff + pytest)
+    # Pinned: ubuntu-latest moves to Ubuntu 26.04 in Nov 2026 and the apt/mesa set below was
+    # verified on 24.04.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # Fatal-only lint: syntax errors / undefined names. No style rules (the repo has no ruff config).
+      - name: ruff (fatal errors only)
+        run: uvx ruff@0.17.2 check --output-format github --select E9,F63,F7,F82 .
+
+      # Install exactly what uv.lock pins, but with the CPU build of torch. `uv sync` would also pull
+      # the ~4 GB of CUDA wheels (venv 8.1 GB vs 3.7 GB) that a GPU-less runner never uses.
+      # pyproject.toml and uv.lock stay untouched.
+      - name: Install dependencies (locked, CPU torch)
+        shell: bash
+        run: |
+          uv venv --python 3.13
+          uv export --frozen --no-hashes --no-emit-project > /tmp/locked.txt
+          TORCH=$(grep -E '^torch==' /tmp/locked.txt | cut -d' ' -f1 | cut -d';' -f1)
+          grep -viE '^(torch|triton|nvidia-|cuda-)' /tmp/locked.txt > /tmp/locked-no-torch.txt
+          uv pip install -r /tmp/locked-no-torch.txt
+          uv pip install "$TORCH" --torch-backend cpu
+
+      # Genesis renders offscreen through EGL (PYOPENGL_PLATFORM defaults to "egl" on Linux), and the
+      # runner has no GPU and no libEGL: without this, 28 tests error with "EGL is required to create
+      # an offscreen OpenGL context". libegl1 -> libegl-mesa0 + mesa-libgallium gives the llvmpipe
+      # software rasterizer; no env vars are needed. libgl1 / libxrender1 are for pyglet and pygel3d
+      # imports; the runner run got past those imports, so they are probably preinstalled (kept so a bare
+      # image works too).
+      - name: Install EGL / Mesa software rendering libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libegl1 libgl1 libgl1-mesa-dri libxrender1
+
+      # --no-sync: `uv run` would otherwise re-sync the env back to the CUDA torch from uv.lock.
+      # The first Genesis scene build compiles kernels (~1 min); the whole suite takes ~2-3 min.
+      - name: pytest
+        run: uv run --no-sync pytest -q
+
+  frontend:
+    name: Frontend (build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build

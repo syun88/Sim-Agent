@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
+import os
+
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -102,6 +104,22 @@ def _enqueue(command: dict) -> dict:
         record['randomization_request']={k:command.get(k) for k in ('seed','shuffle_sides')}
     app.state.executions.append(record)
     return record
+
+
+@app.post('/api/diagnostics/pinch')
+def diagnose_pinch(object: str = 'red_cube', arm: str = 'left', observer: bool = True):
+    """Ask the viewer process to grasp and lift one object and report the contact numbers.
+
+    The viewer owns the Genesis world; the API process cannot reach it. A diagnostic that runs inside
+    that process is the only way to tell "the app's world behaves differently" from "the agent path does",
+    which is the question left open by measurements that agree everywhere else.
+    """
+    # ``observer=False`` detaches the per-step callback for the duration of the diagnostic, so the same
+    # sequence can be run with and without it in the same process - the viewer's per-step callback is the
+    # one thing an in-process probe cannot reproduce.
+    return _enqueue({'action': 'diagnose_pinch', 'object': object, 'arm': arm,
+                     'observer': bool(observer),
+                     'instruction': f'pinch diagnostic: {object}'})
 
 
 @app.post('/api/scene/reset')
@@ -274,11 +292,44 @@ def reconnect_memory():
     return {'available': app.state.memory.available, 'last_error': app.state.memory.last_error}
 
 
+@app.get('/api/physics')
+def physics_relations():
+    """The physical relations the skills evaluate, with units and assumptions.
+
+    The planner is told what exists and asks by name ("the release speed that gives this rise"), the way
+    it asks IK for a joint solution; it never does the arithmetic itself.
+    """
+    from backend.app.physics import GRAVITY, describe
+    return {'gravity_m_s2': GRAVITY, 'relations': describe()}
+
+
+@app.post('/api/physics/evaluate')
+def physics_evaluate(request: dict):
+    """Evaluate one named relation. Unknown names are an error, never a silent zero."""
+    from backend.app.physics import evaluate
+    try:
+        return evaluate(request.get('relation', ''), **(request.get('arguments') or {}))
+    except KeyError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+
+
 @app.get('/api/config/status')
 def config_status():
+    # Report the planner's own switches. Without them an operator cannot tell a request that used the
+    # model from one the grammar answered: both used to report the same provider.
+    planner = AgentPlanner()
     return {'simulation_engine': 'genesis', 'ai_provider': health()['provider'],
             'ai_model': app.state.viewer.get('model'), 'viewer_online': _online(),
-            'neo4j': 'Connected' if app.state.memory.available else 'Fallback'}
+            'neo4j': 'Connected' if app.state.memory.available else 'Fallback',
+            'planner': {'provider': planner.configured_provider, 'enabled': planner.enabled,
+                        'model': planner.local_model if planner.local_enabled else planner.model,
+                        'capability_mode': planner.capability_mode, 'shadow_mode': planner.shadow_mode,
+                        'fast_language': planner.exact_grammar_fast_path},
+            # Two systems, two jobs: deliberation is slow and writes the plan, judgement is fast and
+            # typed. Keeping them separate means a monitor can be swapped without touching the planner.
+            'roles': {'system2_planner': planner.local_model if planner.local_enabled else planner.model,
+                      'system1_monitor': (os.getenv('OPENARM_DECISION_URL', '').strip() or None),
+                      'physics': '/api/physics'}}
 
 
 @app.websocket('/ws')

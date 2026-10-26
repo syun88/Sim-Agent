@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import field_validator, BaseModel, ConfigDict, Field, model_validator
 
 import numpy as np
 
@@ -33,8 +33,50 @@ class TaskAction(BaseModel):
     distance_cm: float | None = Field(default=None, ge=1, le=30)
     height_cm: float | None = Field(default=None, ge=1, le=10)
     volume_ml: float | None = Field(default=None, ge=5, le=35)
+    # The throw's own design, decided by the planner instead of by a constant in the skill: how far the
+    # arm travels before release, and how fast the object leaves it. The engine still measures the
+    # flight, so a weak design cannot be reported as a successful throw.
+    stroke_cm: float | None = Field(default=None, ge=2, le=30)
+    release_speed_m_s: float | None = Field(default=None, ge=.2, le=3.)
     joint: str | None = None
     position_deg: float | None = Field(default=None, allow_inf_nan=False)
+
+    @model_validator(mode='before')
+    @classmethod
+    def accept_common_aliases(cls, values):
+        """Read what a model writes: ``object_id``/``target_id`` are the same fields as ``object``/``target``.
+
+        A planner that answers {"op":"throw","target":"blue_cube","object_id":"red_cube"} has said exactly
+        the right thing; rejecting it for the field's name loses the plan. Measured 2026-10-26.
+        """
+        if not isinstance(values, dict):
+            return values
+        for alias, field in (('object_id', 'object'), ('target_id', 'target'), ('receiver_id', 'receiver')):
+            if alias in values and field not in values:
+                values[field] = values.pop(alias)
+            elif alias in values:
+                values.pop(alias, None)
+        return values
+
+    @field_validator('distance_cm', 'height_cm', 'stroke_cm', 'release_speed_m_s', 'volume_ml',
+                     mode='before')
+    @classmethod
+    def drop_unusable_number(cls, value, info):
+        """Treat an out-of-range optional number as "unspecified" instead of failing the whole plan.
+
+        A model that returns the right actions with 0 for a distance has told us what to do; rejecting the
+        program over that number loses the plan and reports nothing useful. Measured 2026-10-26 with a 3B
+        planner: the aimed-throw actions were correct and the plan was dropped for distance_cm=0.
+        """
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        low, high = {'distance_cm': (1., 30.), 'height_cm': (1., 10.), 'stroke_cm': (2., 30.),
+                     'release_speed_m_s': (.2, 3.), 'volume_ml': (5., 35.)}[info.field_name]
+        return number if low <= number <= high else None
 
 
 class TaskGoal(BaseModel):
@@ -115,6 +157,9 @@ class InstructionMeaning(BaseModel):
     interpretation: Literal['final_state', 'ordered_actions', 'unsupported']
     goals: list[TaskGoal] = Field(default_factory=list, max_length=12)
     keep_in_place: list[str] = Field(default_factory=list, max_length=12)
+    # The model has to be able to state what it assumed when the instruction leaves a choice open;
+    # without a field for it, an ambiguous instruction could only be refused or executed silently.
+    assumptions: list[str] = Field(default_factory=list, max_length=12)
     error: str | None = Field(default=None, max_length=300)
 
     @model_validator(mode='after')
@@ -158,7 +203,8 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
     def emit(skill: str, arm: str, index: int, **kwargs):
         allowed = state.get("capabilities", {}).get("skills")
         if allowed is not None and skill not in allowed:
-            raise GroundingError(f"The selected robot does not support {skill}; its physical gripper is not calibrated")
+            raise GroundingError(f"The selected robot does not offer {skill}; it offers "
+                                 f"{', '.join(sorted(allowed)) if allowed else 'nothing yet'}")
         available = state.get("robot", {}).get("available_arms")
         if available is not None and arm not in available and skill != "navigate_to":
             raise GroundingError(f"The selected robot has arms {available}, not {arm}")
@@ -238,8 +284,12 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
         if action.op != "approach":
             checks.pop(f"approach:{arm}", None)
         action.object, action.arm = obj, arm
-        if action.relation and action.op != "place":
+        if action.relation and action.op not in {"place", "throw"}:
             raise GroundingError("An object-relative relation belongs to a placement action")
+        if action.op == "throw" and action.relation is not None:
+            # "throw it at the red cube" is an aimed throw, not a placement predicate: the relation has no
+            # meaning once the object leaves the hand, and the target is what carries the intent.
+            action.relation = None
         if action.op == "pick":
             previous_owner = owner(obj)
             acquire(obj, arm, index)
@@ -351,11 +401,24 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             acquire(obj, arm, index)
             action.direction = "up"
             action.height_cm = action.height_cm or 3.
-            emit("throw_object", arm, index, object=obj, height_cm=action.height_cm)
+            aim = action.target
+            if aim is not None:
+                if aim == obj:
+                    raise GroundingError("A thrown cube cannot be its own target")
+                if aim not in objects:
+                    raise GroundingError(f"The throw target {aim} is not in this scene")
+            emit("throw_object", arm, index, object=obj, height_cm=action.height_cm,
+                 stroke_cm=action.stroke_cm, release_speed_m_s=action.release_speed_m_s, target=aim)
             held[arm] = None
             checks.pop(obj, None)
-            checks[f"throw:{index}"] = {"type": "throw", "object": obj, "arm": arm,
-                                       "min_height": action.height_cm / 100., "action_index": index}
+            if aim is None:
+                checks[f"throw:{index}"] = {"type": "throw", "object": obj, "arm": arm,
+                                           "min_height": action.height_cm / 100., "action_index": index}
+            else:
+                # An aimed throw is judged by whether it reaches the target. A height check would pass a
+                # cube that arcs past it, and fail one that hits it without clearing the rise.
+                checks[f"hit:{index}"] = {"type": "hit", "object": obj, "target": aim,
+                                          "action_index": index}
         elif action.op == "move":
             if not action.direction or action.distance_cm is None:
                 raise GroundingError("Relative motion requires a direction and distance (1–30 cm)")

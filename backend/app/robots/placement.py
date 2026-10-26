@@ -137,12 +137,24 @@ def plan_placement(skills,arm,obj,xy,surface,reference=None,timeout=90.):
     object_rotation=env.object_pose(obj)[1]
     group=stable_cube_rotations()
     preferred=np.asarray(env.grippers[arm]['grasp_rotation'])
+    # Fewer joints than a pose needs means the attitude is the arm's to choose, not the planner's to
+    # demand: measured 2026-10-25 on the four-joint OpenManipulator-X, every one of 864 placement
+    # candidates was refused at the IK step for failing a 0.5 mm / 0.01 rad six-degree-of-freedom pose.
+    # What the task needs is the CUBE at the target centre, so that is what is accepted here.
+    chain = ((getattr(env, 'profile', None) or {}).get('chains', {}) if isinstance(getattr(env, 'profile', None), dict) else {})
+    under_actuated = bool(chain.get(arm, {}).get('joints')) and len(chain[arm]['joints']) < 6
     # All 24 cube symmetries are equivalent stable faces, including a cube
     # received with its original top face between the two fingers.
     attitudes=sorted(group,key=lambda r:
         .6*np.linalg.norm(Rotation.from_matrix(r@object_rotation.T).as_rotvec())+
         .4*np.linalg.norm(Rotation.from_matrix(r@loaded.relative_rotation.T@preferred.T).as_rotvec()))
     attempts=0
+    # Why a placement plan was refused, counted. "No loaded path can place the cube" cannot be acted on:
+    # the four-joint arm fails for very different reasons (no IK, the goal pose itself in collision, or a
+    # blocked path) and each needs a different fix.
+    rejected = {}
+    def note(reason):
+        rejected[reason] = rejected.get(reason, 0) + 1
     for release_gap in (.006,.010,.016):
         center=np.r_[np.asarray(xy)[:2],surface+env.cube_size/2.+release_gap]
         for attitude in attitudes:
@@ -152,13 +164,32 @@ def plan_placement(skills,arm,obj,xy,surface,reference=None,timeout=90.):
             point=center-rotation@loaded.offset
             for guess in (start,env.home_arm_qpos(arm)):
                 attempts+=1
-                solution=solve_profile_ik(env.profile,arm,point,rotation,model=env.model,q_init=guess,
-                    snapshot=snapshot,joint_limits=env.ik_joint_limits(arm))
-                if not solution['success'] or solution['position_error']>.0005 or solution['rotation_error']>.01:continue
+                solution=solve_profile_ik(env.profile,arm,point,None if under_actuated else rotation,
+                    model=env.model,q_init=guess,snapshot=snapshot,joint_limits=env.ik_joint_limits(arm))
+                if not solution['success'] or solution['position_error']>.0005:
+                    note('ik_no_solution')
+                    continue
+                if not under_actuated and solution['rotation_error']>.01:
+                    note('ik_no_attitude')
+                    continue
                 goal=env.model.nearest_continuous(loaded.names,solution['q_rad'],start)
-                if not loaded.clear({**snapshot,**dict(zip(loaded.names,goal))}):continue
+                executed_rotation=rotation
+                if under_actuated:
+                    tool,achieved,_,_=env.arm_kinematics(arm).evaluate(goal)
+                    predicted=tool+achieved@loaded.offset
+                    if float(np.linalg.norm(predicted-center))>.003:
+                        note('object_off_target_with_achieved_attitude')
+                        continue
+                    # The arm holds whatever attitude it reached; the executor validates the planned path
+                    # against the rotation it is given, so it must be this one, not the wished-for one.
+                    executed_rotation=achieved
+                if not loaded.clear({**snapshot,**dict(zip(loaded.names,goal))}):
+                    note('goal_pose_in_collision')
+                    continue
                 path=loaded.path(loaded.names,start,goal,snapshot,env.ik_joint_limits(arm),c.stop_requested)
-                if path is None:continue
+                if path is None:
+                    note('no_joint_path')
+                    continue
                 for spacing in (.05,.025,.01):
                     dense=[path[0]]
                     for a,b in zip(path,path[1:]):
@@ -168,9 +199,13 @@ def plan_placement(skills,arm,obj,xy,surface,reference=None,timeout=90.):
                     count=max(40,int(np.sum(np.linalg.norm(np.diff(dense,axis=0),axis=1))/.025))
                     samples=np.unique(np.r_[np.linspace(0.,1.,count+1),curve.x])
                     if all(loaded.clear({**snapshot,**dict(zip(loaded.names,curve(t)))}) for t in samples):
-                        return {'path':dense,'target':point,'rotation':rotation,'object_target':center,
+                        return {'path':dense,'target':point,'rotation':executed_rotation,'object_target':center,
                                 'object_rotation':attitude,'candidate_count':attempts,'release_gap_m':release_gap}
-        if time.monotonic()>deadline:break
-    error=SkillError('COLLISION_PATH','No loaded path can place the cube on a stable face without robot, desk or payload collisions')
+                    note('path_in_collision')
+        if time.monotonic()>deadline:
+            note('planning_deadline')
+            break
+    error=SkillError('COLLISION_PATH',f'No loaded path can place the cube on a stable face without '
+                     f'robot, desk or payload collisions; {attempts} candidates rejected: {rejected}')
     error.evidence={'candidate_count':attempts,'reference':reference}
     raise error

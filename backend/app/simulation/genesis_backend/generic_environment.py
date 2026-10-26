@@ -102,11 +102,20 @@ class GenericURDFEnvironment(SimulationBackend):
             material=gs.materials.Rigid(friction=.6), surface=gs.surfaces.Default(color=(.62, .58, .51)))
         self._root_transform = np.asarray(self.profile["root_transform"])
         xyzw = Rotation.from_matrix(self._root_transform[:3, :3]).as_quat()
-        self._entity = self._scene.add_entity(gs.morphs.URDF(file=self.profile["urdf"], fixed=not self._mobile_base,
-            pos=tuple(self._root_transform[:3, 3]), quat=tuple(xyzw[[3, 0, 1, 2]]),
-            merge_fixed_links=False, recompute_inertia=False, default_armature=None,
-            convexify=False, decimate=False, watertighten=None),
-            material=gs.materials.Rigid(friction=.6, gravity_compensation=0. if self._mobile_base else 1.))
+        placement = dict(pos=tuple(self._root_transform[:3, 3]), quat=tuple(xyzw[[3, 0, 1, 2]]))
+        # A package may ship an engine model when its declared adjacent overlaps cannot be expressed in a URDF:
+        # that MJCF carries the per-pair exclusions, and its root is already placed like the URDF's.
+        engine_model = self.profile.get('engine_model') or {}
+        if engine_model.get('morph') == 'mjcf':
+            morph = gs.morphs.MJCF(file=engine_model['file'], convexify=False, **placement)
+        else:
+            # A wheeled base is not welded to the world; a desk-mounted arm is.
+            morph = gs.morphs.URDF(file=self.profile["urdf"], fixed=not self._mobile_base,
+                merge_fixed_links=False, recompute_inertia=False, default_armature=None,
+                convexify=False, decimate=False, watertighten=None, **placement)
+        self._entity = self._scene.add_entity(morph,
+            material=gs.materials.Rigid(friction=.6,
+                gravity_compensation=0. if self._mobile_base else 1.))
         self._objects = {}
         self._object_start = self.spawn_validation['objects']
         for name, point in self._object_start.items():
@@ -361,10 +370,19 @@ class GenericURDFEnvironment(SimulationBackend):
     def _default_zone_position(self, name):
         positions = {entry['arm']: np.asarray(entry['position']) for entry in self._object_start.values()}
         side = 'left' if name in ('left_side', 'blue_zone') else 'right'
-        point = positions.get(side, next(iter(positions.values()))).copy()
-        if name == 'center':
+        # The fallback for an arm with no prop of its own must not be evaluated eagerly: with an empty layout a
+        # plain default argument raises StopIteration inside the caller's generator and takes the whole world
+        # state with it (measured 2026-10-24 on a single-arm robot whose sampler placed nothing).
+        fallback = next(iter(positions.values()), None)
+        if fallback is None:
+            fallback = np.array([0., 0., self.table_height])
+        point = positions.get(side, fallback).copy()
+        if name == 'center' and positions:
             point = np.mean(list(positions.values()), axis=0)
         point[0] += .06
+        # Distinct slots must be distinct places, otherwise a request to place two objects on separate
+        # destinations can never be satisfied (measured 2026-10-25: three slots all at [0.11, 0, 0.76]).
+        point[1] += {'left_side': .10, 'blue_zone': .10, 'right_side': -.10, 'green_zone': -.10}.get(name, 0.)
         point[2] = self.table_height
         return point
 

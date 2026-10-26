@@ -38,6 +38,7 @@ def bind_scene_references(instruction: str, state: dict) -> SceneBinding:
         arm = arm.lower()
         side = '左手' if arm=='left' else '右手'
         literal = named_objects(match.group(), state)
+        alternatives = []
         if held[arm]:
             chosen, kind = held[arm], 'observed_hold'
             if literal and chosen not in literal:
@@ -49,15 +50,27 @@ def bind_scene_references(instruction: str, state: dict) -> SceneBinding:
                 and (o['id'] in literal if literal else o['position'][1]*(1 if arm=='left' else -1)>.025)
                 and (not o.get('bounds') or abs(o['bounds'][0][2]-state.get('workspace',{}).get('table_height_m',1.008))<.008)]
             chosen, kind = (candidates[0] if len(candidates)==1 else None), 'acquire_missing_hold'
+            if chosen is None and len(candidates) > 1:
+                ranked = sorted(candidates, key=lambda name: (-float(objects[name]['position'][2]), name))
+                if float(objects[ranked[0]]['position'][2]) - float(objects[ranked[1]]['position'][2]) > .02:
+                    # Only a stack is resolved here, not a free choice between equals. Of two cubes at
+                    # materially different heights only the upper one can be grasped without
+                    # disturbing the other, so the scene itself answers which one was meant: take it,
+                    # record the choice and the alternatives, and let the task continue. Two cubes at
+                    # the same height stay ambiguous - there the scene offers no answer and stopping
+                    # is still the honest outcome (see the guard in test_task_agent.py).
+                    chosen, kind, alternatives = ranked[0], 'assumed_ambiguity_resolution', ranked[1:]
         if chosen is None:
             diagnosis = {'category':'REFERENCE_NOT_PRESENT','arm':arm,'observed_holder':held[arm],
                          'source':match.group(),'candidates':candidates,
                          'required':'受け渡す物体を一意に指定するか、対象を机の上に準備してください。'}
             raise SceneReferenceError(f'{side}の現在の保持物体は{held[arm] or "ありません"}。対象を一意に決められません。'+diagnosis['required'], diagnosis)
         explanation = (f'{side}が実際に保持している{chosen}を対象にします。' if kind=='observed_hold' else
-                       f'{side}は空です。現在の配置で対象候補は{chosen}だけなので、まず取得してから指示を続けます。')
+                       f'{side}は空です。現在の配置で対象候補は{chosen}だけなので、まず取得してから指示を続けます。' if kind=='acquire_missing_hold' else
+                       f'{side}は空で、指示に合う候補が{len(candidates)}個あります。重なりでは上の物体だけが'
+                       f'把持できるため、いちばん高い{chosen}を対象にします（他: {", ".join(alternatives)}）。')
         decisions.append({'kind':kind,'arm':arm,'object':chosen,'source':match.group(),
-                          'candidates':candidates,'explanation':explanation})
+                          'candidates':candidates,'alternatives':alternatives,'explanation':explanation})
         return f'{side}で{chosen}' if match.group('jp') else f'{chosen} with the {arm} hand'
     text = pattern.sub(bind, instruction)
     def table_reference(match):

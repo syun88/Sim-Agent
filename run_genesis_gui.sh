@@ -14,7 +14,20 @@ if [[ -z "${OPENARM_LOCAL_PLANNER:-}" ]]; then
     export OPENARM_LOCAL_PLANNER=1
   fi
 fi
-export OPENARM_OLLAMA_MODEL="${OPENARM_OLLAMA_MODEL:-qwen3-vl:4b}"
+# The planning model must produce CONTENT, and the thinking models here do not: measured 2026-10-26 on
+# this host, qwen3-vl:4b spent every output token in the thinking channel (content=0 even at
+# num_predict=2000, 7726 characters of thinking) and qwen3:1.7b returned nothing at all, while qwen2.5:3b
+# answered a planning request in 0.4-1.5 s with a usable action list. Vision remains available - set
+# OPENARM_OLLAMA_MODEL to a vision model when images are part of the state.
+export OPENARM_OLLAMA_MODEL="${OPENARM_OLLAMA_MODEL:-qwen2.5:3b}"
+
+# Every task goes through the model when one is installed: the deterministic grammar stays as the
+# labelled fallback for the cases the model's program is refused, not as the default answer. Set
+# OPENARM_CAPABILITY_MODE=0 to run the rules-first behaviour again.
+if [[ -z "${OPENARM_CAPABILITY_MODE:-}" ]] && command -v ollama >/dev/null 2>&1 \
+   && ollama list 2>/dev/null | awk '{print $1}' | grep -qx "${OPENARM_OLLAMA_MODEL}"; then
+  export OPENARM_CAPABILITY_MODE=1
+fi
 
 uv sync
 
@@ -60,4 +73,7 @@ echo "Web UI:  http://127.0.0.1:8000/simple"
 echo "Starting Genesis native viewer..."
 
 # Genesis viewer needs the main thread on macOS.
-GENESIS_SHOW_VIEWER=1 uv run python run_genesis_gui.py "$@"
+# Keep an explicit decision: a host whose native window never gets a GL context can run the same scene
+# through the web UI by exporting GENESIS_SHOW_VIEWER=0 (measured 2026-10-26: the native path stalls while
+# the viewer-off path is ready in 20 s).
+GENESIS_SHOW_VIEWER="${GENESIS_SHOW_VIEWER:-1}" uv run python run_genesis_gui.py "$@"

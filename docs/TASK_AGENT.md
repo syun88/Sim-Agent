@@ -92,6 +92,10 @@ LLMに任意のPython、関節軌道、物体の位置書換えを生成させ�
   接近が成功しただけの取得、途中の受け渡しは完了操作として扱わない。
 - `recover_in_place`: 空のグリッパーの接触解消と退避を行い、同じ物体配置から残りを再計画する。保持中の腕を開放しない。
 - `alternate_arm`: 手の指定を省略した単一取得に限り、同じ物体を別の利用可能な手で取得する。明示された手の役割は変更しない。
+- `replan`: 失敗が**測定値**を伴うとき（例: 投げが「取れたストローク 2 cm・離床 0.42 m/s」と報告した）に限り候補になる。
+  残りの手順を同じ計画で再開すると同じ失敗を繰り返すため、`AgentPlanner` に**新しい計画**を書かせる。
+  失敗の数値は `recent_experience` として渡す。「下がってから投げる」は既存の `move` で表現できる。
+  常時候補にしない理由: 常に候補があると「同じシーン内で使える手段が尽きたら停止する」という契約が成立しなくなる。
 - `reset_and_retry`: 同じシーン内の候補がなくなり、`agent/recovery_policy.py` の観測根拠がある場合の最後の候補。
   対象の物理状態の欠落・非有限値、または対象が机より10cm以上下へ落下し、実装済みの机上スキルでは回収できない場合に限る。
   通常のIK・経路・把持失敗を理由に初期化しない。保持中の物体があれば候補にしない。
@@ -166,3 +170,93 @@ uv run python scripts/verify_language_challenge.py --suite holdout --json output
 最終記録は32/32（`outputs/language-challenge-current.json`）、追加8/8（`outputs/language-additional-current.json`）。
 32文の内訳はモデル採用10件、定型文16件、期待した拒否6件である。全体回帰は221件成功。
 この実装は実行可能な既存操作を使うエージェントであり、新しい接触技能や研究上の新規性・最先端への優越を実証してはいない。
+
+
+## 計画の来歴（どの成分が決めたか）
+
+`AgentPlan` は1リクエストごとに次を持つ。`provider` だけでは「モデルが同意した」と「モデルを呼んでいない」を区別できないため。
+
+- `model_called` / `skipped_because`: モデルを呼んだか、呼んでいないならその理由
+  （`provider_not_configured` / `exact_grammar_fast_path` / `single_direct_command`）
+- `fallback_verdict` / `model_verdict` / `agree`: 決定論の判定、モデル自身の判定、両者の一致
+- `capability_mode` / `shadow`: 能力モード（文法が通ってもモデルに聞く）と、影実行（決定論が答えた後で記録だけ）
+
+`/api/config/status` は `capability_mode`・`shadow_mode`・`fast_language` を公開し、
+`roles` で system1（監視＝型付き判定）/ system2（計画）/ physics を区別して示す。
+
+## 物理量の基盤（`backend/app/physics`）
+
+式と単位と前提を1か所に持ち、名前で問い合わせる。計画側は算術をせず、skill は私有の定数を持たない。
+
+- `GET /api/physics`: 使える関係の一覧（名前・単位・引数・前提）
+- `POST /api/physics/evaluate`: 1つを評価（未知の名前・引数不足は例外。黙って0を返さない）
+- 例: `release_speed_for_rise`（3 cm の上昇に必要な離床速度 0.767 m/s）、`friction_speed_bound`
+  （摩擦が接触時間内に与えられる速度差。短く速いストロークで投げられない理由）、`launch_for_target`
+  （指定した飛翔時間で目標点を通る初速）、`closing_reserve`（注ぎ終いの流出量）
+
+## 診断
+
+- `POST /api/diagnostics/pinch?object=red_cube&observer=true`: viewer プロセスの**中で**把持→持上げを実行し、
+  判定ではなく数値を返す（`gripper_position`・`pinch_established`・パッドのリンク・生の接触）。
+  API プロセスからは Genesis 世界に触れないため、この経路が無いと「アプリの世界が違うのか、経路が違うのか」を分離できない。
+
+## 判定モデルの画像入力（実測 2026-10-27）
+
+`d1-omni-600M` は画像を状態の一部として受け取れる（`scripts/d1_decision_server.py` の `images` に base64 PNG/JPEG）。
+CPU で1リクエスト 0.8 秒。合成画像での実測:
+
+- 「いくつ写っているか」= **two (0.97)** ✓ 内容は読めている
+- 「赤は左か」= 左右を入れ替えても**答えが反転しない** ✗（choice/noul どちらも）
+  合成画像（平坦な矩形）が学習分布から遠い可能性が高い
+
+⇒ 画像を **system1 の入力にできる** ✓ が、**空間関係の質問は実写/レンダ画像とラベル付き検証を通すまで信頼しない** ✗。
+Genesis で RGB-D をレンダし、真値をラベルにして「遮蔽・積み重なり・左右」の質問を校正するのが次の段階。
+
+## 判定モデルの起動と、実測で分かっていること（2026-10-27）
+
+```
+scripts/serve_models.sh all        # d1 :11435 / SAM 3.1 :11436（どちらも任意）
+OPENARM_DECISION_URL=http://127.0.0.1:11435 ./run_genesis_gui.sh --headless
+```
+- 重みは **`/data/hf-cache`**（`HF_HOME`）。`~/.cache/huggingface` には置かない。
+- どちらも**無くても動く**。無い場合 `monitor` フィールドが出ないだけで、判定は決定論の側に残る。
+- **`noul` は P(YES)**（実測: 「空は青いか」0.92 ✓／「腕にジョイントはあるか」0.97 ✓／「立方体は自力で飛べるか」0.13 ✗）。
+  逆向きに読むと**一致を不一致として記録**してしまう（初版がそうだった）。
+- **CPU の実測は 3.8 秒/判定**。System1 の「反射」としては遅いので、ステップ毎の監視は
+  **測定した所要時間が 3 秒を超えたら以後 `skipped_because=measured_latency_too_high` として省く**。
+  失敗時の復旧判定（1回だけ・15秒）はこの制限の外。
+- 保持が**終わる**ステップ（`release_object`/`throw_object`）は、ステップ毎の「保持しているか」質問の
+  対象外。文面が矛盾するため。
+- テキストだけの判定なら `OPENARM_DECISION_MODEL` で **より大きい d1** を指せる（既定は omni-600M）。
+  600M は実測で「片腕ロボットに `alternate_arm` を確信度 0.80 で選ぶ」ので、**合法手フィルタが生命線**。
+
+## 判定モデルの校正（2026-10-27 実測）
+
+`scripts/calibrate_decision_model.py` は**真値が状態から分かる**ケースだけを使い、実際に使う質問を採点する
+（`overall 5/11`）。結果はコードにも `trusted`/`measured` として記録し、番人テストで
+「測っていない質問を trusted にしない」ことを固定している。
+
+| 質問 | 正解 | 所見 |
+|---|---|---|
+| `outcome_achieved` | **3/6** | 偶然と同じ。**計画に使わない**（記録のみ） |
+| `next_step_blocked` | **2/3** | 僅かに上回るが件数不足。**まだ使わない** |
+| `reference_ambiguous` | **0/2** | 両方向に間違い。**使わない** |
+| 復旧手の選択（`assess_failure`） | 実運用で妥当 | **合法手フィルタ必須**（違法手を 0.80 で選んだ実測あり） |
+| 内容の質問（`count` など） | **0.97** | 画像の内容把握は使える |
+
+⇒ 600M は「幾何でも意味判断でもない、**内容の把握**」と「**合法手からの選択**」に限定して使う。
+意味判断を本気で使うなら、**同じラベルでより大きい d1（`OPENARM_DECISION_MODEL`）を測ってから**にする。
+
+### モデルを変えて同じラベルで測った（2026-10-27）
+
+`--inline LiquidAI/d1-3B`（bf16 5GB・CPU）で同じ11ケースを採点: **9/11**（omni-600M は 5/11）。
+
+| 質問 | omni-600M | d1-3B | 採用 |
+|---|---|---|---|
+| `next_step_blocked` | 2/3 | **3/3**（信頼度 0.96–0.98） | **trusted** |
+| `reference_ambiguous` | 0/2 | **2/2**（0.92） | **trusted** |
+| `outcome_achieved` | 3/6 | **4/6**（"stacked" と "hands empty" を誤り） | **使わない**（記録のみ） |
+
+既定の判定モデルは `LiquidAI/d1-3B`（`OPENARM_DECISION_MODEL` で変更可）、`scripts/serve_models.sh` は
+bf16 の 5GB に合わせて `MemoryMax=12G`。**3件/2件という標本の小ささ**は明記しておく: 状況の**説明**には使えるが、
+それを唯一の根拠に行動は決めない。
