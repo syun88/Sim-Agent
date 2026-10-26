@@ -310,7 +310,7 @@ class ImportedRobotSkills(SkillRunner):
                 'over_limit': bool(worst is not None and worst > GRAVITY_TORQUE_RATIO_LIMIT)}
 
     def _plan_corridor(self, arm, rotation, seed, closure, insertion, standoff,
-                       snapshot, names, seed_key):
+                       snapshot, names, seed_key, trace=None):
         """Back-plan the approach corridor from a closure-checked seed.
 
         Returns (corridor, high_point) or None. Identical planning to the
@@ -319,9 +319,17 @@ class ImportedRobotSkills(SkillRunner):
         current arm pose.
         """
         corridor = [seed]
-        for point in reversed(insertion[:-1]):
-            seed, _, _ = self.controller.solve_ik(arm, point, rotation, q_init=seed)
+        points = list(reversed(insertion[:-1]))
+        for index, point in enumerate(points):
+            seed, position_error, rotation_error = self.controller.solve_ik(arm, point, rotation, q_init=seed)
             if seed is None:
+                # Where the straight insertion stopped and with what residual: "corridor_none 24" says nothing about
+                # which waypoint or why (measured 2026-10-27 on the UR5e).
+                if trace is not None:
+                    trace.update({'stopped': 'insertion_ik', 'waypoint': index, 'of': len(points),
+                                  'position_error': round(float(position_error), 5),
+                                  'rotation_error': round(float(rotation_error), 5),
+                                  'target': np.round(np.asarray(point, float), 4).tolist()})
                 return None
             corridor.append(seed)
         high_seed = None
@@ -342,6 +350,10 @@ class ImportedRobotSkills(SkillRunner):
                     names, high_seed, seed, snapshot, minimum_clearance=.0001):
                 high = candidate_high
                 break
+            if trace is not None:
+                trace.update({'stopped': 'high_seed' if high_seed is None else 'edge_blocked',
+                              'height': round(float(height), 3),
+                              'target': np.round(np.asarray(candidate_high, float), 4).tolist()})
             high_seed = None
         if high_seed is None:
             return None
@@ -387,6 +399,8 @@ class ImportedRobotSkills(SkillRunner):
         names = self.env.profile['chains'][arm]['joints']
         rotations = self._approach_rotations(arm, aim, snapshot)
         rejected = {}
+        corridor_trace = {}
+        corridor_trace_last = {}
 
         def note(reason):
             rejected[reason] = rejected.get(reason, 0) + 1
@@ -421,10 +435,14 @@ class ImportedRobotSkills(SkillRunner):
                 if closure is None:
                     note('closure_none')
                     continue
+                corridor_trace = {}
                 planned = self._plan_corridor(arm, rotation, closure[0]['arm_q'], closure,
-                                              insertion, standoff, snapshot, names, seed_key)
+                                              insertion, standoff, snapshot, names, seed_key,
+                                              trace=corridor_trace)
                 if planned is None:
                     note('corridor_none')
+                    if corridor_trace:
+                        corridor_trace_last = dict(corridor_trace)
                     continue
                 reverse_seeds, high = planned
                 chosen_gravity = self._path_gravity(arm, reverse_seeds, closure, snapshot, margin)
@@ -438,9 +456,15 @@ class ImportedRobotSkills(SkillRunner):
                 attempted.add(key)
                 closure = self.controller.plan_closure(arm,before,rotation,seed)
                 if closure is None:continue
+                corridor_trace = {}
                 planned = self._plan_corridor(arm, rotation, closure[0]['arm_q'], closure,
-                                              insertion, standoff, snapshot, names, seed_key)
-                if planned is None:continue
+                                              insertion, standoff, snapshot, names, seed_key,
+                                              trace=corridor_trace)
+                if planned is None:
+                    note('corridor_none')
+                    if corridor_trace:
+                        corridor_trace_last = dict(corridor_trace)
+                    continue
                 reverse_seeds, high = planned
                 chosen_gravity = self._path_gravity(arm, reverse_seeds, closure, snapshot,
                                                     self._gravity_margin(arm, seed, snapshot))
@@ -457,7 +481,8 @@ class ImportedRobotSkills(SkillRunner):
                               'object_pose': np.round(np.asarray(before, float), 5).tolist(),
                               'arm_qpos': np.round(np.asarray(self.env.arm_qpos(arm), float), 4).tolist(),
                               'snapshot': {key: round(float(value), 4) for key, value in sorted(snapshot.items())},
-                              'grasp_offset': np.round(np.asarray(shift, float), 5).tolist()}
+                              'grasp_offset': np.round(np.asarray(shift, float), 5).tolist(),
+                              'corridor': corridor_trace_last}
             raise error
         # The frame that planned the corridor is the frame this arm pinches with from now on.
         self._pinch_frames = {**getattr(self, '_pinch_frames', {}), arm: np.asarray(rotation)}

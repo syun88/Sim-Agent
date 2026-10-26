@@ -370,5 +370,9 @@ fluid       SPH / 8 particles / 51.2 mL / glass 0 / spilled 0
   `corridor_none: 24` は**まったく同じ**。したがって失敗は「高い所からの降下」ではなく、**挿入の直線区間で
   把持姿勢を保てない**こと（`_plan_corridor` の各 waypoint で `solve_ik` が落ちる）。次は挿入点ごとの
   IK 誤差と関節限界を記録して、どの点で・なぜ落ちるかを見る。
+  **実測（2026-10-27）**: 内訳はすべて **`edge_blocked`**（`stopped: edge_blocked, height 0.084,
+  target [-0.215, 0.0018, 0.886]`）。つまり挿入 IK でも退避点の IK でもなく、**退避点→把持姿勢の直線が塞がれている**。
+  中間高度を1点挟む案は試したが `corridor_none: 24` は**変わらず**撤回（次の一手は、塞いでいるリンクを
+  名指しすること: `edge_clear` が False のときの衝突ペアを記録する）。
 - したがって順序は: ①UR5e の接近経路を通す（`COLLISION_PATH` の内訳を読む）→ ②把持成功で `grasp_calibrated` が付く
   → ③wine シーンが許可され、ボトルは既に可達域配置。流体側は準備済み。
