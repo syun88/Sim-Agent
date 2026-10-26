@@ -250,6 +250,18 @@ class GenericURDFEnvironment(SimulationBackend):
     def object_bounds(self, name):
         return self._objects[name].get_link(name).get_AABB().cpu().numpy().astype(float).reshape(2, 3)
 
+    def link_bounds(self, name):
+        """World AABB of one robot link, or None when the link carries no collision geometry.
+
+        The jaw envelope needs this: how far a jaw reaches from the object's centre is a property of the
+        gripper that has to be measured, and the same AABB the renderer and the collision model use is the
+        honest source.
+        """
+        link = self._entity.get_link(name)
+        if link is None or not link.n_geoms:
+            return None
+        return link.get_AABB().cpu().numpy().astype(float).reshape(2, 3)
+
     def record_grasp_verification(self, side, evidence):
         import time
         path = Path(self.profile['directory']) / 'gripper_runtime.json'
@@ -281,10 +293,23 @@ class GenericURDFEnvironment(SimulationBackend):
     def _default_zone_position(self, name):
         positions = {entry['arm']: np.asarray(entry['position']) for entry in self._object_start.values()}
         side = 'left' if name in ('left_side', 'blue_zone') else 'right'
-        point = positions.get(side, next(iter(positions.values()))).copy()
-        if name == 'center':
+        # The fallback for an arm with no prop of its own must not be evaluated eagerly: with an empty
+        # layout - a single-arm imported robot whose sampler placed nothing, measured 2026-10-24 on
+        # UR5e + 2F-85 - a plain default argument raises StopIteration inside the caller's generator,
+        # which surfaces as "generator raised StopIteration" and takes the whole world state with it.
+        fallback = next(iter(positions.values()), None)
+        if fallback is None:
+            fallback = np.array([0., 0., self.table_height])
+        point = positions.get(side, fallback).copy()
+        if name == 'center' and positions:
             point = np.mean(list(positions.values()), axis=0)
         point[0] += .06
+        # Distinct slots must be distinct places. Keying them by arm collapsed every slot onto one
+        # point for a single-arm robot whose props were all sampled by that arm - measured 2026-10-25
+        # on OpenManipulator-X: left_side, right_side and center all reported [0.11, 0.0, 0.76], so a
+        # request to place two cubes on separate destinations could never be satisfied, and the plan
+        # that failed was attributed to the language model rather than to this state.
+        point[1] += {'left_side': .10, 'blue_zone': .10, 'right_side': -.10, 'green_zone': -.10}.get(name, 0.)
         point[2] = self.table_height
         return point
 

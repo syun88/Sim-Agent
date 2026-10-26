@@ -28,6 +28,54 @@ def _credential(name: str) -> str:
     return "" if value.startswith("replace-") else value
 
 
+#: What a re-planned continuation must carry over from the plan it continues. A recovery that rebuilds
+#: the steps through ``compile_prepared_program`` constructs a fresh ``AgentPlan``, so without this the
+#: ledger of a model-planned task reads as "no model was consulted" the moment it recovers - measured
+#: 2026-10-25, where the top-level plan of a task the model had planned showed ``model_called=False``
+#: while the attempt's own plan showed ``True``. One list, so a new provenance field cannot be
+#: half-wired.
+PROVENANCE_FIELDS = ('provider', 'model', 'provider_error', 'model_called', 'skipped_because',
+                     'capability_mode', 'fallback_verdict', 'model_verdict', 'agree', 'shadow')
+
+
+#: Words by which a model states that something *happened*, rather than what it decided. An
+#: assumption is a recorded choice; an outcome claim is unobserved evidence and is discarded.
+_OUTCOME_WORDS = re.compile(r'\b(?:success(?:ful(?:ly)?)?|succeeded|completed?|accomplished|verified|'
+                            r'achieved|done|finished)\b|成功|完了|できました|済み', re.I)
+
+
+def _is_choice_not_outcome(text: str) -> bool:
+    """Keep an assumption that records a decision; drop one that claims an observed result."""
+    return not _OUTCOME_WORDS.search(text)
+
+
+#: A requested operation the plan must actually contain, with the words that ask for it. A placement is
+#: not a throw and a pour is not a place: substituting one for the other satisfies the compiled goal
+#: checks while doing a different task, so the plan is refused instead.
+_OBLIGATIONS = (
+    ("throw_object", re.compile(r"投げ|放り投げ|ほうり|\bthrow\b|\btoss\b", re.I)),
+    ("pour_liquid", re.compile(r"注い|ついで|そそい|\bpour\b", re.I)),
+    ("handover_object", re.compile(r"渡し|わたし|\bhand\s*(?:it|over)\b|\bhandover\b", re.I)),
+)
+
+
+def missing_obligations(instruction: str, plan) -> list[str]:
+    """Operations the instruction asks for that the compiled plan does not perform."""
+    skills = {step.skill for step in plan.steps}
+    return [skill for skill, pattern in _OBLIGATIONS if pattern.search(instruction) and skill not in skills]
+
+
+def program_signature(plan) -> list:
+    """The physical intentions a compiled program carries, for comparing two of them.
+
+    After compilation: 'pick then hand over' and an auto-acquiring handover are equivalent, and an
+    already-held pick may be an explicit no-op, so raw action text cannot be compared directly.
+    """
+    return [(s.skill, s.object, s.arm, s.receiver, s.target, s.direction, s.distance_cm,
+             s.height_cm, s.volume_ml, s.relation, s.joint, s.position_deg,
+             s.stroke_cm, s.release_speed_m_s) for s in plan.steps]
+
+
 class AgentPlanner:
     """Language -> typed intentions -> grounded/validated skills, without fine tuning.
 
@@ -43,6 +91,11 @@ class AgentPlanner:
         self.local_enabled = os.getenv("OPENARM_LOCAL_PLANNER", "").lower() in {"1", "true", "yes"} and bool(self.local_model)
         self.enabled = bool(self.api_key and self.base_url and self.model) or self.local_enabled
         self.exact_grammar_fast_path = os.getenv("OPENARM_FAST_LANGUAGE", "0").strip() == "1"
+        # Capability mode stops the planner from answering out of the deterministic grammar: the model is
+        # asked even when the sentence parses, and the rules are demoted to a labelled fallback. Shadow
+        # mode asks the model anyway after the deterministic path has answered, and records only.
+        self.capability_mode = os.getenv("OPENARM_CAPABILITY_MODE", "0").strip() == "1"
+        self.shadow_mode = os.getenv("OPENARM_SHADOW_PLAN", "0").strip() == "1"
         self._repair_feedback: str | None = None
         self._ollama_raw_chatml: bool | None = None
         self._interpret_meaning = False
@@ -69,6 +122,14 @@ class AgentPlanner:
             "Use mode actions for the complete requested sequence. Preservation is checked independently from source text and physical state. "
             "Operations: pick (grasp and hold), handover (giver arm + receiver), place (put on table), "
             "approach, move (direction + distance_cm), open, close, home, throw (upward cube toss + height_cm), "
+            "A throw that must HIT an object (投げて当てて, ぶつけて) is op throw with target=<that object id>: "
+            "the cube is aimed so that it reaches it, and the engine verifies the closest approach. Never "
+            "replace an aimed throw by a placement or a drop onto the object - that is a different task and "
+            "it is judged differently. "
+            "For throw you also design the launch: optional stroke_cm (2-30, how far the arm travels before "
+            "release) and release_speed_m_s (0.2-3.0). A free rise of h metres needs about sqrt(2*9.81*h) m/s "
+            "at release; short ramp with a long stroke is how to reach it. The skill returns the design and the "
+            "measured release speed, so if a throw falls short, raise release_speed_m_s (or stroke_cm) and retry. "
             "pour (wine_bottle into wine_glass, volume_ml 5 to 35, default 20). "
             "For imported robots, read capabilities.skills and detected grippers; never invent an unavailable skill or gripper. "
             "When the user omits a hand, prefer the object's admitted_grasp_arm if present: its spawn approach passed IK. "
@@ -96,7 +157,14 @@ class AgentPlanner:
             "Return only operations requested in the CURRENT instruction. Do not add a second object's pick, "
             "an extra handover, or a destination absent from it. Resolve each clause independently, in order. "
             "A single place action automatically acquires its object; a handover automatically acquires if needed. "
-            "If the FULL task is unsupported or ambiguous, return mode error with empty items and a short error; never guess a partial task."
+            "Refuse with mode error ONLY when the requested action is physically unsupported: an object "
+            "not in world_state, a skill this robot does not have, or impossible geometry. Never refuse "
+            "because the instruction is vague. If objects, hands or destinations are unspecified but the "
+            "observed scene admits a sensible interpretation, choose concrete ones from world_state and "
+            "record EVERY choice you made in assumptions, one short Japanese line each (which object, "
+            "which destination, which hand, and why the scene admits it). 'Tidy up' means place each "
+            "graspable cube on a distinct free destination. An assumption on the record is required; a "
+            "silent guess is not allowed, and neither is inventing an object that is not observed."
         )
         # Setup diagnostics include many numerical IK candidates. They belong in the
         # evidence API, not the language context where they waste the model budget.
@@ -133,11 +201,16 @@ class AgentPlanner:
                 'Do not reduce requested ordered actions to their final states. '
                 'keep_in_place lists objects explicitly required to stay where they are. '
                 'Return the minimum requested goals. Registered objects are available references, not a list of tasks. '
-                'Never add a holding or placement goal for an object the user did not ask to manipulate. '
+                'Never add a holding or placement goal for an object the user did not ask to manipulate, EXCEPT when '
+                'the user asks for the scene to be arranged, tidied or cleaned: then include each graspable object and '
+                'record the choice. '
                 'A negative clause adds a constraint, never a positive goal. '
                 'Use only registered objects and targets. A reference cube is a target, not another manipulated subject. '
-                'Simultaneously grasping two cubes in one hand, arbitrary new physical skills, unknown objects '
-                'and unclear desired outcomes are unsupported: return interpretation unsupported with a short error. '
+                'An unspecified but feasible outcome is NOT unsupported. If the instruction does not say which objects, '
+                'which destinations or which hands, choose concrete ones from objects and targets (for tidying, one '
+                'distinct free target per graspable object) and write EVERY choice into assumptions, one short Japanese '
+                'line each. Unsupported means the physical action cannot be done by this robot: an unknown object, a '
+                'skill it does not have, or impossible geometry - never mere vagueness. '
                 'Return JSON matching the supplied schema, no invented object poses or successful outcomes.'
             )
             user = {'instruction': strip_preservation(instruction,state), 'objects': [
@@ -175,7 +248,12 @@ class AgentPlanner:
         proposal = ActionProposal.model_validate(payload)
         return {"payload": proposal.task_program().model_dump(), "raw": content}
 
-    def _complete(self, messages, schema, *, timeout=60., max_tokens=1600):
+    def _complete(self, messages, schema, *, timeout=20., max_tokens=1600):
+        # Timeouts measured on this host, 2026-10-25, with the local model on the Radeon RX 7800 XT
+        # through ROCm: a one-word reply takes 1.8 s cold (including loading 3.6 GB) and 0.12 s warm,
+        # and a 220-token planning-shaped generation takes 2.8 s. The previous 60 s and 25 s were sized
+        # for CPU inference, where the same one-word reply took 43 s. 20 s and 12 s keep several times
+        # the measured margin while a stalled provider falls back faster instead of stalling a task.
         if self.configured_provider == "local_ollama":
             # Ollama's native schema decoder constrains the entire program, rather than just
             # asking a small local model to produce something JSON-shaped.
@@ -213,11 +291,61 @@ class AgentPlanner:
             content = response.choices[0].message.content or ""
         return content
 
+    def _monitor_recovery(self, instruction, state, failure, legal_actions):
+        """Ask the local decision model which legal recovery fits, with typed answers.
+
+        A decision model reads a distribution over named options instead of writing prose, so its answer
+        cannot be malformed - only illegal, which the caller checks. Measured on d1-omni-600M
+        (2026-10-25, CPU): 3.8 s for two questions over a scene state. Deliberately advisory: an
+        unavailable or low-confidence judgement returns None and the caller keeps its deterministic path.
+        """
+        from backend.app.planning import decision_model
+
+        criteria = {
+            'resume': 'Continue the uncompleted operations from the observed state; meaningful progress exists.',
+            'recover_in_place': 'Open or retreat the empty contacting gripper, return the free arm home, '
+                                'then replan from the SAME scene.',
+            'alternate_arm': 'Use the other hand because the requested hand cannot do it.',
+            'reset_and_retry': 'Restart the whole scene and retry, discarding all progress.',
+        }
+        criteria = {name: criteria[name] for name in legal_actions if name in criteria}
+        # A monitor that is not asked must say so, for the same reason a skipped model does: "no
+        # judgement" and "judged and overruled" are different facts about a recovery.
+        if len(criteria) < 2:
+            return {'provider': 'local_decision', 'asked': False, 'used': False,
+                    'skipped_because': 'fewer_than_two_legal_options', 'legal_actions': legal_actions}
+        occupancy = {s: state.get('robot', {}).get(s + '_arm', {}).get('held_object') for s in ('left', 'right')}
+        arms = state.get('robot', {}).get('available_arms', [])
+        objects = ', '.join(f"{o['id']} at {[round(v, 3) for v in o.get('position', [])]}"
+                            f"{' held by ' + str(o['held_by']) if o.get('held_by') else ''}"
+                            for o in state.get('objects', []))
+        text = (f"Robot arms available: {arms}. Hand occupancy: {occupancy}. Objects: {objects}. "
+                f"Instruction: {instruction}. Failure: {failure.get('category')} - {failure.get('detail')}")
+        questions = {'next': {'type': 'choice', 'instructions': 'Which legal recovery best fits this failure?',
+                              'criteria': criteria}}
+        answer = decision_model.ask(text, questions, timeout=15.)
+        if not answer:
+            return {'provider': 'local_decision', 'asked': False, 'used': False,
+                    'skipped_because': 'no_answer' if decision_model.available() else 'not_configured'}
+        result = answer['answers'].get('next') or {}
+        decision, confidence = result.get('choice'), float(result.get('confidence') or 0.)
+        return {'asked': True, 'decision': decision, 'confidence': confidence, 'provider': 'local_decision',
+                'probabilities': result.get('probabilities'),
+                'reason': f'local_decision: {decision} ({confidence:.2f})'}
+
     def assess_failure(self, instruction, state, failure, legal_actions):
         """Choose among physically admitted recovery operations, never a new goal."""
+        verdict = self._monitor_recovery(instruction, state, failure, legal_actions)
+        if verdict and verdict.get('asked'):
+            # A judgement that was considered and NOT used must stay visible. "The monitor said
+            # recover_in_place at 0.49 and was overruled" is provenance; dropping it makes an unused
+            # monitor indistinguishable from an absent one.
+            verdict['used'] = bool(verdict['decision'] in legal_actions and verdict['confidence'] >= .5)
+            if verdict['used']:
+                return verdict
         if not self.enabled:
             return {'decision':legal_actions[0], 'reason':'現在の状態で実行可能な復旧手順を選びます。',
-                    'provider':'deterministic_fallback'}
+                    'provider':'deterministic_fallback', 'monitor':verdict}
         schema = {'type':'object','properties':{
             'decision':{'enum':legal_actions},'reason':{'type':'string'},
             'requirements':{'type':'array','items':{'type':'string'},'maxItems':5}},
@@ -236,13 +364,14 @@ class AgentPlanner:
             {'role':'user','content':json.dumps({'instruction':instruction,'observed':facts,'failure':failure,
                 'legal_recoveries':legal_actions,'output_schema':schema},ensure_ascii=False)}]
         try:
-            assessment = self._extract_json(self._complete(messages,schema,timeout=25.,max_tokens=450))
+            assessment = self._extract_json(self._complete(messages,schema,timeout=12.,max_tokens=450))
             if assessment.get('decision') not in legal_actions or not isinstance(assessment.get('reason'),str):
                 raise ValueError('Invalid recovery choice')
-            return {**assessment,'provider':self.configured_provider}
+            return {**assessment,'provider':self.configured_provider,'monitor':verdict}
         except Exception:
             return {'decision':legal_actions[0],'reason':'モデルによる復旧案を検証できないため、観測状態と実行条件から復旧します。',
-                    'provider':'deterministic_fallback','provider_error':'RECOVERY_REASONING_UNAVAILABLE'}
+                    'provider':'deterministic_fallback','provider_error':'RECOVERY_REASONING_UNAVAILABLE',
+                    'monitor':verdict}
 
     def _check_coverage(self, instruction, candidate, state):
         """Independent semantic audit for compound clauses the grammar could not cover."""
@@ -270,10 +399,35 @@ class AgentPlanner:
             'List each unsupported clause verbatim in omitted_or_unsupported. Return JSON only.')
         output = self._extract_json(self._complete([{'role':'system','content':system},
             {'role':'user','content':json.dumps({'isolated_clauses':unknown,'capabilities':state.get('capabilities',{}),
-                'output_schema':schema},ensure_ascii=False)}],timeout=25.,max_tokens=450))
+                'output_schema':schema},ensure_ascii=False)}],timeout=12.,max_tokens=450))
         if output.get('covered') is not True or output.get('omitted_or_unsupported') != []:
             raise GroundingError('INCOMPLETE_SEMANTIC_COVERAGE: '+str(output.get('reason','uncovered requested work')))
         return output
+
+    def _shadow_plan(self, instruction, state, memory, fallback):
+        """Ask the model what it would have said, on a request the rules already answered. Record only.
+
+        The deterministic plan is what runs: this cannot change a step, a hand, or a verdict. That is
+        the point - it measures the model's contribution on requests that never used it, which is the
+        only way to see whether rules and model agree where the rules were confident.
+        """
+        saved = (self._interpret_meaning, self._repair_feedback)
+        try:
+            self._interpret_meaning = False
+            self._repair_feedback = None
+            response = self._ai_plan(instruction, state, memory)
+            if response.get('needs_actions'):
+                return {'attempted': True, 'ok': False, 'error': 'PROVIDER_REQUESTED_ACTIONS'}
+            shadow_plan = compile_prepared_program(TaskProgram.model_validate(response['payload']), state)
+            return {'attempted': True, 'ok': True, 'steps': len(shadow_plan.steps),
+                    'deterministic_steps': None if fallback is None else len(fallback.steps),
+                    'agree': (program_signature(shadow_plan) == program_signature(fallback)
+                              if fallback is not None else None)}
+        except Exception as exc:
+            # A shadow call must never fail the request it is shadowing.
+            return {'attempted': True, 'ok': False, 'error': f'{type(exc).__name__}: {str(exc)[:200]}'}
+        finally:
+            self._interpret_meaning, self._repair_feedback = saved
 
     def plan(self, instruction: str, state: dict, memory: list[dict] | None = None) -> AgentPlan:
         started = time.perf_counter()
@@ -301,6 +455,7 @@ class AgentPlanner:
             if fallback_error.startswith("This scene has only"):
                 raise PlannerProviderError("UNKNOWN_OBJECT", fallback_error) from None
         plan = None
+        model_plan = None
         provider_error = None
         raw = None
         self._repair_feedback = None
@@ -310,13 +465,34 @@ class AgentPlanner:
         temporal = bool(re.search(r'\b(?:after|then|before)\b|てから|た後|渡して|その後', instruction, re.I))
         verbs = [m.lastgroup for m in VERBS.finditer(instruction)]
         procedural = (temporal and len(verbs)>1) or ('move' in verbs and motion_distance_cm(instruction) is not None)
-        self._interpret_meaning = not ((fallback_source and fallback_source.actions) or procedural)
+        # A final-state interpretation cannot express a primitive action: its goals are holding, placement
+        # and relative placement, so an instruction that names a throw, a pour or a joint has no goal to
+        # describe it with and comes back as a placement. Measured 2026-10-25: "throw the blue cube up and
+        # hit the red one" produced a carry-and-drop plan, which the goal checks then passed. When the
+        # instruction names a primitive, the ordered-actions path is the one that can express it.
+        primitive = bool(re.search(r'投げ|放り|\bthrow\b|\btoss\b|注い|ついで|\bpour\b|関節|度に|'
+                                   r'開けて|閉じて|\bopen\b|\bclose\b', instruction, re.I))
+        self._interpret_meaning = not ((fallback_source and fallback_source.actions) or procedural or primitive)
         language_stages = []
+        # Why the model is not asked, stated rather than left implicit. The previous behaviour answered a
+        # single direct command from the grammar and recorded nothing, so a request that used no model at
+        # all looked exactly like one where the model agreed.
+        if not self.enabled:
+            skipped_because = "provider_not_configured"
+        elif fallback and self.exact_grammar_fast_path:
+            skipped_because = "exact_grammar_fast_path"
+        elif fallback and len(fallback.program["actions"]) == 1 and fallback.goal["type"] == "direct_command":
+            skipped_because = "single_direct_command"
+        else:
+            skipped_because = None
+        fallback_verdict = {"ok": fallback is not None, "actions": len(fallback.program["actions"]) if fallback else 0,
+                            "goal": fallback.goal["type"] if fallback else None, "error": fallback_error}
         # The launcher can immediately execute a fully parsed/grounded request.
         # Unrecognised language still uses the model and the same validation.
         # This avoids a model round trip just to reconfirm an identical program.
-        use_ai = self.enabled and not (fallback and (self.exact_grammar_fast_path or (
-            len(fallback.program["actions"]) == 1 and fallback.goal["type"] == "direct_command")))
+        use_ai = self.enabled and (self.capability_mode or skipped_because is None)
+        shadow = self._shadow_plan(instruction, state, memory, fallback) if (self.shadow_mode and self.enabled
+                                                                              and not use_ai) else None
         if use_ai:
             for _ in range(3 if self._interpret_meaning else 2):
                 try:
@@ -396,17 +572,30 @@ class AgentPlanner:
                         for action in program.actions:
                             if action.op == "place" and action.relation:
                                 action.arm = None
-                    # Only the grounding compiler can explain concrete choices. Model
-                    # statements such as "blue is held" are not observed scene facts.
+                    # The compiler explains concrete choices from the scene; the model's own choices are
+                    # kept and labelled, because they are the record of what it assumed. They were
+                    # previously discarded outright, which left an ambiguous instruction either refused
+                    # or executed with no trace of the interpretation behind it.
+                    model_assumptions = [a.strip() for a in (program.assumptions or [])
+                                         if isinstance(a, str) and a.strip() and _is_choice_not_outcome(a)][:5]
                     program.assumptions = []
                     # Revalidate anchored quantities, including the supported range.
                     program = TaskProgram.model_validate(program.model_dump())
                     candidate = compile_prepared_program(program, state)
+                    if model_assumptions:
+                        candidate.assumptions = [f'モデルが選んだ前提: {a}' for a in model_assumptions] + candidate.assumptions
+                        candidate.planning_evidence = {**(candidate.planning_evidence or {}),
+                            'model_assumptions': model_assumptions}
                     if binding_repairs:
                         candidate.planning_evidence = {**(candidate.planning_evidence or {}),
                             'semantic_binding_repairs': binding_repairs}
                         candidate.assumptions.append('文章で指定された物体・保持者・支持物の対応を優先しました。補正内容は実行ログに記録します。')
                     validate_instruction_relations(candidate, instruction, state)
+                    missing = missing_obligations(instruction, candidate)
+                    if missing:
+                        raise GroundingError("The program omits an operation the instruction asks for: "
+                                             + ", ".join(missing) + ". A placement or a handover does not "
+                                             "stand in for it; perform the requested operation.")
                     if not fallback_source:
                         audit = self._check_coverage(instruction,candidate,state)
                         if audit:
@@ -418,14 +607,14 @@ class AgentPlanner:
                             # Compare physical intentions after compilation. 'Pick then
                             # hand over' and an auto-acquiring handover are equivalent;
                             # an already-held pick may also be an explicit no-op.
-                            return [(s.skill, s.object, s.arm, s.receiver, s.target, s.direction, s.distance_cm,
-                                     s.height_cm, s.volume_ml, s.relation, s.joint, s.position_deg) for s in p.steps]
+                            return program_signature(p)
                         if signature(candidate) != signature(fallback):
                             raise GroundingError("Program changes explicit actions/hands in instruction. Expected: " + json.dumps(fallback.program, ensure_ascii=False))
                     valid, errors = validate_plan(candidate, state)
                     if not valid:
                         raise GroundingError("; ".join(errors))
                     plan = candidate
+                    model_plan = candidate
                     plan.provider = self.configured_provider
                     provider_error = None
                     raw = response["raw"]
@@ -449,14 +638,35 @@ class AgentPlanner:
         if plan is None:
             plan = fallback
         if plan is None:
-            detail = str(fallback_error or provider_error)
-            category = "ROBOT_CAPABILITY" if "ROBOT_CAPABILITY:" in detail else "INSTRUCTION_NOT_UNDERSTOOD"
-            raise PlannerProviderError(category, f"Cannot ground the full instruction: {detail}")
+            # Report the failure of the path that actually ran. When the model was asked, its own
+            # validation error is why there is no plan - the grammar's parse error is background, kept in
+            # fallback_verdict. Without this a scene the solver could not satisfy was reported as
+            # "instruction not understood", which points a reader at the wrong component.
+            model_detail = self._repair_feedback if use_ai else None
+            detail = str(model_detail or fallback_error or provider_error)
+            if "ROBOT_CAPABILITY:" in detail:
+                category = "ROBOT_CAPABILITY"
+            elif detail.startswith("GOAL_UNREACHABLE"):
+                category = "GOAL_UNREACHABLE"
+            else:
+                category = "INSTRUCTION_NOT_UNDERSTOOD"
+            raise PlannerProviderError(category, f"Cannot ground the full instruction: {detail[:600]}")
         plan.provider_error = provider_error
         if observed_binding.decisions:
             plan.planning_evidence = {**(plan.planning_evidence or {}),'scene_bindings':observed_binding.decisions}
             plan.assumptions += [d['explanation'] for d in observed_binding.decisions]
         plan.raw_response = raw
+        plan.model_called = bool(use_ai)
+        # 'skipped_because' answers one question only: why the model was not called.
+        plan.skipped_because = None if use_ai else skipped_because
+        plan.capability_mode = self.capability_mode
+        plan.fallback_verdict = fallback_verdict
+        plan.model_verdict = {"ok": model_plan is not None,
+                              "actions": len(model_plan.steps) if model_plan is not None else 0,
+                              "error": provider_error}
+        plan.agree = (program_signature(model_plan) == program_signature(fallback)
+                      if model_plan is not None and fallback is not None else None)
+        plan.shadow = shadow
         plan.model = (self.model if plan.provider == "ai&" else
                       self.local_model if plan.provider == "local_ollama" else None)
         plan.memory_used = memory[-3:]

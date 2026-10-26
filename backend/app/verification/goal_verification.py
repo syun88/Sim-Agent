@@ -87,6 +87,17 @@ def verify_task_goal(env: SimulationBackend, plan, results: list[dict], initial_
             event = next((r for r in results if r.get("skill") == "throw_object" and
                           r.get("action_index") == check["action_index"] and r.get("object") == obj), {})
             evidence = evaluate_throw(event.get("trajectory", []), check["min_height"])
+        elif check["type"] == "hit":
+            from backend.app.skills.dynamic_skills import HIT_TOLERANCE_M
+            event = next((r for r in results if r.get("skill") == "throw_object" and
+                          r.get("action_index") == check["action_index"]), {})
+            from backend.app.skills.dynamic_skills import closest_approach
+            closest = closest_approach(event.get("trajectory") or [], env.object_pose(check["target"])[0])
+            # Re-derived from the recorded trajectory and the target's live pose: the skill's own verdict
+            # is not the evidence here.
+            evidence = {"success": bool(closest is not None and closest <= HIT_TOLERANCE_M),
+                        "closest_approach_m": closest, "tolerance": HIT_TOLERANCE_M,
+                        "target": check["target"]}
         elif check["type"] == "pour":
             event = next((r for r in results if r.get("skill") == "pour_liquid" and
                           r.get("action_index") == check["action_index"]), {})

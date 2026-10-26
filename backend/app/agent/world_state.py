@@ -20,6 +20,36 @@ def physical_holds(env: SimulationBackend) -> dict[str, str | None]:
     return holds
 
 
+
+def _builtin_skills() -> list[str]:
+    """The official cell's list, unchanged: it is trusted as a whole and reports no grippers here."""
+    return ["observe_scene", "park_empty_arm", "approach_object", "grasp_object", "lift_object",
+            "move_to_target", "move_to_object", "release_object", "retreat", "return_home",
+            "open_gripper", "close_gripper", "move_relative", "handover_object",
+            "throw_object", "pour_liquid"]
+
+
+def _imported_skills(grippers, arms, pinch_verified, has_fluid) -> list[str]:
+    """What an imported robot offers, derived from what it has rather than from its loader.
+
+    Measured 2026-10-25 on UR5e + 2F-85 and OpenManipulator-X: both can be pinched with physically
+    verified (grasp_calibrated), yet the imported path offered neither throwing nor pouring. Throwing
+    needs a verified hold - the skill itself refuses one it cannot prove - so it follows the pinch, and
+    pouring additionally needs a scene with fluid in it. Handover remains a two-arm skill.
+    """
+    skills = ["observe_scene", "park_empty_arm", "move_relative", "return_home", "move_joint"]
+    if not grippers:
+        return skills
+    skills += ["approach_object", "grasp_object", "lift_object", "move_to_target", "move_to_object",
+               "release_object", "retreat", "open_gripper", "close_gripper"]
+    if pinch_verified:
+        skills.append("throw_object")
+        if has_fluid:
+            skills.append("pour_liquid")
+    if len(arms) > 1:
+        skills.append("handover_object")
+    return skills
+
 def build_world_state(env: SimulationBackend) -> dict:
     frame = env.frame()
     holds = physical_holds(env)
@@ -50,6 +80,17 @@ def build_world_state(env: SimulationBackend) -> dict:
     for name, position in frame.zones.items():
         targets.append({"id": name, "color": name.split("_")[0], "position": position})
     imported = getattr(env, "robot_id", "openarm_v2") != "openarm_v2"
+    profile = getattr(env, "profile", None) or {}
+    grippers = profile.get("grippers") or {}
+    arms = list(getattr(env, "available_arms", ["left", "right"]))
+    # A robot's skills follow what it can do, not which loader built it. Measured 2026-10-25: the
+    # imported path withheld throw_object and pour_liquid from every imported robot, so a robot with a
+    # physically verified pinch could not throw even though every environment API the skill needs is
+    # inherited from the same base class - and the refusal blamed a calibration that was in fact valid
+    # (the package's gripper_runtime.json verified, hashes matching). The built-in cell keeps exactly
+    # the list it had: it reports no grippers through this profile and is trusted as a whole.
+    pinch_verified = bool(grippers) and bool(profile.get("grasp_calibrated"))
+    has_fluid = bool(getattr(frame, "fluid", None))
     targets.extend({"id": name, "position": env.zone_position(name).tolist() if imported else list(position),
                     "type": "table_region"} for name, position in TABLE_TARGETS.items())
     relations = []
@@ -99,11 +140,7 @@ def build_world_state(env: SimulationBackend) -> dict:
         "support_relations": supports,
         "workspace": {"table_height_m":env.table_height,"position_unit":"m","rotation":"world_from_object"},
         "capabilities": {"relative_placement": ["on", "left_of", "right_of", "front_of", "behind", "near"],
-                         "skills": ["observe_scene", "park_empty_arm", "move_relative", "return_home", "move_joint"] if imported and not env.profile.get("grippers") else
-                         ["observe_scene", "park_empty_arm", "approach_object", "grasp_object", "lift_object", "move_to_target", "move_to_object",
-                          "release_object", "retreat", "return_home", "open_gripper", "close_gripper",
-                          "move_relative", "handover_object", *([] if imported else ["throw_object", "pour_liquid"]),
-                          *(["move_joint"] if imported else [])],
+                         "skills": _builtin_skills() if not imported else _imported_skills(grippers, arms, pinch_verified, has_fluid),
                          "geometry_source": "Genesis collision bounds", "grasp": env.grasp_mode},
         "grasp_mode": env.grasp_mode,
         "spawn_validation": getattr(env, "spawn_validation", None),

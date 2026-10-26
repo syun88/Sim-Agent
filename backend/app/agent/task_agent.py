@@ -11,7 +11,7 @@ import time
 
 from backend.app.agent.scene_reasoning import SceneReferenceError, bind_scene_references
 from backend.app.agent.recovery_policy import reset_evidence
-from backend.app.planning.agent_planner import PlannerProviderError
+from backend.app.planning.agent_planner import PROVENANCE_FIELDS, PlannerProviderError
 from backend.app.planning.preparation import compile_prepared_program
 from backend.app.planning.spatial_language import preservation_spans
 from backend.app.planning.task_program import GroundingError, TaskProgram
@@ -216,7 +216,7 @@ class TaskAgent:
                 return finish(result)
             announce({'kind':assessment['decision'],'explanation':assessment.get('reason','復旧します。'),
                 'assessment':assessment,'completed_action_prefix':prefix,'reset_evidence':certificate})
-            recovery={'decision':assessment['decision'],'before':observed}
+            recovery={'decision':assessment['decision'],'assessment':assessment,'before':observed}
             recoveries.append(recovery)
             if assessment['decision']=='resume':
                 plan = continuation
@@ -260,6 +260,6 @@ class TaskAgent:
                     plan = compile_prepared_program(source,epoch_initial)
                 except GroundingError as error:
                     return blocked(str(error),'RECOVERY_PRECONDITION_FAILED')
-            for field in ('provider','model','provider_error'):
+            for field in PROVENANCE_FIELDS:
                 setattr(plan,field,getattr(original,field))
         return blocked('AGENT_ATTEMPT_BUDGET','AGENT_ATTEMPT_BUDGET')

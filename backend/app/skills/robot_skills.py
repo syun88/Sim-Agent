@@ -356,17 +356,70 @@ class SkillRunner:
                     "support_bounds": self.env.object_bounds(target).tolist()}
         return self._skill("move_to_object", run, time.perf_counter())
 
-    def _carry_to(self, arm: str, obj: str, desired: np.ndarray) -> dict:
+    def _carry_aim(self, arm: str, obj: str, desired, *, attitude: str = "pinned"):
+        """The end-effector pose a carry to ``desired`` (the object's pose) commands, and its rotation.
+
+        One owner for the grasp-offset arithmetic, because everything that asks whether a carry is
+        possible must ask the same question the carry itself will command. Measured 2026-10-25 on
+        OpenManipulator-X: the wind-up search asked the IK for the end effector to be at the *object*'s
+        column, while the carry commanded the end effector held off from it by the grasp offset, so a
+        wind-up passed the search and the carry stopped 92 mm short - the offset's own length.
+        """
+        ee, rotation = self.env.ee_pose(arm)
+        offset = rotation.T @ (self.env.object_pose(obj)[0].copy() - ee)
+        commanded_rotation = None if attitude == "free" else self.controller.target_rotations.get(arm, rotation)
+        aim = rotation if commanded_rotation is None else commanded_rotation
+        return np.asarray(desired) - aim @ offset, commanded_rotation, offset
+
+    def _planned_carry(self, arm: str, obj: str, desired: np.ndarray, rotation):
+        """A planner-solved joint path that carries the held object to ``desired``, and its attitude.
+
+        Only for arms with fewer than six joints, where the controller's own damped local solver stops
+        tens of millimetres short of poses the planner's IK solves with zero error: measured
+        2026-10-25 on the four-joint OpenManipulator-X, the solver's position error on the wind-up
+        candidates was 90-118 mm while ``launch_ready`` had already accepted the same targets below
+        2 mm through the planner. The decision stays with ``move_to_site``, which validates the path it
+        is handed (start continuity, joint limits, final pose) and refuses a plan that does not hold.
+        """
+        from backend.app.robots.urdf import solve_profile_ik
+
+        env = self.env
+        names = env.profile['chains'][arm]['joints']
+        ee, held = env.ee_pose(arm)
+        offset = held.T @ (env.object_pose(obj)[0].copy() - ee)
+        aim = held if rotation is None else np.asarray(rotation, float)
+        start = env.object_pose(obj)[0].copy()
+        goal = np.asarray(desired, float)
+        seed = env.arm_qpos(arm)
+        path = [seed]
+        count = max(1, int(np.ceil(np.linalg.norm(goal - start) / .025)))
+        for alpha in np.linspace(0., 1., count + 1)[1:]:
+            solution = solve_profile_ik(env.profile, arm, (1 - alpha) * start + alpha * goal - aim @ offset,
+                                        None, model=env.model, q_init=seed, snapshot=env.joint_snapshot())
+            if not solution['success']:
+                return None
+            seed = env.model.nearest_continuous(names, solution['q_rad'], seed)
+            path.append(seed)
+        return path, np.asarray(env.arm_kinematics(arm).evaluate(seed)[1], float)
+
+    def _carry_to(self, arm: str, obj: str, desired: np.ndarray, *, attitude: str = "pinned") -> dict:
+        """Carry the held object to a pose. ``attitude="free"`` lets the arm choose its orientation.
+
+        A six-joint arm carries the attitude its pinch was validated in, and that is the default. An arm
+        whose pinch frame is only achievable near the object cannot carry it any higher while keeping
+        that frame - measured 2026-10-25 on OpenManipulator-X, whose wind-up arrived but whose carry was
+        refused with the held attitude. Free travel still requires the verified hold at every waypoint,
+        the same fallback the grasp planning already uses below six joints.
+        """
         self._require_hold(arm, obj)
         ee, rotation = self.env.ee_pose(arm)
         start = self.env.object_pose(obj)[0].copy()
-        offset = rotation.T @ (start - ee)
-        commanded_rotation = self.controller.target_rotations.get(arm, rotation)
-        target = np.asarray(desired) - commanded_rotation @ offset
+        target, commanded_rotation, offset = self._carry_aim(arm, obj, desired, attitude=attitude)
+        aim = rotation if commanded_rotation is None else commanded_rotation
         # Keep the carried cube on a Cartesian clearance path. A joint interpolation
         # between two high endpoints can still dip the palm through a table object.
         count = max(1, int(np.ceil(np.linalg.norm(np.asarray(desired) - start) / .025)))
-        via = [(1 - alpha) * start + alpha * np.asarray(desired) - commanded_rotation @ offset
+        via = [(1 - alpha) * start + alpha * np.asarray(desired) - aim @ offset
                for alpha in np.linspace(0., 1., count + 1)[1:-1]]
         if self.controller.motion_speed == 1.:
             for waypoint in via:
@@ -375,10 +428,28 @@ class SkillRunner:
                     raise SkillError(result.error or "IK_FAILURE", "Cartesian carry was blocked")
                 self._require_hold(arm, obj)
             via = []
+        # An imported arm with fewer than six joints is carried along a planner-solved path: its own
+        # solver cannot reach the wind-up candidates the planner accepts (see ``_planned_carry``).
+        # Six-joint arms - the official cell - keep exactly the motion they had, and so does an
+        # environment that does not expose a profile at all: an unknown arm must not be assumed to be
+        # the short one, or the official environment is silently handed a plan it never had.
+        profile = getattr(self.env, 'profile', None)
+        chain_joints = profile.get('chains', {}).get(arm, {}).get('joints') if isinstance(profile, dict) else None
+        planned = (self._planned_carry(arm, obj, np.asarray(desired, float), commanded_rotation)
+                   if chain_joints is not None and len(chain_joints) < 6 else None)
         for attempt in range(3):
-            result = self.controller.move_to_site(arm, target, commanded_rotation,
-                via=via if attempt == 0 else None, on_sample=lambda: self._require_hold(arm, obj))
+            if attempt == 1 and planned is not None:
+                result = self.controller.move_to_site(arm, target, planned[1], planned_joints=planned[0],
+                                                      on_sample=lambda: self._require_hold(arm, obj))
+            else:
+                result = self.controller.move_to_site(arm, target, commanded_rotation,
+                    via=via if attempt == 0 else None, on_sample=lambda: self._require_hold(arm, obj))
             if not result.success:
+                # The controller's own solve failing is what the planner-solved path is for: without this
+                # the fallback sits behind a raise that never lets it run (measured: the residuals were
+                # bit-identical with and without the plan, which is how the dead path was found).
+                if attempt == 0 and planned is not None:
+                    continue
                 raise SkillError(result.error or "IK_FAILURE", f"Cannot carry {obj} to {np.round(desired, 4).tolist()} (EE {np.round(target, 4).tolist()}, position residual {result.position_error}, rotation residual {result.rotation_error})")
             self._require_hold(arm, obj)
             actual = self.env.object_pose(obj)[0]
@@ -565,9 +636,18 @@ class SkillRunner:
         # objects, rather than a fixed point near the original cube locations.
         return {**self.park_empty_arm(arm),'skill':'return_home'}
 
-    def throw_object(self, arm: str, obj: str, height_cm: float = 3.) -> dict:
+    def throw_object(self, arm: str, obj: str, height_cm: float = 3.,
+                     stroke_cm: float | None = None, release_speed_m_s: float | None = None,
+                     target: str | None = None) -> dict:
         from backend.app.skills.dynamic_skills import throw_up
-        return self._skill("throw_object", lambda: throw_up(self, arm, obj, height_cm), time.perf_counter())
+        # An aimed throw names its target; the skill needs the point, and it reads it from the engine
+        # rather than from the language.
+        point = None if target is None else self.env.object_pose(target)[0]
+        return self._skill("throw_object", lambda: throw_up(self, arm, obj, height_cm,
+                                                           stroke_cm=stroke_cm,
+                                                           release_speed_m_s=release_speed_m_s,
+                                                           target_point=point),
+                           time.perf_counter())
 
     def pour_liquid(self, arm: str, obj: str, target: str, volume_ml: float) -> dict:
         from backend.app.skills.pouring import pour_wine
@@ -614,7 +694,10 @@ class SkillRunner:
             elif skill == "handover_object":
                 result = self.handover_object(arm, step["object"], step.get("receiver") or "")
             elif skill == "throw_object":
-                result = self.throw_object(arm, step["object"], float(step.get("height_cm") or 3.))
+                result = self.throw_object(arm, step["object"], float(step.get("height_cm") or 3.),
+                                           stroke_cm=step.get("stroke_cm"),
+                                           release_speed_m_s=step.get("release_speed_m_s"),
+                                           target=step.get("target"))
             elif skill == "pour_liquid":
                 result = self.pour_liquid(arm, step["object"], step.get("target") or "wine_glass", float(step.get("volume_ml") or 20.))
             else:

@@ -16,6 +16,14 @@ if [[ -z "${OPENARM_LOCAL_PLANNER:-}" ]]; then
 fi
 export OPENARM_OLLAMA_MODEL="${OPENARM_OLLAMA_MODEL:-qwen3-vl:4b}"
 
+# Every task goes through the model when one is installed: the deterministic grammar stays as the
+# labelled fallback for the cases the model's program is refused, not as the default answer. Set
+# OPENARM_CAPABILITY_MODE=0 to run the rules-first behaviour again.
+if [[ -z "${OPENARM_CAPABILITY_MODE:-}" ]] && command -v ollama >/dev/null 2>&1 \
+   && ollama list 2>/dev/null | awk '{print $1}' | grep -qx "${OPENARM_OLLAMA_MODEL}"; then
+  export OPENARM_CAPABILITY_MODE=1
+fi
+
 uv sync
 
 # Reuse this project's running owner instead of starting another Python window.

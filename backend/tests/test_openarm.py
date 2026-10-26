@@ -205,3 +205,23 @@ def test_reset_restores_the_documented_scene(env):
     assert env.object_pose("red_cube")[0] == pytest.approx(
         initial_object_positions()["red_cube"], abs=1e-6
     )
+
+
+def test_a_zone_position_survives_an_empty_spawn_layout():
+    """A single-arm imported robot whose sampler placed nothing still needs a world state.
+
+    Measured 2026-10-24 on UR5e + 2F-85: the empty layout made ``zone_position`` raise StopIteration
+    from an eagerly evaluated fallback argument - ``positions.get(side, next(iter(positions.values())))``
+    evaluates its default even when the key is present - and the caller's generator turned that into
+    "generator raised StopIteration", taking the whole world state with it, so the sequence verifier
+    could not even build one. This fails if the fallback becomes eager again.
+    """
+    from types import SimpleNamespace
+    from backend.app.simulation.genesis_backend.generic_environment import GenericURDFEnvironment
+    empty = SimpleNamespace(_object_start={}, table_height=.76)
+    for name in ("left_side", "right_side", "center"):
+        point = GenericURDFEnvironment._default_zone_position(empty, name)
+        assert point.shape == (3,) and np.isfinite(point).all()
+    one_arm = SimpleNamespace(_object_start={"_cube": {"arm": "left", "position": [.1, 0., .8]}},
+                              table_height=.76)
+    assert np.isfinite(GenericURDFEnvironment._default_zone_position(one_arm, "right_side")).all()

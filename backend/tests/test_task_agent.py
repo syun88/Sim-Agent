@@ -234,3 +234,32 @@ def test_next_prompt_plans_from_previous_result_after_homing(world,postcondition
     assert observations[1]['support_relations'][0]['object']=='red_cube'
     assert second['agent_trace'][0]['kind']=='scene_observed'
     assert second['initial_world_state']['discourse']['last_object']=='blue_cube'
+
+
+def test_a_stack_is_resolved_to_its_upper_cube_and_the_choice_is_recorded(world):
+    """'Grab the blue cube' with two blue cubes: only the upper one can be grasped, so proceed.
+
+    Stopping would hand back a task the scene already answers. What must not happen is an unrecorded
+    guess: two cubes at the same height stay ambiguous (the guard above), and the stack case names the
+    object it chose and the candidates it chose over.
+    """
+    world['objects'] = [
+        {'id': 'blue_low', 'type': 'cube', 'position': [.44, -.1, 1.031]},
+        {'id': 'blue_high', 'type': 'cube', 'position': [.44, -.1, 1.083]},
+    ]
+    result = bind_scene_references('右手にある青いキューブを取って', world)
+    decision = result.decisions[0]
+    assert decision['kind'] == 'assumed_ambiguity_resolution'
+    assert decision['object'] == 'blue_high'
+    assert decision['alternatives'] == ['blue_low']
+    assert set(decision['candidates']) == {'blue_low', 'blue_high'}
+    assert 'blue_high' in result.instruction
+
+
+def test_two_cubes_at_the_same_height_still_stop_rather_than_guess(world):
+    world['objects'] = [
+        {'id': 'blue_a', 'type': 'cube', 'position': [.44, -.1, 1.031]},
+        {'id': 'blue_b', 'type': 'cube', 'position': [.44, -.1, 1.031]},
+    ]
+    with pytest.raises(SceneReferenceError):
+        bind_scene_references('右手にある青いキューブを取って', world)

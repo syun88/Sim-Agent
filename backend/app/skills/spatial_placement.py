@@ -15,6 +15,14 @@ def relative_destination(env, obj, target, relation, arm, distance_cm=None):
         direction = np.asarray(directions[relation])
         half_sizes = (bounds[1, :2] - bounds[0, :2] + support[1, :2] - support[0, :2]) / 2.
         gap = .03 if distance_cm is None else distance_cm / 100.
+        # A placement beside a reference has to survive the jaws OPENING, not just the cube arriving: the
+        # moving jaw sweeps out to the release aperture, and a reference inside that sweep blocks the
+        # release. Measured 2026-10-25 on OpenManipulator-X: a 30 mm gap put the reference in contact with
+        # gripper_right_link and the release raised GRIPPER_BLOCKED. The floor is physical, so it wins over
+        # a smaller requested distance - a gap that cannot be released is not a gap - and it follows the
+        # partial release (see gripper_envelope), not the gripper's full opening.
+        from backend.app.robots.gripper_envelope import reference_gap
+        gap = max(gap, reference_gap(env, arm, obj))
         desired[:2] += direction * (float(np.dot(abs(direction), half_sizes)) + gap)
         desired[2] = support[0, 2] + bottom_offset + .003
     return desired
