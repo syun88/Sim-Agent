@@ -228,6 +228,26 @@ def main() -> None:
                     env.step(200)
                     body.update(success=True, verification={'success': True, 'goal_type': 'scene_reset',
                         'randomization':env.spawn_validation.get('randomization')}, final_world_state=build_world_state(env))
+                elif command['action'] == 'diagnose_pinch':
+                    # Run the same skills the task path runs, inside this process, and report the contact
+                    # numbers instead of a verdict: q, the pinch verdict, the pad links and the candidate
+                    # contacts. This is the measurement that separates world state from agent path.
+                    arm = command.get('arm', 'left'); obj = command.get('object', 'red_cube')
+                    rows = []
+                    for skill in ('approach_object', 'grasp_object', 'lift_object'):
+                        out = getattr(executor.skills, skill)(arm, obj)
+                        evidence = env.pinch_evidence(obj, arm) if hasattr(env, 'pinch_evidence') else {}
+                        rows.append({'skill': skill, 'success': out.get('success'), 'error': out.get('error'),
+                                     'gripper_position': float(env.gripper_position(arm)),
+                                     'pinch_established': bool(evidence.get('established')),
+                                     'pads': sorted({c.get('robot_link') for c in
+                                                     (evidence.get('candidate_contacts') or [])}),
+                                     'object_position': [round(float(v), 5) for v in env.object_pose(obj)[0]],
+                                     'raw_contacts': sorted(env.object_contacts(obj, arm))})
+                        if not out.get('success'):
+                            break
+                    body.update(success=all(row['success'] for row in rows), verification={'success': True,
+                        'goal_type': 'pinch_diagnostic', 'rows': rows}, final_world_state=build_world_state(env))
                 elif command['action'] == 'select_robot':
                     prepare_robot(command['robot_id'])
                     body.update(success=True, verification={'success': True, 'goal_type': 'robot_selection', 'robot_id': command['robot_id']},

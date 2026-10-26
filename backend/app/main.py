@@ -106,6 +106,18 @@ def _enqueue(command: dict) -> dict:
     return record
 
 
+@app.post('/api/diagnostics/pinch')
+def diagnose_pinch(object: str = 'red_cube', arm: str = 'left'):
+    """Ask the viewer process to grasp and lift one object and report the contact numbers.
+
+    The viewer owns the Genesis world; the API process cannot reach it. A diagnostic that runs inside
+    that process is the only way to tell "the app's world behaves differently" from "the agent path does",
+    which is the question left open by measurements that agree everywhere else.
+    """
+    return _enqueue({'action': 'diagnose_pinch', 'object': object, 'arm': arm,
+                     'instruction': f'pinch diagnostic: {object}'})
+
+
 @app.post('/api/scene/reset')
 def reset_scene(randomize: bool = False,seed:int|None=Query(default=None,ge=0,le=2**32-1),shuffle_sides:bool=True):
     seed=resolve_seed(seed) if randomize else None
