@@ -627,10 +627,17 @@ class AgentPlanner:
                 except PlannerProviderError as exc:
                     if exc.category == "UNSUPPORTED_TASK":
                         raise
+                    # Keep WHY the provider failed, so a request that reached the model is not reported with
+                    # the grammar's parse error. Measured 2026-10-26: an aimed throw failed with "Unrecognised
+                    # instruction suffix" while the model had in fact been asked and had returned nothing
+                    # usable, which points a reader at the language fallback instead of at the model.
+                    self._repair_feedback = f'model provider failed: {exc.category}: {str(exc)[:300]}'
                     provider_error = "PROVIDER_UNAVAILABLE"
                     break
-                except Exception:
-                    # Provider exception strings can include URLs, request data or secrets.
+                except Exception as exc:
+                    # Provider exception strings can include URLs, request data or secrets; the type and a
+                    # short message are enough to say which component failed.
+                    self._repair_feedback = f'model provider raised {type(exc).__name__}: {str(exc)[:300]}'
                     provider_error = "PROVIDER_UNAVAILABLE"
                     break
             if plan is None:
@@ -650,7 +657,8 @@ class AgentPlanner:
                 category = "GOAL_UNREACHABLE"
             else:
                 category = "INSTRUCTION_NOT_UNDERSTOOD"
-            raise PlannerProviderError(category, f"Cannot ground the full instruction: {detail[:600]}")
+            via = "after the model was asked" if use_ai else "without asking the model"
+            raise PlannerProviderError(category, f"Cannot ground the full instruction ({via}): {detail[:600]}")
         plan.provider_error = provider_error
         if observed_binding.decisions:
             plan.planning_evidence = {**(plan.planning_evidence or {}),'scene_bindings':observed_binding.decisions}

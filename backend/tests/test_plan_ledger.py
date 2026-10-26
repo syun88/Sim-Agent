@@ -154,3 +154,22 @@ def test_a_placement_cannot_stand_in_for_a_requested_throw(monkeypatch):
                         lambda self, i, s, m: {"payload": placement.program, "raw": "model"})
     with pytest.raises(Exception):
         AgentPlanner().plan("青いキューブを上に投げて赤いキューブに当てて", WORLD_STATE)
+
+
+def test_a_model_failure_is_not_reported_as_a_grammar_failure(monkeypatch):
+    """The model was asked and failed; the message must say so instead of blaming the parser."""
+    from backend.app.planning.agent_planner import PlannerProviderError
+
+    _local(monkeypatch)
+    monkeypatch.setenv("OPENARM_CAPABILITY_MODE", "1")
+
+    def _explode(self, instruction, state, memory):
+        raise RuntimeError("the model returned nothing usable")
+
+    monkeypatch.setattr(AgentPlanner, "_ai_plan", _explode)
+    with pytest.raises(PlannerProviderError) as raised:
+        AgentPlanner().plan("青いキューブを上に投げて赤いキューブに当てて", WORLD_STATE)
+    message = str(raised.value)
+    assert "after the model was asked" in message
+    assert "the model returned nothing usable" in message
+    assert "Unrecognised" not in message
