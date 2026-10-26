@@ -49,6 +49,7 @@ class TaskAgent:
         epoch_initial = initial
         decisions, attempts, recoveries, resets = [], [], [], 0
         staging_used=False
+        replan_used=False
         alternate_used=False
         def announce(decision):
             decisions.append(decision)
@@ -201,6 +202,12 @@ class TaskAgent:
                     except GroundingError:
                         pass
             certificate=reset_evidence(observed,source)
+            # A skill that reports the numbers behind its failure - a throw that says which stroke it
+            # could get and how fast the cube left - is asking for a different plan, not for somebody to
+            # retry the same one. "Back off, then throw" is expressible in the existing language, so the
+            # planner gets the chance to write it.
+            if not replan_used and 'design' in str(failed.get('detail') or ''):
+                legal.append('replan')
             if not legal and certificate and reset_allowed and resets<self.max_resets:
                 legal.append('reset_and_retry')
             if not legal:
@@ -226,6 +233,19 @@ class TaskAgent:
                 # No arm was requested: the same cube may be held by either
                 # admitted arm. Preserve explicit ownership everywhere else.
                 original.goal=deepcopy(plan.goal)
+            elif assessment['decision']=='replan':
+                replan_used=True
+                try:
+                    replanned=self.plan_call(instruction,observed,
+                        [{'recent_failure':failed.get('detail'),'measured':failed.get('evidence')}])
+                except Exception:
+                    replanned=None
+                if replanned is None or not getattr(replanned,'steps',None):
+                    result['detail']=f'{category}: 失敗の数値を踏まえた再計画を作れませんでした。'
+                    return finish(result)
+                plan=replanned
+                original=replanned
+                recovery['replanned_steps']=[step.skill for step in plan.steps]
             elif assessment['decision']=='recover_in_place':
                 staging_used=True
                 staging=self.executor.home_empty_arms(emit=emit,should_stop=should_stop,clear_contacts=True)

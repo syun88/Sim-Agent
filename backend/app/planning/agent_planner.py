@@ -341,6 +341,9 @@ class AgentPlanner:
             'resume': 'Continue the uncompleted operations from the observed state; meaningful progress exists.',
             'recover_in_place': 'Open or retreat the empty contacting gripper, return the free arm home, '
                                 'then replan from the SAME scene.',
+            'replan': 'The failure reported measurements (how far the arm could travel, how fast the object '
+                      'left). Write a NEW plan that respects them - for example approach or back off first, '
+                      'then perform the action with the room it needs.',
             'alternate_arm': 'Use the other hand because the requested hand cannot do it.',
             'reset_and_retry': 'Restart the whole scene and retry, discarding all progress.',
         }
