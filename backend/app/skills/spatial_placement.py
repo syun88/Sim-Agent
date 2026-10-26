@@ -22,7 +22,7 @@ def relative_destination(env, obj, target, relation, arm, distance_cm=None):
         # a smaller requested distance - a gap that cannot be released is not a gap - and it follows the
         # partial release (see gripper_envelope), not the gripper's full opening.
         from backend.app.robots.gripper_envelope import reference_gap
-        gap = max(gap, reference_gap(env, arm, obj))
+        gap = max(gap, reference_gap(env, arm, obj, direction=direction))
         desired[:2] += direction * (float(np.dot(abs(direction), half_sizes)) + gap)
         desired[2] = support[0, 2] + bottom_offset + .003
     return desired
