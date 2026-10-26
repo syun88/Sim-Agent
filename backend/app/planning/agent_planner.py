@@ -284,7 +284,14 @@ class AgentPlanner:
                 "action_shapes": {"move": {"direction": "up|down|left|right|forward|back", "distance_cm": "1-30",
                                            "object": "omit this for arm motion"},
                                   "home": {"object": "omit"}, "approach": {"object": "<id>"},
-                                  "place": {"object": "<id>", "target": "<zone id or cube id>"}}}
+                                  "place": {"object": "<id>", "target": "<zone id or cube id>"},
+                                  # A throw needs BOTH ids: the cube that leaves the hand and the object it is
+                                  # aimed at. Measured 2026-10-27: given only the failure numbers, the model wrote
+                                  # {"op":"throw","target":"blue_cube"} and the compiler refused it for a missing
+                                  # object - the shape belongs where the model reads it, not only in prose.
+                                  "throw": {"object": "<the cube to throw>", "target": "<the object to hit>",
+                                            "height_cm": "1-10", "flight_time_s": "0.10-1.00",
+                                            "back_off_cm": "0-20"}}}
         messages = [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]
         content = self._complete(messages, schema)
         payload = self._extract_json(content)
