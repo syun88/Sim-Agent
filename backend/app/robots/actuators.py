@@ -5,6 +5,16 @@ import numpy as np
 
 
 PRESETS={
+    'xm430_w350':{
+        'manufacturer':'ROBOTIS','model':'XM430-W350-T','voltage_V':12.0,
+        'peak_effort_Nm':4.1,'no_load_velocity_rad_s':46.*np.pi/30.,
+        'source_url':'https://emanual.robotis.com/docs/en/dxl/x/xm430-w350/',
+        # The turtlebot3_lime description already carries this motor in its velocity field: the
+        # arm joints declare velocity="4.8" and 46 rev/min is 4.82 rad/s, while the wheels
+        # declare 8.063 rad/s, which is 77 rev/min and belongs to the XM430-W210 the description
+        # names for them in a comment. Arm mass 0.683 kg and reach 0.353 m match OpenManipulator-X
+        # (0.70 kg, 380 mm), whose official actuator is this one.
+        'limit_semantics':'Peak stall torque and no-load speed are separate limits; not a measured torque-speed curve.'},
     'xm430_w210':{
         'manufacturer':'ROBOTIS','model':'XM430-W210-T','voltage_V':12.0,
         'peak_effort_Nm':3.0,'no_load_velocity_rad_s':8.063,

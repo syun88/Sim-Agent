@@ -73,14 +73,14 @@ def main():
     # above the wheel limits in bigwheel_orin.urdf.xacro), so record that identity here.
     # The preset's numbers live in backend/app/robots/actuators.py beside the other
     # motors, and a joint with no entry keeps its URDF limit, which is what the arm does.
-    # The description names this motor for the wheels, in a comment right above their limits.
-    # The arm's own motor is named nowhere in the package, so the same motor is declared for
-    # it, for a measured reason: the arm needs at most 0.55 Nm to hold any posture (computed
-    # from the URDF masses, 0.68 kg of arm), but the URDF also declares 1.0 Nm of joint
-    # friction, so the placeholder effort="1" cannot overcome its own friction and the arm
-    # moved 2-46 percent of a 0.2 rad command. At 3.0 Nm every joint tracks within 0.013 rad
-    # and the runtime validation passes. Replace this with the arm's real motor when known.
-    arm = {'joint%d' % i: {'preset': 'xm430_w210'} for i in range(1, 7)}
+    # The arm's motor is not named in the package, but it is written in the velocity field: the
+    # arm joints declare velocity="4.8" and the wheels 8.063, which are 46 and 77 rev/min - the
+    # no-load speeds of the XM430-W350 and the XM430-W210 the description names in a comment for
+    # the wheels. Arm mass 0.683 kg and reach 0.353 m match OpenManipulator-X (0.70 kg, 380 mm),
+    # whose official actuator is the XM430-W350. Its placeholder effort="1" cannot even overcome
+    # the URDF's own 1.0 Nm of joint friction (each joint moved 2-46 percent of a 0.2 rad command
+    # before this change), while the arm needs at most 0.55 Nm to hold any posture.
+    arm = {'joint%d' % i: {'preset': 'xm430_w350'} for i in range(1, 7)}
     wheels = {"wheel_left_joint": {"preset": "xm430_w210"},
               "wheel_right_joint": {"preset": "xm430_w210"}, **arm}
     (args.out.parent / "actuators.json").write_text(

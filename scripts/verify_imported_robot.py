@@ -105,10 +105,10 @@ def main():
             swing_point, swing_rotation = env.arm_kinematics(side).evaluate(swing)[:2]
             swing_rows = {}
             for label, scale in (('scaled', True), ('unscaled', False)):
-                result = executor.controller.move_to_site(side, swing_point, swing_rotation, duration=2., scale_speed=scale)
+                swing_result = executor.controller.move_to_site(side, swing_point, swing_rotation, duration=2., scale_speed=scale)
                 reached = float(np.linalg.norm(np.asarray(env.ee_pose(side)[0]) - np.asarray(swing_point)))
-                swing_rows[label] = {'success': bool(result.success), 'error': result.error, 'reached_m': reached}
-                print('large travel %s: success=%s error=%s reached=%.4f' % (label, result.success, result.error, reached), flush=True)
+                swing_rows[label] = {'success': bool(swing_result.success), 'error': swing_result.error, 'reached_m': reached}
+                print('large travel %s: success=%s error=%s reached=%.4f' % (label, swing_result.success, swing_result.error, reached), flush=True)
                 executor.controller.move_to_site(side, np.asarray(actual), rotation, duration=2., scale_speed=False)
             result['large_travel'] = swing_rows
             if not any(row['reached_m'] < .01 for row in swing_rows.values()):
