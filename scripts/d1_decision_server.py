@@ -67,13 +67,25 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "invalid json"})
             return
         state, questions = request.get("state"), request.get("questions")
+        images = request.get("images") or []
         if not isinstance(state, str) or not isinstance(questions, dict) or not questions:
             self._send(400, {"error": "state (str) and questions (dict) are required"})
             return
+        if not isinstance(images, list):
+            self._send(400, {"error": "images must be a list of base64 PNG/JPEG strings"})
+            return
         started = time.time()
         try:
+            # The decision model takes the image itself as part of the state: "is the red cube left of the
+            # blue one" is a question about the frame, not about a numeric world state.
+            decoded = None
+            if images:
+                import base64
+                import io
+                from PIL import Image
+                decoded = [Image.open(io.BytesIO(base64.b64decode(item))).convert("RGB") for item in images]
             with _lock:  # one forward pass at a time: the model is shared and the host is shared
-                answer = model().system_one(state, questions)
+                answer = model().system_one(state, questions, images=decoded)
         except Exception as error:  # a bad question must not take the server down
             self._send(500, {"error": f"{type(error).__name__}: {str(error)[:300]}"})
             return

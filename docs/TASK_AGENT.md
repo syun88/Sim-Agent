@@ -199,3 +199,15 @@ uv run python scripts/verify_language_challenge.py --suite holdout --json output
 - `POST /api/diagnostics/pinch?object=red_cube&observer=true`: viewer プロセスの**中で**把持→持上げを実行し、
   判定ではなく数値を返す（`gripper_position`・`pinch_established`・パッドのリンク・生の接触）。
   API プロセスからは Genesis 世界に触れないため、この経路が無いと「アプリの世界が違うのか、経路が違うのか」を分離できない。
+
+## 判定モデルの画像入力（実測 2026-10-27）
+
+`d1-omni-600M` は画像を状態の一部として受け取れる（`scripts/d1_decision_server.py` の `images` に base64 PNG/JPEG）。
+CPU で1リクエスト 0.8 秒。合成画像での実測:
+
+- 「いくつ写っているか」= **two (0.97)** ✓ 内容は読めている
+- 「赤は左か」= 左右を入れ替えても**答えが反転しない** ✗（choice/noul どちらも）
+  合成画像（平坦な矩形）が学習分布から遠い可能性が高い
+
+⇒ 画像を **system1 の入力にできる** ✓ が、**空間関係の質問は実写/レンダ画像とラベル付き検証を通すまで信頼しない** ✗。
+Genesis で RGB-D をレンダし、真値をラベルにして「遮蔽・積み重なり・左右」の質問を校正するのが次の段階。
