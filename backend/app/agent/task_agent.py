@@ -205,7 +205,13 @@ class TaskAgent:
             certificate=reset_evidence(observed,source)
             # Measured failures can be answered with a different plan; only when they carry numbers, so the
             # agent can still run out of options.
-            if not replan_used and 'design' in str(failed.get('detail') or ''):
+            # Replanning is offered when the failure carries something a different plan could use: a design, or
+            # measurements plus the levers that produced them (a throw that reports which lever would help).
+            # Conditional, not unconditional: the agent must still be able to run out of options.
+            evidence = failed.get('evidence') or {}
+            carries_measurements = ('design' in str(failed.get('detail') or '')
+                                    or bool(evidence.get('levers')) or bool(evidence.get('unreachable_by_m')))
+            if not replan_used and carries_measurements:
                 legal.append('replan')
             if not legal and certificate and reset_allowed and resets<self.max_resets:
                 legal.append('reset_and_retry')
