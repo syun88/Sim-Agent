@@ -597,14 +597,25 @@ class ImportedRobotSkills(SkillRunner):
             if error.category not in ('GRASP_LOST', 'GRASP_SLIP'):
                 raise
             first = {'error': error.category, 'detail': str(error)[:200]}
-        self.controller.wait_gripper(arm, False, .4)
-        self._approach(arm, obj)
-        try:
-            self._close_pinch(arm, obj)
-            result = self._lift_once(arm, obj, height)
-            return {**result, 'lift_retry': first}
-        except SkillError as error:
-            raise SkillError(error.category, f'{error} (after a re-grasp following {first["error"]})') from None
+        attempts = []
+        # A bias sweep on this gripper measured which grasps hold: 0 and +6 mm along the object's z both
+        # held, -6 mm did not. So the retries walk from the measured-good bias towards the plain one rather
+        # than repeating the placement that just failed.
+        for bias in ([0., 0., .006], [0., 0., .004], [0., 0., 0.]):
+            self.controller.wait_gripper(arm, False, .4)
+            try:
+                self._approach(arm, obj)
+                self._close_pinch(arm, obj, grasp_bias=np.asarray(bias))
+                result = self._lift_once(arm, obj, height)
+                return {**result, 'lift_retry': {**first, 'bias': bias, 'attempts': attempts}}
+            except SkillError as error:
+                if error.category not in ('GRASP_LOST', 'GRASP_SLIP', 'GRASP_FAILED', 'IK_FAILURE',
+                                          'COLLISION_PATH'):
+                    raise
+                attempts.append({'bias': bias, 'error': error.category})
+        raise SkillError(attempts[-1]['error'] if attempts else 'GRASP_LOST',
+                         f'No holding grasp after {len(attempts)} re-grasps following {first["error"]}: '
+                         f'{attempts}') from None
 
     def _lift_once(self, arm, obj, height=None):
         def run():
