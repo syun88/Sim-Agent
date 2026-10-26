@@ -114,6 +114,11 @@ def vessel_xml(name: str, fixed: bool) -> str:
 
 
 class WineWorld:
+    #: Defaults are the official cell's constants, as class attributes so an instance built without __init__ (tests do
+    #: this to exercise the volume arithmetic) still has them.
+    bottle_start = BOTTLE_START
+    glass_start = GLASS_START
+
     def __init__(self, scene, gs, *, fixed_bottle=False, async_surface=True,
                  bottle_position=None, glass_position=None):
         # The vessel positions are the official cell's constants by default. An imported arm has its own table height
