@@ -578,6 +578,35 @@ class ImportedRobotSkills(SkillRunner):
                    on_sample=lambda: self._require_hold(arm, obj))
 
     def lift_object(self, arm, obj, height=None):
+        started = time.perf_counter()
+        return self._skill('lift_object', lambda: self._lift_with_retry(arm, obj, height), started)
+
+    def _lift_with_retry(self, arm, obj, height=None):
+        """Lift; if the hold is lost, grasp again once and retry.
+
+        The pinch on this arm is *nearly* stable and occasionally not: measured 2026-10-27, the same
+        cube at the same pose lifted after 200, 1000 and 8000 settle steps and lost the hold at 3000, with
+        the jaws closing a further 0.008 of stroke - the cube leaves during the lift itself. Nothing in the
+        plan, the env parameters or the concurrency reproduces it deterministically, so the honest answer is
+        a retry on physical evidence rather than a search for determinism: re-approach, close with a small
+        bias towards the object (0 and +6 mm both held in a bias sweep, -6 mm did not), and lift again.
+        """
+        try:
+            return self._lift_once(arm, obj, height)
+        except SkillError as error:
+            if error.category not in ('GRASP_LOST', 'GRASP_SLIP'):
+                raise
+            first = {'error': error.category, 'detail': str(error)[:200]}
+        self.controller.wait_gripper(arm, False, .4)
+        self._approach(arm, obj)
+        try:
+            self._close_pinch(arm, obj)
+            result = self._lift_once(arm, obj, height)
+            return {**result, 'lift_retry': first}
+        except SkillError as error:
+            raise SkillError(error.category, f'{error} (after a re-grasp following {first["error"]})') from None
+
+    def _lift_once(self, arm, obj, height=None):
         def run():
             self._require_hold(arm,obj)
             bottom = float(self.env.object_bounds(obj)[0,2])
@@ -593,7 +622,9 @@ class ImportedRobotSkills(SkillRunner):
                 raise SkillError('GRASP_SLIP','Transport lift did not reach its clearance')
             return {**result,'requested_rise_m':rise,'bottom_height_m':actual,
                     'minimum_bottom_height_m':minimum,'automatic_clearance':height is None}
-        return self._skill('lift_object',run,time.perf_counter())
+        # Raise, do not wrap: the retrying caller above is the one that owns success/failure reporting, and
+        # _skill() here would swallow the GRASP_LOST that triggers the retry.
+        return run()
 
     def _move_relative(self, arm, delta):
         start,rotation = self.env.ee_pose(arm)
