@@ -260,3 +260,10 @@ OPENARM_DECISION_URL=http://127.0.0.1:11435 ./run_genesis_gui.sh --headless
 既定の判定モデルは `LiquidAI/d1-3B`（`OPENARM_DECISION_MODEL` で変更可）、`scripts/serve_models.sh` は
 bf16 の 5GB に合わせて `MemoryMax=12G`。**3件/2件という標本の小ささ**は明記しておく: 状況の**説明**には使えるが、
 それを唯一の根拠に行動は決めない。
+
+### 関係を「文章」で渡すと score が上がる（2026-10-27）
+
+`fact_packet` に **`statements`**（導出した関係の短文: 「blue_cube is above red_cube」）を足し、判定モデルには
+**言語の照合**だけをさせる形にした。同じ12ケースで `outcome_achieved` は **7/12 → 9/12**。
+残る外しは「積み」「右」で、**座標推論を要求しない形にしても空間関係は苦手**という結果は変わらない。
+したがって `trusted` は据え置き（`next_step_blocked` 3/3・`reference_ambiguous` 2/2 のみ）。

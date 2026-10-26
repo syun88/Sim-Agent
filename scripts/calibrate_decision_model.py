@@ -124,6 +124,9 @@ def main():
             text = f"Instruction: {instruction}. Observed situation: {description}."
             question = {name: {key: value for key, value in QUESTIONS[name].items() if key != "why"}}
             payload = {"facts": packet, "instruction": instruction, "situation": description}
+            # Give the derived relations as sentences: the model then matches language, not geometry - the
+            # thing it was measured to be good at for situation and ambiguity questions.
+            payload["what_is_true"] = packet.get("statements") or []
             answers = (inline.ask(payload, question) if inline is not None
                        else ask(args.url, payload, question))
             answer = answers.get(name) or {}

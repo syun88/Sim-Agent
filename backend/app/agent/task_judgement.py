@@ -25,10 +25,10 @@ QUESTIONS = {
         "type": "noul",
         "instructions": "Has the instruction's requested outcome been achieved, according to these facts?",
         "why": "Interpreting the instruction against observed end state is a language judgement, not geometry.",
-        # Twelve labelled outcomes with d1-3B: 7/12, and every miss is spatial - "stacked", "left of",
-        # "right of", and a held-versus-placed confusion. Those facts are derived from the state anyway, so
-        # this question is both unreliable and redundant. Records only.
-        "trusted": False, "measured": "d1-3B 7/12 with all misses spatial, omni-600M 3/6 (2026-10-27)",
+        # Twelve labelled outcomes with d1-3B. Bare coordinates: 7/12, every miss spatial. With the derived
+        # relations supplied as sentences ("blue_cube is above red_cube"), 9/12 - still missing "stacked",
+        # "right of", and one held-versus-placed case. Better, not enough: records only.
+        "trusted": False, "measured": "d1-3B 9/12 given derived statements (7/12 without), omni-600M 3/6",
     },
     "next_step_blocked": {
         "type": "choice",
@@ -92,6 +92,27 @@ def relations(objects: list[dict], pair_distance: float = .12) -> list[dict]:
     return derived
 
 
+#: Words that turn a derived relation into a sentence. The decision model is asked to match language against
+#: these, never to reason about coordinates - measured 2026-10-27, it answers spatial questions unreliably
+#: (7/12, with every miss spatial) while answering situation questions 3/3 and ambiguity 2/2.
+_RELATION_PHRASES = {
+    "left_of": "to the left of", "right_of": "to the right of", "front_of": "in front of",
+    "behind": "behind", "above": "above", "below": "below", "near": "next to",
+}
+
+
+def summarise_relations(derived: list[dict], limit: int = 12) -> list[str]:
+    """Turn derived relations into short statements a language model can match against an instruction."""
+    lines = []
+    for row in derived[:limit]:
+        phrases = [_RELATION_PHRASES.get(name, name) for name in row["relation"]]
+        if not phrases:
+            continue
+        joined = phrases[0] if len(phrases) == 1 else ", ".join(phrases[:-1]) + " and " + phrases[-1]
+        lines.append(f"{row['object']} is {joined} {row['reference']}")
+    return lines
+
+
 def fact_packet(state: dict, *, pair_distance: float = .12) -> dict:
     """The compact, pre-computed description a decision model is given instead of a world state."""
     objects = [{k: obj.get(k) for k in ("id", "type", "color", "graspable", "held_by")}
@@ -101,10 +122,12 @@ def fact_packet(state: dict, *, pair_distance: float = .12) -> dict:
         obj["position"] = [round(float(v), 3) for v in position[:3]] if position else None
         obj["touching"] = sorted(source.get("touching") or [])
     robot = state.get("robot") or {}
+    derived = relations(objects, pair_distance)
     packet = {
         "hands": {side: (robot.get(f"{side}_arm") or {}).get("held_object") for side in ("left", "right")},
         "objects": objects,
-        "relations": relations(objects, pair_distance),
+        "relations": derived,
+        "statements": summarise_relations(derived),
         "capabilities": sorted((state.get("capabilities") or {}).get("skills") or []),
         "navigation": bool((state.get("capabilities") or {}).get("navigation")),
         "derived_by": "engine state; no model call was spent on these",
