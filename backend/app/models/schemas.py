@@ -36,6 +36,8 @@ class PlanStep(BaseModel):
     volume_ml: float | None = Field(default=None, ge=5, le=35)
     stroke_cm: float | None = Field(default=None, ge=2, le=30)
     release_speed_m_s: float | None = Field(default=None, ge=.2, le=3.)
+    flight_time_s: float | None = Field(default=None, ge=.10, le=1.0)
+    back_off_cm: float | None = Field(default=None, ge=0., le=20.)
     joint: str | None = None
     position_deg: float | None = Field(default=None, allow_inf_nan=False)
     target_xy: list[float] | None = Field(default=None, min_length=2, max_length=2)

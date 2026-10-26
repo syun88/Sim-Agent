@@ -38,6 +38,11 @@ class TaskAction(BaseModel):
     # flight, so a weak design cannot be reported as a successful throw.
     stroke_cm: float | None = Field(default=None, ge=2, le=30)
     release_speed_m_s: float | None = Field(default=None, ge=.2, le=3.)
+    # The aim and the room to make it: how long the flight takes (a shorter time needs a flatter, faster
+    # throw, a longer one a higher arc) and how far to back the arm off before the stroke. Both are the
+    # agent's to choose when a throw reports it could not get the stroke it needed.
+    flight_time_s: float | None = Field(default=None, ge=.10, le=1.0)
+    back_off_cm: float | None = Field(default=None, ge=0., le=20.)
     joint: str | None = None
     position_deg: float | None = Field(default=None, allow_inf_nan=False)
 
@@ -408,7 +413,8 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
                 if aim not in objects:
                     raise GroundingError(f"The throw target {aim} is not in this scene")
             emit("throw_object", arm, index, object=obj, height_cm=action.height_cm,
-                 stroke_cm=action.stroke_cm, release_speed_m_s=action.release_speed_m_s, target=aim)
+                 stroke_cm=action.stroke_cm, release_speed_m_s=action.release_speed_m_s, target=aim,
+                 flight_time_s=action.flight_time_s, back_off_cm=action.back_off_cm)
             held[arm] = None
             checks.pop(obj, None)
             if aim is None:

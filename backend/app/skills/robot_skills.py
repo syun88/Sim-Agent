@@ -728,7 +728,8 @@ class SkillRunner:
 
     def throw_object(self, arm: str, obj: str, height_cm: float = 3.,
                      stroke_cm: float | None = None, release_speed_m_s: float | None = None,
-                     target: str | None = None) -> dict:
+                     target: str | None = None, flight_time_s: float | None = None,
+                     back_off_cm: float | None = None) -> dict:
         from backend.app.skills.dynamic_skills import throw_up
         # An aimed throw names its target; the skill needs the point, and it reads it from the engine
         # rather than from the language.
@@ -736,7 +737,9 @@ class SkillRunner:
         return self._skill("throw_object", lambda: throw_up(self, arm, obj, height_cm,
                                                            stroke_cm=stroke_cm,
                                                            release_speed_m_s=release_speed_m_s,
-                                                           target_point=point),
+                                                           target_point=point,
+                                                           flight_time_s=flight_time_s or .30,
+                                                           back_off_cm=back_off_cm),
                            time.perf_counter())
 
     def pour_liquid(self, arm: str, obj: str, target: str, volume_ml: float) -> dict:
@@ -787,7 +790,9 @@ class SkillRunner:
                 result = self.throw_object(arm, step["object"], float(step.get("height_cm") or 3.),
                                            stroke_cm=step.get("stroke_cm"),
                                            release_speed_m_s=step.get("release_speed_m_s"),
-                                           target=step.get("target"))
+                                           target=step.get("target"),
+                                           flight_time_s=step.get("flight_time_s"),
+                                           back_off_cm=step.get("back_off_cm"))
             elif skill == "pour_liquid":
                 result = self.pour_liquid(arm, step["object"], step.get("target") or "wine_glass", float(step.get("volume_ml") or 20.))
             elif skill == "navigate_to":

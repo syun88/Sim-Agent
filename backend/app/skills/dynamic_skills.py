@@ -101,7 +101,7 @@ def launch_ready(runner, arm, obj, windup, attitude, stroke=.14):
 
 def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
              stroke_cm: float | None = None, release_speed_m_s: float | None = None,
-             target_point=None, flight_time_s: float = .30) -> dict:
+             target_point=None, flight_time_s: float = .30, back_off_cm: float | None = None) -> dict:
     """Throw upward. The *design* is computed; the *measurement* is the engine's.
 
     Three things determine whether a pinch throw leaves the hand at all, and all three are physics rather
@@ -198,7 +198,7 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
             break
         if windup is not None:
             break
-        if stroke == strokes[0] and back_off(.06):
+        if stroke == strokes[0] and back_off((back_off_cm / 100.) if back_off_cm else .06):
             # Retry the longest stroke once from the new standoff; the search is unchanged.
             for candidate, label, candidate_mode in windup_candidates(runner, arm, obj, stroke=stroke):
                 attitude = _attitude_in_use(runner, arm)
@@ -253,7 +253,17 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
                                    launch_rotation, model=env.model, q_init=start,
                                    snapshot=env.joint_snapshot())
     if not planned['success']:
-        raise SkillError("IK_FAILURE", f"Launch stroke is unreachable ({planned['position_error']:.4f})")
+        # Say what was short and which levers exist, so the planner can choose instead of guessing. Measured
+        # 2026-10-27: the aimed stroke from the cube nearest the base was 24 mm out of reach, and backing off
+        # 6 cm did not recover it - the same measurements a replan needs.
+        error = SkillError("IK_FAILURE", f"Launch stroke is unreachable ({planned['position_error']:.4f}) "
+                          f"at flight_time_s={flight_time_s:.2f}, stroke_cm={stroke * 100:.0f}")
+        error.evidence = {"unreachable_by_m": round(float(planned['position_error']), 4),
+                          "levers": {"flight_time_s": "0.10-1.00, shorter is flatter and faster",
+                                     "back_off_cm": "0-20, more room before the stroke",
+                                     "stroke_cm": "2-30", "release_speed_m_s": "0.2-3.0"},
+                          "aim_direction": np.round(direction, 3).tolist()}
+        raise error
     end = env.model.nearest_continuous(env.profile['chains'][arm]['joints'], planned['q_rad'], start)
     if mode == "strict":
         control.target_rotations[arm] = rotation.copy()
