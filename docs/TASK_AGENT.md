@@ -357,3 +357,12 @@ fluid       SPH / 8 particles / 51.2 mL / glass 0 / spilled 0
 - **d1 の居場所は遅いループ** ✓: 事象の**後**に「何が起きたか／どう解釈するか／合法な復旧はどれか」を型付きで答える
   （復旧選択は 3/3 ✓・曖昧さ 2/2 ✓ と実測済み）。判断は**非同期・advisory**で、制御ループには入れない。
 - 三層の分担: **engine 閾値（~ms）→ d1（~2-4 s、事象ごと）→ qwen（計画、~2 s/プラン）**。
+
+### UR5e で注ぐ場合の現状（2026-10-27 実測）
+
+- wine シーンは UR5e でも**構築可能**だが、入口のゲートが止める:
+  `grippers=True grasp_calibrated=False`（＝物理ピンチ未検証）。
+- UR5e の把持を cubes シーンで試すと **`COLLISION_PATH`（corridor）** で失敗し、校正は付かない
+  （既知の `forearm_link ↔ desk` 系の経路問題）。
+- したがって順序は: ①UR5e の接近経路を通す（`COLLISION_PATH` の内訳を読む）→ ②把持成功で `grasp_calibrated` が付く
+  → ③wine シーンが許可され、ボトルは既に可達域配置。流体側は準備済み。
