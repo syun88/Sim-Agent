@@ -247,3 +247,42 @@ def test_a_partial_runtime_declaration_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
     with pytest.raises(ValueError, match='every collidable adjacent pair'):
         registry.import_robot(source.parent.parent)
+
+
+def lime_source_robot(tmp_path):
+    """The Lime's shape: a wheeled base carrying the 6-joint arm the profile shows."""
+    root = tmp_path / 'source' / 'genesis'
+    root.mkdir(parents=True)
+    text = """<robot name="turtlebot3_lime">
+    <link name="base_footprint"/><link name="base_link"/>
+    <link name="wheel_left_link"/><link name="wheel_right_link"/><link name="link1"/>
+    <joint name="base_joint" type="fixed"><parent link="base_footprint"/><child link="base_link"/><origin xyz="0 0 .01"/></joint>
+    <joint name="wheel_left_joint" type="continuous"><parent link="base_link"/><child link="wheel_left_link"/><origin xyz="0 .1 0"/><axis xyz="0 1 0"/><limit effort="1" velocity="10"/></joint>
+    <joint name="wheel_right_joint" type="continuous"><parent link="base_link"/><child link="wheel_right_link"/><origin xyz="0 -.1 0"/><axis xyz="0 1 0"/><limit effort="1" velocity="10"/></joint>
+    <joint name="arm_mount_joint" type="fixed"><parent link="base_link"/><child link="link1"/><origin xyz=".08 0 .12"/></joint>""" + "".join(
+        f'<link name="link{n + 1}"/><joint name="joint{n}" type="revolute">'
+        f'<parent link="link{n}"/><child link="link{n + 1}"/><origin xyz="0 0 .1"/>'
+        f'<axis xyz="0 1 0"/><limit lower="-1.5" upper="1.5" effort="3" velocity="1"/></joint>'
+        for n in range(1, 7)) + """</robot>"""
+    path = root / 'robot.urdf'
+    path.write_text(text)
+    return path
+
+
+def test_a_wheeled_base_keeps_the_arm_chain_and_leaves_the_wheels_out(tmp_path, monkeypatch):
+    """Measured on the real description: chains['left'] is joint1..joint6, wheels apart.
+
+    The Lime is a wheeled base carrying a 6-joint arm, so an import that folded a wheel
+    joint into the arm chain would drive the base while reaching, and one that lost the
+    chain would leave the arm unusable.
+    """
+    source = lime_source_robot(tmp_path)
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    profile = registry.import_robot(source.parent.parent)
+    assert profile['root_link'] == 'base_footprint'
+    assert profile['chains']['left']['joints'] == ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
+    every_chain_joint = [j for chain in profile['chains'].values() for j in chain['joints']]
+    assert not [j for j in every_chain_joint if 'wheel' in j]
+    directory = Path(profile['directory'])
+    assert json.loads((directory / 'scene.json').read_text())['openarm_cell'] is False
+    assert profile['id'] in [r['id'] for r in registry.available_robots()]
