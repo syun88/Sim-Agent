@@ -376,6 +376,10 @@ class ImportedRobotSkills(SkillRunner):
         snapshot = self.env.joint_snapshot()
         names = self.env.profile['chains'][arm]['joints']
         rotations = self._approach_rotations(arm, before, snapshot)
+        rejected = {}
+
+        def note(reason):
+            rejected[reason] = rejected.get(reason, 0) + 1
         # Gravity margin orders the candidates; it does not veto them. A
         # collision-free seed whose holding torque exceeds the margin is
         # remembered and planned only when no in-margin seed yields a
@@ -392,18 +396,26 @@ class ImportedRobotSkills(SkillRunner):
                 goal = solve_profile_ik(self.env.profile,arm,before,rotation,model=self.env.model,q_init=guess,snapshot=snapshot,
                                         joint_limits=(self.env.ik_joint_limits(arm) if hasattr(self.env, 'ik_joint_limits') else None
                                                       ))
-                if not goal['success']:continue
+                if not goal['success']:
+                    note('ik_no_goal')
+                    continue
                 seed = self.env.model.nearest_continuous(names,goal['q_rad'],self.env.arm_qpos(arm))
-                if not self.env.collision_queries.clear({**snapshot,**dict(zip(names,seed))}):continue
+                if not self.env.collision_queries.clear({**snapshot,**dict(zip(names,seed))}):
+                    note('seed_in_collision')
+                    continue
                 margin = self._gravity_margin(arm, seed, snapshot)
                 if margin is not None and margin['over_limit']:
                     over_limit.append((margin['worst_ratio'], rotation, seed))
                     continue
                 closure = self.controller.plan_closure(arm,before,rotation,seed)
-                if closure is None:continue
+                if closure is None:
+                    note('closure_none')
+                    continue
                 planned = self._plan_corridor(arm, rotation, closure[0]['arm_q'], closure,
                                               insertion, standoff, snapshot, names, seed_key)
-                if planned is None:continue
+                if planned is None:
+                    note('corridor_none')
+                    continue
                 reverse_seeds, high = planned
                 chosen_gravity = self._path_gravity(arm, reverse_seeds, closure, snapshot, margin)
                 break
@@ -424,7 +436,12 @@ class ImportedRobotSkills(SkillRunner):
                                                     self._gravity_margin(arm, seed, snapshot))
                 break
         if reverse_seeds is None:
-            raise SkillError('COLLISION_PATH','No grasp posture has a continuous collision-free approach corridor')
+            error = SkillError('COLLISION_PATH',
+                'No grasp posture has a continuous collision-free approach corridor; rejections: '
+                f'{rejected}')
+            error.evidence = {'rejections': rejected, 'rotations_tried': len(rotations),
+                              'guesses': len(guesses)}
+            raise error
         # The frame that planned the corridor is the frame this arm pinches with from now on.
         self._pinch_frames = {**getattr(self, '_pinch_frames', {}), arm: np.asarray(rotation)}
         self._move(arm, high, rotation=rotation, q_init=reverse_seeds[-1], progress=progress)
