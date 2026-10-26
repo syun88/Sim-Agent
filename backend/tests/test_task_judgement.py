@@ -56,3 +56,21 @@ def test_a_spatial_question_is_detected_when_someone_adds_one():
 
 def test_relations_ignore_objects_without_positions():
     assert relations([{"id": "a"}, {"id": "b", "position": [0, 0, 0]}]) == []
+
+
+def test_a_question_records_whether_it_was_measured_trustworthy():
+    """Calibrated 2026-10-27 with omni-600M: every question in this table scored at or below chance, so none of
+    them may influence a plan until a bigger model is measured on the same labels."""
+    for name, spec in QUESTIONS.items():
+        assert "trusted" in spec, f"{name} does not say whether it is trusted"
+        assert "measured" in spec, f"{name} does not record the measurement"
+        assert spec["trusted"] is False, f"{name} claims trust without a measurement behind it"
+
+
+def test_the_calibration_script_exists_and_uses_the_labels_the_state_gives():
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[2] / "scripts" / "calibrate_decision_model.py"
+    text = script.read_text()
+    assert "OUTCOME_CASES" in text and "BLOCK_CASES" in text
+    assert "fact_packet" in text, "calibration must ask over the same packet the app sends"

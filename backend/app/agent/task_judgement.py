@@ -25,6 +25,8 @@ QUESTIONS = {
         "type": "noul",
         "instructions": "Has the instruction's requested outcome been achieved, according to these facts?",
         "why": "Interpreting the instruction against observed end state is a language judgement, not geometry.",
+        # Measured 2026-10-27 with omni-600M on six labelled outcomes: 3 of 6, i.e. chance. Records only.
+        "trusted": False, "measured": "3/6 (2026-10-27, omni-600M, chance level)",
     },
     "next_step_blocked": {
         "type": "choice",
@@ -36,11 +38,13 @@ QUESTIONS = {
             "not_observed": "the referenced object is not in the scene",
         },
         "why": "Choosing among named causes from a described situation is a typed decision.",
+        "trusted": False, "measured": "2/3 (2026-10-27, omni-600M); too few cases to trust, and one miss",
     },
     "reference_ambiguous": {
         "type": "noul",
         "instructions": "Do the facts leave it genuinely unclear which object the instruction means?",
         "why": "Ambiguity is about what the words admit, not about where things are.",
+        "trusted": False, "measured": "0/2 (2026-10-27, omni-600M; wrong in both directions)",
     },
 }
 
