@@ -77,3 +77,83 @@ def test_continuous_angle_uses_nearest_turn_without_changing_fractional_mimics(t
     source.write_text(source.read_text().replace('multiplier="1"','multiplier=".5"'))
     model=URDFModel(source)
     np.testing.assert_allclose(model.nearest_continuous(['axis'],[2*np.pi+.1],[0.]),[2*np.pi+.1])
+
+
+class _ScriptedKinematics:
+    """Polar two-joint arm: joint a is a radius, joint b an angle.
+
+    The tool point is ``a * (cos b, sin b)`` and the tool attitude is the
+    z rotation by b, so one Cartesian target has two branches - (a, b) and
+    (-a, b + pi) - whose joint-space midpoint collapses toward the origin,
+    exactly how a real branch jump breaks a follow check.
+    """
+
+    def evaluate(self, q):
+        from scipy.spatial.transform import Rotation
+        point = np.array([q[0] * np.cos(q[1]), q[0] * np.sin(q[1]), 0.])
+        return point, Rotation.from_euler('z', q[1]).as_matrix(), None, None
+
+
+class _AlwaysClear:
+    def clear(self, snapshot):
+        return True
+
+
+class ScriptedClosureEnv:
+    """Two-joint arm whose IK is scripted, for closure follow checks.
+
+    The gripper sweep moves the centre target along +x by 10 mm over
+    closure, so a target x of ``-.01 * jaw`` identifies the jaw value each
+    solve belongs to, and the scripted IK returns the exact configuration
+    for it - with whatever attitude law the test picks.
+    """
+
+    def __init__(self):
+        self.profile = {'chains': {'left': {'joints': ['a', 'b']}}}
+        self.grippers = {'left': {'joint': 'jaw', 'followers': {}, 'open_q': 0., 'closed_q': 1.,
+            'pad_region': {'normal': [1., 0., 0.]},
+            'sweep': [{'q': 0., 'face_a': -.01, 'face_b': .01},
+                      {'q': 1., 'face_a': 0., 'face_b': .02}]}}
+        self.collision_queries = _AlwaysClear()
+        self._gripper_force_holds = set()
+
+    def joint_snapshot(self):
+        return {}
+
+    def arm_kinematics(self, side):
+        return _ScriptedKinematics()
+
+
+def _scripted_controller(flip):
+    env = ScriptedClosureEnv()
+    controller = ImportedRobotController(env, configure_motors=False)
+
+    def solve(side, target_position, target_rotation=None, q_init=None, snapshot=None,
+              minimum_clearance=.0001, **kwargs):
+        x = float(np.asarray(target_position, dtype=float)[0])
+        jaw = -x / .01
+        phi = .02 * jaw + (np.pi if flip and jaw < .5 else 0.)
+        return np.array([x / np.cos(phi), phi]), 0., 0.
+
+    controller.solve_ik = solve
+    return controller
+
+
+def test_closure_follow_allows_a_continuous_sweep_with_endpoint_attitude_residual():
+    # The endpoints sit up to 0.020 rad off the planned frame - inside the IK
+    # solver's own acceptance for an arm that cannot hold a six-constraint
+    # frame exactly - and the attitude drifts linearly between them. The
+    # sweep is continuous, so it must plan (49 samples); judging the
+    # interpolated attitude against the frame instead of the endpoint
+    # segment rejected exactly this case on LeKiwi.
+    controller = _scripted_controller(flip=False)
+    samples = controller.plan_closure('left', np.zeros(3), np.eye(3), np.zeros(2))
+    assert samples is not None and len(samples) == 49
+
+
+def test_closure_follow_rejects_an_attitude_branch_jump():
+    # Same sweep, but past halfway the IK returns the other polar branch:
+    # the endpoints still reach the target, yet the joint-space midpoint
+    # leaves the planned segment and the closure must not plan.
+    controller = _scripted_controller(flip=True)
+    assert controller.plan_closure('left', np.zeros(3), np.eye(3), np.zeros(2)) is None

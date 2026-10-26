@@ -1,10 +1,22 @@
 """Motor-driven manipulation using gripper frames inferred from URDF geometry."""
+import copy
 import time
+from contextlib import contextmanager
+
 import numpy as np
 
 from backend.app.execution.task_executor import TaskExecutor
 from backend.app.skills.robot_skills import SkillRunner, SkillError
 from backend.app.control.motion import OpenArmV2Controller
+from backend.app.robots.gravity import GRAVITY_TORQUE_RATIO_LIMIT, gravity_report
+
+
+#: How many candidate placements the relocation search evaluates (in
+#: preference order) while collecting placements with a collision-free
+#: grasp seed. Evaluation is planning-only; at most three of the collected
+#: placements are actually driven to. The bound keeps a hopeless search
+#: from enumerating the whole grid after a failed approach.
+_PLACEMENT_EVALUATION_BUDGET = 64
 
 
 class ImportedRobotController(OpenArmV2Controller):
@@ -14,7 +26,7 @@ class ImportedRobotController(OpenArmV2Controller):
         self._approach_seeds = {}
 
     def solve_ik(self, side, target_position, target_rotation=None, q_init=None, max_iterations=500,
-                 snapshot=None, minimum_clearance=.0001,path_start=None,require_direct=False,relaxed=None):
+                 snapshot=None, minimum_clearance=.0001,path_start=None,require_direct=False):
         from backend.app.robots.urdf import solve_profile_ik
         snapshot = self.env.joint_snapshot() if snapshot is None else snapshot
         names = self.env.profile['chains'][side]['joints']
@@ -46,21 +58,13 @@ class ImportedRobotController(OpenArmV2Controller):
                 return None, error, error
             result = solve_profile_ik(self.env.profile, side, target_position, target_rotation,
                 model=self.env.model, q_init=seed, snapshot=snapshot,joint_limits=limits)
-            # A transit waypoint only has to be collision-free and close: the caller asks for a looser
-            # acceptance where the arm is allowed to reorient, and keeps the solver's own thresholds
-            # for the grasp pose itself. Measured 2026-10-24 on UR5e + 2F-85: one insertion waypoint
-            # 27.5 mm behind the object is reachable in position (error 0.00000) but misses the inferred
-            # frame by about 1.7 degrees, which the strict acceptance refuses.
-            solved = result['success'] or (relaxed is not None
-                                           and result['position_error'] <= relaxed
-                                           and result['rotation_error'] <= relaxed)
             error = min(error, result['position_error']+result['rotation_error']*.2)
             q = self.env.model.nearest_continuous(names,result['q_rad'],start)
             if continuation and np.max(abs(q-start)/self.env.arm_velocity_limits(side))>.75:
                 continue
             tolerance = -minimum_clearance if minimum_clearance else .0002
-            collisions = self.env.collision_queries.contacts({**snapshot, **dict(zip(names, q))},tolerance=tolerance) if solved else []
-            if (solved and collisions
+            collisions = self.env.collision_queries.contacts({**snapshot, **dict(zip(names, q))},tolerance=tolerance) if result['success'] else []
+            if (result['success'] and collisions
                     and max(c['penetration_m'] for c in collisions)<.003 and target_rotation is not None):
                 adjusted = self.env.collision_queries.refine_pose(self.env.profile, side,
                     np.asarray(target_position), target_rotation, q, snapshot,minimum_clearance=minimum_clearance)
@@ -71,7 +75,7 @@ class ImportedRobotController(OpenArmV2Controller):
                     from backend.app.simulation.transform import orientation_error
                     result['position_error'] = float(np.linalg.norm(point-target_position))
                     result['rotation_error'] = float(np.linalg.norm(orientation_error(attitude,target_rotation)))
-            if solved and not collisions:
+            if result['success'] and not collisions:
                 if self.env.collision_queries.edge_clear(names, edge_start, q, snapshot,minimum_clearance=minimum_clearance):
                     self._ik_seeds[side] = [q.copy(), *self._ik_seeds.get(side, [])][:6]
                     return q, result['position_error'], result['rotation_error']
@@ -91,14 +95,6 @@ class ImportedRobotController(OpenArmV2Controller):
             gap_rows=sorted(rows,key=lambda row:row['gap'])
             closed_q=float(np.interp(minimum_gap,[r['gap'] for r in gap_rows],[r['q'] for r in gap_rows]))
         normal = np.array(g['pad_region']['normal'])
-        # Keeping the pads on the object's face while the jaws close only means anything to within a
-        # fraction of that face, so the tolerances scale with the object: the nominal 52 mm cube keeps
-        # the original 0.8 mm and 0.01 rad exactly. Measured 2026-10-24 on UR5e + 2F-85 (78 mm cube):
-        # the first intermediate posture missed by 1.036 mm and 0.0101 rad - just outside limits
-        # calibrated on a 25 mm object - and every closure plan failed, so the approach reported
-        # COLLISION_PATH. More closure samples did not change it, because the gap comes from the IK's
-        # own acceptance (2 mm, 0.03 rad), not from the chord between samples.
-        slack = max(1., float(g.get('cube_size') or .052) / .052)
         snapshot = dict(self.env.joint_snapshot() if snapshot is None else snapshot)
         samples = []
         snapshot[g['joint']] = closed_q
@@ -120,6 +116,22 @@ class ImportedRobotController(OpenArmV2Controller):
             if seed is None:return None
             if samples:
                 previous = samples[-1]
+                # Follow is judged against the segment between the two
+                # accepted endpoint poses, not against the fixed frame.
+                # An endpoint is an IK solution, and on an arm with fewer
+                # joints than the frame's six constraints its attitude
+                # residual against the frame can reach the solver's own
+                # acceptance (0.03 rad); comparing the interpolated attitude
+                # against the frame then rejects a continuous sweep at its
+                # first step (measured on LeKiwi: endpoints up to 0.020 rad
+                # off frame, midpoints 0.000 rad off the endpoint slerp and
+                # 0.04 mm off the endpoint segment). A branch jump still
+                # fails: it throws the midpoint off the segment, and the
+                # position check below keeps the absolute frame reference.
+                from scipy.spatial.transform import Rotation, Slerp
+                _, previous_attitude, _, _ = self.env.arm_kinematics(side).evaluate(previous['arm_q'])
+                _, seed_attitude, _, _ = self.env.arm_kinematics(side).evaluate(seed)
+                attitude_path = Slerp([0.,1.],Rotation.from_matrix([previous_attitude,seed_attitude]))
                 for alpha in (.25,.5,.75):
                     q = previous['arm_q']+(seed-previous['arm_q'])*alpha
                     j = previous['jaw_q']+(jaw_q-previous['jaw_q'])*alpha
@@ -130,7 +142,7 @@ class ImportedRobotController(OpenArmV2Controller):
                     point,attitude,_,_ = self.env.arm_kinematics(side).evaluate(q)
                     expected = object_position-rotation@normal*(np.interp(j,qs,centers)-initial_center)
                     from backend.app.simulation.transform import orientation_error
-                    if np.linalg.norm(point-expected)>.0008*slack or np.linalg.norm(orientation_error(attitude,rotation))>.01*slack:
+                    if np.linalg.norm(point-expected)>.0008 or np.linalg.norm(orientation_error(attitude,attitude_path([alpha]).as_matrix()[0]))>.01:
                         return None
             samples.append({'jaw_q':float(jaw_q),'arm_q':seed.copy()})
         if check_lift and g.get('cube_size'):
@@ -187,101 +199,6 @@ class ImportedRobotSkills(SkillRunner):
                               'close_trace': getattr(self, '_close_trace', [])}
             raise error
 
-    #: Corrections tried, in meters, along the jaws' closing axis when a pinch does not take. The first
-    #: attempt is the plan's own placement, so an ordinary grasp costs exactly what it did.
-    GRASP_RETRY_OFFSETS = (0., .004, -.004, .008, -.008)
-
-    @staticmethod
-    def _group_links(env, arm):
-        groups = [list(group) for group in (env.grippers[arm].get('contact_groups') or [])]
-        return [group[0] for group in groups if group]
-
-    def closing_axis(self, arm):
-        """Unit world vector along which the jaws approach each other, measured from their own links.
-
-        The axis is not a convention to assume: it is the direction between the two jaw bodies, read from
-        the same link geometry the collision model uses. A pinch that touches with one pad while the jaws
-        are fully closed is a cube sitting beside this axis, so the correction has to be along it.
-        """
-        links = self._group_links(self.env, arm)
-        if len(links) < 2 or not hasattr(self.env, 'link_bounds'):
-            return None
-        centres = []
-        for name in links[:2]:
-            bounds = self.env.link_bounds(name)
-            if bounds is None:
-                return None
-            centres.append(np.asarray(bounds, float).mean(axis=0))
-        axis = centres[1] - centres[0]
-        norm = float(np.linalg.norm(axis))
-        return None if norm < 1e-6 else axis / norm
-
-    def pinch_straddle(self, arm, obj):
-        """How far the cube centre is from the jaws' midline, along and across the closing axis."""
-        axis = self.closing_axis(arm)
-        if axis is None:
-            return None
-        links = self._group_links(self.env, arm)
-        centres = [np.asarray(self.env.link_bounds(name), float).mean(axis=0) for name in links[:2]]
-        midline = (centres[0] + centres[1]) / 2.
-        offset = np.asarray(self.env.object_pose(obj)[0], float) - midline
-        along = float(offset @ axis)
-        across = float(np.linalg.norm(offset - along * axis))
-        return {'along_m': along, 'across_m': across, 'axis': axis.tolist(),
-                'straddles': across < float(self.env.cube_size) * .75}
-
-    def grasp_object(self, arm, obj, grasp_offset_x=0.):
-        """Close on the object; if a pad misses, move along the CLOSING AXIS and try again.
-
-        A pinch that misses is a contact problem, and repeating the same posture repeats the same miss:
-        measured 2026-10-26 on OpenManipulator-X, the cube nearest the base gripped in 1 of 3 attempts
-        while the far cube gripped every time, with identical plans. Instrumenting it showed the jaws fully
-        closed with only ONE pad touching, i.e. the cube beside the closing axis rather than between the
-        pads - so the correction is along that axis, measured from the jaw links, not along world x.
-        """
-        started = time.perf_counter()
-        return self._skill("grasp_object",
-                           lambda: self._grasp_with_offsets(arm, obj, grasp_offset_x), started)
-
-    def _grasp_with_offsets(self, arm, obj, grasp_offset_x=0.):
-        base = np.array([grasp_offset_x, 0., 0.])
-        axis = self.closing_axis(arm)
-        straddle = self.pinch_straddle(arm, obj)
-        attempts = []
-        directions = [None] + ([] if axis is None else [axis])
-        for direction in directions:
-            for distance in self.GRASP_RETRY_OFFSETS:
-                try:
-                    if attempts:
-                        # Re-place the jaws before closing again: closing where the previous attempt left
-                        # them would repeat the same contact geometry.
-                        shift = base if direction is None else base + direction * distance
-                        self._approach(arm, obj, grasp_offset=shift)
-                    # Dynamic dispatch, not the base class: this robot's own _grasp is the one that
-                    # closes with the measured pinch (plan_closure/_close_pinch). Calling the base
-                    # implementation bypassed it and made every pinch fail, including the ones that had
-                    # always worked - which is what the "bimodal" pinches of the previous two commits
-                    # actually were.
-                    result = self._grasp(arm, obj)
-                    if attempts:
-                        result = {**result, 'grasp_retries': attempts}
-                    if straddle is not None:
-                        result = {**result, 'pinch_straddle': straddle}
-                    return result
-                except SkillError as error:
-                    if error.category not in ('GRASP_LOST', 'GRASP_FAILED', 'GRASP_SLIP'):
-                        raise
-                    attempts.append({'direction': 'world_x' if direction is None else 'closing_axis',
-                                     'offset_m': round(distance, 3), 'error': error.category,
-                                     'detail': str(error)[:120]})
-                    try:
-                        self.controller.wait_gripper(arm, False, .4)
-                    except Exception:
-                        pass
-        error = SkillError('GRASP_LOST', f'No pinch on {obj} after {len(attempts)} placements: {attempts}')
-        error.evidence = {'attempts': attempts, 'pinch_straddle': straddle}
-        raise error
-
     def _nominal_attitude(self, arm):
         return np.asarray(self.env.grippers[arm]['grasp_rotation'])
 
@@ -325,7 +242,9 @@ class ImportedRobotSkills(SkillRunner):
             return [nominal]
         from backend.app.robots.urdf import solve_profile_ik
         free = solve_profile_ik(self.env.profile, arm, target, None, model=self.env.model,
-                                q_init=self.env.home_arm_qpos(arm), snapshot=snapshot)
+                                q_init=self.env.home_arm_qpos(arm), snapshot=snapshot,
+                                joint_limits=(self.env.ik_joint_limits(arm) if hasattr(self.env, 'ik_joint_limits') else None
+                                              ))
         if not free['success']:
             return [nominal]
         frame = sampler.achieved_attitude(arm, free['q_rad'], snapshot)
@@ -337,100 +256,352 @@ class ImportedRobotSkills(SkillRunner):
             return [nominal]
         return [nominal, np.asarray(frame)]
 
-    def _approach(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0., grasp_offset=None):
+    @contextmanager
+    def _base_hold(self):
+        """Servo the wheels on the measured base pose while the arm works.
+
+        A mobile base left in zero-velocity wheel control still walks
+        under the arm's reaction torques (measured on LeKiwi: +0.081 rad
+        of yaw during one approach transit, and the sagging arm shoved the
+        target cube 0.11 m). The env's base hold closes the loop on the
+        measured pose for the duration of a manipulation skill; navigation
+        suspends the hold itself and re-anchors it on arrival. Envs
+        without a mobile base have no hold to engage.
+        """
+        engage = getattr(self.env, 'engage_base_hold', None)
+        if not callable(engage) or not self.env.profile.get('mobile_base'):
+            yield
+            return
+        engage()
+        try:
+            yield
+        finally:
+            self.env.release_base_hold()
+
+    def _gravity_margin(self, arm, q, snapshot=None):
+        """Gravity-torque report for one arm posture, or None if unscored.
+
+        Planning on a mobile base cannot assume the posture can be held:
+        the servos' peak effort is finite and gravity is not compensated
+        (see backend/app/robots/gravity.py). A None report (profile
+        without effort data, stub envs in tests) never gates a seed.
+        """
+        try:
+            return gravity_report(self.env.profile, self.env.model, arm, q, snapshot)
+        except Exception:
+            return None
+
+    def _path_gravity(self, arm, corridor, closure, snapshot, seed_report):
+        """Worst gravity-torque ratio over a planned approach, for evidence.
+
+        Scores the grasp seed, every closure-sweep sample and every
+        corridor waypoint, so the reported margin covers the poses the
+        arm will actually be commanded through, not only the seed.
+        """
+        worst = None if seed_report is None else seed_report['worst_ratio']
+        postures = [row['arm_q'] for row in (closure or [])] + list(corridor or [])
+        for q in postures:
+            report = self._gravity_margin(arm, q, snapshot)
+            if report is not None:
+                worst = report['worst_ratio'] if worst is None else max(worst, report['worst_ratio'])
+        return {'seed_worst_ratio': None if seed_report is None else seed_report['worst_ratio'],
+                'path_worst_ratio': worst, 'limit': GRAVITY_TORQUE_RATIO_LIMIT,
+                'over_limit': bool(worst is not None and worst > GRAVITY_TORQUE_RATIO_LIMIT)}
+
+    def _plan_corridor(self, arm, rotation, seed, closure, insertion, standoff,
+                       snapshot, names, seed_key):
+        """Back-plan the approach corridor from a closure-checked seed.
+
+        Returns (corridor, high_point) or None. Identical planning to the
+        original inline code: insertion chain back from the grasp seed,
+        then a high transit seed with a direct, edge-clear path from the
+        current arm pose.
+        """
+        corridor = [seed]
+        for point in reversed(insertion[:-1]):
+            seed, _, _ = self.controller.solve_ik(arm, point, rotation, q_init=seed)
+            if seed is None:
+                return None
+            corridor.append(seed)
+        high_seed = None
+        high = None
+        for height in (.08, .05, max(.025, self.env.cube_size)):
+            candidate_high = standoff + [0., 0., height]
+            high_seed, _, _ = self.controller.solve_ik(arm, candidate_high, rotation, q_init=seed,
+                                                       path_start=self.env.arm_qpos(arm), require_direct=True)
+            if high_seed is None:
+                high_seed, _, _ = self.controller.solve_ik(arm, candidate_high, rotation,
+                                                           path_start=self.env.arm_qpos(arm), require_direct=True)
+            if high_seed is not None and self.env.collision_queries.edge_clear(
+                    names, high_seed, seed, snapshot, minimum_clearance=.0001):
+                high = candidate_high
+                break
+            high_seed = None
+        if high_seed is None:
+            return None
+        corridor.append(high_seed)
+        self._closure_plans = {**getattr(self, '_closure_plans', {}), arm: closure}
+        self.controller._approach_seeds[seed_key] = [corridor[0],
+                                                     *self.controller._approach_seeds.get(seed_key, [])][:4]
+        return corridor, high
+
+    def _approach_planned(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
         if arm not in self.env.grippers:
             raise SkillError('ROBOT_CAPABILITY', 'This arm has no detected opposed jaws')
         if self.held_object(arm):
             raise SkillError('HAND_OCCUPIED', 'Place the held object first')
         before = self.env.object_pose(obj)[0].copy()
-        # The placement may be shifted, and the shift matters: a pinch that closes with one pad touching
-        # needs millimetres along the jaws' closing axis, not along world x. ``before`` stays the cube's
-        # real pose for the displacement check; ``aim`` is where the jaws are told to go.
-        shift = np.asarray(grasp_offset, float) if grasp_offset is not None else np.array([grasp_offset_x, 0., 0.])
-        aim = before + shift
         direction = np.asarray(self.env.grippers[arm]['approach_axis'])
-        standoff = aim - direction * .055
+        standoff = before - direction * .055
         high = standoff + [0., 0., .08]
         self.controller.wait_gripper(arm, False, .6)
         # Plan back from the insertion pose. Choosing a redundant elbow posture
         # for the high point in isolation can force a several-radian posture
         # change beside the cube, even for the last millimetres of approach.
         # All these poses and edges are checked on the private collision model.
-        insertion = [standoff + (aim-standoff)*a for a in np.linspace(0.,1.,9)]
-        # The insertion is a straight push along the approach axis, so its intermediate poses are transit:
-        # the final grasp pose is what must hold the jaw frame exactly, and the closure plan is checked on
-        # its own. Measured 2026-10-24 on UR5e + 2F-85: the strict acceptance refuses one of these
-        # waypoints over about 1.7 degrees of orientation while its position solves exactly.
-        transit = .06
+        insertion = [standoff + (before-standoff)*a for a in np.linspace(0.,1.,9)]
         from backend.app.robots.urdf import solve_profile_ik
         home = self.env.home_arm_qpos(arm)
         limits = self.env.arm_limits(arm)
-        seed_key = (arm,*np.round(aim/.002).astype(int))
+        seed_key = (arm,*np.round(before/.002).astype(int))
         guesses = [*self.controller._approach_seeds.get(seed_key,[]), self.env.arm_qpos(arm), home]
         guesses.extend(np.clip(home+axis*shift,*limits.T) for axis in np.eye(len(home)) for shift in [-.5,.5,-1.,1.])
         reverse_seeds = None
+        chosen_gravity = None
         snapshot = self.env.joint_snapshot()
         names = self.env.profile['chains'][arm]['joints']
-        rotations = self._approach_rotations(arm, aim, snapshot)
+        rotations = self._approach_rotations(arm, before, snapshot)
+        # Gravity margin orders the candidates; it does not veto them. A
+        # collision-free seed whose holding torque exceeds the margin is
+        # remembered and planned only when no in-margin seed yields a
+        # corridor, best margin first, with the excess reported in the
+        # result. The gate matters on mobile bases, where gravity is not
+        # compensated: on LeKiwi the first clear seed at every placement
+        # the search found demanded 2.4-3.7x the shoulder servo's peak
+        # effort just to stand still, and the executed transit sagged to
+        # the floor (MOTION_BLOCKED, tool at 0.006 m).
+        over_limit = []
         for rotation in rotations:
             for guess in guesses:
                 if self.controller.stop_requested():raise SkillError('STOPPED','Approach planning stopped')
-                goal = solve_profile_ik(self.env.profile,arm,aim,rotation,model=self.env.model,q_init=guess,snapshot=snapshot)
+                goal = solve_profile_ik(self.env.profile,arm,before,rotation,model=self.env.model,q_init=guess,snapshot=snapshot,
+                                        joint_limits=(self.env.ik_joint_limits(arm) if hasattr(self.env, 'ik_joint_limits') else None
+                                                      ))
                 if not goal['success']:continue
                 seed = self.env.model.nearest_continuous(names,goal['q_rad'],self.env.arm_qpos(arm))
                 if not self.env.collision_queries.clear({**snapshot,**dict(zip(names,seed))}):continue
-                closure = self.controller.plan_closure(arm,aim,rotation,seed)
+                margin = self._gravity_margin(arm, seed, snapshot)
+                if margin is not None and margin['over_limit']:
+                    over_limit.append((margin['worst_ratio'], rotation, seed))
+                    continue
+                closure = self.controller.plan_closure(arm,before,rotation,seed)
                 if closure is None:continue
-                seed = closure[0]['arm_q']
-                corridor = [seed]
-                for point in reversed(insertion[:-1]):
-                    seed, _, _ = self.controller.solve_ik(arm, point, rotation, q_init=seed, relaxed=transit)
-                    if seed is None:
-                        # A single local solve can miss one waypoint of a Cartesian branch it has not
-                        # explored, which drops an otherwise executable corridor: measured 2026-10-24
-                        # on UR5e + 2F-85, every attempt died on exactly one insertion point. Passing
-                        # no seed makes the controller try its whole seed set, the way the grasp itself
-                        # already does for every guess. When the local solve works nothing changes.
-                        seed, _, _ = self.controller.solve_ik(arm, point, rotation, relaxed=transit)
-                    if seed is None:break
-                    corridor.append(seed)
-                if seed is not None:
-                    # Reconfiguration is allowed in the high, empty-hand transit.
-                    # Only the final insertion needs a single Cartesian branch.
-                    high_seed = None
-                    for height in (.08,.05,max(.025,self.env.cube_size)):
-                        candidate_high = standoff+[0.,0.,height]
-                        high_seed,_,_ = self.controller.solve_ik(arm,candidate_high,rotation,q_init=seed,
-                            path_start=self.env.arm_qpos(arm),require_direct=True,relaxed=transit)
-                        if high_seed is None:
-                            high_seed,_,_ = self.controller.solve_ik(arm,candidate_high,rotation,
-                                path_start=self.env.arm_qpos(arm),require_direct=True,relaxed=transit)
-                        if high_seed is not None and self.env.collision_queries.edge_clear(
-                                names,high_seed,seed,snapshot,minimum_clearance=.0001):
-                            high = candidate_high
-                            break
-                        high_seed = None
-                    if high_seed is None:continue
-                    corridor.append(high_seed)
-                    reverse_seeds = corridor
-                    self._closure_plans = {**getattr(self,'_closure_plans',{}),arm:closure}
-                    self.controller._approach_seeds[seed_key] = [corridor[0],*self.controller._approach_seeds.get(seed_key,[])][:4]
-                    break
+                planned = self._plan_corridor(arm, rotation, closure[0]['arm_q'], closure,
+                                              insertion, standoff, snapshot, names, seed_key)
+                if planned is None:continue
+                reverse_seeds, high = planned
+                chosen_gravity = self._path_gravity(arm, reverse_seeds, closure, snapshot, margin)
+                break
             if reverse_seeds is not None:break
+        if reverse_seeds is None:
+            attempted = set()
+            for ratio, rotation, seed in sorted(over_limit, key=lambda row: row[0]):
+                key = tuple(np.round(seed, 6))
+                if key in attempted:continue
+                attempted.add(key)
+                closure = self.controller.plan_closure(arm,before,rotation,seed)
+                if closure is None:continue
+                planned = self._plan_corridor(arm, rotation, closure[0]['arm_q'], closure,
+                                              insertion, standoff, snapshot, names, seed_key)
+                if planned is None:continue
+                reverse_seeds, high = planned
+                chosen_gravity = self._path_gravity(arm, reverse_seeds, closure, snapshot,
+                                                    self._gravity_margin(arm, seed, snapshot))
+                break
         if reverse_seeds is None:
             raise SkillError('COLLISION_PATH','No grasp posture has a continuous collision-free approach corridor')
         # The frame that planned the corridor is the frame this arm pinches with from now on.
         self._pinch_frames = {**getattr(self, '_pinch_frames', {}), arm: np.asarray(rotation)}
         self._move(arm, high, rotation=rotation, q_init=reverse_seeds[-1], progress=progress)
         self._move(arm, standoff, rotation=rotation, q_init=reverse_seeds[-2], progress=progress)
-        result = self._move(arm,aim,rotation=rotation,progress=progress,planned_joints=[
+        result = self._move(arm,before,rotation=rotation,progress=progress,planned_joints=[
             self.env.arm_qpos(arm),*reversed(reverse_seeds[:-2])])
         after = self.env.object_pose(obj)[0]
         disturbance = float(np.linalg.norm(after - before))
         if disturbance > self.env.cube_size * .12:
             raise SkillError('APPROACH_COLLISION', f'Approach displaced the cube by {disturbance:.6f}m')
-        return {'target': aim.tolist(), 'grasp_offset': shift.tolist(), 'final': result.final_position,
-                'object_displacement': disturbance, 'cube_size': self.env.cube_size}
+        return {'target': before.tolist(), 'final': result.final_position,
+                'object_displacement': disturbance, 'cube_size': self.env.cube_size,
+                'gravity_torque': chosen_gravity}
+
+    # -- mobile base placement search --------------------------------------
+    #
+    # A mobile base arrives at the navigate compiler's fixed standoff, but
+    # for an imported arm that placement can leave only self-colliding grasp
+    # postures (see backend/app/skills/base_placement.py). When the approach
+    # fails with COLLISION_PATH on a mobile base, search other placements -
+    # planning only, against hypothetical root transforms - drive to each
+    # placement that admits a collision-free grasp seed (through the normal
+    # navigate skill, so the motion stays physical), and retry the approach
+    # there. Desk robots and non-collision failures are untouched.
+
+    def _approach(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
+        with self._base_hold():
+            return self._approach_attempt(arm, obj, progress, fault_offset, grasp_offset_x)
+
+    def _approach_attempt(self, arm, obj, progress=None, fault_offset=None, grasp_offset_x=0.):
+        try:
+            return self._approach_planned(arm, obj, progress, fault_offset, grasp_offset_x)
+        except SkillError as exc:
+            if exc.category != 'COLLISION_PATH' or not self.env.profile.get('mobile_base'):
+                raise
+            result = self._retry_approach_from_searched_placements(
+                arm, obj, progress, fault_offset, grasp_offset_x)
+            if result is None:
+                evidence = getattr(self, '_placement_search_evidence', None)
+                if evidence:
+                    exc.evidence = {**(exc.evidence or {}), 'base_placement_search': evidence}
+                raise
+            return result
+
+    def _retry_approach_from_searched_placements(self, arm, obj, progress, fault_offset, grasp_offset_x):
+        from backend.app.control.navigation import wrap_angle
+        from backend.app.skills.base_placement import candidate_base_placements
+        target = self.env.object_pose(obj)[0].copy()
+        current = self.env.base_pose()
+        snapshot = self.env.joint_snapshot()
+        original_root = copy.deepcopy(self.env.profile['root_transform'])
+        evidence = {'evaluated_candidates': 0, 'clear_seed_placements': [], 'drives': []}
+        self._placement_search_evidence = evidence
+        try:
+            # Collect first (planning only), then drive. Placements whose
+            # grasp seed the arm can actually hold - gravity-torque ratio
+            # within the margin - are driven to before placements whose
+            # seeds exceed it, which are ordered by margin; driving is the
+            # physical, expensive step, so the ordering is settled while
+            # changing it is still free.
+            clear = []
+            for placement in candidate_base_placements(target[:2], current[:2]):
+                if len(clear) >= 3 or evidence['evaluated_candidates'] >= _PLACEMENT_EVALUATION_BUDGET:
+                    break
+                if (np.linalg.norm(np.asarray(placement.target_xy) - current[:2]) < .03
+                        and abs(wrap_angle(placement.target_yaw - float(current[2]))) < .08):
+                    continue  # The base already sits there; the approach just failed there.
+                evidence['evaluated_candidates'] += 1
+                seed = self._grasp_seed_at_placement(arm, target, snapshot, placement, original_root)
+                if seed is None:
+                    continue
+                clear.append((placement, seed))
+                evidence['clear_seed_placements'].append(
+                    {**placement.as_dict(), 'arm_q': seed['arm_q'],
+                     'closure_planned': seed['closure_planned'],
+                     'gravity_worst_ratio': seed.get('gravity_worst_ratio')})
+
+            def over_limit(seed):
+                ratio = seed.get('gravity_worst_ratio')
+                return ratio is not None and ratio > GRAVITY_TORQUE_RATIO_LIMIT
+
+            ordered = ([entry for entry in clear if not over_limit(entry[1])]
+                       + sorted((entry for entry in clear if over_limit(entry[1])),
+                                key=lambda entry: entry[1]['gravity_worst_ratio']))
+            for placement, seed in ordered[:3]:
+                # The placement was evaluated at this exact pose and the
+                # grasp margins beyond it are millimetric, so drive with
+                # tight arrival tolerances: at the default 50 mm / 0.05 rad
+                # a candidate 45 mm from the current pose was accepted as
+                # "arrived" without the base translating at all, and the
+                # retried approach then planned from a different robot
+                # than the one that was evaluated (measured on LeKiwi).
+                move = self.navigate_to(placement.target_xy, placement.target_yaw, exclude_object=obj,
+                                        arrive_tolerance=.01, yaw_tolerance=.02)
+                evidence['drives'].append({**placement.as_dict(), 'navigate_success': bool(move.get('success'))})
+                if not move.get('success'):
+                    continue
+                try:
+                    result = self._approach_planned(arm, obj, progress, fault_offset, grasp_offset_x)
+                except SkillError:
+                    continue
+                result['base_placement'] = {**placement.as_dict(), 'arm_q': seed['arm_q'],
+                                            'closure_planned': seed['closure_planned'],
+                                            'gravity_worst_ratio': seed.get('gravity_worst_ratio'),
+                                            'gravity_over_limit': over_limit(seed),
+                                            'evaluated_candidates': evidence['evaluated_candidates']}
+                return result
+            return None
+        finally:
+            # Re-anchor the planner's root to wherever the base physically is
+            # (the pre-search pose when nothing was driven, the driven pose
+            # otherwise); a fresh snapshot would do the same on next use.
+            try:
+                self.env.base_pose()
+            except Exception:
+                self.env.profile['root_transform'] = original_root
+
+    def _grasp_seed_at_placement(self, arm, target, snapshot, placement, original_root):
+        """Planning-only grasp check at a hypothetical base placement.
+
+        Mirrors the goal-seed stage of _approach_planned (same rotations,
+        same IK guesses, same private-collision gate) with the profile's
+        root transform temporarily anchored at the candidate placement; the
+        caller's snapshot is reused throughout, because a fresh
+        joint_snapshot would re-anchor the root to the base's real pose.
+        Also reports whether the jaw-closure plan succeeds for the found
+        seed - diagnostic only: closure planning runs again inside the
+        retried approach, so it does not gate selection. Returns
+        {"arm_q": ..., "closure_planned": bool, "gravity_worst_ratio":
+        float | None} or None.
+
+        Seed choice within the placement is gravity-aware, like the
+        approach itself: the first in-margin clear seed wins; when every
+        clear seed exceeds the holding-torque margin, the best-margin one
+        is returned (its ratio travels with it, so the caller's drive
+        ordering and the result evidence can surface the excess).
+        """
+        from backend.app.robots.urdf import solve_profile_ik
+        profile = self.env.profile
+        yaw = placement.target_yaw
+        transform = np.eye(4)
+        transform[:3, :3] = [[np.cos(yaw), -np.sin(yaw), 0.], [np.sin(yaw), np.cos(yaw), 0.], [0., 0., 1.]]
+        transform[:3, 3] = [placement.target_xy[0], placement.target_xy[1],
+                            float(np.asarray(original_root, dtype=float)[2, 3])]
+        profile['root_transform'] = transform.tolist()
+        try:
+            names = profile['chains'][arm]['joints']
+            home = self.env.home_arm_qpos(arm)
+            limits = self.env.arm_limits(arm)
+            ik_limits = self.env.ik_joint_limits(arm) if hasattr(self.env, 'ik_joint_limits') else None
+            seed_key = (arm, *np.round(target / .002).astype(int))
+            guesses = [*self.controller._approach_seeds.get(seed_key, []), self.env.arm_qpos(arm), home]
+            guesses.extend(np.clip(home + axis * shift, *limits.T)
+                           for axis in np.eye(len(home)) for shift in [-.5, .5, -1., 1.])
+            best_over = None  # (gravity ratio, rotation, seed)
+            for rotation in self._approach_rotations(arm, target, snapshot):
+                for guess in guesses:
+                    if self.controller.stop_requested():
+                        return None
+                    goal = solve_profile_ik(profile, arm, target, rotation, model=self.env.model,
+                                            q_init=guess, snapshot=snapshot, joint_limits=ik_limits)
+                    if not goal['success']:
+                        continue
+                    seed = self.env.model.nearest_continuous(names, goal['q_rad'], self.env.arm_qpos(arm))
+                    if not self.env.collision_queries.clear({**snapshot, **dict(zip(names, seed))}):
+                        continue
+                    margin = self._gravity_margin(arm, seed, snapshot)
+                    if margin is not None and margin['over_limit']:
+                        if best_over is None or margin['worst_ratio'] < best_over[0]:
+                            best_over = (margin['worst_ratio'], rotation, seed)
+                        continue
+                    closure = self.controller.plan_closure(arm, target, rotation, seed, snapshot=snapshot)
+                    return {'arm_q': np.asarray(seed).tolist(), 'closure_planned': closure is not None,
+                            'gravity_worst_ratio': None if margin is None else margin['worst_ratio']}
+            if best_over is not None:
+                ratio, rotation, seed = best_over
+                closure = self.controller.plan_closure(arm, target, rotation, seed, snapshot=snapshot)
+                return {'arm_q': np.asarray(seed).tolist(), 'closure_planned': closure is not None,
+                        'gravity_worst_ratio': ratio}
+            return None
+        finally:
+            profile['root_transform'] = copy.deepcopy(original_root)
 
     def _close_pinch(self, arm, obj, *, rotation=None, grasp_bias=None, monitor=None):
         rotation = self._attitude(arm) if rotation is None else np.asarray(rotation)
@@ -525,22 +696,20 @@ class ImportedRobotSkills(SkillRunner):
         return contacts
 
     def _grasp(self, arm, obj):
+        with self._base_hold():
+            return self._grasp_attempt(arm, obj)
+
+    def _grasp_attempt(self, arm, obj):
         before = self.env.object_pose(obj)[0].copy()
         contacts = self._close_pinch(arm,obj)
         position, rotation = self.env.ee_pose(arm)
         self.controller.target_rotations[arm] = self._attitude(arm).copy()
-        # The verification lift only has to prove the hold, and 30 mm is more than a small cube needs: on a
-        # 25.5 mm cube the near posture loses the pinch during it (measured 2026-10-27 - grasp reports
-        # success, the pads are on the cube, and by the next skill one pad is gone and the jaws have closed
-        # a further 0.006). Scale the proof to the object, and require most of it back.
-        verify = min(.03, max(.015, float(self.env.cube_size) * .6))
-        self._move_relative(arm,[0.,0.,verify])
+        self._move_relative(arm,[0.,0.,.03])
         self._require_hold(arm, obj)
         after = self.env.object_pose(obj)[0]
         rise = float(after[2] - before[2])
-        if rise < verify * .7:
-            raise SkillError('GRASP_LOST', f'Cube rose only {rise:.6f}m during a {verify*1000:.0f}mm '
-                                           f'verification lift')
+        if rise < .021:
+            raise SkillError('GRASP_LOST', f'Cube rose only {rise:.6f}m during 30mm verification lift')
         start_ee, start_rotation = self.env.ee_pose(arm)
         relative = start_rotation.T @ (after - start_ee)
         samples = []
@@ -578,46 +747,6 @@ class ImportedRobotSkills(SkillRunner):
                    on_sample=lambda: self._require_hold(arm, obj))
 
     def lift_object(self, arm, obj, height=None):
-        started = time.perf_counter()
-        return self._skill('lift_object', lambda: self._lift_with_retry(arm, obj, height), started)
-
-    def _lift_with_retry(self, arm, obj, height=None):
-        """Lift; if the hold is lost, grasp again once and retry.
-
-        The pinch on this arm is *nearly* stable and occasionally not: measured 2026-10-27, the same
-        cube at the same pose lifted after 200, 1000 and 8000 settle steps and lost the hold at 3000, with
-        the jaws closing a further 0.008 of stroke - the cube leaves during the lift itself. Nothing in the
-        plan, the env parameters or the concurrency reproduces it deterministically, so the honest answer is
-        a retry on physical evidence rather than a search for determinism: re-approach, close with a small
-        bias towards the object (0 and +6 mm both held in a bias sweep, -6 mm did not), and lift again.
-        """
-        try:
-            return self._lift_once(arm, obj, height)
-        except SkillError as error:
-            if error.category not in ('GRASP_LOST', 'GRASP_SLIP'):
-                raise
-            first = {'error': error.category, 'detail': str(error)[:200]}
-        attempts = []
-        # A bias sweep on this gripper measured which grasps hold: 0 and +6 mm along the object's z both
-        # held, -6 mm did not. So the retries walk from the measured-good bias towards the plain one rather
-        # than repeating the placement that just failed.
-        for bias in ([0., 0., .006], [0., 0., .004], [0., 0., 0.]):
-            self.controller.wait_gripper(arm, False, .4)
-            try:
-                self._approach(arm, obj)
-                self._close_pinch(arm, obj, grasp_bias=np.asarray(bias))
-                result = self._lift_once(arm, obj, height)
-                return {**result, 'lift_retry': {**first, 'bias': bias, 'attempts': attempts}}
-            except SkillError as error:
-                if error.category not in ('GRASP_LOST', 'GRASP_SLIP', 'GRASP_FAILED', 'IK_FAILURE',
-                                          'COLLISION_PATH'):
-                    raise
-                attempts.append({'bias': bias, 'error': error.category})
-        raise SkillError(attempts[-1]['error'] if attempts else 'GRASP_LOST',
-                         f'No holding grasp after {len(attempts)} re-grasps following {first["error"]}: '
-                         f'{attempts}') from None
-
-    def _lift_once(self, arm, obj, height=None):
         def run():
             self._require_hold(arm,obj)
             bottom = float(self.env.object_bounds(obj)[0,2])
@@ -633,11 +762,13 @@ class ImportedRobotSkills(SkillRunner):
                 raise SkillError('GRASP_SLIP','Transport lift did not reach its clearance')
             return {**result,'requested_rise_m':rise,'bottom_height_m':actual,
                     'minimum_bottom_height_m':minimum,'automatic_clearance':height is None}
-        # Raise, do not wrap: the retrying caller above is the one that owns success/failure reporting, and
-        # _skill() here would swallow the GRASP_LOST that triggers the retry.
-        return run()
+        return self._skill('lift_object',run,time.perf_counter())
 
     def _move_relative(self, arm, delta):
+        with self._base_hold():
+            return self._move_relative_attempt(arm, delta)
+
+    def _move_relative_attempt(self, arm, delta):
         start,rotation = self.env.ee_pose(arm)
         rotation = self.controller.target_rotations.get(arm,rotation)
         obj = self.held_object(arm)
@@ -755,31 +886,14 @@ class ImportedRobotSkills(SkillRunner):
         return self._skill('move_to_object',run,time.perf_counter())
 
     def _release(self, arm, obj):
-        from backend.app.robots.gripper_envelope import release_command
         self.env.set_gripper_effort(arm, holding=False)
         before = self.env.object_pose(obj)[0].copy()
         # Hold the already-checked arm pose and withdraw the moving jaw. Keeping
         # an empty aperture centred would add an unnecessary wrist translation
         # and could drive a root joint into its mechanical contact limit.
-        # Open only as far as the object needs: a full-aperture release sweeps the jaw into whatever sits
-        # beside it, which is what made an adjacent placement need 71.5 mm of clearance.
-        target = release_command(self.env, arm, obj)
-        self.env.set_gripper(arm, target)
-        # Settle without re-commanding: controller.wait_gripper() would send its own full-open target and
-        # undo the partial opening that this release depends on. Wait for the TARGET, not for the motion
-        # to look small: a jaw that has not started moving yet looks settled, and breaking on that left
-        # the cube still pinched (measured 2026-10-25).
-        quantum = max(1, int(round(.01 / self.env.timestep)))
-        budget = max(1, int(round(.8 / self.env.timestep)))
-        for _ in range(budget // quantum):
-            self.env.step(quantum)
-            if abs(self.env.gripper_position(arm) - target) < .02:
-                break
+        self.controller.wait_gripper(arm,False,.6)
         self.env.step(round(.15 / self.env.timestep))
-        # Judge against the opening that was COMMANDED, not against a full-open zero: with a partial
-        # release the jaw legitimately stops at ~0.45 of the stroke, and the old absolute test read that
-        # as "did not open" (measured 2026-10-25, every partial release reported GRIPPER_BLOCKED).
-        if self.env.gripper_position(arm) > target + .05 or self.env.pinch_established(obj,arm):
+        if abs(self.env.gripper_position(arm))>.05 or self.env.pinch_established(obj,arm):
             raise SkillError('GRIPPER_BLOCKED','The jaws did not open and release the object')
         return {'position_before': before.tolist(), 'position_after': self.env.object_pose(obj)[0].tolist(),
                 'contacts': self.env.object_contacts(obj, arm)}
@@ -957,6 +1071,10 @@ class ImportedRobotSkills(SkillRunner):
         return evidence
 
     def _joint_trajectory(self, arm, target, duration=1.):
+        with self.skills._base_hold():
+            return self._joint_trajectory_attempt(arm, target, duration)
+
+    def _joint_trajectory_attempt(self, arm, target, duration=1.):
         start = self.env.arm_qpos(arm)
         specs = {j['name']: j for j in self.env.profile['joints']}
         velocities = np.asarray([max(.01, specs[name]['velocity']) for name in self.env.profile['chains'][arm]['joints']])

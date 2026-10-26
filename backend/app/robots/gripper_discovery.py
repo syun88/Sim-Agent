@@ -108,6 +108,21 @@ def _coupled_fingers(model, geometry, joint):
     return [own_pad], [opposite_pad], followers
 
 
+def _fixed_assembly(model, link):
+    """All links rigidly connected to `link` through fixed joints only."""
+    seen, queue = {link}, [link]
+    while queue:
+        current = queue.pop()
+        for joint in model.joints:
+            if joint['type'] != 'fixed':
+                continue
+            for a, b in ((joint['parent'], joint['child']), (joint['child'], joint['parent'])):
+                if a == current and b not in seen:
+                    seen.add(b)
+                    queue.append(b)
+    return sorted(seen)
+
+
 def _candidate(model, geometry, profile, joint, cube_size=None):
     parent, child = joint['parent'], joint['child']
     followers = {}
@@ -119,7 +134,11 @@ def _candidate(model, geometry, profile, joint, cube_size=None):
             followers[opposite['name']] = -1. if dot > 0 else 1.
     # The sibling rule first, so a gripper whose opposing finger is a plain joint is inferred
     # exactly as before; the coupled rule is only reached when that produced no jaws.
-    groups = [([child], [opposite['child']] if opposite else [parent], followers, 'sibling')]
+    # With no actuated opposite finger, the fixed jaw is whatever is rigidly
+    # attached to the parent side of the joint: CAD exports often put the
+    # fixed jaw on the grandparent link, across a fixed joint from the
+    # servo body that parents the moving jaw (SO-101/LeKiwi wrist).
+    groups = [([child], [opposite['child']] if opposite else _fixed_assembly(model, parent), followers, 'sibling')]
     coupled = _coupled_fingers(model, geometry, joint)
     if coupled is not None and (coupled[0], coupled[1]) != (groups[0][0], groups[0][1]):
         groups.append((*coupled, 'coupled'))

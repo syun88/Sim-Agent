@@ -163,6 +163,8 @@ class AgentPlanner:
             "at release; short ramp with a long stroke is how to reach it. The skill returns the design and the "
             "measured release speed, so if a throw falls short, raise release_speed_m_s (or stroke_cm) and retry. "
             "pour (wine_bottle into wine_glass, volume_ml 5 to 35, default 20). "
+            "navigate (drive the mobile base to a known object, stopping at arm's reach from it; only when "
+            "capabilities.navigation is true). "
             "For imported robots, read capabilities.skills and detected grippers; never invent an unavailable skill or gripper. "
             "When the user omits a hand, prefer the object's admitted_grasp_arm if present: its spawn approach passed IK. "
             "Operation joint uses joint=<exact URDF joint name>,position_deg=<requested rotary angle>. "

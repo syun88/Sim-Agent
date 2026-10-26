@@ -13,6 +13,17 @@ from backend.app.simulation.base import SimulationBackend, Frame
 from backend.app.simulation.genesis_backend.environment import _ensure_genesis_init, simulation_speed_from_environment
 
 
+#: Velocity-loop gain for wheel joints under velocity control (see _drive).
+WHEEL_VELOCITY_KV = 8.
+
+#: Base-hold servo gains (see engage_base_hold): a proportional loop on the
+#: measured base pose, re-commanded every physics step while the hold is
+#: engaged. The position gain turns a 5 cm error into a 0.125 m/s command;
+#: the yaw gain turns the 0.08 rad drift measured on LeKiwi into 0.28 rad/s.
+BASE_HOLD_POSITION_GAIN = 2.5
+BASE_HOLD_YAW_GAIN = 3.5
+
+
 class GenericURDFEnvironment(SimulationBackend):
     name = "genesis"
     grasp_mode = "unconfigured-gripper"
@@ -27,6 +38,10 @@ class GenericURDFEnvironment(SimulationBackend):
     def __init__(self, robot_id, show_viewer=False, prefer_gpu=False):
         self.profile = get_profile(robot_id)
         self.robot_id, self.robot_name = self.profile['id'], self.profile["name"]
+        # A profile may declare a wheeled mobile base (registry detects the
+        # wheel joints no arm chain claims). Such a robot stands on the floor
+        # and moves through its wheels; everything desk-shaped is skipped.
+        self._mobile_base = self.profile.get("mobile_base")
         self.model = URDFModel(self.profile["urdf"])
         self.available_arms = list(self.profile["chains"])
         self.grippers = self.profile.get("grippers", {})
@@ -39,12 +54,36 @@ class GenericURDFEnvironment(SimulationBackend):
         self.table_height = scene_config["table_top"]
         self.cube_size = scene_config.get("cube_size", .052)
         self.cube_mass = scene_config.get("cube_mass", .05)
+        # The sampler's desk layout is never used for a floor robot (the
+        # mobile branches below supply floor objects instead), but its
+        # model-based helpers - IK joint limits, collision queries and the
+        # arm-achieved attitude the approach planner needs - are shared.
         self._spawn_sampler = ReachableDeskSpawns(self.profile, scene_config)
-        self.spawn_validation = self._spawn_sampler.layout()
+        # A mobile scene's props are the floor objects authored in
+        # scene.json (registry imports them from floor_objects.json);
+        # a desk scene samples them from the reachable-spawn layout.
+        self.spawn_validation = ({"objects": scene_config.get("objects") or {}}
+                                 if self._mobile_base else self._spawn_sampler.layout())
         self._adjacent_collision = bool(scene_config.get('adjacent_collision', True))
         self._dt = float(scene_config["physics_dt"])
-        self._scene = gs.Scene(sim_options=gs.options.SimOptions(dt=self._dt, substeps=int(scene_config.get('physics_substeps',2))),
-            rigid_options=gs.options.RigidOptions(constraint_solver=gs.constraint_solver.Newton,
+        if self._mobile_base:
+            # A CAD-exported mobile base defeats the grasping-tuned solver
+            # settings, measured on LeKiwi: with the Newton solver / elliptic
+            # cone, and again with self-collision on, two of the three wheel
+            # joints stay locked at exactly zero velocity under any command
+            # (the model's non-adjacent overlaps become contact constraints,
+            # and the solver projects the coupled wheel motion out). A floor
+            # scene therefore uses the engine's default solver and cone and
+            # no self-collision; arm self-collision checking in mobile scenes
+            # is future work, not silently claimed here.
+            rigid_options = gs.options.RigidOptions(
+                enable_torsional_friction=True, enable_rolling_friction=True,
+                enable_self_collision=False, enable_neutral_collision=False,
+                enable_adjacent_collision=False,
+                max_collision_pairs=max(512, sum(
+                    len(link.findall('collision')) for link in self.model.links.values()) * 4))
+        else:
+            rigid_options = gs.options.RigidOptions(constraint_solver=gs.constraint_solver.Newton,
                 friction_cone=gs.friction_cone.elliptic, enable_torsional_friction=True, enable_rolling_friction=True,
                 enable_self_collision=True, enable_neutral_collision=True,
                 # scene.json owns this per robot: a URDF whose adjacent link meshes overlap by
@@ -52,28 +91,31 @@ class GenericURDFEnvironment(SimulationBackend):
                 # registry.collision_declaration). Anything else stays as before.
                 enable_adjacent_collision=bool(scene_config.get('adjacent_collision', True)),
                 max_collision_pairs=max(512, sum(
-                    len(link.findall('collision')) for link in self.model.links.values()) * 4)),
+                    len(link.findall('collision')) for link in self.model.links.values()) * 4))
+        self._scene = gs.Scene(sim_options=gs.options.SimOptions(dt=self._dt, substeps=int(scene_config.get('physics_substeps',2))),
+            rigid_options=rigid_options,
             viewer_options=gs.options.ViewerOptions(refresh_rate=60, realtime_factor=self.simulation_speed,
                 camera_pos=(1.1, -1.3, 1.5), camera_lookat=(0., 0., 1.)), show_viewer=show_viewer)
         self._scene.add_entity(gs.morphs.Plane(), material=gs.materials.Rigid(friction=.6))
-        self._table = self._scene.add_entity(gs.morphs.Box(size=tuple(scene_config["table_size"]),
+        self._table = None if self._mobile_base else self._scene.add_entity(gs.morphs.Box(size=tuple(scene_config["table_size"]),
             pos=(0., 0., scene_config["table_top"] - scene_config["table_size"][2] / 2.), fixed=True),
             material=gs.materials.Rigid(friction=.6), surface=gs.surfaces.Default(color=(.62, .58, .51)))
         self._root_transform = np.asarray(self.profile["root_transform"])
         xyzw = Rotation.from_matrix(self._root_transform[:3, :3]).as_quat()
         placement = dict(pos=tuple(self._root_transform[:3, 3]), quat=tuple(xyzw[[3, 0, 1, 2]]))
-        # A package may ship an engine model when its declared adjacent overlaps cannot be expressed in
-        # a URDF: that MJCF carries the per-pair exclusions. The URDF-only morph options do not apply
-        # to it, and its root is already placed the way the profile's transform places the URDF.
+        # A package may ship an engine model when its declared adjacent overlaps cannot be expressed in a URDF:
+        # that MJCF carries the per-pair exclusions, and its root is already placed like the URDF's.
         engine_model = self.profile.get('engine_model') or {}
         if engine_model.get('morph') == 'mjcf':
             morph = gs.morphs.MJCF(file=engine_model['file'], convexify=False, **placement)
         else:
-            morph = gs.morphs.URDF(file=self.profile["urdf"], fixed=True, merge_fixed_links=False,
-                recompute_inertia=False, default_armature=None, convexify=False, decimate=False,
-                watertighten=None, **placement)
+            # A wheeled base is not welded to the world; a desk-mounted arm is.
+            morph = gs.morphs.URDF(file=self.profile["urdf"], fixed=not self._mobile_base,
+                merge_fixed_links=False, recompute_inertia=False, default_armature=None,
+                convexify=False, decimate=False, watertighten=None, **placement)
         self._entity = self._scene.add_entity(morph,
-            material=gs.materials.Rigid(friction=.6, gravity_compensation=1.))
+            material=gs.materials.Rigid(friction=.6,
+                gravity_compensation=0. if self._mobile_base else 1.))
         self._objects = {}
         self._object_start = self.spawn_validation['objects']
         for name, point in self._object_start.items():
@@ -94,12 +136,22 @@ class GenericURDFEnvironment(SimulationBackend):
         response=np.asarray([POLICY['arm_response_rad_s'] if name in arm_names else POLICY['finger_response_rad_s']
                              for name in self._all_names])
         kp = np.clip(inertia * response**2,POLICY['kp_min'],POLICY['kp_max'])
-        self._entity.set_dofs_kp(kp, self._all_dofs)
         kv = 2. * np.sqrt(kp * inertia)
+        if self._mobile_base:
+            # Desk scenes cancel gravity for the whole entity; a mobile
+            # base cannot (it must rest on its wheels), so gains sized for
+            # a weightless arm let it fold under gravity while driving
+            # (measured on LeKiwi: elbow drifted -0.66 rad in one drive).
+            # Floor the arm gains at values that hold against gravity
+            # within the joints' effort limits.
+            arm_mask = np.array([name in arm_names for name in self._all_names])
+            kp = np.where(arm_mask, np.maximum(kp, 60.), kp)
+            kv = np.where(arm_mask, np.maximum(kv, 4.), kv)
+        self._entity.set_dofs_kp(kp, self._all_dofs)
         self._entity.set_dofs_kv(kv, self._all_dofs)
         effort = np.asarray([max(0., j["effort"]) for j in self.profile["joints"]])
         self._entity.set_dofs_force_range(-effort, effort, self._all_dofs)
-        self._link_names = {link.idx: link.name for entity in [self._entity, self._table, *self._objects.values()] for link in entity.links}
+        self._link_names = {link.idx: link.name for entity in [self._entity, *([self._table] if self._table is not None else []), *self._objects.values()] for link in entity.links}
         self._gripper_dofs = {side: {name: self._entity.get_joint(name).dofs_idx_local[0]
                               for name in [g['joint'], *g['followers']]} for side, g in self.grippers.items()}
         self._gripper_force_holds = set()
@@ -116,6 +168,9 @@ class GenericURDFEnvironment(SimulationBackend):
                 'transit_effort_limit': float(transit), 'kp': float(kp[index]), 'kv': float(kv[index]), 'damping': damping}
             self.set_gripper_effort(side, holding=False)
         self._gripper_commands, self._gripper_goals = {}, {}
+        self._base_hold_pose = None
+        self._base_hold_suspended = False
+        self._base_hold_depth = 0
         self._sim_step = 0
         self._contact_evidence_cache, self._contact_visuals = {}, {}
         from backend.app.robots.contacts import PinchContactTracker
@@ -130,10 +185,35 @@ class GenericURDFEnvironment(SimulationBackend):
         return self._private_collisions
 
     def joint_snapshot(self):
-        return dict(zip(self._all_names, self._entity.get_dofs_position(self._all_dofs).cpu().numpy().astype(float)))
+        snapshot = dict(zip(self._all_names, self._entity.get_dofs_position(self._all_dofs).cpu().numpy().astype(float)))
+        if self._mobile_base:
+            self._sync_root_transform()
+            # Planning snapshots describe the arm's problem in the root
+            # frame; the base's own joints (wheels, synthesized rollers)
+            # belong to navigation, so pin them at their home values or
+            # their spin phase leaks phantom contacts into arm planning.
+            home = self.profile.get("home") or {}
+            for name in self._mobile_base["wheel_joints"]:
+                snapshot[name] = float(home.get(name, 0.))
+            for name in snapshot:
+                if "_roller_" in name:
+                    snapshot[name] = 0.
+        return snapshot
 
     def ik_joint_limits(self,side):
-        return self._spawn_sampler.arm_joint_limits(side)
+        limits = np.array(self._spawn_sampler.arm_joint_limits(side), dtype=float)
+        # A continuous arm joint in a CAD export declares no range at all,
+        # and when every adjacent pair is declaration-excluded the interval
+        # computation has nothing to bound it with either - the IK then
+        # wanders into multi-turn contortions no servo performs. Clamp the
+        # unbounded ends to a half-turn: the widest envelope a positional
+        # servo joint is ever planned through.
+        types = {j["name"]: j["type"] for j in self.profile["joints"]}
+        for row, name in zip(limits, self.profile["chains"][side]["joints"]):
+            if types.get(name) in ("revolute", "continuous"):
+                row[0] = -np.pi if not np.isfinite(row[0]) else row[0]
+                row[1] = np.pi if not np.isfinite(row[1]) else row[1]
+        return limits
 
     def plan_joint_waypoints(self, side, waypoints, stop=lambda: False):
         names = self.profile['chains'][side]['joints']
@@ -167,11 +247,14 @@ class GenericURDFEnvironment(SimulationBackend):
 
     def reset(self, randomize=False, object_positions=None, seed=None,shuffle_sides=True):
         self._resolved_zones = {}
-        placements = self._spawn_sampler.layout(randomize=randomize, object_positions=object_positions,
+        placements = {"objects": dict(self._object_start)} if self._mobile_base else self._spawn_sampler.layout(randomize=randomize, object_positions=object_positions,
             base=self._object_start,seed=seed,shuffle_sides=shuffle_sides,
             stop=getattr(self,'planning_pulse',lambda:False))
         self.spawn_validation = placements
         self._sim_step = 0
+        self._base_hold_pose = None
+        self._base_hold_suspended = False
+        self._base_hold_depth = 0
         self._contact_evidence_cache.clear()
         self._pinch_tracker.reset()
         q = np.array([self.profile["home"][name] for name in self._all_names])
@@ -186,6 +269,10 @@ class GenericURDFEnvironment(SimulationBackend):
                 self._entity.control_dofs_position(np.array([g['open_q'] * multiplier]), dof)
             self._gripper_commands[side] = g["open_q"]
             self.set_gripper(side, 0.)
+        if self._mobile_base:
+            xyzw_reset = Rotation.from_matrix(self._root_transform[:3, :3]).as_quat()
+            self._entity.set_pos(tuple(self._root_transform[:3, 3]))
+            self._entity.set_quat(tuple(xyzw_reset[[3, 0, 1, 2]]))
         for name, entry in placements['objects'].items():
             position = np.asarray(entry['position'])
             self._objects[name].set_qpos(np.r_[position, 1., 0., 0., 0.], zero_velocity=True)
@@ -193,6 +280,8 @@ class GenericURDFEnvironment(SimulationBackend):
 
     def step(self, steps=1):
         for _ in range(steps):
+            if self._base_hold_pose is not None and not self._base_hold_suspended:
+                self._command_base_hold()
             for side, target in self._gripper_goals.items():
                 g = self.grippers[side]
                 multipliers = {g['joint']: 1., **g['followers']}
@@ -250,18 +339,6 @@ class GenericURDFEnvironment(SimulationBackend):
     def object_bounds(self, name):
         return self._objects[name].get_link(name).get_AABB().cpu().numpy().astype(float).reshape(2, 3)
 
-    def link_bounds(self, name):
-        """World AABB of one robot link, or None when the link carries no collision geometry.
-
-        The jaw envelope needs this: how far a jaw reaches from the object's centre is a property of the
-        gripper that has to be measured, and the same AABB the renderer and the collision model use is the
-        honest source.
-        """
-        link = self._entity.get_link(name)
-        if link is None or not link.n_geoms:
-            return None
-        return link.get_AABB().cpu().numpy().astype(float).reshape(2, 3)
-
     def record_grasp_verification(self, side, evidence):
         import time
         path = Path(self.profile['directory']) / 'gripper_runtime.json'
@@ -293,10 +370,9 @@ class GenericURDFEnvironment(SimulationBackend):
     def _default_zone_position(self, name):
         positions = {entry['arm']: np.asarray(entry['position']) for entry in self._object_start.values()}
         side = 'left' if name in ('left_side', 'blue_zone') else 'right'
-        # The fallback for an arm with no prop of its own must not be evaluated eagerly: with an empty
-        # layout - a single-arm imported robot whose sampler placed nothing, measured 2026-10-24 on
-        # UR5e + 2F-85 - a plain default argument raises StopIteration inside the caller's generator,
-        # which surfaces as "generator raised StopIteration" and takes the whole world state with it.
+        # The fallback for an arm with no prop of its own must not be evaluated eagerly: with an empty layout a
+        # plain default argument raises StopIteration inside the caller's generator and takes the whole world
+        # state with it (measured 2026-10-24 on a single-arm robot whose sampler placed nothing).
         fallback = next(iter(positions.values()), None)
         if fallback is None:
             fallback = np.array([0., 0., self.table_height])
@@ -304,11 +380,8 @@ class GenericURDFEnvironment(SimulationBackend):
         if name == 'center' and positions:
             point = np.mean(list(positions.values()), axis=0)
         point[0] += .06
-        # Distinct slots must be distinct places. Keying them by arm collapsed every slot onto one
-        # point for a single-arm robot whose props were all sampled by that arm - measured 2026-10-25
-        # on OpenManipulator-X: left_side, right_side and center all reported [0.11, 0.0, 0.76], so a
-        # request to place two cubes on separate destinations could never be satisfied, and the plan
-        # that failed was attributed to the language model rather than to this state.
+        # Distinct slots must be distinct places, otherwise a request to place two objects on separate
+        # destinations can never be satisfied (measured 2026-10-25: three slots all at [0.11, 0, 0.76]).
         point[1] += {'left_side': .10, 'blue_zone': .10, 'right_side': -.10, 'green_zone': -.10}.get(name, 0.)
         point[2] = self.table_height
         return point
@@ -475,8 +548,18 @@ class GenericURDFEnvironment(SimulationBackend):
 
     def arm_kinematics(self, side):
         actual = self._entity.get_dofs_position(self._all_dofs).cpu().numpy()
+        # The planning frame is the profile's root transform, read live:
+        # IK (solve_profile_ik) and the collision queries anchor on it, a
+        # mobile base re-anchors it to the driven pose, and the placement
+        # search swaps it for a hypothetical one. The construction-time
+        # copy (self._root_transform, still the spawn anchor for reset)
+        # froze FK at the spawn pose instead, so after a 0.32 m drive
+        # plan_closure's follow check compared world targets against
+        # origin-frame FK and failed with a phantom ~0.3 m error at the
+        # second sweep sample even though the IK solution had moved by
+        # ~0.001 rad. Desk robots never re-anchor, so they are unaffected.
         return URDFKinematics(self.model, self.profile['chains'][side], dict(zip(self._all_names, actual)),
-                              self._root_transform, self.profile['chains'][side]['tool_offset'])
+                              np.asarray(self.profile["root_transform"]), self.profile['chains'][side]['tool_offset'])
 
     def ee_pose(self, side):
         link = self._entity.get_link(self.profile['chains'][side]['end_link'])
@@ -558,4 +641,169 @@ class GenericURDFEnvironment(SimulationBackend):
               for side in ('left', 'right')}
         return Frame(self._sim_step * self._dt, self._entity.get_qpos().cpu().numpy().tolist(),
                      {name: self.object_pose(name)[0].tolist() for name in self._objects}, {}, ee,
-                     {side: self.gripper_position(side) for side in ('left', 'right')}, self.contact_names())
+                     {side: self.gripper_position(side) for side in ('left', 'right')}, self.contact_names(),
+                     base=self.base_pose().tolist() if self._mobile_base else None)
+
+    # -- mobile base -----------------------------------------------------------
+
+    def _drive(self):
+        """The drive kinematics + wheel DOFs for the declared mobile base."""
+        if getattr(self, "_drive_cache", None) is None:
+            from backend.app.control.navigation import DiffDrive, KiwiDrive
+            spec = self._mobile_base
+            self._wheel_dofs = np.array([self._entity.get_joint(name).dofs_idx_local[0]
+                                         for name in spec["wheel_joints"]])
+            self._wheel_limits = np.array([abs(self.model.by_name[name]["velocity"])
+                                           for name in spec["wheel_joints"]])
+            # Optional measured drive model (scripts/calibrate_mobile_base.py):
+            # achieved twist = model @ commanded twist in this engine. When
+            # present, commands are corrected through its inverse.
+            self._drive_model = None
+            calibration_path = Path(self.profile["directory"]) / "drive_calibration.json"
+            if calibration_path.is_file():
+                self._drive_model = np.asarray(json.loads(calibration_path.read_text())["model"], dtype=float)
+            # The URDF-derived kv targets the position-controlled arm
+            # response and leaves velocity control too weak to break ground
+            # friction (measured: commanded wheels stayed at exactly zero).
+            # A wheel servo's velocity loop is stiff; use a fixed gain.
+            self._entity.set_dofs_kv(np.full(len(self._wheel_dofs), WHEEL_VELOCITY_KV), self._wheel_dofs)
+            if spec["drive"] == "kiwi":
+                self._drive_cache = KiwiDrive(spec.get("wheel_levers", spec["base_radius"]), tuple(spec["wheel_angles"]))
+            else:
+                self._drive_cache = DiffDrive(spec["wheel_radius"], spec["track_width"])
+        return self._drive_cache
+
+    def base_speed_limits(self):
+        """Achievable (translation m/s, rotation rad/s) from the wheel limits.
+
+        The skill caps its commands with these; commanding past the slowest
+        wheel's limit clips each wheel differently and bends the twist.
+        """
+        if not self._mobile_base:
+            raise NotImplementedError("This robot has no mobile base")
+        self._drive()
+        fastest_wheel = float(np.min(self._wheel_limits)) * self._mobile_base["wheel_radius"]
+        if self._mobile_base["drive"] == "kiwi":
+            longest_lever = max(self._mobile_base.get("wheel_levers", [self._mobile_base["base_radius"]]))
+            return fastest_wheel, fastest_wheel / longest_lever
+        return fastest_wheel, 2. * fastest_wheel / self._mobile_base["track_width"]
+
+    def _sync_root_transform(self):
+        # The profile's root_transform is where every planner believes the
+        # robot stands. A desk robot never moves, so the import-time value
+        # stays true; a mobile base must re-anchor it to the driven pose,
+        # or IK keeps solving for a robot that is still at the origin.
+        if not self._mobile_base:
+            return
+        link = self._entity.get_link(self.profile["root_link"])
+        position = link.get_pos().cpu().numpy().astype(float)
+        quat = link.get_quat().cpu().numpy()
+        transform = np.eye(4)
+        transform[:3, :3] = Rotation.from_quat(quat[[1, 2, 3, 0]]).as_matrix()
+        transform[:3, 3] = position
+        self.profile["root_transform"] = transform.tolist()
+
+    def base_pose(self):
+        if not self._mobile_base:
+            raise NotImplementedError("This robot has no mobile base")
+        link = self._entity.get_link(self.profile["root_link"])
+        position = link.get_pos().cpu().numpy().astype(float)
+        quat = link.get_quat().cpu().numpy()
+        rotation = Rotation.from_quat(quat[[1, 2, 3, 0]]).as_matrix()
+        self._sync_root_transform()
+        return np.array([position[0], position[1], np.arctan2(rotation[1, 0], rotation[0, 0])])
+
+    def command_base_velocity(self, vx, vy, omega):
+        if not self._mobile_base:
+            raise NotImplementedError("This robot has no mobile base")
+        drive = self._drive()
+        spec = self._mobile_base
+        from backend.app.control.navigation import correct_twist, limit_wheel_speeds
+        vx, vy, omega = correct_twist(self._drive_model, (vx, vy, omega))
+        signs = np.asarray(spec.get("wheel_signs", [1] * len(spec["wheel_joints"])), dtype=float)
+        if spec["drive"] == "kiwi":
+            # KiwiDrive returns linear rolling speeds; the joints want rad/s,
+            # signed by each axle's measured mounting direction.
+            angular = signs * drive.wheel_speeds(vx, vy, omega) / spec["wheel_radius"]
+        else:
+            if abs(vy) > 1e-9:
+                raise ValueError("A differential-drive base cannot move sideways")
+            angular = signs * np.array(drive.wheel_speeds(vx, omega))
+        angular = limit_wheel_speeds(angular, self._wheel_limits)
+        self._entity.control_dofs_velocity(angular.astype(np.float32), self._wheel_dofs)
+
+    # -- base hold -----------------------------------------------------------
+    #
+    # Arm work on a wheeled base pushes the base around. Between drives the
+    # wheels sit in velocity control at a zero command, which resists
+    # rolling only through the wheel velocity gain; an arm swinging several
+    # kilograms of CAD links walks the base anyway (measured on LeKiwi:
+    # +0.081 rad of yaw and 5 mm of translation during one approach
+    # transit - enough to move the tool out of its planned frame and shove
+    # the target cube 0.11 m). While manipulation skills run, the hold
+    # closes the loop on the *measured* base pose instead: every physics
+    # step it commands the twist that reduces the pose error. It only ever
+    # commands wheel velocities; the base pose itself is never written
+    # outside reset, per the project rule.
+
+    def engage_base_hold(self):
+        """Hold the base at its current measured pose during arm motion.
+
+        Re-entrant (nested skills share the first captured pose); a no-op
+        for robots without a mobile base.
+        """
+        if not self._mobile_base:
+            return
+        self._base_hold_depth += 1
+        if self._base_hold_depth == 1:
+            self._base_hold_pose = self.base_pose().copy()
+            self._base_hold_suspended = False
+
+    def release_base_hold(self):
+        if not self._mobile_base:
+            return
+        self._base_hold_depth = max(0, self._base_hold_depth - 1)
+        if self._base_hold_depth == 0 and self._base_hold_pose is not None:
+            self._base_hold_pose = None
+            self._base_hold_suspended = False
+            self.command_base_velocity(0., 0., 0.)
+
+    def suspend_base_hold(self):
+        """Pause the hold while the base is deliberately driven.
+
+        The drive commands the wheels itself; resume_base_hold re-anchors
+        the target to wherever the base was driven to.
+        """
+        if self._base_hold_pose is not None:
+            self._base_hold_suspended = True
+
+    def resume_base_hold(self):
+        if self._base_hold_pose is not None:
+            self._base_hold_pose = self.base_pose().copy()
+            self._base_hold_suspended = False
+
+    @property
+    def base_hold_active(self):
+        return self._base_hold_pose is not None and not self._base_hold_suspended
+
+    def _command_base_hold(self):
+        from backend.app.control.navigation import wrap_angle
+        target = self._base_hold_pose
+        measured = self.base_pose()
+        error_xy = target[:2] - measured[:2]
+        error_yaw = wrap_angle(float(target[2] - measured[2]))
+        if np.linalg.norm(error_xy) < .002 and abs(error_yaw) < .002:
+            self.command_base_velocity(0., 0., 0.)
+            return
+        yaw = float(measured[2])
+        forward = np.cos(yaw) * error_xy[0] + np.sin(yaw) * error_xy[1]
+        lateral = -np.sin(yaw) * error_xy[0] + np.cos(yaw) * error_xy[1]
+        max_v, max_omega = self.base_speed_limits()
+        vx = float(np.clip(BASE_HOLD_POSITION_GAIN * forward, -.6 * max_v, .6 * max_v))
+        # A differential-drive base cannot strafe; its lateral error is
+        # corrected through the yaw term instead of a sideways command
+        # (command_base_velocity would refuse the sideways component).
+        vy = float(np.clip(BASE_HOLD_POSITION_GAIN * lateral, -.6 * max_v, .6 * max_v)) \
+            if self._mobile_base["drive"] == "kiwi" else 0.
+        omega = float(np.clip(BASE_HOLD_YAW_GAIN * error_yaw, -.6 * max_omega, .6 * max_omega))
+        self.command_base_velocity(vx, vy, omega)

@@ -26,6 +26,7 @@ from typing import Callable
 import numpy as np
 
 from backend.app.control.motion import OpenArmV2Controller
+from backend.app.control.navigation import BasePose, WaypointController, clearance_to_aabbs
 from backend.app.simulation.base import SimulationBackend
 from backend.app.simulation.openarm_v2.definition import (
     FINGERTIP_MIDPOINT,
@@ -302,6 +303,89 @@ class SkillRunner:
                 raise SkillError("INVALID_PLAN", "Relative move must be between 1 and 30 cm")
             return self._move_relative(arm, DIRECTION_VECTORS[direction] * distance_cm / 100.0)
         return self._skill("move_relative", run, started)
+
+    def navigate_to(self, target, target_yaw: float | None = None, timeout: float = 60.,
+                    exclude_object: str | None = None,
+                    arrive_tolerance: float | None = None, yaw_tolerance: float | None = None) -> dict:
+        """Drive the scene's mobile base to a world (x, y) target.
+
+        The base moves only through its wheel actuators; arrival is decided
+        from the measured base pose, and an obstacle the guard cannot pass
+        fails the skill instead of being driven through. Holonomic bases are
+        driven forward-only in this slice (no strafing yet).
+
+        Callers whose target pose was *evaluated* at an exact placement
+        (the grasp-placement retry) can tighten the arrival tolerances;
+        the defaults are the waypoint controller's.
+        """
+        started = time.perf_counter()
+        return self._skill("navigate_to", lambda: self._navigate_to(
+            target, target_yaw, timeout, exclude_object, arrive_tolerance, yaw_tolerance), started)
+
+    def _navigate_to(self, target, target_yaw, timeout, exclude_object=None,
+                     arrive_tolerance=None, yaw_tolerance=None) -> dict:
+        try:
+            self.env.base_pose()
+        except NotImplementedError:
+            raise SkillError("NAVIGATION_UNSUPPORTED", "This scene's robot has no mobile base")
+        # A base hold (engaged by a surrounding manipulation skill) servos
+        # the wheels on the measured pose and would fight this drive; the
+        # drive suspends it and resumes on exit, which re-anchors the hold
+        # to the pose the base was deliberately driven to.
+        suspend = getattr(self.env, "suspend_base_hold", None)
+        if callable(suspend):
+            suspend()
+
+        def resume_hold():
+            resume = getattr(self.env, "resume_base_hold", None)
+            if callable(resume):
+                resume()
+        limits = getattr(self.env, "base_speed_limits", None)
+        max_v, max_omega = limits() if callable(limits) else (0.5, 1.2)
+        controller = WaypointController(
+            max_v=float(max_v), max_omega=float(max_omega),
+            **({"arrive_tolerance": float(arrive_tolerance)} if arrive_tolerance is not None else {}),
+            **({"yaw_tolerance": float(yaw_tolerance)} if yaw_tolerance is not None else {}))
+        target = np.asarray(target, dtype=float)
+        # Command at ~50 Hz of simulation time, like the motor cadence.
+        chunk = max(1, round(0.02 / self.env.timestep))
+        elapsed = 0.
+        final = None
+        while elapsed <= timeout:
+            measured = self.env.base_pose()
+            pose = BasePose(float(measured[0]), float(measured[1]), float(measured[2]))
+            aabbs = []
+            for name in self.env.frame().objects:
+                if name == exclude_object:
+                    # The destination itself is not an obstacle to avoid.
+                    continue
+                try:
+                    bounds = np.asarray(self.env.object_bounds(name), dtype=float)
+                except NotImplementedError:
+                    continue
+                aabbs.append(bounds[:, :2])
+            clearance = clearance_to_aabbs(pose, 0.25, np.array(aabbs)) if aabbs else float("inf")
+            command = controller.update(pose, target, target_yaw=target_yaw, obstacle_clearance=clearance)
+            final = pose
+            if command.status == "arrived":
+                self.env.command_base_velocity(0., 0., 0.)
+                resume_hold()
+                return {"target": target.tolist(),
+                        "final_pose": [pose.x, pose.y, pose.yaw],
+                        "final_distance_m": float(np.linalg.norm(target - pose.position()))}
+            if command.status == "blocked":
+                self.env.command_base_velocity(0., 0., 0.)
+                resume_hold()
+                raise SkillError("NAVIGATION_BLOCKED",
+                                 f"Obstacle stopped the base {float(np.linalg.norm(target - pose.position())):.2f} m short of the target")
+            self.env.command_base_velocity(command.v, 0., command.omega)
+            self.env.step(chunk)
+            elapsed += chunk * self.env.timestep
+        self.env.command_base_velocity(0., 0., 0.)
+        resume_hold()
+        raise SkillError("NAVIGATION_TIMEOUT",
+                         f"Base did not reach the target within {timeout:.0f} s of simulation time"
+                         + (f"; last pose {final}" if final else ""))
 
     def move_to_target(self, arm: str, target: str) -> dict:
         started = time.perf_counter()
@@ -706,6 +790,9 @@ class SkillRunner:
                                            target=step.get("target"))
             elif skill == "pour_liquid":
                 result = self.pour_liquid(arm, step["object"], step.get("target") or "wine_glass", float(step.get("volume_ml") or 20.))
+            elif skill == "navigate_to":
+                result = self.navigate_to(step["target_xy"], step.get("target_yaw"),
+                                          exclude_object=step.get("object"))
             else:
                 result = {"skill": skill, "success": False, "duration": 0.0, "error": "INVALID_PLAN", "detail": "Unknown skill"}
             results.append(result)

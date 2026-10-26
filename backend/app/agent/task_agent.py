@@ -11,7 +11,7 @@ import time
 
 from backend.app.agent.scene_reasoning import SceneReferenceError, bind_scene_references
 from backend.app.agent.recovery_policy import reset_evidence
-from backend.app.planning.agent_planner import PROVENANCE_FIELDS, PlannerProviderError
+from backend.app.planning.agent_planner import PlannerProviderError
 from backend.app.planning.preparation import compile_prepared_program
 from backend.app.planning.spatial_language import preservation_spans
 from backend.app.planning.task_program import GroundingError, TaskProgram
@@ -21,15 +21,8 @@ RECOVERABLE = {'IK_FAILURE','GRASP_FAILED','COLLISION_PATH','MOTION_BLOCKED','HO
                'GOAL_NOT_SATISFIED','INVALID_PLAN','HANDOVER_FAILED','PARK_COLLISION','GRASP_LOST','GRASP_SLIP',
                'HANDOVER_UNREACHABLE','HANDOVER_APPROACH_COLLISION','HANDOVER_NO_RECEIVER_PINCH',
                'HANDOVER_DONOR_CONTACT','HANDOVER_LOST','HAND_CONTACT',
-               # A throw that reports the stroke it could get and the speed the cube left is recoverable by
-               # measurement like any other physical failure: the agent can back off and throw again.
-               # Measured 2026-10-27: THROW_FAILED was not in this set, so the agent exited without ever
-               # offering the planner the numbers.
                'THROW_FAILED'}
-#: Operations a task may retry from the observed scene. A throw belongs here for the same reason a place
-#: does: it is a physical action whose failure reports its own measurements, and refusing to restart a task
-#: that contains one made every aimed throw unrecoverable before it could be replanned.
-RESTARTABLE = {'pick','handover','place','approach','home','throw','pour'}
+RESTARTABLE = {'pick','handover','place','approach','home','navigate'}
 
 
 def completed_prefix(plan, result):
@@ -210,18 +203,12 @@ class TaskAgent:
                     except GroundingError:
                         pass
             certificate=reset_evidence(observed,source)
-            # A skill that reports the numbers behind its failure - a throw that says which stroke it
-            # could get and how fast the cube left - is asking for a different plan, not for somebody to
-            # retry the same one. "Back off, then throw" is expressible in the existing language, so the
-            # planner gets the chance to write it.
-            if not legal and certificate and reset_allowed and resets<self.max_resets:
-                legal.append('reset_and_retry')
-            # Offered only when the failure carried measurements (a skill that says how far it could travel
-            # and how fast the object left). Always offering it would mean the agent can never run out of
-            # options, and "stop when nothing in the scene can help" is a contract this repo keeps: two
-            # guards pin it, and they failed the moment replan was unconditional.
+            # Measured failures can be answered with a different plan; only when they carry numbers, so the
+            # agent can still run out of options.
             if not replan_used and 'design' in str(failed.get('detail') or ''):
                 legal.append('replan')
+            if not legal and certificate and reset_allowed and resets<self.max_resets:
+                legal.append('reset_and_retry')
             if not legal:
                 result['detail'] = f'{category}: 同じシーン内で利用できる復旧案を試しました。配置を維持して停止します。'
                 return finish(result)
@@ -235,7 +222,7 @@ class TaskAgent:
                 return finish(result)
             announce({'kind':assessment['decision'],'explanation':assessment.get('reason','復旧します。'),
                 'assessment':assessment,'completed_action_prefix':prefix,'reset_evidence':certificate})
-            recovery={'decision':assessment['decision'],'assessment':assessment,'before':observed}
+            recovery={'decision':assessment['decision'],'before':observed}
             recoveries.append(recovery)
             if assessment['decision']=='resume':
                 plan = continuation
@@ -292,6 +279,6 @@ class TaskAgent:
                     plan = compile_prepared_program(source,epoch_initial)
                 except GroundingError as error:
                     return blocked(str(error),'RECOVERY_PRECONDITION_FAILED')
-            for field in PROVENANCE_FIELDS:
+            for field in ('provider','model','provider_error'):
                 setattr(plan,field,getattr(original,field))
         return blocked('AGENT_ATTEMPT_BUDGET','AGENT_ATTEMPT_BUDGET')

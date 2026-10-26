@@ -13,7 +13,7 @@ from backend.app.robots.policy import IMPORTED_ROBOT_POLICY,policy_signature
 GENERATED_ROOT = Path(__file__).resolve().parents[3] / "outputs" / "robots"
 OPENARM = {"id": "openarm_v2", "name": "OpenArm v2", "source": "official openarm-mujoco",
            "builtin": True, "capabilities": ["motion", "physical_grasp", "handover", "stack", "pour"]}
-PROFILE_VERSION = 14
+PROFILE_VERSION = 16
 _file_hash_cache = {}
 
 
@@ -104,6 +104,202 @@ def collision_declaration(source):
             "documented_excluded_adjacent_pairs": len(settings.get("excluded_adjacent_pairs", []))}
 
 
+def _link_wheel_radius(model, link_name):
+    """Rolling radius of a wheel link from its own geometry, or None.
+
+    A cylinder/sphere collision gives the radius directly; a mesh (the usual
+    CAD export) gives it as half its largest extent, the wheel's diameter.
+    """
+    link = model.links[link_name]
+    for kind in ("collision", "visual"):
+        for element in link.findall(kind):
+            cylinder = element.find("geometry/cylinder")
+            if cylinder is not None and cylinder.get("radius"):
+                return float(cylinder.get("radius"))
+            sphere = element.find("geometry/sphere")
+            if sphere is not None and sphere.get("radius"):
+                return float(sphere.get("radius"))
+            mesh = element.find("geometry/mesh")
+            if mesh is not None:
+                import trimesh
+                geometry = trimesh.load(mesh_path(mesh.get("filename"), model.path), force="mesh", process=False)
+                # CAD exports often model in millimetres and carry the unit
+                # conversion in the mesh scale; apply it like the root fit.
+                scale = vector(mesh.get("scale"), [1., 1., 1.])
+                extents = (np.asarray(geometry.bounds[1]) - np.asarray(geometry.bounds[0])) * scale
+                return float(extents.max()) / 2.
+    return None
+
+
+def _wheel_body_link(model, joint):
+    """The link that actually rolls for a wheel joint.
+
+    The joint's child is often just a mount (LeKiwi: omni_wheel_mount) and
+    the wheel body hangs below it on a fixed joint; measuring the mount
+    understates both the radius (~28 mm instead of ~52 mm) and the lever
+    arm. Follow fixed joints down and keep the descendant whose own
+    geometry gives the largest radius.
+    """
+    descendants = [joint["child"]]
+    queue = [joint["child"]]
+    while queue:
+        parent = queue.pop()
+        for other in model.joints:
+            if other["parent"] == parent and other["type"] == "fixed":
+                descendants.append(other["child"])
+                queue.append(other["child"])
+    return max(descendants, key=lambda name: _link_wheel_radius(model, name) or 0.)
+
+
+def _detect_mobile_base(model, chains):
+    """Detect a wheeled mobile base among the joints no arm chain claims.
+
+    A wheel joint is an actuated joint with "wheel" in its name that is not
+    part of any selected arm chain (LeKiwi: base_left_wheel, base_back_wheel,
+    base_right_wheel). Three wheels make a holonomic kiwi drive, two a
+    differential drive. Wheel positions come from the model's own forward
+    kinematics at the zero pose, so the drive geometry is measured from the
+    URDF, never assumed. Returns None when the robot has no wheeled base.
+    """
+    chain_joints = {name for chain in chains.values() for name in chain["joints"]}
+    wheels = [j for j in model.active if "wheel" in j["name"].lower() and j["name"] not in chain_joints]
+    if len(wheels) not in (2, 3):
+        return None
+    poses, axes = model.forward({})
+    root_position = poses[model.root][:3, 3]
+    bodies = [_wheel_body_link(model, j) for j in wheels]
+    centres = np.array([poses[body][:3, 3] - root_position for body in bodies])
+    # Sign of each wheel's spin, from the no-slip condition at the contact:
+    # spinning about the axle a moves the contact patch along -(a x z), so
+    # the dof sign that rolls the wheel along its tangent t is t . (a x z).
+    # Measured from the model's own world axes, never assumed (LeKiwi's
+    # axles all point radially outward and all three signs come out -1;
+    # a differential pair with mirrored outward axles comes out (+1, -1)).
+    forward_axis = poses[model.root][:3, :3] @ np.array([1., 0., 0.])
+    signs = []
+    for j, centre in zip(wheels, centres):
+        if len(wheels) == 3:
+            theta = np.arctan2(centre[1], centre[0])
+            tangent = np.array([-np.sin(theta), np.cos(theta), 0.])
+        else:
+            tangent = forward_axis
+        axis_world = np.asarray(axes[j["name"]][1], dtype=float)
+        signs.append(1 if float(tangent @ np.cross(axis_world, np.array([0., 0., 1.]))) > 0 else -1)
+    radii = [_link_wheel_radius(model, body) for body in bodies]
+    wheel_radius = float(np.mean([r for r in radii if r])) if any(radii) else None
+    if len(wheels) == 3:
+        return {"drive": "kiwi", "wheel_joints": [j["name"] for j in wheels],
+                "wheel_angles": [float(np.arctan2(c[1], c[0])) for c in centres],
+                "wheel_signs": signs,
+                "wheel_levers": [float(np.linalg.norm(c[:2])) for c in centres],
+                "base_radius": float(np.mean(np.linalg.norm(centres[:, :2], axis=1))),
+                "wheel_radius": wheel_radius}
+    order = sorted(range(len(wheels)), key=lambda i: -centres[i, 1])
+    return {"drive": "diff", "wheel_joints": [wheels[i]["name"] for i in order],
+            "wheel_signs": [signs[i] for i in order],
+            "track_width": float(abs(centres[order[0], 1] - centres[order[1], 1])),
+            "wheel_radius": wheel_radius}
+
+
+def _rpy_from_matrix(rotation):
+    """URDF rpy (R = Rz @ Ry @ Rx) from a rotation matrix."""
+    pitch = float(np.arcsin(np.clip(-rotation[2, 0], -1., 1.)))
+    if abs(np.cos(pitch)) < 1e-6:
+        return [float(np.arctan2(-rotation[0, 1], rotation[1, 1])), pitch, 0.]
+    return [float(np.arctan2(rotation[2, 1], rotation[2, 2])), pitch,
+            float(np.arctan2(rotation[1, 0], rotation[0, 0]))]
+
+
+def _synthesize_omni_wheels(model, spec):
+    """Rewrite fused CAD omni wheels as hub + free-spinning rollers.
+
+    CAD exports fuse an omni wheel's rollers into one rigid body, so in
+    physics the contact resists sliding along the axle with full friction:
+    a kiwi base then cannot translate (measured: ~15-25% of the commanded
+    speed, the rest lost to scrub). The real wheel's rollers spin freely
+    about tangential axes and make the axle direction nearly free. This
+    rewrite keeps the CAD visual on the hub, drops the hub's collision,
+    and hangs K small roller cylinders around the rim on passive
+    continuous joints, restoring that mechanism in the physics URDF.
+    Only the serialized physics URDF changes; detection and the profile
+    keep describing the source model.
+    """
+    import xml.etree.ElementTree as ET
+
+    def fmt(values):
+        return " ".join(f"{float(v):.6g}" for v in values)
+
+    poses, axes = model.forward({})
+    joints_by_name = {j["name"]: j for j in model.joints}
+    elements = {el.get("name"): el for el in model.xml.findall("joint")}
+    rollers_per_wheel = 8
+    for name in spec["wheel_joints"]:
+        joint = joints_by_name[name]
+        body_name = _wheel_body_link(model, joint)
+        body = model.links[body_name]
+        radius = _link_wheel_radius(model, body_name) or spec["wheel_radius"]
+        # Width = smallest mesh extent of the wheel body (its thickness).
+        width = 0.6 * radius
+        for element in body.findall("visual"):
+            mesh = element.find("geometry/mesh")
+            if mesh is not None:
+                import trimesh
+                geometry = trimesh.load(mesh_path(mesh.get("filename"), model.path), force="mesh", process=False)
+                scale = vector(mesh.get("scale"), [1., 1., 1.])
+                width = float(((np.asarray(geometry.bounds[1]) - np.asarray(geometry.bounds[0])) * scale).min())
+                break
+        # Axle direction in the body frame, from the measured world axis.
+        world_axis = np.asarray(axes[name][1], dtype=float)
+        axle = poses[body_name][:3, :3].T @ world_axis
+        axle = axle / np.linalg.norm(axle)
+        helper = np.array([0., 0., 1.]) if abs(axle[2]) < 0.9 else np.array([1., 0., 0.])
+        u = np.cross(axle, helper)
+        u = u / np.linalg.norm(u)
+        v = np.cross(axle, u)
+        # Keep the measured mass on the hub, light rollers.
+        inertial = body.find("inertial")
+        mass_el0 = inertial.find("mass") if inertial is not None else None
+        total_mass = float(mass_el0.get("value")) if mass_el0 is not None and mass_el0.get("value") else 0.1
+        if inertial is not None:
+            mass_el0.set("value", fmt([total_mass * 0.65]))
+            inertia_el = inertial.find("inertia")
+            if inertia_el is not None:
+                for attr in ("ixx", "ixy", "ixz", "iyy", "iyz", "izz"):
+                    if inertia_el.get(attr):
+                        inertia_el.set(attr, fmt([float(inertia_el.get(attr)) * 0.65]))
+        for collision in body.findall("collision"):
+            body.remove(collision)
+        roller_radius = float(np.clip(radius * 0.22, 0.006, 0.016))
+        ring = radius - roller_radius
+        roller_length = max(width * 0.55, 0.01)
+        roller_mass = total_mass * 0.35 / rollers_per_wheel
+        # Phase the rollers so one sits at the contact patch at spawn.
+        down = poses[body_name][:3, :3].T @ np.array([0., 0., -1.])
+        phase = float(np.arctan2(down @ v, down @ u))
+        for k in range(rollers_per_wheel):
+            theta = phase + 2 * np.pi * k / rollers_per_wheel
+            radial = np.cos(theta) * u + np.sin(theta) * v
+            tangent = -np.sin(theta) * u + np.cos(theta) * v
+            rotation = np.column_stack([radial, axle, tangent])
+            rpy = _rpy_from_matrix(rotation)
+            roller_name = f"{body_name}_roller_{k}"
+            link_el = ET.SubElement(model.xml, "link", {"name": roller_name})
+            inertial_el = ET.SubElement(link_el, "inertial")
+            ET.SubElement(inertial_el, "mass", {"value": fmt([roller_mass])})
+            ixx = roller_mass * (3 * roller_radius ** 2 + roller_length ** 2) / 12.
+            ET.SubElement(inertial_el, "inertia", {
+                "ixx": fmt([ixx]), "ixy": "0", "ixz": "0",
+                "iyy": fmt([ixx]), "iyz": "0", "izz": fmt([0.5 * roller_mass * roller_radius ** 2])})
+            collision_el = ET.SubElement(link_el, "collision")
+            geometry_el = ET.SubElement(collision_el, "geometry")
+            ET.SubElement(geometry_el, "cylinder", {"radius": fmt([roller_radius]), "length": fmt([roller_length])})
+            joint_el = ET.SubElement(model.xml, "joint", {"name": roller_name, "type": "continuous"})
+            ET.SubElement(joint_el, "parent", {"link": body_name})
+            ET.SubElement(joint_el, "child", {"link": roller_name})
+            ET.SubElement(joint_el, "origin", {"xyz": fmt(ring * radial), "rpy": fmt(rpy)})
+            ET.SubElement(joint_el, "axis", {"xyz": "0 0 1"})
+
+
 def import_robot(folder):
     root = Path(folder).expanduser().resolve()
     if root.is_file() and root.suffix.lower() == ".urdf":
@@ -176,6 +372,7 @@ def import_robot(folder):
     if not chosen:
         raise ValueError("No actuated chain found in this URDF")
     chains = {}
+    mobile_base = _detect_mobile_base(model, chains)
     for candidate in chosen:
         tokens = " ".join([candidate["end_link"], *candidate["joints"]])
         side = "right" if re.search(r"(?:^|[_\s])(?:r|right)(?:[_\s]|$)", tokens, re.I) else "left"
@@ -204,14 +401,31 @@ def import_robot(folder):
         minimum_z = float(np.concatenate(vertices)[:, 2].min())
     root_transform = np.eye(4)
     root_transform[:3, :3] = Rotation.from_euler("z", yaw).as_matrix()
-    # A package may record how high it stands above the desk (a pedestal), separately from its setup
-    # posture. A gripper mounted directly on the desk cannot descend to an object lying on it: measured
-    # 2026-10-24 on UR5e + 2F-85, no desk position was reachable with an object centre 19 mm above the
-    # surface and only one prop of two could be placed, until the robot stood 0.30 m higher.
-    setup_file = source.with_name("initial_state.json")
-    mount_height = (float(json.loads(setup_file.read_text()).get('mount_height', 0.))
-                    if setup_file.is_file() else 0.)
-    root_transform[:3, 3] = [-.25, 0., .76 + mount_height - minimum_z + .001]
+    if mobile_base:
+        # A wheeled base stands on the floor: rest the robot's lowest measured point on z=0, using every
+        # link's visual mesh transformed by the zero-pose forward kinematics.
+        floor_z = minimum_z
+        for link_name, pose in poses.items():
+            for visual in model.links[link_name].findall("visual"):
+                mesh = visual.find("geometry/mesh")
+                if mesh is None:
+                    continue
+                geometry = trimesh.load(mesh_path(mesh.get("filename"), source), force="mesh", process=False)
+                points = np.asarray(geometry.vertices) * vector(mesh.get("scale"), [1., 1., 1.])
+                transform = origin(visual.find("origin"))
+                world = points @ transform[:3, :3].T + transform[:3, 3]
+                world = world @ pose[:3, :3].T + pose[:3, 3]
+                floor_z = min(floor_z, float(world[:, 2].min()))
+        root_transform[:3, 3] = [0., 0., -floor_z + .001]
+    else:
+        # A package may record how high it stands above the desk (a pedestal), separately from its setup
+        # posture. A gripper mounted directly on the desk cannot descend to an object lying on it: measured
+        # 2026-10-24 on UR5e + 2F-85, no desk position was reachable with an object centre 19 mm above the
+        # surface and only one prop of two could be placed, until the robot stood 0.30 m higher.
+        setup_file = source.with_name("initial_state.json")
+        mount_height = (float(json.loads(setup_file.read_text()).get('mount_height', 0.))
+                        if setup_file.is_file() else 0.)
+        root_transform[:3, 3] = [-.25, 0., .76 + mount_height - minimum_z + .001]
     initial = {}
     initial_file = source.with_name("initial_state.json")
     if initial_file.is_file():
@@ -259,6 +473,8 @@ def import_robot(folder):
              "torsional_friction": True, "rolling_friction": True}
     from backend.app.robots.gripper_discovery import discover_grippers
     analysis = discover_grippers(model, profile)
+    if mobile_base:
+        profile['mobile_base'] = mobile_base
     profile['grippers'] = analysis['grippers']
     for side, gripper in profile['grippers'].items():
         chains[side] = {'end_link': gripper['reference_link'], 'tool_offset': gripper['tool_offset'],
@@ -275,6 +491,8 @@ def import_robot(folder):
     profile['cube_size'] = scene['cube_size']
     # The private model reads the declaration from the profile, so it must be recorded before the
     # engine model is built from it.
+    if mobile_base and mobile_base.get("drive") == "kiwi":
+        _synthesize_omni_wheels(model, mobile_base)
     profile['collision_config'] = declaration
     if engine_model_required:
         # Both the private queries and the engine must ignore the same pairs; the URDF cannot express
@@ -302,7 +520,19 @@ def import_robot(folder):
                  for side, seed in seeds.items()}
     (target / 'ik_validation.json').write_text(json.dumps(ik_checks, indent=2) + '\n')
     from backend.app.robots.spawn import ReachableDeskSpawns
-    spawn = ReachableDeskSpawns(profile, scene).layout()
+    if mobile_base:
+        # A floor robot's props are authored, not desk-sampled: an optional floor_objects.json next to the
+        # URDF maps object names to floor positions ([x, y] or [x, y, z]; z defaults to half the cube size).
+        spawn = {"objects": {}}
+        authored = source.parent / "floor_objects.json"
+        if authored.is_file():
+            for name, entry in json.loads(authored.read_text()).get("objects", {}).items():
+                position = [float(v) for v in entry["position"]]
+                if len(position) == 2:
+                    position.append(scene["cube_size"] / 2)
+                spawn["objects"][name] = {"position": position}
+    else:
+        spawn = ReachableDeskSpawns(profile, scene).layout()
     if not spawn['objects'] and profile['grippers']:
         # An object shorter than the arm can descend above the desk is unpickable: no position is
         # reachable, so the layout omits every prop. Measure the height this arm needs and grow the

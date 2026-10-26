@@ -52,6 +52,12 @@ def _imported_skills(grippers, arms, pinch_verified, has_fluid) -> list[str]:
 
 def build_world_state(env: SimulationBackend) -> dict:
     frame = env.frame()
+    # A mobile base reports its own pose; desk scenes have none, and what the planner is told is conditioned
+    # on that.
+    try:
+        base_pose = [float(v) for v in env.base_pose()]
+    except (AttributeError, TypeError, NotImplementedError):
+        base_pose = None
     holds = physical_holds(env)
     contacts = env.contact_names()
     available = getattr(env,'available_arms',['left','right'])
@@ -91,8 +97,11 @@ def build_world_state(env: SimulationBackend) -> dict:
     # the list it had: it reports no grippers through this profile and is trusted as a whole.
     pinch_verified = bool(grippers) and bool(profile.get("grasp_calibrated"))
     has_fluid = bool(getattr(frame, "fluid", None))
-    targets.extend({"id": name, "position": env.zone_position(name).tolist() if imported else list(position),
-                    "type": "table_region"} for name, position in TABLE_TARGETS.items())
+    if base_pose is None:
+        # Table regions belong to desk scenes; a floor robot's world has floor objects and no table targets.
+        targets.extend({"id": name,
+                        "position": env.zone_position(name).tolist() if imported else list(position),
+                        "type": "table_region"} for name, position in TABLE_TARGETS.items())
     relations = []
     from backend.app.agent.scene_relations import support_relations
     supports = support_relations(objects,contacts)
@@ -118,6 +127,10 @@ def build_world_state(env: SimulationBackend) -> dict:
         from backend.app.simulation.openarm_v2.definition import ARM_JOINTS
         joints = {name:float(value) for side in available
                   for name,value in zip(ARM_JOINTS[side],env.arm_qpos(side))}
+    skills = _builtin_skills() if not imported else _imported_skills(grippers, arms, pinch_verified, has_fluid)
+    # Driving the base is a capability of the scene, not of the gripper.
+    if base_pose is not None and "navigate_to" not in skills:
+        skills = [*skills, "navigate_to"]
     return {
         "robot": {
             "type": getattr(env, "robot_id", "openarm_v2"),
@@ -134,12 +147,14 @@ def build_world_state(env: SimulationBackend) -> dict:
             "left_arm": {"ee": frame.ee["left"], "gripper": frame.grippers["left"], "held_object": holds["left"]},
             "right_arm": {"ee": frame.ee["right"], "gripper": frame.grippers["right"], "held_object": holds["right"]},
         },
+        "base_pose": base_pose,
         "objects": objects,
         "targets": targets,
         "spatial_relations": relations,
         "support_relations": supports,
         "workspace": {"table_height_m":env.table_height,"position_unit":"m","rotation":"world_from_object"},
-        "capabilities": {"relative_placement": ["on", "left_of", "right_of", "front_of", "behind", "near"],
+        "capabilities": {"navigation": base_pose is not None,
+                         "relative_placement": ["on", "left_of", "right_of", "front_of", "behind", "near"],
                          "skills": _builtin_skills() if not imported else _imported_skills(grippers, arms, pinch_verified, has_fluid),
                          "geometry_source": "Genesis collision bounds", "grasp": env.grasp_mode},
         "grasp_mode": env.grasp_mode,

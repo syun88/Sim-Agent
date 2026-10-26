@@ -9,6 +9,8 @@ from typing import Literal
 
 from pydantic import field_validator, BaseModel, ConfigDict, Field, model_validator
 
+import numpy as np
+
 from backend.app.models.schemas import AgentPlan, PlanStep
 
 SIDES = {"left", "right"}
@@ -21,7 +23,7 @@ TABLE_TARGETS = {
 
 class TaskAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    op: Literal["pick", "handover", "place", "approach", "move", "open", "close", "home", "throw", "pour", "joint"]
+    op: Literal["pick", "handover", "place", "approach", "move", "open", "close", "home", "throw", "pour", "joint", "navigate"]
     object: str | None = None
     arm: Literal["left", "right"] | None = None
     receiver: Literal["left", "right"] | None = None
@@ -191,7 +193,7 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
     last_arm: str = discourse.get("last_arm") or "left"
     available_arms = state.get('robot', {}).get('available_arms', ['left', 'right'])
     if last_arm not in available_arms:
-        last_arm = available_arms[0]
+        last_arm = available_arms[0] if available_arms else "left"
     steps: list[PlanStep] = []
     checks: dict[str, dict] = {obj: {"type": "holding", "object": obj, "arm": side} for side, obj in held.items() if obj}
     canonical: list[TaskAction] = []
@@ -204,7 +206,7 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             raise GroundingError(f"The selected robot does not offer {skill}; it offers "
                                  f"{', '.join(sorted(allowed)) if allowed else 'nothing yet'}")
         available = state.get("robot", {}).get("available_arms")
-        if available is not None and arm not in available:
+        if available is not None and arm not in available and skill != "navigate_to":
             raise GroundingError(f"The selected robot has arms {available}, not {arm}")
         steps.append(PlanStep(skill=skill, arm=arm, action_index=index, **kwargs))
 
@@ -310,6 +312,29 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             held[arm], held[receiver] = None, obj
             checks[obj] = {"type": "holding", "object": obj, "arm": receiver}
             last_arm = receiver
+        elif action.op == "navigate":
+            if not state.get("capabilities", {}).get("navigation"):
+                raise GroundingError("ROBOT_CAPABILITY: this robot has no mobile base to navigate with")
+            base_pose = state.get("robot", {}).get("base_pose")
+            if base_pose is None:
+                raise GroundingError("ROBOT_CAPABILITY: the base pose is not observed in this scene")
+            if obj is not None:
+                destination = np.asarray(objects[obj]["position"], dtype=float)[:2]
+                offset = np.asarray(base_pose[:2], dtype=float) - destination
+                distance = float(np.linalg.norm(offset))
+                # Stop at arm's reach from the object, on the side the base
+                # already faces it from, and end facing the object.
+                point = destination + (offset / distance * .32 if distance > 1e-6 else np.array([.32, 0.]))
+                yaw = float(np.arctan2(destination[1] - point[1], destination[0] - point[0]))
+            elif action.target is not None:
+                named = {t["id"]: t["position"] for t in state.get("targets", [])}
+                if action.target not in named:
+                    raise GroundingError(f"Unknown navigation target: {action.target}")
+                point = np.asarray(named[action.target], dtype=float)[:2]
+                yaw = float(base_pose[2])
+            else:
+                raise GroundingError("Navigate needs an object or a named target")
+            emit("navigate_to", arm, index, object=obj, target_xy=[float(point[0]), float(point[1])], target_yaw=yaw)
         elif action.op == "place":
             if obj == "wine_bottle":
                 if (action.target is None and canonical and canonical[-1].op == "pour"
@@ -448,7 +473,7 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
         else:
             labels = {"pick": "grasp", "approach": "approach", "move": "grasp_and_move" if first.object else "move_relative",
                       "open": "open_gripper", "close": "close_gripper", "home": "return_home", "handover": "handover",
-                      "throw": "throw", "pour": "pour", "joint": "joint"}
+                      "throw": "throw", "pour": "pour", "joint": "joint", "navigate": "navigate"}
             goal.update(type="direct_command", action=labels[first.op], arm=first.arm)
             if first.object:
                 goal["object"] = first.object
