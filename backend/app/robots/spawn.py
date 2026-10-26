@@ -114,6 +114,8 @@ class ReachableDeskSpawns:
                     if off > self.attitude_tolerance_deg:
                         raise ValueError(f'{side}: the arm can only hold a jaw frame {off:.0f} deg off the inferred one')
                     frame_in_use = candidate
+        home_q = np.asarray([snapshot[name] for name in names], float)
+
         def checked_pose(target, initial):
             frame = frame_in_use
             result = solve_profile_ik(self.profile,side,target,frame,model=self.model,q_init=initial,
@@ -136,6 +138,13 @@ class ReachableDeskSpawns:
                 from scipy.spatial.transform import Rotation
                 result = {**result,'q_rad':q.tolist(),'position_error':float(np.linalg.norm(actual-target)),
                     'rotation_error':float(np.linalg.norm(Rotation.from_matrix(frame@rotation.T).as_rotvec()))}
+            # Can the arm actually ENTER this posture from its setup pose? A grasp pose with an IK solution and no
+            # collision is not the same as a reachable one: measured 2026-10-27 on the UR5e, spawn validation called a
+            # position reachable while every approach to it reported corridor_none 24. The check is the straight joint
+            # segment the approach also has to cross; a spawn that fails it is rejected here instead of at run time.
+            if not self.collision_queries.edge_clear(names, home_q, np.asarray(q, float), snapshot,
+                                                     minimum_clearance=.0001):
+                raise ValueError(f'{side}: no collision-free corridor from the setup posture to this spawn')
             return result,q,frame
         # Plan at the supported height. The object rests on the desk, so that height is the
         # desk's, not the caller's z minus the setup clearance: re-validating a settled object
