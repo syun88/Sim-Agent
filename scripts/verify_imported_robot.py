@@ -1,6 +1,7 @@
 """URDF + desk runtime, private FK/Jacobian agreement and motor-driven IK travel."""
 import argparse
 import json
+import time
 import os
 from pathlib import Path
 import sys
@@ -36,6 +37,9 @@ def main():
     env.set_arm = observe_command
     result = {'robot_id': profile['id'], 'robot_links': env._entity.n_links, 'robot_dofs': env._entity.n_dofs,
               'collision_geoms': env._entity.n_geoms, 'native': args.native, 'phases': [], 'success': False,
+              # The run stamps itself, so a reader can tell whether this file is the result of the run
+              # it just started or a leftover from an earlier one. A missing stamp means it predates this.
+              'started_at': time.time(),
               'openarm_cell': False, 'physics': 'Genesis', 'grasp_calibrated': False}
     try:
         env.step(200)
@@ -62,20 +66,32 @@ def main():
             if error > .0001:
                 raise RuntimeError(f'{side}: URDF/Genesis FK differ by {error:.6f}m')
             print(side, 'FK error', error, flush=True)
-            target = actual + [0., 0., .01]
-            solution, _, _ = executor.controller.solve_ik(side, target, rotation)
+            # Ask for a centimetre of travel in a direction this arm can actually reach. A pose at
+            # the top of its own workspace cannot rise, but this stage is about holding the arm to
+            # what it was commanded, not about the rise; a desk arm reaches the first direction, so
+            # nothing changes for it.
+            solution = None
+            for delta in ([0., 0., .01], [.01, 0., 0.], [0., .01, 0.], [-.01, 0., 0.], [0., -.01, 0.], [0., 0., -.01]):
+                target = actual + delta
+                solution, _, _ = executor.controller.solve_ik(side, target, rotation)
+                if solution is not None:
+                    break
             if solution is None:
-                raise RuntimeError(side + ': IK goal is unreachable')
+                raise RuntimeError(side + ': IK goal is unreachable in every direction')
+            command = np.asarray(delta, dtype=float)
+            command /= float(np.linalg.norm(command))
             motion = executor.controller.move_to_site(side, target, rotation, duration=1., scale_speed=True)
             measured = env.ee_pose(side)[0]
             record = {'arm': side, 'fk_error': error, 'ik_solution_rad': solution.tolist(),
                       'initial_position': actual.tolist(), 'target_position': target.tolist(), 'actual_position': measured.tolist(),
                       'actual_position_error': float(np.linalg.norm(measured - target)), 'motion_success': motion.success,
+              'command': command.tolist(), 'actual_travel': float(np.dot(np.asarray(measured) - np.asarray(actual), command)),
                       'actual_rise': float(measured[2] - actual[2])}
             result['phases'].append(record)
+            result['finished_at'] = time.time()
             output.write_text(json.dumps(result, indent=2))
             print(record, flush=True)
-            if not motion.success or record['actual_position_error'] > .003 or record['actual_rise'] < .007:
+            if not motion.success or record['actual_position_error'] > .003 or record['actual_travel'] < .007:
                 raise RuntimeError(side + ': physical IK tracking failed')
         result['maximum_command_velocity_ratio'] = maximum_velocity_ratio
         if maximum_velocity_ratio > 1.001:
