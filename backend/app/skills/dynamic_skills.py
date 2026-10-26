@@ -329,7 +329,11 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
             if t >= max(0., release_at - .06):
                 trace.append({"t": t, "position": env.object_pose(obj)[0].tolist(),
                               "velocity": env.object_velocity(obj).tolist(),
-                              "contacts": env.object_contact_links(obj)})
+                              "contacts": env.object_contact_links(obj),
+                              # The fingers separately: a cube that has left the hand can still be listed as touching
+                              # the gripper by a trailing contact, and that alone rejected a real hit (38.6 mm from
+                              # centre, measured 2026-10-27).
+                              "finger_contacts": env.object_contacts(obj, arm)})
             if t < release_at - .005 and not runner._pinch_established(obj, arm):
                 raise SkillError("GRASP_LOST", "The cube slipped before commanded release")
     finally:
@@ -396,20 +400,28 @@ def evaluate_throw(trace: list[dict], minimum_rise: float, release_after: float 
     # ``upward_min`` is the vertical speed a release must show. A throw aimed at another object is a flatter arc,
     # so a low vertical speed is not evidence of no release: measured 2026-10-27, a 0.18 s flight hit the target
     # 67 mm from centre and was read as "no release" because its upward speed at separation was under 0.1 m/s.
+    def separated(sample):
+        fingers = sample.get("finger_contacts")
+        if fingers is not None:
+            return not fingers
+        return not sample["contacts"]
+
     release = next((i for i, sample in enumerate(trace)
-                    if sample["t"] >= release_after and not sample["contacts"]
+                    if sample["t"] >= release_after and separated(sample)
                     and sample["velocity"][2] > upward_min), None)
     if release is None:
         return {"success": False, "failure_category": "NO_UPWARD_FREE_FLIGHT"}
     flight = []
     for sample in trace[release:]:
-        if sample["contacts"]:
+        if not separated(sample):
             break
         flight.append(sample)
         if sample["velocity"][2] <= 0:
             break
     first = trace[release]
-    apex = max(sample["position"][2] for sample in flight)
+    # Guard the empty case: a release identified by finger contact can still have a trailing all-contact sample,
+    # and max() on an empty flight would crash instead of reporting a failure (measured 2026-10-27).
+    apex = max((sample["position"][2] for sample in flight), default=first["position"][2])
     rise = apex - first["position"][2]
     duration = flight[-1]["t"] - first["t"]
     # Ballistic acceleration is an additional guard against reporting a prescribed
