@@ -4,6 +4,9 @@ from pathlib import Path
 import numpy as np
 
 
+#: What a preset's two numbers do and do not mean. Recorded once so three copies cannot drift.
+LIMIT_SEMANTICS='Peak stall torque and no-load speed are separate limits; not a measured torque-speed curve.'
+
 PRESETS={
     'xm430_w350':{
         'manufacturer':'ROBOTIS','model':'XM430-W350-T','voltage_V':12.0,
@@ -14,7 +17,7 @@ PRESETS={
         # declare 8.063 rad/s, which is 77 rev/min and belongs to the XM430-W210 the description
         # names for them in a comment. Arm mass 0.683 kg and reach 0.353 m match OpenManipulator-X
         # (0.70 kg, 380 mm), whose official actuator is this one.
-        'limit_semantics':'Peak stall torque and no-load speed are separate limits; not a measured torque-speed curve.'},
+        'limit_semantics':LIMIT_SEMANTICS},
     'xm430_w210':{
         'manufacturer':'ROBOTIS','model':'XM430-W210-T','voltage_V':12.0,
         'peak_effort_Nm':3.0,'no_load_velocity_rad_s':8.063,
@@ -22,13 +25,13 @@ PRESETS={
         # Both numbers come from the official turtlebot3_lime description, which names
         # this motor in a comment right above the limit it sets (bigwheel_orin xacro,
         # wheel_left/right joints). 8.063 rad/s is 77.0 rpm, the no-load figure at 12 V.
-        'limit_semantics':'Peak stall torque and no-load speed are separate limits; not a measured torque-speed curve.'},
+        'limit_semantics':LIMIT_SEMANTICS},
     'sts3215_c001_7_4v':{
         'manufacturer':'FEETECH','model':'STS3215-C001','voltage_V':7.4,
         'peak_effort_Nm':19.5*.0980665,'rated_effort_Nm':5.*.0980665,
         'no_load_velocity_rad_s':np.pi/(3.*.192),
         'source_url':'https://akizukidenshi.com/goodsaffix/STS3215-C001%20SEPC.pdf',
-        'limit_semantics':'Peak stall torque and no-load speed are separate limits; not a measured torque-speed curve.'}}
+        'limit_semantics':LIMIT_SEMANTICS}}
 
 
 def apply_actuator_configuration(model,source):

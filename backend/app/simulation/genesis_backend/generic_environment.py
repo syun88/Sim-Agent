@@ -555,7 +555,7 @@ class GenericURDFEnvironment(SimulationBackend):
         # second sweep sample even though the IK solution had moved by
         # ~0.001 rad. Desk robots never re-anchor, so they are unaffected.
         # Re-anchor before reading it. joint_snapshot already does this for planning, but
-        # this getter is also read directly (the FK/Jacobian checks and the swing solver),
+        # this getter is also read directly by the FK/Jacobian checks and by execute_joint_path,
         # and the profile's root carries the spawn clearance until the body settles.
         # Measured on a wheeled robot that settles 1.0 mm: the URDF/Genesis FK check
         # failed by exactly that much. Re-anchoring is cheap: one link lookup.

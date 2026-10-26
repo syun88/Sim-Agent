@@ -535,7 +535,7 @@ def import_robot(folder):
         # sees the output, and name the file that fixes it.
         try:
             from backend.app.robots.collision_planner import PrivateCollisionQueries
-            probe = PrivateCollisionQueries({**profile, 'grippers': profile['grippers']}, 0.)
+            probe = PrivateCollisionQueries(profile, scene['table_top'])
             adjacent_pairs = {tuple(sorted((joint['parent'], joint['child']))) for joint in model.joints}
             overlaps = {}
             for contact in probe.contacts(home, tolerance=-.0001):

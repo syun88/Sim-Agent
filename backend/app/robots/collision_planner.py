@@ -75,8 +75,10 @@ class PrivateCollisionQueries:
             centre = [float(value) for value in support['position']]
             body = ET.SubElement(world, 'body', name=f'support_{index}',
                                  pos=f'{centre[0]} {centre[1]} {centre[2]}')
+            # No friction here: this model is only ever asked geometric questions (mj_collision),
+            # never stepped, so contact parameters would only imply dynamics that do not run.
             ET.SubElement(body, 'geom', name=f'support_{index}_geom', type='box',
-                          size=' '.join(map(str, half)), friction='1 0.02 0.001')
+                          size=' '.join(map(str, half)))
         assets = {}
         def pose_args(transform):
             quat = Rotation.from_matrix(transform[:3, :3]).as_quat()[[3, 0, 1, 2]]

@@ -45,6 +45,8 @@ class ReachableDeskSpawns:
     def collision_queries(self):
         if self._collision_queries is None:
             from backend.app.robots.collision_planner import PrivateCollisionQueries
+            # Authored supports come with the scene's objects, which the registry sets before
+            # the environment builds this sampler; floor objects exist for wheeled robots only.
             supports = [entry['support'] for entry in (self.scene.get('objects') or {}).values()
                         if entry.get('support')]
             self._collision_queries = PrivateCollisionQueries(self.profile, self.scene['table_top'], supports)

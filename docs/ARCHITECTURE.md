@@ -152,6 +152,14 @@ effort/velocity limits using named hardware presets; no hardware is inferred fro
 The STS3215-C001 7.4V preset records 1.9123Nm peak torque, 5.454rad/s no-load speed and
 0.4903Nm rated torque, with the FEETECH specification URL. Source URDF bytes remain unchanged.
 The metadata enters the asset/configuration hash and invalidates previous runtime evidence.
+A manufacturer's CAD overlaps adjacent links at their own joints, which a URDF cannot express and
+which the private queries would otherwise read as a collision in every posture. A sidecar states what
+the geometry cannot: `collision_config.json` names the adjacent pairs the runtime must not collide,
+and the import measures a package's undeclared overlaps and warns where the failure will appear.
+A wheeled robot's props are authored in `floor_objects.json`, which places objects on the floor and
+may give each one a `support` box to stand on; a support is a scene body in both the engine and the
+private collision model, so a corridor that would touch one is rejected while planning rather than
+after the arm has been shoved off it.
 Adjacent parent/child collision geometry supplies connected IK intervals; normal candidate,
 edge and curve checks still run. The analytic orientation-residual Jacobian is checked against
 finite differences, including near-180-degree rotations.
