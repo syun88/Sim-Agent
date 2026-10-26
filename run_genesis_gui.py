@@ -51,7 +51,15 @@ def main() -> None:
     # Register before constructing a scene: a second launch cannot open a second viewer.
     response = client.post('/api/genesis/register', json={'viewer_id': viewer_id, 'provider': planner.configured_provider})
     response.raise_for_status()
-    os.environ['GENESIS_SHOW_VIEWER'] = '0' if args.headless else '1'
+    # The native window needs a working GL context, and on this host it does not get one: measured
+    # 2026-10-26, the native path sat at "Building ... on Genesis" for minutes at ~26-58% CPU while the
+    # identical scene built in 20 s with the viewer off (the same 14 s the test suite sees). So an
+    # explicit decision in the environment is kept - GENESIS_SHOW_VIEWER=0 runs the same scene through
+    # the web UI - and only an unset value follows --headless.
+    if args.headless:
+        os.environ['GENESIS_SHOW_VIEWER'] = '0'
+    else:
+        os.environ.setdefault('GENESIS_SHOW_VIEWER', '1')
     robot_id = get_profile(args.robot or selected_robot())['id']
     print(f'Building {robot_id} on Genesis...', flush=True)
     env = create_backend(args.scene if robot_id == 'openarm_v2' else 'cubes', robot_id=robot_id)

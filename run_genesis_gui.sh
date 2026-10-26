@@ -68,4 +68,7 @@ echo "Web UI:  http://127.0.0.1:8000/simple"
 echo "Starting Genesis native viewer..."
 
 # Genesis viewer needs the main thread on macOS.
-GENESIS_SHOW_VIEWER=1 uv run python run_genesis_gui.py "$@"
+# Keep an explicit decision: a host whose native window never gets a GL context can run the same scene
+# through the web UI by exporting GENESIS_SHOW_VIEWER=0 (measured 2026-10-26: the native path stalls while
+# the viewer-off path is ready in 20 s).
+GENESIS_SHOW_VIEWER="${GENESIS_SHOW_VIEWER:-1}" uv run python run_genesis_gui.py "$@"
