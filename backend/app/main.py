@@ -107,14 +107,18 @@ def _enqueue(command: dict) -> dict:
 
 
 @app.post('/api/diagnostics/pinch')
-def diagnose_pinch(object: str = 'red_cube', arm: str = 'left'):
+def diagnose_pinch(object: str = 'red_cube', arm: str = 'left', observer: bool = True):
     """Ask the viewer process to grasp and lift one object and report the contact numbers.
 
     The viewer owns the Genesis world; the API process cannot reach it. A diagnostic that runs inside
     that process is the only way to tell "the app's world behaves differently" from "the agent path does",
     which is the question left open by measurements that agree everywhere else.
     """
+    # ``observer=False`` detaches the per-step callback for the duration of the diagnostic, so the same
+    # sequence can be run with and without it in the same process - the viewer's per-step callback is the
+    # one thing an in-process probe cannot reproduce.
     return _enqueue({'action': 'diagnose_pinch', 'object': object, 'arm': arm,
+                     'observer': bool(observer),
                      'instruction': f'pinch diagnostic: {object}'})
 
 

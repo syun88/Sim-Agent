@@ -233,6 +233,9 @@ def main() -> None:
                     # numbers instead of a verdict: q, the pinch verdict, the pad links and the candidate
                     # contacts. This is the measurement that separates world state from agent path.
                     arm = command.get('arm', 'left'); obj = command.get('object', 'red_cube')
+                    saved_observer = env.step_observer
+                    if command.get('observer') is False:
+                        env.step_observer = None
                     rows = []
                     for skill in ('approach_object', 'grasp_object', 'lift_object'):
                         out = getattr(executor.skills, skill)(arm, obj)
@@ -246,8 +249,10 @@ def main() -> None:
                                      'raw_contacts': sorted(env.object_contacts(obj, arm))})
                         if not out.get('success'):
                             break
+                    env.step_observer = saved_observer
                     body.update(success=all(row['success'] for row in rows), verification={'success': True,
-                        'goal_type': 'pinch_diagnostic', 'rows': rows}, final_world_state=build_world_state(env))
+                        'goal_type': 'pinch_diagnostic', 'observer': command.get('observer') is not False,
+                        'rows': rows}, final_world_state=build_world_state(env))
                 elif command['action'] == 'select_robot':
                     prepare_robot(command['robot_id'])
                     body.update(success=True, verification={'success': True, 'goal_type': 'robot_selection', 'robot_id': command['robot_id']},
