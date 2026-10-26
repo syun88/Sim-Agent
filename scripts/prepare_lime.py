@@ -33,6 +33,7 @@ Usage:  uv run python scripts/prepare_lime.py [--raw PATH] [--out PATH]
 """
 import argparse
 import json
+import sys
 import pathlib
 import xml.etree.ElementTree as ET
 
@@ -45,6 +46,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--raw", type=pathlib.Path, default=DEFAULT_RAW,
                         help="xacro output of the full robot (default: %(default)s)")
+    parser.add_argument("--overlap-threshold-mm", type=float, default=.1,
+                        help="declare an adjacent overlap at or above this depth")
     parser.add_argument("--out", type=pathlib.Path, default=DEFAULT_OUT,
                         help="prepared URDF next to the description (default: %(default)s)")
     args = parser.parse_args()
@@ -70,10 +73,46 @@ def main():
     # above the wheel limits in bigwheel_orin.urdf.xacro), so record that identity here.
     # The preset's numbers live in backend/app/robots/actuators.py beside the other
     # motors, and a joint with no entry keeps its URDF limit, which is what the arm does.
+    # The description names this motor for the wheels, in a comment right above their limits.
+    # The arm's own motor is named nowhere in the package, so the same motor is declared for
+    # it, for a measured reason: the arm needs at most 0.55 Nm to hold any posture (computed
+    # from the URDF masses, 0.68 kg of arm), but the URDF also declares 1.0 Nm of joint
+    # friction, so the placeholder effort="1" cannot overcome its own friction and the arm
+    # moved 2-46 percent of a 0.2 rad command. At 3.0 Nm every joint tracks within 0.013 rad
+    # and the runtime validation passes. Replace this with the arm's real motor when known.
+    arm = {'joint%d' % i: {'preset': 'xm430_w210'} for i in range(1, 7)}
     wheels = {"wheel_left_joint": {"preset": "xm430_w210"},
-              "wheel_right_joint": {"preset": "xm430_w210"}}
+              "wheel_right_joint": {"preset": "xm430_w210"}, **arm}
     (args.out.parent / "actuators.json").write_text(
         json.dumps({"joints": wheels}, indent=2) + "\n")
+
+    # A manufacturer URDF's meshes are visual-quality parts: adjacent links overlap at every
+    # joint by design (measured 2026-10-24 on OpenManipulator-X, the arm family this robot
+    # carries: 21.4-43.3 mm). The URDF cannot say which overlaps the runtime must ignore, so
+    # the package declares it. Without the declaration every IK candidate is rejected as a
+    # collision and the arm never moves; reuse the measurement the OpenManipulator-X package
+    # already performs instead of writing a second copy of it.
+    # Measure before writing: the measurement imports the package, and a declaration left
+    # from an earlier run is validated at import time, so it would reject itself.
+    stale = args.out.parent / "collision_config.json"
+    stale.unlink(missing_ok=True)
+    sys.path.insert(0, str(pathlib.Path(__file__).parent))
+    from prepare_open_manipulator_x import _collision_declaration
+    settings = _collision_declaration(args.out, args.overlap_threshold_mm)
+    if settings:
+        # The runtime request is all-or-nothing: the engine turns adjacent collision off
+        # wholesale, so a partial set would drop a real constraint that the private queries
+        # still honour. Declare every adjacent pair that carries collision geometry, which is
+        # what a URDF-based planner already does with parent/child pairs, and leave the
+        # measured overlaps in the file as the record of why the declaration exists.
+        from backend.app.robots.urdf import URDFModel
+        model = URDFModel(str(args.out))
+        adjacent = {tuple(sorted((joint['parent'], joint['child']))) for joint in model.joints}
+        settings["runtime_excluded_adjacent_pairs"] = [list(pair) for pair in sorted(
+            {pair for pair in adjacent
+             if all(len(model.links[link].findall('collision')) for link in pair)})]
+        (args.out.parent / "collision_config.json").write_text(
+            json.dumps(settings, indent=2) + "\n")
 
     ET.ElementTree(root).write(args.out, encoding="utf-8", xml_declaration=False)
     print(f"{args.out}: {len(root.findall('link'))} links, {len(root.findall('joint'))} joints, "
