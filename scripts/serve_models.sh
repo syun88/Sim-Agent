@@ -21,7 +21,7 @@ start() {
     return 0
   fi
   echo "starting $name on :$port"
-  setsid systemd-run --user --scope -q -p MemoryMax=6G -p CPUQuota=400% \
+  setsid systemd-run --user --scope -q -p MemoryMax=12G -p CPUQuota=600% \
     env HF_HOME="$CACHE" HF_HUB_DISABLE_TELEMETRY=1 HOME="${HOME:-/home/yuu}" \
     "$PY" "scripts/$script" --port "$port" --preload \
     >"/tmp/${name}.log" 2>&1 &

@@ -26,7 +26,7 @@ from transformers import AutoModel
 
 #: Text-only judgements do not need the smallest multimodal variant: d1-3B is the stronger choice
 #: for that job (measured note in docs/TASK_AGENT.md). Override with OPENARM_DECISION_MODEL.
-MODEL = os.getenv("OPENARM_DECISION_MODEL", "LiquidAI/d1-omni-600M")
+MODEL = os.getenv("OPENARM_DECISION_MODEL", "LiquidAI/d1-3B")
 _lock = threading.Lock()
 _model = None
 _loaded_at = 0.0

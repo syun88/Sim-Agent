@@ -67,6 +67,23 @@ AMBIGUOUS_CASES = [
 ]
 
 
+class InlineModel:
+    """Load the model in this process and answer like the server does.
+
+    Comparing models needs one thing the HTTP server cannot give: a different checkpoint. Loading here keeps
+    the questions and the labels identical to the scored set, so the only variable is the model.
+    """
+
+    def __init__(self, repo: str):
+        import torch
+        from transformers import AutoModel
+        self.model = AutoModel.from_pretrained(repo, trust_remote_code=True, dtype=torch.bfloat16).eval()
+
+    def ask(self, packet: dict, questions: dict, timeout: float = 30.) -> dict:
+        import json as _json
+        return self.model.system_one(_json.dumps(packet, ensure_ascii=False), questions)["answers"]
+
+
 def ask(base_url: str, packet: dict, questions: dict, timeout: float = 30.) -> dict:
     body = json.dumps({"state": json.dumps(packet, ensure_ascii=False), "questions": questions}).encode()
     request = urllib.request.Request(base_url + "/decide", data=body,
@@ -79,8 +96,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:11435")
     parser.add_argument("--out", default="/tmp/d1_calibration.json")
+    parser.add_argument("--inline", help="load this checkpoint here instead of calling a server")
     args = parser.parse_args()
-    report = {"url": args.url, "noul_means": "P(YES) (measured separately)", "questions": {}}
+    inline = InlineModel(args.inline) if args.inline else None
+    report = {"model": args.inline or args.url, "noul_means": "P(YES) (measured separately)", "questions": {}}
 
     def score(name, rows):
         correct, detail = 0, []
@@ -89,8 +108,9 @@ def main():
             packet = fact_packet(world)
             text = f"Instruction: {instruction}. Observed situation: {description}."
             question = {name: {key: value for key, value in QUESTIONS[name].items() if key != "why"}}
-            answers = ask(args.url, {"facts": packet, "instruction": instruction, "situation": description},
-                          question)
+            payload = {"facts": packet, "instruction": instruction, "situation": description}
+            answers = (inline.ask(payload, question) if inline is not None
+                       else ask(args.url, payload, question))
             answer = answers.get(name) or {}
             if name == "next_step_blocked":
                 predicted = answer.get("choice")

@@ -25,8 +25,9 @@ QUESTIONS = {
         "type": "noul",
         "instructions": "Has the instruction's requested outcome been achieved, according to these facts?",
         "why": "Interpreting the instruction against observed end state is a language judgement, not geometry.",
-        # Measured 2026-10-27 with omni-600M on six labelled outcomes: 3 of 6, i.e. chance. Records only.
-        "trusted": False, "measured": "3/6 (2026-10-27, omni-600M, chance level)",
+        # 600M: 3/6 (chance). d1-3B: 4/6, missing "stacked" and "hands empty". Records only until a bigger
+        # sample says otherwise.
+        "trusted": False, "measured": "d1-3B 4/6, omni-600M 3/6 (2026-10-27)",
     },
     "next_step_blocked": {
         "type": "choice",
@@ -38,13 +39,16 @@ QUESTIONS = {
             "not_observed": "the referenced object is not in the scene",
         },
         "why": "Choosing among named causes from a described situation is a typed decision.",
-        "trusted": False, "measured": "2/3 (2026-10-27, omni-600M); too few cases to trust, and one miss",
+        # d1-3B answered all three with 0.96-0.98 confidence and all correct; the 600M got 2/3. Three cases is
+        # a small sample, so this is trusted for *labelling a situation*, never as the only reason to act.
+        "trusted": True, "measured": "d1-3B 3/3 at 0.96-0.98, omni-600M 2/3 (2026-10-27)",
     },
     "reference_ambiguous": {
         "type": "noul",
         "instructions": "Do the facts leave it genuinely unclear which object the instruction means?",
         "why": "Ambiguity is about what the words admit, not about where things are.",
-        "trusted": False, "measured": "0/2 (2026-10-27, omni-600M; wrong in both directions)",
+        # 600M was wrong in both directions; d1-3B got both at 0.92.
+        "trusted": True, "measured": "d1-3B 2/2 at 0.92, omni-600M 0/2 (2026-10-27)",
     },
 }
 

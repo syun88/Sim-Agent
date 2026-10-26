@@ -58,13 +58,16 @@ def test_relations_ignore_objects_without_positions():
     assert relations([{"id": "a"}, {"id": "b", "position": [0, 0, 0]}]) == []
 
 
-def test_a_question_records_whether_it_was_measured_trustworthy():
-    """Calibrated 2026-10-27 with omni-600M: every question in this table scored at or below chance, so none of
-    them may influence a plan until a bigger model is measured on the same labels."""
+def test_trust_requires_a_measurement_and_names_the_model():
+    """Calibrated 2026-10-27: omni-600M scored 5/11 overall, d1-3B 9/11 - three of three on "which cause
+    blocks this step" and two of two on ambiguity, four of six on outcome. Only measured questions may be
+    trusted, and the record must say which model produced the number."""
+    trusted = [name for name, spec in QUESTIONS.items() if spec.get("trusted")]
+    assert trusted == ["next_step_blocked", "reference_ambiguous"], trusted
     for name, spec in QUESTIONS.items():
-        assert "trusted" in spec, f"{name} does not say whether it is trusted"
-        assert "measured" in spec, f"{name} does not record the measurement"
-        assert spec["trusted"] is False, f"{name} claims trust without a measurement behind it"
+        assert "trusted" in spec and "measured" in spec, f"{name} is missing its record"
+        assert "d1-3B" in spec["measured"] or "omni-600M" in spec["measured"], f"{name} names no model"
+    assert QUESTIONS["outcome_achieved"]["trusted"] is False, "4/6 is not a basis for acting"
 
 
 def test_the_calibration_script_exists_and_uses_the_labels_the_state_gives():

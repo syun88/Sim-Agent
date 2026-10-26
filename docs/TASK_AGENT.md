@@ -246,3 +246,17 @@ OPENARM_DECISION_URL=http://127.0.0.1:11435 ./run_genesis_gui.sh --headless
 
 ⇒ 600M は「幾何でも意味判断でもない、**内容の把握**」と「**合法手からの選択**」に限定して使う。
 意味判断を本気で使うなら、**同じラベルでより大きい d1（`OPENARM_DECISION_MODEL`）を測ってから**にする。
+
+### モデルを変えて同じラベルで測った（2026-10-27）
+
+`--inline LiquidAI/d1-3B`（bf16 5GB・CPU）で同じ11ケースを採点: **9/11**（omni-600M は 5/11）。
+
+| 質問 | omni-600M | d1-3B | 採用 |
+|---|---|---|---|
+| `next_step_blocked` | 2/3 | **3/3**（信頼度 0.96–0.98） | **trusted** |
+| `reference_ambiguous` | 0/2 | **2/2**（0.92） | **trusted** |
+| `outcome_achieved` | 3/6 | **4/6**（"stacked" と "hands empty" を誤り） | **使わない**（記録のみ） |
+
+既定の判定モデルは `LiquidAI/d1-3B`（`OPENARM_DECISION_MODEL` で変更可）、`scripts/serve_models.sh` は
+bf16 の 5GB に合わせて `MemoryMax=12G`。**3件/2件という標本の小ささ**は明記しておく: 状況の**説明**には使えるが、
+それを唯一の根拠に行動は決めない。
