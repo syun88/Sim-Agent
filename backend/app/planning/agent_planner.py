@@ -277,10 +277,13 @@ class AgentPlanner:
                 "failure": recent[-1].get("recent_failure"),
                 "measurements": recent[-1].get("measured"),
                 "hands": recent[-1].get("hands"),
+                "failed_values": (recent[-1].get("measured") or {}).get("used"),
                 "note": "The previous plan failed with these measurements. Repeating the same operations will "
                         "fail again. Different operations, or preparation before them, are allowed and expected. "
                         "This new plan starts from the observed hands: if an object is not held, include the "
-                        "operations that acquire it, and put any preparation BEFORE the operation it enables.",
+                        "operations that acquire it, and put any preparation BEFORE the operation it enables. "
+                        "If failed_values lists a value for a lever, do NOT reuse it: choose a different value "
+                        "inside that lever's range.",
                 "action_shapes": {"move": {"direction": "up|down|left|right|forward|back", "distance_cm": "1-30",
                                            "object": "omit this for arm motion"},
                                   "home": {"object": "omit"}, "approach": {"object": "<id>"},

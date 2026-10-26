@@ -259,6 +259,11 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
         error = SkillError("IK_FAILURE", f"Launch stroke is unreachable ({planned['position_error']:.4f}) "
                           f"at flight_time_s={flight_time_s:.2f}, stroke_cm={stroke * 100:.0f}")
         error.evidence = {"unreachable_by_m": round(float(planned['position_error']), 4),
+                          # What was used, so a replan can pick different values instead of repeating these: measured
+                          # 2026-10-27, the model re-emitted flight_time_s=0.30 after being told 0.30 was too far.
+                          "used": {"flight_time_s": round(float(flight_time_s), 3),
+                                   "stroke_cm": round(stroke * 100., 1),
+                                   "back_off_cm": back_off_cm},
                           "levers": {"flight_time_s": "0.10-1.00, shorter is flatter and faster",
                                      "back_off_cm": "0-20, more room before the stroke",
                                      "stroke_cm": "2-30", "release_speed_m_s": "0.2-3.0"},
