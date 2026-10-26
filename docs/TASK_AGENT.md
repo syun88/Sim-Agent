@@ -376,6 +376,9 @@ fluid       SPH / 8 particles / 51.2 mL / glass 0 / spilled 0
   名指しすること: `edge_clear` が False のときの衝突ペアを記録する）。
   **さらに実測（2026-10-27）**: 経路計画は `edge_clear` だけで判定していたが、`collision_queries` には**RRT-connect
   (`path()`) が既にある**。迂回を繋いだところ、UR5e では `route=None`（**迂回も見つからない**）→ 塞がりは
-  1本の辺ではなく**空間全体**。次は `path()` の内部（goal の clear 判定・RRT 予算）を計測する。
+  1本の辺ではなく**空間全体**。`path()` の2つのゲートを計測した結果:
+  **`goal_pose_clear: true` / `rrt: searched_and_failed`** —— 把持姿勢そのものは衝突していない ✓ のに
+  コネクタが繋げない ✗。探索範囲（`spread`, 既定 1.2 rad）を **2.0 / 2.8 rad** に広げても
+  `corridor_none: 24` は**まったく同じ**（否定）。次は**反復予算**と `edge_clear` の分解能（.06 rad）を疑う。
 - したがって順序は: ①UR5e の接近経路を通す（`COLLISION_PATH` の内訳を読む）→ ②把持成功で `grasp_calibrated` が付く
   → ③wine シーンが許可され、ボトルは既に可達域配置。流体側は準備済み。

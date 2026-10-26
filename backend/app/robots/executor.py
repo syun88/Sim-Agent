@@ -356,13 +356,22 @@ class ImportedRobotSkills(SkillRunner):
                 # was refusing instead of asking it - measured 2026-10-27: all 24 UR5e refusals were edge_blocked.
                 route = self.env.collision_queries.path(names, high_seed, seed, snapshot,
                                                         self.env.ik_joint_limits(arm),
-                                                        self.controller.stop_requested)
+                                                        self.controller.stop_requested,
+                                                        spread=float(os.getenv('OPENARM_RRT_SPREAD', '1.2')))
                 if route:
                     corridor.extend(list(route)[1:-1])
                     high = candidate_high
                     if trace is not None:
                         trace.update({'detour': 'rrt_connect', 'waypoints': len(route)})
                     break
+                if trace is not None:
+                    # Why the connector found nothing: path() refuses early when the GOAL pose is in collision, and
+                    # otherwise searches. Telling those apart is the difference between "the grasp pose is bad" and
+                    # "the corridor around it is" (measured 2026-10-27: the UR5e refused all 24 candidates).
+                    goal_clear = self.env.collision_queries.clear({**snapshot,
+                                                                  **dict(zip(names, seed))})
+                    trace.update({'goal_pose_clear': bool(goal_clear), 'rrt': 'refused_goal' if not goal_clear
+                                  else 'searched_and_failed'})
             if trace is not None:
                 trace.update({'stopped': 'high_seed' if high_seed is None else 'edge_blocked',
                               'height': round(float(height), 3),

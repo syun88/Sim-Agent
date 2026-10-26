@@ -295,7 +295,7 @@ class PrivateCollisionQueries:
                     if minimum_clearance else self.clear({**snapshot, **dict(zip(names, q))}))
                    for q in np.linspace(start, end, steps))
 
-    def path(self, names, start, goal, snapshot, limits, stop=lambda: False):
+    def path(self, names, start, goal, snapshot, limits, stop=lambda: False, spread=1.2):
         """RRT-connect when a direct joint segment intersects robot or desk."""
         start, goal = np.asarray(start), np.asarray(goal)
         if self.edge_clear(names, start, goal, snapshot):
@@ -303,8 +303,11 @@ class PrivateCollisionQueries:
         if not self.clear({**snapshot, **dict(zip(names, goal))}):
             return None
         rng = np.random.default_rng(36)
-        lower = np.maximum(limits[:, 0], np.minimum(start, goal)-1.2)
-        upper = np.minimum(limits[:, 1], np.maximum(start, goal)+1.2)
+        # ``spread`` is how far around start/goal the sampler may wander. A folded posture reaching forward can need
+        # more than 1.2 rad of reconfiguration, and a connector that cannot wander there reports "no path" for a
+        # corridor that exists (measured 2026-10-27 on the UR5e: goal pose clear, connector searched and failed).
+        lower = np.maximum(limits[:, 0], np.minimum(start, goal) - spread)
+        upper = np.minimum(limits[:, 1], np.maximum(start, goal) + spread)
         trees = [([start], [-1]), ([goal], [-1])]
         def extend(tree, target):
             nodes, parents = tree
