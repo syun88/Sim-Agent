@@ -91,3 +91,34 @@ def test_closest_approach_measures_the_trajectory_not_the_plan():
     assert closest_approach(trace, [.04, 0., 0.]) == pytest.approx(.0005 ** .5, abs=1e-6)
     assert closest_approach(trace, [.05, 0., .021]) == pytest.approx(.001, abs=.001)
     assert closest_approach([], [0., 0., 0.]) is None
+
+
+def test_a_flat_aimed_throw_is_recognised_as_released():
+    """Measured 2026-10-27: a hit 57 mm from centre was read as "no release" because the arc was flat.
+
+    With upward_min=0 an aimed throw counts contact loss with any upward speed; without it, the 0.1 m/s rule
+    still applies to a pure upward throw.
+    """
+    from backend.app.skills.dynamic_skills import evaluate_throw
+
+    flat = [
+        {"t": 0.30, "position": [0., 0., 1.0], "velocity": [1.0, 0., 0.04], "contacts": ["g|obj"]},
+        {"t": 0.31, "position": [0.01, 0., 1.0001], "velocity": [1.0, 0., 0.02], "contacts": []},
+        {"t": 0.32, "position": [0.02, 0., 0.9999], "velocity": [1.0, 0., 0.0], "contacts": []},
+    ]
+    aimed = evaluate_throw(flat, 0., release_after=0.30, upward_min=0.)
+    upward = evaluate_throw(flat, 0., release_after=0.30)
+    assert aimed.get("release_velocity") is not None, "a flat arc still has a release"
+    assert upward.get("release_velocity") is None, "the upward rule must still reject a flat arc"
+    assert upward["failure_category"] == "NO_UPWARD_FREE_FLIGHT"
+
+
+def test_an_aimed_throw_counts_only_a_measured_hit():
+    from backend.app.skills.dynamic_skills import HIT_TOLERANCE_M, closest_approach
+
+    trace = [{"t": 0.30, "position": [0., 0., 1.0], "velocity": [1.0, 0., 0.04], "contacts": ["g|obj"]},
+             {"t": 0.31, "position": [0.05, 0., 1.0], "velocity": [1.0, 0., 0.], "contacts": []},
+             {"t": 0.32, "position": [0.12, 0., 0.99], "velocity": [1.0, 0., 0.], "contacts": []}]
+    target = [0.06, 0., 1.0]
+    assert closest_approach(trace, target) <= HIT_TOLERANCE_M     # this one lands
+    assert closest_approach(trace, [0.30, 0., 1.0]) > HIT_TOLERANCE_M   # this one does not
