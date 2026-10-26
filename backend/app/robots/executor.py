@@ -187,6 +187,52 @@ class ImportedRobotSkills(SkillRunner):
                               'close_trace': getattr(self, '_close_trace', [])}
             raise error
 
+    #: Lateral offsets, in meters, tried in order when a pinch does not take. The first attempt is the
+    #: plan's own offset, so an ordinary grasp costs exactly what it did.
+    GRASP_RETRY_OFFSETS = (0., .005, -.005, .010, -.010)
+
+    def grasp_object(self, arm, obj, grasp_offset_x=0.):
+        """Close on the object, and if the pinch does not take, move the jaws and try again.
+
+        A pinch that misses is a contact problem, and repeating the same posture repeats the same miss:
+        measured 2026-10-26 on OpenManipulator-X, the cube nearest the base gripped in 1 of 3 attempts
+        while the far cube gripped every time, with identical plans. The offsets are already a declared
+        part of the grasp language (``grasp_offset_x``, +-2 cm), so retrying with them moves the gripper
+        by millimetres and re-verifies on physical contacts rather than on the plan.
+        """
+        started = time.perf_counter()
+        return self._skill("grasp_object",
+                           lambda: self._grasp_with_offsets(arm, obj, grasp_offset_x), started)
+
+    def _grasp_with_offsets(self, arm, obj, grasp_offset_x=0.):
+        offsets = [grasp_offset_x] + [o for o in self.GRASP_RETRY_OFFSETS if abs(o - grasp_offset_x) > 1e-9]
+        attempts = []
+        for offset in offsets:
+            try:
+                if abs(offset - grasp_offset_x) > 1e-9 or attempts:
+                    # Re-place the jaws at the new offset before closing again; closing where the previous
+                    # attempt left them would repeat the same contact geometry.
+                    self._approach(arm, obj, grasp_offset_x=offset)
+                result = super()._grasp(arm, obj)
+                if attempts:
+                    result = {**result, 'grasp_retries': attempts}
+                return result
+            except SkillError as error:
+                if error.category not in ('GRASP_LOST', 'GRASP_FAILED', 'GRASP_SLIP'):
+                    raise
+                attempts.append({'offset_x': offset, 'error': error.category, 'detail': str(error)[:160]})
+                try:
+                    self.controller.wait_gripper(arm, False, .4)
+                except Exception:
+                    pass
+        raise self._grasp_failure(obj, attempts)
+
+    @staticmethod
+    def _grasp_failure(obj, attempts):
+        error = SkillError('GRASP_LOST', f'No pinch on {obj} after {len(attempts)} placements: {attempts}')
+        error.evidence = {'attempts': attempts}
+        return error
+
     def _nominal_attitude(self, arm):
         return np.asarray(self.env.grippers[arm]['grasp_rotation'])
 
