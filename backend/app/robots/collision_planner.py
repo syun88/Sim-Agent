@@ -13,7 +13,7 @@ from backend.app.robots.urdf import URDFModel, mesh_path, origin, vector
 
 
 class PrivateCollisionQueries:
-    def __init__(self, profile, table_top=None):
+    def __init__(self, profile, table_top=None, supports=None):
         import mujoco
         self.mujoco = mujoco
         self.urdf = URDFModel(profile['urdf'])
@@ -66,6 +66,17 @@ class PrivateCollisionQueries:
         if table_top is not None:
             ET.SubElement(world, 'geom', name='desk', type='box', size='.8 .7 .025',
                           pos=f'0 0 {table_top-.025}')
+        # Authored supports are part of the scene the arm actually works in, so they belong in
+        # this model too. Measured 2026-10-26 on the Lime: without them the planner certified a
+        # side-approach corridor as clear while the engine had the arm pressed against the
+        # support, and the arm ended 22 cm above the commanded pose with the joints 0.5 rad off.
+        for index, support in enumerate(supports or []):
+            half = [float(value) / 2. for value in support['size']]
+            centre = [float(value) for value in support['position']]
+            body = ET.SubElement(world, 'body', name=f'support_{index}',
+                                 pos=f'{centre[0]} {centre[1]} {centre[2]}')
+            ET.SubElement(body, 'geom', name=f'support_{index}_geom', type='box',
+                          size=' '.join(map(str, half)), friction='1 0.02 0.001')
         assets = {}
         def pose_args(transform):
             quat = Rotation.from_matrix(transform[:3, :3]).as_quat()[[3, 0, 1, 2]]

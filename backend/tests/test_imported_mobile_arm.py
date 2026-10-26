@@ -141,3 +141,28 @@ def test_an_authored_object_stands_on_its_support(wheeled):
     env.step(120)
     z = float(np.asarray(env.object_pose('cube')[0])[2])
     assert z > .10, 'the cube fell to %.3f m: the support was not created' % z
+
+
+def test_the_private_collision_model_knows_the_support(wheeled):
+    """The planner queries collisions privately, so a support it cannot see is invisible to it.
+
+    Measured 2026-10-26 on the Lime: with the support missing from this model the planner certified
+    a side-approach corridor as clear, the engine pressed the arm against the support, and the arm
+    ended 22 cm above the commanded pose with its joints 0.5 rad off target.
+    """
+    import mujoco
+
+    from backend.app.robots.collision_planner import PrivateCollisionQueries
+    profile, _ = wheeled
+    spawn = json.loads((pathlib.Path(profile['directory']) / 'spawn_validation.json').read_text())
+    supports = [entry['support'] for entry in spawn['objects'].values() if entry.get('support')]
+    assert supports, 'the fixture places its object on a support'
+
+    def support_body_ids(queries):
+        return [mujoco.mj_name2id(queries.model, mujoco.mjtObj.mjOBJ_BODY, 'support_%d' % index)
+                for index in range(len(supports))]
+
+    with_supports = PrivateCollisionQueries(profile, 0., supports)
+    without = PrivateCollisionQueries(profile, 0.)
+    assert all(body_id >= 0 for body_id in support_body_ids(with_supports))
+    assert all(body_id < 0 for body_id in support_body_ids(without))

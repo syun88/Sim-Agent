@@ -45,7 +45,9 @@ class ReachableDeskSpawns:
     def collision_queries(self):
         if self._collision_queries is None:
             from backend.app.robots.collision_planner import PrivateCollisionQueries
-            self._collision_queries = PrivateCollisionQueries(self.profile,self.scene['table_top'])
+            supports = [entry['support'] for entry in (self.scene.get('objects') or {}).values()
+                        if entry.get('support')]
+            self._collision_queries = PrivateCollisionQueries(self.profile, self.scene['table_top'], supports)
         return self._collision_queries
 
     def arm_joint_limits(self,side):
