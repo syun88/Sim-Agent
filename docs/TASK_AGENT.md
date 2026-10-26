@@ -374,5 +374,8 @@ fluid       SPH / 8 particles / 51.2 mL / glass 0 / spilled 0
   target [-0.215, 0.0018, 0.886]`）。つまり挿入 IK でも退避点の IK でもなく、**退避点→把持姿勢の直線が塞がれている**。
   中間高度を1点挟む案は試したが `corridor_none: 24` は**変わらず**撤回（次の一手は、塞いでいるリンクを
   名指しすること: `edge_clear` が False のときの衝突ペアを記録する）。
+  **さらに実測（2026-10-27）**: 経路計画は `edge_clear` だけで判定していたが、`collision_queries` には**RRT-connect
+  (`path()`) が既にある**。迂回を繋いだところ、UR5e では `route=None`（**迂回も見つからない**）→ 塞がりは
+  1本の辺ではなく**空間全体**。次は `path()` の内部（goal の clear 判定・RRT 予算）を計測する。
 - したがって順序は: ①UR5e の接近経路を通す（`COLLISION_PATH` の内訳を読む）→ ②把持成功で `grasp_calibrated` が付く
   → ③wine シーンが許可され、ボトルは既に可達域配置。流体側は準備済み。

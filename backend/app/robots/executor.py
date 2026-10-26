@@ -350,6 +350,19 @@ class ImportedRobotSkills(SkillRunner):
                     names, high_seed, seed, snapshot, minimum_clearance=.0001):
                 high = candidate_high
                 break
+            if high_seed is not None:
+                # The direct edge from the transit point to the grasp pose can be blocked while both ends are clear.
+                # The collision queries already own an RRT-connect for exactly this (path()), and the corridor planner
+                # was refusing instead of asking it - measured 2026-10-27: all 24 UR5e refusals were edge_blocked.
+                route = self.env.collision_queries.path(names, high_seed, seed, snapshot,
+                                                        self.env.ik_joint_limits(arm),
+                                                        self.controller.stop_requested)
+                if route:
+                    corridor.extend(list(route)[1:-1])
+                    high = candidate_high
+                    if trace is not None:
+                        trace.update({'detour': 'rrt_connect', 'waypoints': len(route)})
+                    break
             if trace is not None:
                 trace.update({'stopped': 'high_seed' if high_seed is None else 'edge_blocked',
                               'height': round(float(height), 3),
