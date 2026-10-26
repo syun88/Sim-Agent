@@ -362,7 +362,10 @@ fluid       SPH / 8 particles / 51.2 mL / glass 0 / spilled 0
 
 - wine シーンは UR5e でも**構築可能**だが、入口のゲートが止める:
   `grippers=True grasp_calibrated=False`（＝物理ピンチ未検証）。
-- UR5e の把持を cubes シーンで試すと **`COLLISION_PATH`（corridor）** で失敗し、校正は付かない
-  （既知の `forearm_link ↔ desk` 系の経路問題）。
+- UR5e の把持を cubes シーンで試すと **`COLLISION_PATH`** で失敗し、校正は付かない。内訳（実測）:
+  **`corridor_none: 24` / `seed_in_collision: 2`（26 通り、rotations 1）** —— **IK はほぼ通っている**のに
+  **挿入経路が全滅**している。対象は基部の直近（cube z=0.80、腕の初期関節は `[-0.66,-0.52,-1.56,1.42,-1.90,0.10]`）
+  なので、**机上を腕が掃く**経路になっている可能性が高い（既知の `forearm_link ↔ desk` 系）。
+  次の一手は「接近の高度・姿勢を上げる／対象を台座に載せる」で `corridor_none` が減るかを測ること。
 - したがって順序は: ①UR5e の接近経路を通す（`COLLISION_PATH` の内訳を読む）→ ②把持成功で `grasp_calibrated` が付く
   → ③wine シーンが許可され、ボトルは既に可達域配置。流体側は準備済み。
