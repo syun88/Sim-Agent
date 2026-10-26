@@ -188,7 +188,13 @@ class TaskAgent:
                     continuation.goal['allowed_object_motion'] = sorted({s.object for s in original.steps if s.object})
                     # First try useful progress. With no completed action,
                     # clear/reposition free arms before another approach.
-                    if prefix>0 and not any(r.get('decision')=='resume' for r in recoveries):
+                    # Resuming assumes the world still matches the plan. After a throw the object has left the hand
+                    # and is moving or landed elsewhere, so the remaining steps would act on a stale picture:
+                    # measured 2026-10-27, the resumed approach found the cube in the air at z=0.93 and reported a
+                    # collision, and on another run approached where the cube no longer was.
+                    object_left_the_hand = str(failed.get('skill') or '') in {'throw_object', 'release_object'}
+                    if (prefix > 0 and not object_left_the_hand
+                            and not any(r.get('decision') == 'resume' for r in recoveries)):
                         legal.append('resume')
                 except GroundingError:
                     pass

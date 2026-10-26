@@ -458,7 +458,18 @@ class ImportedRobotSkills(SkillRunner):
         after = self.env.object_pose(obj)[0]
         disturbance = float(np.linalg.norm(after - before))
         if disturbance > self.env.cube_size * .12:
-            raise SkillError('APPROACH_COLLISION', f'Approach displaced the cube by {disturbance:.6f}m')
+            error = SkillError('APPROACH_COLLISION', f'Approach displaced the cube by {disturbance:.6f}m '
+                              f'(limit {self.env.cube_size * .12:.6f}m)')
+            # Same reason as the corridor refusal: record what the planner was handed so the failure can be
+            # replayed from another process. Measured 2026-10-27: the app failed here on a cube the in-process
+            # probe approaches repeatedly without contact.
+            error.evidence = {'object_pose': np.round(np.asarray(before, float), 5).tolist(),
+                              'object_pose_after': np.round(np.asarray(after, float), 5).tolist(),
+                              'arm_qpos': np.round(np.asarray(self.env.arm_qpos(arm), float), 4).tolist(),
+                              'snapshot': {key: round(float(value), 4)
+                                           for key, value in sorted(self.env.joint_snapshot().items())},
+                              'contacts': sorted(self.env.object_contacts(obj))}
+            raise error
         return {'target': before.tolist(), 'final': result.final_position,
                 'object_displacement': disturbance, 'cube_size': self.env.cube_size,
                 'gravity_torque': chosen_gravity}
