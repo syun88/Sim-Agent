@@ -1,5 +1,6 @@
 """Motor-driven manipulation using gripper frames inferred from URDF geometry."""
 import copy
+import os
 import time
 from contextlib import contextmanager
 
@@ -325,7 +326,12 @@ class ImportedRobotSkills(SkillRunner):
             corridor.append(seed)
         high_seed = None
         high = None
-        for height in (.08, .05, max(.025, self.env.cube_size)):
+        # Descent altitudes, highest first. The default set was measured on a desk-mounted arm that could clear the
+        # table from 8 cm; a taller mount or a folded six-joint posture may need to approach from higher, so the list
+        # can be widened for an experiment without touching the code path:
+        #   OPENARM_APPROACH_HEIGHTS=0.20,0.14,0.08,0.05
+        heights = [float(v) for v in (os.getenv('OPENARM_APPROACH_HEIGHTS') or '').replace(' ', '').split(',') if v]
+        for height in (heights or [.08, .05, max(.025, self.env.cube_size)]):
             candidate_high = standoff + [0., 0., height]
             high_seed, _, _ = self.controller.solve_ik(arm, candidate_high, rotation, q_init=seed,
                                                        path_start=self.env.arm_qpos(arm), require_direct=True)
