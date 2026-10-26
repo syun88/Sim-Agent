@@ -540,6 +540,12 @@ class GenericURDFEnvironment(SimulationBackend):
         # origin-frame FK and failed with a phantom ~0.3 m error at the
         # second sweep sample even though the IK solution had moved by
         # ~0.001 rad. Desk robots never re-anchor, so they are unaffected.
+        # Re-anchor before reading it. joint_snapshot already does this for planning, but
+        # this getter is also read directly (the FK/Jacobian checks and the swing solver),
+        # and the profile's root carries the spawn clearance until the body settles.
+        # Measured on a wheeled robot that settles 1.0 mm: the URDF/Genesis FK check
+        # failed by exactly that much. Re-anchoring is cheap: one link lookup.
+        self._sync_root_transform()
         return URDFKinematics(self.model, self.profile['chains'][side], dict(zip(self._all_names, actual)),
                               np.asarray(self.profile["root_transform"]), self.profile['chains'][side]['tool_offset'])
 
