@@ -277,7 +277,13 @@ class TaskAgent:
                         # repositioning the arms is a real change before retrying.
                         plan=compile_prepared_program(source,observed)
                     else:
-                        remaining=TaskProgram(actions=plan.program['actions'][prefix:])
+                        # ``prefix`` counts completed actions; when it equals the list length there is nothing
+                        # left to re-compile, and TaskProgram refuses an empty action list (measured
+                        # 2026-10-27: the recovery surfaced as a raw ValidationError instead of a decision).
+                        remaining_actions = plan.program['actions'][prefix:]
+                        if not remaining_actions:
+                            remaining_actions = plan.program['actions']
+                        remaining=TaskProgram(actions=remaining_actions)
                         plan=compile_prepared_program(remaining,observed)
                         plan.goal=deepcopy(original.goal)
                     plan.goal['allowed_object_motion']=sorted({s.object for s in original.steps if s.object})

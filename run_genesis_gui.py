@@ -281,9 +281,13 @@ def main() -> None:
             except InterruptedError:
                 body.update(success=False,status='STOPPED',detail='Stopped during observation or reasoning',final_world_state=build_world_state(env))
             except Exception as exc:
-                # Never serialize provider HTTP exceptions or environment credentials.
-                body.update(success=False, detail=f'Execution stopped: {type(exc).__name__}', final_world_state=build_world_state(env))
+                # Never serialize provider HTTP exceptions or environment credentials, but do keep the message and
+                # the traceback: a bare type name cost a whole diagnosis cycle (measured 2026-10-27, ValidationError).
+                import traceback
+                body.update(success=False, detail=f'Execution stopped: {type(exc).__name__}: {str(exc)[:300]}',
+                            final_world_state=build_world_state(env))
                 print(body['detail'], flush=True)
+                print(traceback.format_exc()[-2000:], flush=True)
             client.post('/api/genesis/result', json=body, timeout=5).raise_for_status()
             active_id = None
             publish(force=True)
