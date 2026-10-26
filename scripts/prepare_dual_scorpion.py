@@ -59,11 +59,15 @@ def main():
                         help="CoACD concavity threshold, lower is more pieces")
     parser.add_argument("--max-pieces", type=int, default=8,
                         help="CoACD cap per link mesh")
+    parser.add_argument("--skin-mm", type=float, default=.5,
+                        help="pull each collision piece inside the authored surface by this much")
     parser.add_argument("--overlap-threshold-mm", type=float, default=.1,
                         help="declare an adjacent overlap at or above this depth")
     args = parser.parse_args()
 
     import coacd
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    from backend.app.robots.collision_geometry import inset_authored_boundary
     import os
     os.environ.setdefault("GENESIS_SHOW_VIEWER", "0")
 
@@ -113,8 +117,24 @@ def main():
             if not decomposed:
                 decomposed = [(np.asarray(solid.vertices, float), np.asarray(solid.faces, np.int64))]
             for index, (vertices, faces) in enumerate(decomposed):
-                piece = trimesh.Trimesh(np.asarray(vertices, float), np.asarray(faces, np.int64), process=True)
-                if not len(piece.faces):
+                # Repair before exporting: Genesis computes an SDF wall thickness for every collision
+                # mesh, and a piece that is not closed makes that step fail outright (measured
+                # 2026-10-26: "operands could not be broadcast together with shapes (0,) (0,3)" from
+                # get_wall_thickness, which aborted the whole scene build).
+                piece = _clean(trimesh.Trimesh(np.asarray(vertices, float), np.asarray(faces, np.int64),
+                                               process=True))
+                if not len(piece.faces) or not piece.is_volume:
+                    continue
+                # Pull the piece inside the authored surface by the skin, the same way the
+                # OpenManipulator-X preparation does. Without it, decomposition overshoots: measured
+                # 2026-10-26, two body meshes of the DualScorpion overlapped by 3.3 mm at the setup
+                # posture although they are not connected by a joint, which left one permanent
+                # self-contact and every IK candidate rejected as a collision.
+                inset = inset_authored_boundary(piece, solid, args.skin_mm / 1000.)
+                if inset is None or not len(inset.faces):
+                    continue
+                piece = _clean(inset)
+                if float(piece.volume) <= 0.:
                     continue
                 relative = f"{link.get('name')}_proxy_{index}.stl"
                 piece.export(mesh_out / relative)

@@ -42,6 +42,10 @@ class GenericURDFEnvironment(SimulationBackend):
         # wheel joints no arm chain claims). Such a robot stands on the floor
         # and moves through its wheels; everything desk-shaped is skipped.
         self._mobile_base = self.profile.get("mobile_base")
+        # A fixed-base package can also stand on the floor (profile['mount'] == 'floor'). That is a
+        # different question from having wheels: the robot is still fixed to the world and still
+        # needs gravity handled like a fixed one, but there is no desk and props are authored.
+        self._floor_scene = bool(self._mobile_base) or self.profile.get("mount") == "floor"
         self.model = URDFModel(self.profile["urdf"])
         self.available_arms = list(self.profile["chains"])
         self.grippers = self.profile.get("grippers", {})
@@ -63,7 +67,7 @@ class GenericURDFEnvironment(SimulationBackend):
         # scene.json (registry imports them from floor_objects.json);
         # a desk scene samples them from the reachable-spawn layout.
         self.spawn_validation = ({"objects": scene_config.get("objects") or {}}
-                                 if self._mobile_base else self._spawn_sampler.layout())
+                                 if self._floor_scene else self._spawn_sampler.layout())
         self._adjacent_collision = bool(scene_config.get('adjacent_collision', True))
         self._dt = float(scene_config["physics_dt"])
         if self._mobile_base:
@@ -97,7 +101,7 @@ class GenericURDFEnvironment(SimulationBackend):
             viewer_options=gs.options.ViewerOptions(refresh_rate=60, realtime_factor=self.simulation_speed,
                 camera_pos=(1.1, -1.3, 1.5), camera_lookat=(0., 0., 1.)), show_viewer=show_viewer)
         self._scene.add_entity(gs.morphs.Plane(), material=gs.materials.Rigid(friction=.6))
-        self._table = None if self._mobile_base else self._scene.add_entity(gs.morphs.Box(size=tuple(scene_config["table_size"]),
+        self._table = None if self._floor_scene else self._scene.add_entity(gs.morphs.Box(size=tuple(scene_config["table_size"]),
             pos=(0., 0., scene_config["table_top"] - scene_config["table_size"][2] / 2.), fixed=True),
             material=gs.materials.Rigid(friction=.6), surface=gs.surfaces.Default(color=(.62, .58, .51)))
         self._root_transform = np.asarray(self.profile["root_transform"])
@@ -252,7 +256,7 @@ class GenericURDFEnvironment(SimulationBackend):
 
     def reset(self, randomize=False, object_positions=None, seed=None,shuffle_sides=True):
         self._resolved_zones = {}
-        placements = {"objects": dict(self._object_start)} if self._mobile_base else self._spawn_sampler.layout(randomize=randomize, object_positions=object_positions,
+        placements = {"objects": dict(self._object_start)} if self._floor_scene else self._spawn_sampler.layout(randomize=randomize, object_positions=object_positions,
             base=self._object_start,seed=seed,shuffle_sides=shuffle_sides,
             stop=getattr(self,'planning_pulse',lambda:False))
         self.spawn_validation = placements
