@@ -25,14 +25,25 @@ class TaskExecutor:
     def world_state(self):
         return {**build_world_state(self.env), "discourse": self.discourse.copy()}
 
+    #: Measured on this host 2026-10-27 with obvious questions: noul is P(YES) - "is the sky blue" 0.92,
+    #: "does a robot arm have joints" 0.97, "can a cube fly by itself" 0.13. The first version of this read it
+    #: backwards and would have recorded every agreement as a disagreement.
+    MONITOR_TIMEOUT = 3.
+    #: Steps whose outcome is "the hand is still holding the object". A release or a throw ends the hold, so
+    #: asking whether the report agrees with holding something confuses the question rather than testing it.
+    MONITORED_STEPS = {"grasp_object", "lift_object", "move_to_object", "move_to_target", "handover_object"}
+
     def _monitor_step(self, step, result):
-        """Ask the local decision model one closed question about this step, if it is running."""
+        """Ask the local decision model one closed question about this step, if it is running and fast enough."""
         from backend.app.planning import decision_model
 
-        if not decision_model.available() or step.get("skill") not in {
-                "grasp_object", "lift_object", "move_to_object", "move_to_target", "release_object",
-                "throw_object", "handover_object"}:
+        if not decision_model.available() or step.get("skill") not in self.MONITORED_STEPS:
             return None
+        if getattr(self, '_monitor_latency', 0.) > self.MONITOR_TIMEOUT:
+            # A monitor that costs more than the step it watches is not a reflex; record why it was skipped
+            # instead of silently paying for it on every step.
+            return {"step": step.get("skill"), "asked": False, "skipped_because": "measured_latency_too_high",
+                    "advisory": True}
         obj = step.get("object")
         if not obj:
             return None
@@ -43,18 +54,21 @@ class TaskExecutor:
         state = (f"Robot step just finished: {step.get('skill')} on {obj}. Reported success: "
                  f"{bool(result.get('success'))}. The arm reports holding an object: {held}. "
                  f"Failure category from the skill, if any: {result.get('error') or 'none'}.")
-        questions = {"consistent": {
+        questions = {"agrees": {
             "type": "noul",
-            "instructions": "Does the skill's reported outcome agree with the robot's own report that it holds "
-                            "an object after this step?"}}
-        answer = decision_model.ask(state, questions, timeout=6.)
+            "instructions": "Does the skill's reported outcome agree with the robot's own report of holding "
+                            "an object after this step? Answer yes if they agree."}}
+        started = __import__('time').perf_counter()
+        answer = decision_model.ask(state, questions, timeout=self.MONITOR_TIMEOUT)
+        self._monitor_latency = __import__('time').perf_counter() - started
         if not answer:
             return None
-        judgement = (answer.get("answers") or {}).get("consistent") or {}
+        judgement = (answer.get("answers") or {}).get("agrees") or {}
         if "noul" not in judgement:
             return None
-        return {"step": step.get("skill"), "agrees": bool(float(judgement["noul"]) < .5),
-                "p_agree": round(float(judgement["noul"]), 3), "advisory": True}
+        p_yes = float(judgement["noul"])
+        return {"step": step.get("skill"), "asked": True, "agrees": p_yes >= .5, "p_yes": round(p_yes, 3),
+                "latency_seconds": round(self._monitor_latency, 2), "advisory": True}
 
     def reset_context(self):
         self.discourse.clear()

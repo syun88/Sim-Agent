@@ -80,9 +80,12 @@ def test_a_single_legal_option_does_not_ask_the_monitor(monkeypatch):
     assert seen == [], "a question with one possible answer costs a forward pass and teaches nothing"
 
 
-def test_a_per_step_judgement_is_advisory_and_absence_is_silent(monkeypatch):
-    """The monitor may annotate a step; it must never decide the step's outcome."""
-    import numpy as np
+def test_a_per_step_judgement_uses_the_measured_direction_of_noul(monkeypatch):
+    """Measured 2026-10-27: noul is P(YES). Obvious yes answered 0.92/0.97, obvious no 0.13.
+
+    The first version read it backwards (`agrees = noul < .5`), which would have recorded every agreement as
+    a disagreement; these expectations pin the measured direction.
+    """
     from backend.app.execution.task_executor import TaskExecutor
 
     class _Skills:
@@ -91,17 +94,52 @@ def test_a_per_step_judgement_is_advisory_and_absence_is_silent(monkeypatch):
 
     executor = TaskExecutor.__new__(TaskExecutor)
     executor.skills = _Skills()
+    executor._monitor_latency = 0.
     step = {"skill": "lift_object", "arm": "left", "object": "red_cube"}
 
     monkeypatch.delenv("OPENARM_DECISION_URL", raising=False)
-    assert executor._monitor_step(step, {"success": True}) is None    # not configured -> silent
+    assert executor._monitor_step(step, {"success": True}) is None          # no server: silent
+
     monkeypatch.setenv("OPENARM_DECISION_URL", "http://monitor.invalid")
-    monkeypatch_payload = {"answers": {"consistent": {"type": "noul", "noul": .12}}}
     original = decision_model.ask
     try:
-        decision_model.ask = lambda *a, **k: monkeypatch_payload
-        recorded = executor._monitor_step(step, {"success": True})
-        assert recorded["agrees"] is True and recorded["advisory"] is True
-        assert recorded["p_agree"] == pytest.approx(.12)
+        decision_model.ask = lambda *a, **k: {"answers": {"agrees": {"type": "noul", "noul": .92}}}
+        assert executor._monitor_step(step, {"success": True})["agrees"] is True
+        decision_model.ask = lambda *a, **k: {"answers": {"agrees": {"type": "noul", "noul": .13}}}
+        assert executor._monitor_step(step, {"success": True})["agrees"] is False
     finally:
         decision_model.ask = original
+
+
+def test_a_release_is_not_asked_whether_it_is_still_holding(monkeypatch):
+    """A release or a throw ends the hold; the question would test the wording, not the step."""
+    from backend.app.execution.task_executor import TaskExecutor
+
+    class _Skills:
+        def held_object(self, arm):
+            return None
+
+    executor = TaskExecutor.__new__(TaskExecutor)
+    executor.skills = _Skills()
+    executor._monitor_latency = 0.
+    monkeypatch.setenv("OPENARM_DECISION_URL", "http://monitor.invalid")
+    for skill in ("release_object", "throw_object"):
+        assert executor._monitor_step({"skill": skill, "arm": "left", "object": "red_cube"},
+                                     {"success": True}) is None
+
+
+def test_a_slow_monitor_is_skipped_and_says_so(monkeypatch):
+    """It is meant to be a reflex: once it is measured slower than the step, it is not asked."""
+    from backend.app.execution.task_executor import TaskExecutor
+
+    class _Skills:
+        def held_object(self, arm):
+            return "red_cube"
+
+    executor = TaskExecutor.__new__(TaskExecutor)
+    executor.skills = _Skills()
+    executor._monitor_latency = 9.  # measured in an earlier step
+    monkeypatch.setenv("OPENARM_DECISION_URL", "http://monitor.invalid")
+    recorded = executor._monitor_step({"skill": "lift_object", "arm": "left", "object": "red_cube"},
+                                      {"success": True})
+    assert recorded["asked"] is False and recorded["skipped_because"] == "measured_latency_too_high"

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,7 +24,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import torch
 from transformers import AutoModel
 
-MODEL = "LiquidAI/d1-omni-600M"
+#: Text-only judgements do not need the smallest multimodal variant: d1-3B is the stronger choice
+#: for that job (measured note in docs/TASK_AGENT.md). Override with OPENARM_DECISION_MODEL.
+MODEL = os.getenv("OPENARM_DECISION_MODEL", "LiquidAI/d1-omni-600M")
 _lock = threading.Lock()
 _model = None
 _loaded_at = 0.0
