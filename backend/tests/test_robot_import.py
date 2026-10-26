@@ -286,3 +286,49 @@ def test_a_wheeled_base_keeps_the_arm_chain_and_leaves_the_wheels_out(tmp_path, 
     directory = Path(profile['directory'])
     assert json.loads((directory / 'scene.json').read_text())['openarm_cell'] is False
     assert profile['id'] in [r['id'] for r in registry.available_robots()]
+
+def overlapping_robot(tmp_path):
+    """Two adjacent links whose collision boxes sit in the same place, as manufacturer CAD does."""
+    root = tmp_path / 'source' / 'genesis'
+    root.mkdir(parents=True)
+    text = '''<robot name="overlap_arm">
+    <link name="base"><collision><geometry><box size=".10 .10 .10"/></geometry></collision></link>
+    <link name="link1"><collision><geometry><box size=".10 .10 .10"/></geometry></collision></link>
+    <link name="tool"/>
+    <joint name="turn" type="continuous"><parent link="base"/><child link="link1"/><axis xyz="0 0 1"/><limit effort="4" velocity="2"/></joint>
+    <joint name="elbow" type="revolute"><parent link="link1"/><child link="tool"/><origin xyz=".3 0 0"/><axis xyz="0 1 0"/><limit lower="-1" upper="1" effort="3" velocity="1"/></joint>
+    </robot>'''
+    path = root / 'robot.urdf'
+    path.write_text(text)
+    return path
+
+
+def test_overlapping_adjacent_links_say_so_and_name_the_file_that_fixes_it(tmp_path, monkeypatch, capsys):
+    source = overlapping_robot(tmp_path)
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    profile = registry.import_robot(source)
+    warnings = ' '.join(profile['warnings'])
+    assert 'Adjacent links overlap' in warnings
+    assert 'base|link1' in warnings and 'collision_config.json' in warnings
+    assert 'WARNING:' in capsys.readouterr().out
+
+
+def test_declaring_the_pairs_silences_the_overlap_warning(tmp_path, monkeypatch, capsys):
+    source = overlapping_robot(tmp_path)
+    (source.parent / 'collision_config.json').write_text(
+        json.dumps({'runtime_excluded_adjacent_pairs': [['base', 'link1']]}))
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    profile = registry.import_robot(source)
+    assert not any('Adjacent links overlap' in warning for warning in profile['warnings'])
+    assert 'WARNING:' not in capsys.readouterr().out
+
+
+def test_an_actuator_file_keeps_the_import_warnings(tmp_path, monkeypatch):
+    source = overlapping_robot(tmp_path)
+    (source.parent / 'actuators.json').write_text(
+        json.dumps({'joints': {'turn': {'preset': 'sts3215_c001_7_4v'}}}))
+    monkeypatch.setattr(registry, 'GENERATED_ROOT', tmp_path / 'generated')
+    profile = registry.import_robot(source)
+    warnings = ' '.join(profile['warnings'])
+    assert 'Adjacent links overlap' in warnings
+    assert 'Explicit actuators.json supplies motor effort' in warnings
