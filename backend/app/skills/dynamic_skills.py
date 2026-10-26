@@ -250,18 +250,30 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
     from backend.app.robots.urdf import solve_profile_ik
     aim = None
     direction = np.array([0., 0., 1.])
+    flight_used = flight_time_s
     if target_point is not None:
-        # Aimed throw: the physics substrate says which velocity carries the cube through the target
-        # after a chosen flight time, and the stroke is made along that direction so the release
-        # velocity points at it. The engine still measures whether it actually got there.
+        # Aimed throw: a flight time fixes the velocity that carries the cube through the target, and the stroke is
+        # made along that direction. Which flight time is usable is a physical fact about this arm from this
+        # wind-up, so it is chosen here, after the wind-up and before anything moves: the FLATTEST arc whose stroke
+        # plans. Measured 2026-10-27 on the cube nearest the base: 0.30-0.26 reach nothing, 0.22 is reachable and
+        # misses by 116 mm, and 0.18/0.16 are reachable and hit (66.7 and 57.4 mm against a 70 mm tolerance).
         delta = np.asarray(target_point, float) - (np.asarray(position, float) + np.array([0., 0., stroke * .5]))
-        aim = launch_for_target(delta, flight_time_s)
-        direction = np.asarray(aim['direction'], float)
-        speed = float(aim['speed']) / PINCH_TRANSMISSION
-        ramp = max(.05, min(.6, ramp_for_release_speed(stroke, speed, RELEASE_PHASE)))
-        release_at = RELEASE_PHASE * ramp
-    planned = solve_profile_ik(env.profile, arm, np.asarray(position, float) + direction * stroke,
-                               launch_rotation, model=env.model, q_init=start, snapshot=env.joint_snapshot())
+        for candidate in (.16, .18, .20, .22, .26, .30):
+            trial = launch_for_target(delta, candidate)
+            trial_direction = np.asarray(trial['direction'], float)
+            planned = solve_profile_ik(env.profile, arm, np.asarray(position, float) + trial_direction * stroke,
+                                       launch_rotation, model=env.model, q_init=start,
+                                       snapshot=env.joint_snapshot())
+            if planned['success']:
+                aim, direction, flight_used = trial, trial_direction, candidate
+                break
+        if aim is not None:
+            speed = float(aim['speed']) / PINCH_TRANSMISSION
+            ramp = max(.05, min(.6, ramp_for_release_speed(stroke, speed, RELEASE_PHASE)))
+            release_at = RELEASE_PHASE * ramp
+    if aim is None:
+        planned = solve_profile_ik(env.profile, arm, np.asarray(position, float) + direction * stroke,
+                                   launch_rotation, model=env.model, q_init=start, snapshot=env.joint_snapshot())
     if not planned['success'] and back_off(.06):
         # The stroke starts where the arm happens to be; a cube near the base leaves no room for it. Backing off
         # and re-solving the same stroke is the same physical remedy the wind-up search uses, and it is measured:
@@ -277,11 +289,11 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
         # 2026-10-27: the aimed stroke from the cube nearest the base was 24 mm out of reach, and backing off
         # 6 cm did not recover it - the same measurements a replan needs.
         error = SkillError("IK_FAILURE", f"Launch stroke is unreachable ({planned['position_error']:.4f}) "
-                          f"at flight_time_s={flight_time_s:.2f}, stroke_cm={stroke * 100:.0f}")
+                          f"at flight_time_s={flight_used:.2f}, stroke_cm={stroke * 100:.0f}")
         error.evidence = {"unreachable_by_m": round(float(planned['position_error']), 4),
                           # What was used, so a replan can pick different values instead of repeating these: measured
                           # 2026-10-27, the model re-emitted flight_time_s=0.30 after being told 0.30 was too far.
-                          "used": {"flight_time_s": round(float(flight_time_s), 3),
+                          "used": {"flight_time_s": round(float(flight_used), 3),
                                    "stroke_cm": round(stroke * 100., 1),
                                    "back_off_cm": back_off_cm},
                           "levers": {"flight_time_s": "0.10-1.00, shorter is flatter and faster",
@@ -306,7 +318,10 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
             if t >= release_at:
                 control.set_gripper(arm, False)
             env.step()
-            if t >= max(0., release_at - .06) and step % 2 == 0:
+            # Every step, not every other one: a flatter aimed throw separates for about 6 ms, and sampling at 8 ms
+            # intervals can miss the only free-flight sample (measured 2026-10-27: a hit at 57 mm from centre was
+            # reported as "no release").
+            if t >= max(0., release_at - .06):
                 trace.append({"t": t, "position": env.object_pose(obj)[0].tolist(),
                               "velocity": env.object_velocity(obj).tolist(),
                               "contacts": env.object_contact_links(obj)})
