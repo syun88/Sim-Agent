@@ -242,6 +242,16 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
         release_at = RELEASE_PHASE * ramp
     planned = solve_profile_ik(env.profile, arm, np.asarray(position, float) + direction * stroke,
                                launch_rotation, model=env.model, q_init=start, snapshot=env.joint_snapshot())
+    if not planned['success'] and back_off(.06):
+        # The stroke starts where the arm happens to be; a cube near the base leaves no room for it. Backing off
+        # and re-solving the same stroke is the same physical remedy the wind-up search uses, and it is measured:
+        # 2026-10-27 the aimed stroke from the near cube was 24 mm out of reach.
+        position, rotation = env.ee_pose(arm)
+        start = env.arm_qpos(arm)
+        launch_rotation = rotation if mode == "strict" else None
+        planned = solve_profile_ik(env.profile, arm, np.asarray(position, float) + direction * stroke,
+                                   launch_rotation, model=env.model, q_init=start,
+                                   snapshot=env.joint_snapshot())
     if not planned['success']:
         raise SkillError("IK_FAILURE", f"Launch stroke is unreachable ({planned['position_error']:.4f})")
     end = env.model.nearest_continuous(env.profile['chains'][arm]['joints'], planned['q_rad'], start)

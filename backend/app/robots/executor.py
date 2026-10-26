@@ -701,13 +701,54 @@ class ImportedRobotSkills(SkillRunner):
         if monitor:monitor()
         return contacts
 
-    def _grasp(self, arm, obj):
-        with self._base_hold():
-            return self._grasp_attempt(arm, obj)
+    #: Grasp biases (object frame) tried in order, the measured-good one first: a sweep on this gripper showed
+    #: +6 mm and 0 holding while -6 mm did not, and the near posture sits at the edge of that tolerance.
+    GRASP_BIASES = ([0., 0., .006], [0., 0., .004], [0., 0., 0.])
 
-    def _grasp_attempt(self, arm, obj):
+    def grasp_object(self, arm, obj, grasp_offset_x=0.):
+        """Close on the object and verify the pinch immediately, re-placing the jaws if it did not take.
+
+        Discovering a lost hold at the next skill is a wasted step and an unclear failure: measured 2026-10-27 on
+        the cube nearest the base, grasp reported success, lift succeeded, and the throw then found no pinch. The
+        pinch is checked here, where it is created, and a miss tries the next bias from a sweep that measured
+        which postures hold - moving the jaws by millimetres and re-verifying on physical contacts.
+        """
+        started = time.perf_counter()
+        return self._skill('grasp_object', lambda: self._grasp_with_biases(arm, obj), started)
+
+    def _grasp_with_biases(self, arm, obj):
+        attempts = []
+        for index, bias in enumerate(self.GRASP_BIASES):
+            try:
+                if index:
+                    # Re-place the jaws before closing again: closing where the previous attempt left them would
+                    # repeat the same contact geometry.
+                    with self._base_hold():
+                        self.controller.wait_gripper(arm, False, .4)
+                        self._approach(arm, obj)
+                        self._close_pinch(arm, obj, grasp_bias=np.asarray(bias))
+                        self._require_hold(arm, obj)
+                    result = {'object': obj, 'arm': arm, 'reclosed': True, 'bias': bias}
+                else:
+                    result = self._grasp(arm, obj, grasp_bias=np.asarray(bias))
+                if attempts:
+                    result = {**result, 'grasp_retries': attempts}
+                return result
+            except SkillError as error:
+                if error.category not in ('GRASP_LOST', 'GRASP_SLIP', 'GRASP_FAILED'):
+                    raise
+                attempts.append({'bias': bias, 'error': error.category, 'detail': str(error)[:140]})
+        error = SkillError('GRASP_LOST', f'No pinch on {obj} after {len(attempts)} placements: {attempts}')
+        error.evidence = {'attempts': attempts}
+        raise error
+
+    def _grasp(self, arm, obj, grasp_bias=None):
+        with self._base_hold():
+            return self._grasp_attempt(arm, obj, grasp_bias)
+
+    def _grasp_attempt(self, arm, obj, grasp_bias=None):
         before = self.env.object_pose(obj)[0].copy()
-        contacts = self._close_pinch(arm,obj)
+        contacts = self._close_pinch(arm,obj,grasp_bias=grasp_bias)
         position, rotation = self.env.ee_pose(arm)
         self.controller.target_rotations[arm] = self._attitude(arm).copy()
         # The verification lift only has to prove the hold, and 30 mm is more than a small cube needs: measured
