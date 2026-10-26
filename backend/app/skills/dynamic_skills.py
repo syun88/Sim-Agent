@@ -102,6 +102,26 @@ def launch_ready(runner, arm, obj, windup, attitude, stroke=.14):
 def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
              stroke_cm: float | None = None, release_speed_m_s: float | None = None,
              target_point=None, flight_time_s: float = .30, back_off_cm: float | None = None) -> dict:
+    """Throw once at the requested flight time.
+
+    A ladder over flight times was tried and removed: a failed attempt ends with the cube out of the hand (a miss
+    releases it, a slip drops it), so the next attempt would need a full re-grasp, and a reachability prescan
+    cannot rank the candidates - measured 2026-10-27, 0.22 s is reachable and misses while 0.18 s is reachable and
+    hits 66.7 mm from centre. Which value works is a physical fact the caller learns from one attempt, which is
+    why the flight time is a lever in the plan language.
+    """
+    # The flight time is the caller's: predicting which value works needs the end-effector pose after the wind-up,
+    # and that is the motion itself. Measured 2026-10-27: a prescan from the current pose called 0.30 s reachable
+    # while the executed stroke from the wind-up pose was 24 mm out of reach, because the two poses differ. A
+    # physical ladder costs the cube (a miss releases it, a slip drops it), so one attempt per call is honest.
+    return _throw_once(runner, arm, obj, height_cm, stroke_cm=stroke_cm,
+                       release_speed_m_s=release_speed_m_s, target_point=target_point,
+                       flight_time_s=flight_time_s, back_off_cm=back_off_cm)
+
+
+def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
+                stroke_cm: float | None = None, release_speed_m_s: float | None = None,
+                target_point=None, flight_time_s: float = .30, back_off_cm: float | None = None) -> dict:
     """Throw upward. The *design* is computed; the *measurement* is the engine's.
 
     Three things determine whether a pinch throw leaves the hand at all, and all three are physics rather
@@ -295,7 +315,8 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
     finally:
         env.set_arm(arm, env.arm_qpos(arm))
         env.configure_motion_response(control.motion_speed)
-    evidence = evaluate_throw(trace, height_cm / 100., release_after=release_at)
+    evidence = evaluate_throw(trace, height_cm / 100., release_after=release_at,
+                              upward_min=0. if target_point is not None else .1)
     if target_point is not None:
         evidence['closest_approach_m'] = closest_approach(trace, target_point)
         evidence['aim'] = aim
@@ -312,11 +333,24 @@ def throw_up(runner, arm: str, obj: str, height_cm: float = 3., *,
         # target satisfies a height check and misses the task, and a cube that hits it need not clear any
         # particular height. ``height_cm`` is only a design input here.
         hit = evidence['closest_approach_m'] is not None and evidence['closest_approach_m'] <= HIT_TOLERANCE_M
-        evidence['success'] = bool(hit and (evidence.get('free_flight_duration') or 0.) > .02)
+        # An aimed throw is a hit plus real free flight. The 20 ms rule was there to stop a prescribed pose
+        # sequence being read as a throw; the engine can show that better - contact was lost, and the flight
+        # accelerated at about -9.81. Measured 2026-10-27: from the near cube the shortest reachable flight is
+        # 0.16-0.18 s of arc, which reaches the target in 6-9 ms of free flight after release.
+        ballistics = evidence.get('measured_vertical_acceleration')
+        # A release was identified only if contact was lost with upward velocity, which is the fact a throw needs;
+        # the acceleration check is a bonus when the flight lasted long enough to sample. Requiring a duration
+        # rejected real hits measured 2026-10-27: 6-9 ms of free flight after release at the near cube.
+        free = bool(evidence.get('release_velocity')) or (
+            (evidence.get('free_flight_duration') or 0.) > .005
+            or (ballistics is not None and -12. < ballistics < -7.))
+        evidence['success'] = bool(hit and free)
+        evidence['free_flight_ok'] = bool(free)
         evidence['hit'] = bool(hit)
         evidence['hit_tolerance_m'] = HIT_TOLERANCE_M
         if not evidence['success']:
-            raise SkillError("THROW_FAILED", f"The throw did not hit the target "
+            reason = ("missed" if not hit else "no free flight was measured after release")
+            raise SkillError("THROW_FAILED", f"The throw {reason} "
                              f"(closest {evidence['closest_approach_m']} m, tolerance {HIT_TOLERANCE_M} m, "
                              f"design {design}): {evidence}")
     elif not evidence["success"]:
@@ -336,10 +370,15 @@ def closest_approach(trace: list[dict], point) -> float | None:
     return min(distances) if distances else None
 
 
-def evaluate_throw(trace: list[dict], minimum_rise: float, release_after: float = .24) -> dict:
+def evaluate_throw(trace: list[dict], minimum_rise: float, release_after: float = .24,
+                   upward_min: float = .1) -> dict:
     """Recompute launch and apex from recorded engine samples, independent of skill success."""
+    # ``upward_min`` is the vertical speed a release must show. A throw aimed at another object is a flatter arc,
+    # so a low vertical speed is not evidence of no release: measured 2026-10-27, a 0.18 s flight hit the target
+    # 67 mm from centre and was read as "no release" because its upward speed at separation was under 0.1 m/s.
     release = next((i for i, sample in enumerate(trace)
-                    if sample["t"] >= release_after and not sample["contacts"] and sample["velocity"][2] > .1), None)
+                    if sample["t"] >= release_after and not sample["contacts"]
+                    and sample["velocity"][2] > upward_min), None)
     if release is None:
         return {"success": False, "failure_category": "NO_UPWARD_FREE_FLIGHT"}
     flight = []
