@@ -89,7 +89,9 @@ class PrivateCollisionQueries:
             for first, second in excluded:
                 ET.SubElement(contact, 'exclude', body1=self.body_names.get(first, first),
                               body2=self.body_names.get(second, second))
-        self.model = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding='unicode'))
+        # Kept so a package can turn this model into an engine model; see engine_model.engine_mjcf.
+        self.xml = ET.tostring(root, encoding='unicode')
+        self.model = mujoco.MjModel.from_xml_string(self.xml)
         self.data = mujoco.MjData(self.model)
         self.addresses = {j['name']: self.model.jnt_qposadr[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, j['name'])]
                           for j in self.urdf.joints if j['type'] != 'fixed'}

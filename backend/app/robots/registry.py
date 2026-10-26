@@ -127,9 +127,10 @@ def import_robot(folder):
         raise ValueError('runtime_excluded_adjacent_pairs names unknown links: ' + ', '.join(unknown))
     if any(pair[0] == pair[1] for pair in declared):
         raise ValueError('runtime_excluded_adjacent_pairs pairs two identical links')
-    if [pair for pair in declared if pair not in adjacent]:
-        raise ValueError('A URDF path cannot filter non-adjacent link pairs: '
-                         + json.dumps(sorted(pair for pair in declared if pair not in adjacent)))
+    # A URDF path cannot filter a pair that does not share a joint, but an engine model can exclude
+    # any pair. A coupled linkage whose parts overlap across branches needs exactly that - the pair
+    # does not overlap at one hinge, so no amount of collision-mesh preparation separates it.
+    non_adjacent = sorted(pair for pair in declared if pair not in adjacent)
     # Only pairs whose two links both carry collision geometry can ever collide; a virtual
     # frame (world, end_effector) cannot, so it needs no declaration. Coverage means every
     # such pair is declared - the engine can only turn adjacent collision off wholesale, and
@@ -137,18 +138,13 @@ def import_robot(folder):
     collidable = {pair for pair in adjacent
                   if all(len(model.links[link].findall('collision')) for link in pair)}
     declaration['covers_adjacent_pairs'] = bool(declared) and declared >= collidable
-    if declared and not declaration['covers_adjacent_pairs']:
-        # The engine can only turn adjacent collision off wholesale, so a partial runtime
-        # declaration leaves the private queries ignoring pairs the engine still collides.
-        # Measured 2026-10-24: with one of two overlapping adjacent pairs declared, the engine was
-        # told adjacent_collision=True while the private model was silent on the declared pair, so a
-        # posture colliding only there passes validation and then collides in physics. A partial set
-        # belongs in the documentation-only key.
-        raise ValueError(
-            'runtime_excluded_adjacent_pairs must declare every collidable adjacent pair (%d of %d '
-            'declared), because the engine turns adjacent collision off wholesale and cannot match a '
-            'partial set; use excluded_adjacent_pairs to document an overlap instead.'
-            % (len(declared & collidable), len(collidable)))
+    # A partial declaration is legitimate only when the engine can exclude exactly the declared pairs.
+    # A URDF cannot filter individual pairs, which is why a complete set is normally required - but a
+    # package whose overlaps live in its authored visuals has no complete set to declare, and no
+    # amount of collision-mesh preparation removes them. Such a package ships an engine model whose
+    # <contact><exclude> set is the declaration itself, so both the private queries and the engine
+    # ignore exactly the declared pairs. See engine_model.engine_mjcf.
+    engine_model_required = bool(declared) and (bool(non_adjacent) or not declaration['covers_adjacent_pairs'])
     declaration['adjacent_pair_count'] = len(collidable)
     declaration['non_collidable_adjacent_pairs'] = len(adjacent) - len(collidable)
     from backend.app.robots.actuators import apply_actuator_configuration
@@ -208,7 +204,14 @@ def import_robot(folder):
         minimum_z = float(np.concatenate(vertices)[:, 2].min())
     root_transform = np.eye(4)
     root_transform[:3, :3] = Rotation.from_euler("z", yaw).as_matrix()
-    root_transform[:3, 3] = [-.25, 0., .76 - minimum_z + .001]
+    # A package may record how high it stands above the desk (a pedestal), separately from its setup
+    # posture. A gripper mounted directly on the desk cannot descend to an object lying on it: measured
+    # 2026-10-24 on UR5e + 2F-85, no desk position was reachable with an object centre 19 mm above the
+    # surface and only one prop of two could be placed, until the robot stood 0.30 m higher.
+    setup_file = source.with_name("initial_state.json")
+    mount_height = (float(json.loads(setup_file.read_text()).get('mount_height', 0.))
+                    if setup_file.is_file() else 0.)
+    root_transform[:3, 3] = [-.25, 0., .76 + mount_height - minimum_z + .001]
     initial = {}
     initial_file = source.with_name("initial_state.json")
     if initial_file.is_file():
@@ -226,8 +229,9 @@ def import_robot(folder):
                         '(%d pairs) and the private queries exclude the same pairs; non-adjacent self-collision stays on.'
                         % len(declared))
     elif declaration['runtime_excluded_adjacent_pairs']:
-        warnings.append('Declared adjacent-pair overlaps are partial (%d of %d): the private queries exclude them, '
-                        'the engine keeps adjacent collision on for the undeclared rest.'
+        warnings.append('Declared adjacent-pair overlaps are partial (%d of %d): the private queries '
+                        'exclude them and the package ships an engine model that excludes exactly the '
+                        'same pairs, so collision stays on for the undeclared rest.'
                         % (len(declared), declaration['adjacent_pair_count']))
     if len(candidates) > 2:
         warnings.append("Longest distinct chains selected; all candidate chains are recorded for configuration.")
@@ -246,8 +250,9 @@ def import_robot(folder):
              "physics_substeps":IMPORTED_ROBOT_POLICY['physics_substeps'],
              "robot_gravity_compensation": 1., "self_collision": True,
              # URDF cannot filter individual pairs, so the engine expresses only a declaration
-             # that covers every adjacent pair (see collision_declaration).
-             "adjacent_collision": not declaration['covers_adjacent_pairs'],
+             # that covers every adjacent pair (see collision_declaration). A package that ships an
+             # engine model instead relies on that model's own exclusions, which can name any pair.
+             "adjacent_collision": bool(engine_model_required) or not declaration['covers_adjacent_pairs'],
              "runtime_excluded_adjacent_pairs": declaration['runtime_excluded_adjacent_pairs'],
              "default_armature": None,
              "constraint_solver": "Newton", "friction_cone": "elliptic",
@@ -268,7 +273,21 @@ def import_robot(folder):
     scene['physics_dt']=min(IMPORTED_ROBOT_POLICY['physics_dt_max_s'],max(IMPORTED_ROBOT_POLICY['physics_dt_min_s'],
         scene['cube_size']*IMPORTED_ROBOT_POLICY['physics_dt_per_cube_meter']))
     profile['cube_size'] = scene['cube_size']
+    # The private model reads the declaration from the profile, so it must be recorded before the
+    # engine model is built from it.
     profile['collision_config'] = declaration
+    if engine_model_required:
+        # Both the private queries and the engine must ignore the same pairs; the URDF cannot express
+        # them, so the package carries an MJCF engine model built from the private collision model.
+        from backend.app.robots.collision_planner import PrivateCollisionQueries
+        from backend.app.robots.engine_model import engine_mjcf
+        queries = PrivateCollisionQueries(profile, scene['table_top'])
+        xml, restored_ranges = engine_mjcf(queries.xml, normalized)
+        engine_file = target / 'engine_model.xml'
+        engine_file.write_text(xml + '\n')
+        profile['engine_model'] = {'morph': 'mjcf', 'file': str(engine_file),
+                                   'excluded_adjacent_pairs': declaration['runtime_excluded_adjacent_pairs'],
+                                   'restored_joint_ranges': restored_ranges}
     (target / 'gripper_analysis.json').write_text(json.dumps(analysis, indent=2) + '\n')
     seeds = {}
     for side, chain in chains.items():
@@ -284,6 +303,54 @@ def import_robot(folder):
     (target / 'ik_validation.json').write_text(json.dumps(ik_checks, indent=2) + '\n')
     from backend.app.robots.spawn import ReachableDeskSpawns
     spawn = ReachableDeskSpawns(profile, scene).layout()
+    if not spawn['objects'] and profile['grippers']:
+        # An object shorter than the arm can descend above the desk is unpickable: no position is
+        # reachable, so the layout omits every prop. Measure the height this arm needs and grow the
+        # object to it while it still fits the jaws - a robot whose inferred cube already works never
+        # reaches this branch, so nothing moves for the robots that spawn today. Measured 2026-10-24:
+        # UR5e + 2F-85 places both props at an 84 mm cube and none at the inferred 33.6 mm.
+        # See ReachableDeskSpawns.minimum_pinch_height.
+        inferred_cube = scene['cube_size']
+        side = min(profile['grippers'], key=lambda name: profile['grippers'][name]['cube_size'])
+        gripper = profile['grippers'][side]
+        needed = ReachableDeskSpawns(profile, scene).minimum_pinch_height(side)
+        limit = float(gripper['maximum_aperture']) - .002
+
+        def use_cube(size):
+            scene['cube_size'] = float(size)
+            scene['cube_mass'] = .05 * (scene['cube_size'] / .052) ** 3
+            scene['physics_dt'] = min(IMPORTED_ROBOT_POLICY['physics_dt_max_s'],
+                max(IMPORTED_ROBOT_POLICY['physics_dt_min_s'],
+                    scene['cube_size'] * IMPORTED_ROBOT_POLICY['physics_dt_per_cube_meter']))
+            profile['cube_size'] = scene['cube_size']
+            for entry in profile['grippers'].values():
+                entry['cube_size'] = scene['cube_size']
+
+        # A height that admits some clean posture need not admit a whole layout - placing the second
+        # prop also has to be reachable beside the first - so the layout itself decides, and the
+        # largest object the jaws open to is the last resort (measured: 84 mm places both props for
+        # UR5e + 2F-85 where 60 and 70 mm place one).
+        taller = None
+        for candidate in ([limit] if needed is None else [min(2. * needed, limit), limit]):
+            if candidate <= inferred_cube + .0005:
+                continue
+            use_cube(candidate)
+            attempt = ReachableDeskSpawns(profile, scene).layout()
+            if not attempt['omitted']:
+                spawn, taller = attempt, candidate
+                break
+        if taller is None:
+            use_cube(inferred_cube)
+            warnings.append('No prop can be pinched on this desk: this arm cannot reach an object centre '
+                            'below %s above the surface, and the jaws open to only %.1f mm.'
+                            % ((('%.1f mm' % (2. * needed * 1000.)) if needed is not None else 'the ladder'),
+                               float(gripper['maximum_aperture']) * 1000.))
+        else:
+            warnings.append('The inferred cube (%.1f mm) is shorter than this arm can descend above the '
+                            'desk, so no desk position was reachable; the scene uses %.1f mm%s.'
+                            % (inferred_cube * 1000., scene['cube_size'] * 1000.,
+                               (' (the height it needs is %.1f mm)' % (2. * needed * 1000.)
+                                if needed is not None else ', the largest the jaws hold')))
     scene['objects'] = spawn['objects']
     (target / 'scene.json').write_text(json.dumps(scene, indent=2) + '\n')
     (target / 'spawn_validation.json').write_text(json.dumps(spawn, indent=2) + '\n')
@@ -311,6 +378,7 @@ def import_robot(folder):
          'adjacent_collision': not declaration['covers_adjacent_pairs'],
          **({'runtime_excluded_adjacent_pairs': declaration['runtime_excluded_adjacent_pairs']}
             if declaration['runtime_excluded_adjacent_pairs'] else {}),
+         **({'engine_morph': profile['engine_model']['morph']} if profile.get('engine_model') else {}),
          'chains': chains, 'grippers': profile['grippers'], 'cube_size': scene['cube_size'],
          'home': home, 'root': profile['root_transform']}, sort_keys=True).encode()).hexdigest()
     # The catalog sees only complete registrations, after all IK/setup files exist.
