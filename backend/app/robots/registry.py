@@ -569,6 +569,20 @@ def import_robot(folder):
             if not attempt['omitted']:
                 spawn, taller = attempt, candidate
                 break
+        # Reaching a pose and entering it are different budgets, and the largest layout that fits is not
+        # necessarily one the jaws can close around: measured 2026-10-27, the UR5e places both props only at an
+        # 84 mm cube and that is one millimetre per side inside its 86 mm aperture, so the pads touch the cube on
+        # the way in and no approach completes. The spawn is still emitted - the prop has to sit somewhere - but
+        # the margin is stated so the impossibility is visible instead of arriving as MOTION_BLOCKED at run time.
+        if taller is not None:
+            side_entry = profile['grippers'].get(side) or {}
+            aperture = float(side_entry.get('maximum_aperture') or 0.)
+            margin = (aperture - float(taller)) / 2. if aperture else None
+            if margin is not None and margin < .006:
+                warnings.append(
+                    f'The only spawn that places every prop uses a {float(taller) * 1000:.1f} mm object, '
+                    f'which leaves {margin * 1000:.1f} mm per side inside a {aperture * 1000:.1f} mm aperture: '
+                    'the jaws can reach it but not open around it.')
         if taller is None:
             use_cube(inferred_cube)
             warnings.append('No prop can be pinched on this desk: this arm cannot reach an object centre '
