@@ -575,14 +575,10 @@ def import_robot(folder):
         # the way in and no approach completes. The spawn is still emitted - the prop has to sit somewhere - but
         # the margin is stated so the impossibility is visible instead of arriving as MOTION_BLOCKED at run time.
         if taller is not None:
-            side_entry = profile['grippers'].get(side) or {}
-            aperture = float(side_entry.get('maximum_aperture') or 0.)
-            margin = (aperture - float(taller)) / 2. if aperture else None
-            if margin is not None and margin < .006:
-                warnings.append(
-                    f'The only spawn that places every prop uses a {float(taller) * 1000:.1f} mm object, '
-                    f'which leaves {margin * 1000:.1f} mm per side inside a {aperture * 1000:.1f} mm aperture: '
-                    'the jaws can reach it but not open around it.')
+            note = entry_margin_warning(float(taller),
+                                        float((profile['grippers'].get(side) or {}).get('maximum_aperture') or 0.))
+            if note:
+                warnings.append(note)
         if taller is None:
             use_cube(inferred_cube)
             warnings.append('No prop can be pinched on this desk: this arm cannot reach an object centre '
@@ -644,3 +640,20 @@ def selected_robot():
 def remember_selection(robot_id):
     GENERATED_ROOT.mkdir(parents=True, exist_ok=True)
     (GENERATED_ROOT / "selection.json").write_text(json.dumps({"robot_id": robot_id}) + "\n")
+
+
+def entry_margin_warning(size, aperture, minimum=.006):
+    """Why an object the jaws can reach may still be one they cannot open around, or None.
+
+    Reaching a pose and entering it are separate budgets: measured 2026-10-27, the UR5e places both props only at an
+    84 mm cube and holds 86 mm of aperture, so the pads touch it on the way in and every approach ends in
+    MOTION_BLOCKED. Kept as a function so the rule is testable without importing a robot.
+    """
+    if not aperture:
+        return None
+    margin = (float(aperture) - float(size)) / 2.
+    if margin >= minimum:
+        return None
+    return (f'The only spawn that places every prop uses a {float(size) * 1000:.1f} mm object, which leaves '
+            f'{margin * 1000:.1f} mm per side inside a {float(aperture) * 1000:.1f} mm aperture: the jaws can reach '
+            'it but not open around it.')
