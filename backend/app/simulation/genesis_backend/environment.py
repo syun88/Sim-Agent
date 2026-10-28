@@ -678,6 +678,17 @@ class GenesisOpenArmV2Environment(SimulationBackend):
     def arm_kinematics(self, side: str) -> OfficialArmKinematics:
         return OfficialArmKinematics(self._meta.model, self._observed_model_qpos(), side)
 
+    def plan_arm_pose(self, side: str, position, rotation=None, *, q_init=None) -> dict:
+        """Plan a pose with the cell's own solve.
+
+        The policy and the measurements behind it - an under-actuated arm is not asked for an attitude,
+        the home posture is retried, other basins are searched - live in ``pose_planning.plan_pose``,
+        which ``OpenArmV2Controller.solve_ik`` also plans through, so the cell answers "can this arm
+        reach this pose" in one place rather than two.
+        """
+        from backend.app.simulation.openarm_v2.pose_planning import plan_pose
+        return plan_pose(self, side, position, rotation, q_init=q_init, planner_grade=True)
+
     def _observed_model_qpos(self) -> np.ndarray:
         qpos = self._meta.keyframe_qpos
         observed = self._entity.get_qpos().cpu().numpy()

@@ -180,6 +180,18 @@ class SimulationBackend(ABC):
         """Optional source velocity caps for a generated URDF motion profile."""
         return None
 
+    def plan_arm_pose(self, side: str, position: np.ndarray, rotation: np.ndarray | None = None,
+                      *, q_init: np.ndarray | None = None) -> dict | None:
+        """Plan a joint vector that reaches this pose, or ``None`` when this robot cannot plan one.
+
+        A skill that plans a pose - a throw's wind-up search and its launch stroke are the two - asks
+        here instead of assuming a shape of its own, because the two kinds of robot answer it with
+        different machinery: an imported package through the planner that reads its URDF profile, the
+        builtin official cell through its own kinematics. The result carries ``success``, ``q_rad``
+        (continuous with ``q_init`` where the joints can wrap), and the errors that justify the verdict.
+        """
+        return None
+
     @abstractmethod
     def kinematics(self) -> None:
         """Refresh forward kinematics after `set_arm_qpos`, without stepping physics."""

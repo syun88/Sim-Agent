@@ -57,6 +57,27 @@ def _attitude_in_use(runner, arm):
     return np.asarray(runner.controller.target_rotations.get(arm, env.ee_pose(arm)[1]))
 
 
+def _pose_plan(env, arm, position, rotation=None, *, q_init=None):
+    """The robot's own answer to "can this pose be reached, and with which joints".
+
+    Planning a pose is the environment's business (``SimulationBackend.plan_arm_pose``): an imported
+    package answers with the planner that reads its URDF profile, the builtin official cell with its own
+    kinematics. Measured 2026-10-28: the throw reached into ``env.profile`` directly, which the cell does
+    not have, so ``throw_right`` ended in an AttributeError on the cell while the same case passed before
+    the throw was rewritten for imported robots. A robot that cannot plan a pose at all is refused here,
+    by name, rather than downstream by an attribute error.
+    """
+    planner = getattr(env, 'plan_arm_pose', None)
+    if planner is None:
+        from backend.app.skills.robot_skills import SkillError
+        raise SkillError('IK_FAILURE', f'{type(env).__name__} cannot plan an arm pose')
+    planned = planner(arm, np.asarray(position, float), rotation, q_init=q_init)
+    if planned is None:
+        from backend.app.skills.robot_skills import SkillError
+        raise SkillError('IK_FAILURE', f'{type(env).__name__} declined to plan a pose for {arm}')
+    return planned
+
+
 def reachable(env, arm, pose, rotation):
     """Can this robot's own IK reach the pose?  Asked of the planner, not of the controller.
 
@@ -65,10 +86,9 @@ def reachable(env, arm, pose, rotation):
     measured 2026-10-25 on OpenManipulator-X, the controller rejected every searched wind-up while the
     same poses solved with zero error through ``solve_profile_ik``. Planning asks the planner.
     """
-    from backend.app.robots.urdf import solve_profile_ik
-    result = solve_profile_ik(env.profile, arm, np.asarray(pose, float), rotation, model=env.model,
-                              q_init=env.home_arm_qpos(arm), snapshot=env.joint_snapshot())
-    return bool(result['success'])
+    if getattr(env, 'plan_arm_pose', None) is None:
+        return False                     # a robot that cannot plan a pose cannot reach a searched one
+    return bool(_pose_plan(env, arm, pose, rotation, q_init=env.home_arm_qpos(arm))['success'])
 
 
 def launch_ready(runner, arm, obj, windup, attitude, stroke=.14):
@@ -250,9 +270,8 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
     position, rotation = env.ee_pose(arm)
     start = env.arm_qpos(arm)
     launch_rotation = rotation if mode == "strict" else None
-    # Solved by the planner's IK, for the same reason the wind-up is: the controller's own IK is a
-    # local, damped solve that a four-joint arm cannot satisfy a full six-degree-of-freedom pose with.
-    from backend.app.robots.urdf import solve_profile_ik
+    # Planned by the robot's own planner, for the same reason the wind-up is: the controller's own IK
+    # carries a carrying arm's constraints, which reject poses the planner solves.
     aim = None
     direction = np.array([0., 0., 1.])
     flight_used = flight_time_s
@@ -266,9 +285,8 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
         for candidate in (.16, .18, .20, .22, .26, .30):
             trial = launch_for_target(delta, candidate)
             trial_direction = np.asarray(trial['direction'], float)
-            planned = solve_profile_ik(env.profile, arm, np.asarray(position, float) + trial_direction * stroke,
-                                       launch_rotation, model=env.model, q_init=start,
-                                       snapshot=env.joint_snapshot())
+            planned = _pose_plan(env, arm, np.asarray(position, float) + trial_direction * stroke,
+                                 launch_rotation, q_init=start)
             if planned['success']:
                 aim, direction, flight_used = trial, trial_direction, candidate
                 break
@@ -277,8 +295,8 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
             ramp = max(.05, min(.6, ramp_for_release_speed(stroke, speed, RELEASE_PHASE)))
             release_at = RELEASE_PHASE * ramp
     if aim is None:
-        planned = solve_profile_ik(env.profile, arm, np.asarray(position, float) + direction * stroke,
-                                   launch_rotation, model=env.model, q_init=start, snapshot=env.joint_snapshot())
+        planned = _pose_plan(env, arm, np.asarray(position, float) + direction * stroke,
+                             launch_rotation, q_init=start)
     if not planned['success'] and back_off(.06):
         # The stroke starts where the arm happens to be; a cube near the base leaves no room for it. Backing off
         # and re-solving the same stroke is the same physical remedy the wind-up search uses, and it is measured:
@@ -286,9 +304,8 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
         position, rotation = env.ee_pose(arm)
         start = env.arm_qpos(arm)
         launch_rotation = rotation if mode == "strict" else None
-        planned = solve_profile_ik(env.profile, arm, np.asarray(position, float) + direction * stroke,
-                                   launch_rotation, model=env.model, q_init=start,
-                                   snapshot=env.joint_snapshot())
+        planned = _pose_plan(env, arm, np.asarray(position, float) + direction * stroke,
+                             launch_rotation, q_init=start)
     if not planned['success']:
         # Say what was short and which levers exist, so the planner can choose instead of guessing. Measured
         # 2026-10-27: the aimed stroke from the cube nearest the base was 24 mm out of reach, and backing off
@@ -306,7 +323,7 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
                                      "stroke_cm": "2-30", "release_speed_m_s": "0.2-3.0"},
                           "aim_direction": np.round(direction, 3).tolist()}
         raise error
-    end = env.model.nearest_continuous(env.profile['chains'][arm]['joints'], planned['q_rad'], start)
+    end = np.asarray(planned['q_rad'], float)          # the planner already made it continuous with start
     if mode == "strict":
         control.target_rotations[arm] = rotation.copy()
     ramp = max(.05, min(.6, ramp_for_release_speed(stroke, speed, RELEASE_PHASE)))
