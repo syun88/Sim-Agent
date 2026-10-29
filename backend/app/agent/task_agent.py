@@ -17,6 +17,7 @@ from backend.app.planning.spatial_language import preservation_spans
 from backend.app.planning.task_program import GroundingError, TaskProgram
 from backend.app.planning.task_contract import TaskContract, requested_program
 from backend.app.execution.contract_evidence import ContractEvidence, completed_prefix
+from backend.app.execution.failure_evidence import failure_observation
 
 
 RECOVERABLE = {'IK_FAILURE','GRASP_FAILED','COLLISION_PATH','MOTION_BLOCKED','HOLD_LOST',
@@ -47,6 +48,7 @@ class TaskAgent:
         initial = self.executor.world_state()
         epoch_initial = initial
         decisions, attempts, recoveries, resets = [], [], [], 0
+        evidence_ledger = []
         staging_used=False
         replan_used=False
         alternate_used=False
@@ -58,6 +60,7 @@ class TaskAgent:
         def finish(result):
             result = {**result,'agent_trace':decisions,'agent_attempts':attempts,'agent_recoveries':recoveries,
                 'initial_world_state':initial,'final_world_state':self.executor.world_state(),
+                'evidence_ledger':deepcopy(evidence_ledger),
                 'total_duration':time.perf_counter()-started}
             result['verification'] = {**result.get('verification',{}),'agent_attempts':len(attempts),
                 'scene_resets':resets,'all_agent_attempts_succeeded':all(a['result']['success'] for a in attempts)}
@@ -121,6 +124,7 @@ class TaskAgent:
             plan.planning_evidence = {**(plan.planning_evidence or {}), 'task_contract':contract.describe()}
             if emit:
                 emit('plan_generated',status='VALIDATING',plan=plan.model_dump(),agent_trace=deepcopy(decisions))
+            before_attempt = self.executor.world_state()
             result = self.executor.run(plan,emit=emit,should_stop=should_stop,force_failure=force_failure and iteration==0)
             receipts.record(plan, result, iteration + 1)
             if result['success']:
@@ -130,12 +134,19 @@ class TaskAgent:
                 if not final['success']:
                     result.update(success=False,status='FAILED')
                     result['verification'].update(success=False,failure_category=final['failure_category'])
-            attempts.append({'attempt':iteration+1,'plan':plan.model_dump(),'result':deepcopy(result)})
+            failure_receipt = None
+            if not result['success']:
+                failure_receipt = failure_observation(contract, receipts.epoch, iteration + 1,
+                    result, before_attempt, self.executor.world_state())
+                evidence_ledger.append(failure_receipt)
+            attempts.append({'attempt':iteration+1,'plan':plan.model_dump(),'result':deepcopy(result),
+                             'failure_evidence_id':failure_receipt['id'] if failure_receipt else None})
             if result['success']:
                 # Homing is part of task completion, not a reset. A requested
                 # physical hold is retained; empty arms return to model home.
                 home_required=bool(source.goals) or (source.actions[-1].op in {'pick','handover','place','throw','pour'})
                 if home_required:
+                    home_before = self.executor.world_state()
                     home=self.executor.home_empty_arms(emit=emit,should_stop=should_stop)
                     result['post_task_homing']=home
                     result['verification']['task_goal_before_homing']=True
@@ -149,6 +160,18 @@ class TaskAgent:
                         if not final['success']:
                             result.update(success=False,status='FAILED',detail='ホーム復帰後に作業の最終状態を確認できませんでした。')
                             result['verification'].update(success=False,failure_category='POST_TASK_SCENE_CHANGED')
+                    if not result['success']:
+                        phase = 'homing' if not home['success'] else 'post_homing_verification'
+                        raw = home if phase == 'homing' else final
+                        terminal = failure_observation(contract, receipts.epoch, iteration + 1,
+                            {**result, 'failure_phase':phase, 'failure_evidence':raw},
+                            home_before, self.executor.world_state())
+                        evidence_ledger.append(terminal)
+                        attempts[-1]['failure_evidence_id'] = terminal['id']
+                        attempts[-1]['result'] = deepcopy(result)
+                        announce({'kind':'execution_failed','explanation':f"{terminal['code']}。完了後の検査が失敗しました。",
+                                  'failure_category':terminal['code'],'evidence_id':terminal['id'],
+                                  'classification':terminal['classification']})
                 return finish(result)
             if result.get('status')=='STOPPED':
                 return finish(result)
@@ -157,7 +180,9 @@ class TaskAgent:
             category = failed.get('error') or category
             observed = self.executor.world_state()
             announce({'kind':'execution_failed','explanation':f'{category}。現在の保持・接触と残りの作業を再確認します。',
-                'failure_category':category,'observed_hands':{s:observed.get('robot',{}).get(s+'_arm',{}).get('held_object') for s in ('left','right')}})
+                'failure_category':category,'evidence_id':failure_receipt['id'],
+                'classification':failure_receipt['classification'],
+                'observed_hands':{s:observed.get('robot',{}).get(s+'_arm',{}).get('held_object') for s in ('left','right')}})
             if iteration+1==self.max_attempts or category not in RECOVERABLE or not restartable:
                 result['detail'] = result.get('detail') or f'{category}: 自動復旧できる操作の範囲または試行上限に達しました。'
                 return finish(result)
@@ -219,7 +244,8 @@ class TaskAgent:
                 return finish(result)
             assessment = self.recovery_call(instruction,observed,
                 {'category':category,'detail':failed.get('detail') or result.get('detail'),
-                 'completed_action_prefix':prefix,'attempt':iteration+1,'resets':resets},legal)
+                 'completed_action_prefix':prefix,'attempt':iteration+1,'resets':resets,
+                 'evidence_id':failure_receipt['id'],'failure_observation':deepcopy(failure_receipt)},legal)
             if assessment.get('decision') not in legal:
                 assessment = {'decision':legal[0],'reason':'観測状態で実行可能な復旧手順を選びます。','provider':'deterministic_fallback'}
             if should_stop and should_stop():
@@ -243,6 +269,7 @@ class TaskAgent:
                     # compact scene, not only the failure, so a plan cannot assume an object is already held.
                     replanned=self.plan_call(instruction,observed,
                         [{'recent_failure':failed.get('detail'),'measured':failed.get('evidence'),
+                          'evidence_id':failure_receipt['id'], 'failure_observation':deepcopy(failure_receipt),
                           'hands':{side:(observed.get('robot',{}).get(f'{side}_arm') or {}).get('held_object')
                                    for side in ('left','right')},
                           'scene':compact_scene(observed)}])

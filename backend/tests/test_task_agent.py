@@ -124,6 +124,47 @@ def test_failed_attempt_is_retained_after_in_place_recovery(world,postconditions
     assert result['agent_recoveries'][0]['decision']=='recover_in_place'
 
 
+def test_failure_receipt_is_the_same_fact_in_diagnosis_replan_and_trace(world,postconditions):
+    seen=[]
+    def fails(executor,plan):
+        return {'success':False,'status':'FAILED','skills':[{'skill':'approach_object',
+            'object':'blue_cube','arm':'right','action_index':0,'step_index':0,'success':False,
+            'error':'IK_FAILURE','detail':'No collision-screened solution',
+            'evidence':{'unreachable_by_m':.021,'levers':{'stroke_cm':'change design'}}}],
+            'verification':{'success':False,'failure_category':'IK_FAILURE'}}
+    planner=AgentPlanner()
+    calls=[]
+    def replan(text,state,memory):
+        calls.append(memory)
+        return planner.plan('右手で青を掴んで',state)
+    def assess(text,state,failure,legal):
+        seen.append(failure)
+        return {'decision':'replan','reason':'candidate'}
+    executor=FakeExecutor(world,[fails,True])
+    result=TaskAgent(executor,planner,plan_call=replan,recovery_call=assess).run('右手で青を掴んで')
+    receipt=result['evidence_ledger'][0]
+    assert receipt['id']==seen[0]['evidence_id']==calls[1][0]['evidence_id']
+    assert next(d for d in result['agent_trace'] if d['kind']=='execution_failed')['evidence_id']==receipt['id']
+    assert receipt['phase']=='skill' and receipt['raw']['unreachable_by_m']==.021
+    assert receipt['classification']=='REACHABILITY' and receipt['measurement']['unreachable_by_m']==.021
+    assert receipt['attempt']==1 and receipt['scene_epoch']==0 and receipt['action_index']==0
+    assert result['agent_attempts'][0]['failure_evidence_id']==receipt['id']
+
+
+def test_invalid_plan_preflight_has_receipt_even_without_a_skill(world):
+    def refused(executor,plan):
+        return {'success':False,'status':'FAILED','detail':'INVALID_PLAN: Selected robot does not support grasp_object',
+                'skills':[], 'preflight':{'kind':'plan_validation','errors':['Selected robot does not support grasp_object']},
+                'verification':{'success':False,'failure_category':'INVALID_PLAN'}}
+    executor=FakeExecutor(world,[refused])
+    result=TaskAgent(executor,AgentPlanner(),max_attempts=1).run('右手で青を掴んで')
+    receipt=result['evidence_ledger'][0]
+    assert receipt['phase']=='preflight' and receipt['classification']=='UNKNOWN'
+    assert receipt['raw']['errors']==['Selected robot does not support grasp_object']
+    assert receipt['action_index'] is None and receipt['measurement']=={}
+    assert not result['success']
+
+
 def test_repeated_motion_failure_keeps_scene_and_stops(world):
     executor=FakeExecutor(world,[False,False,False])
     result=TaskAgent(executor,AgentPlanner()).run('青いキューブを掴んで')
@@ -212,6 +253,9 @@ def test_home_failure_preserves_completed_task_without_replay_or_reset(world,pos
     assert not result['success'] and len(executor.calls)==1 and executor.resets==0
     assert result['verification']['task_goal_before_homing']
     assert result['verification']['failure_category']=='POST_TASK_HOME_FAILED'
+    assert result['evidence_ledger'][-1]['phase']=='homing'
+    assert result['evidence_ledger'][-1]['code']=='POST_TASK_HOME_FAILED'
+    assert result['agent_attempts'][0]['failure_evidence_id']==result['evidence_ledger'][-1]['id']
 
 
 def test_next_prompt_plans_from_previous_result_after_homing(world,postconditions):
@@ -335,6 +379,8 @@ def test_homing_reobserves_a_hold_instead_of_reusing_its_success(world):
     assert result['verification']['agent_final_postconditions']['success']
     assert not result['verification']['after_homing_postconditions']['success']
     assert result['verification']['failure_category']=='POST_TASK_SCENE_CHANGED'
+    assert result['evidence_ledger'][-1]['phase']=='post_homing_verification'
+    assert result['agent_attempts'][0]['failure_evidence_id']==result['evidence_ledger'][-1]['id']
 
 
 def test_replanning_cannot_replace_the_requested_object(world,postconditions):

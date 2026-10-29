@@ -246,7 +246,8 @@ def viewer_state(body: dict):
 def genesis_result(result: dict[str, Any]):
     _owns_scene(result.get('viewer_id'))
     record = _record(result.get('task_id', ''))
-    for field in ('plan', 'skills', 'verification', 'detail', 'retry_count', 'total_duration', 'initial_world_state', 'final_world_state', 'agent_trace', 'agent_attempts', 'agent_recoveries', 'post_task_homing', 'diagnosis'):
+    for field in ('plan', 'skills', 'verification', 'detail', 'retry_count', 'total_duration', 'initial_world_state', 'final_world_state', 'agent_trace', 'agent_attempts', 'agent_recoveries', 'evidence_ledger', 'task_contract',
+                  'post_task_homing', 'diagnosis'):
         if field in result:
             record[field] = result[field]
     stopped = record['status'] == 'STOP_REQUESTED' or result.get('status') == 'STOPPED'

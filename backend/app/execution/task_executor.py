@@ -141,7 +141,8 @@ class TaskExecutor:
         valid, errors = validate_plan(plan, initial)
         if not valid:
             return {"success": False, "status": "FAILED", "detail": "INVALID_PLAN: " + "; ".join(errors),
-                    "plan": plan.model_dump(), "skills": [], "verification": {"success": False, "failure_category": "INVALID_PLAN"},
+                    "plan": plan.model_dump(), "skills": [], "preflight": {"kind": "plan_validation", "errors": errors},
+                    "verification": {"success": False, "failure_category": "INVALID_PLAN"},
                     "initial_world_state": initial, "final_world_state": initial, "retry_count": 0,
                     "total_duration": time.perf_counter() - started}
         results = []
@@ -156,6 +157,7 @@ class TaskExecutor:
             if emit:
                 emit("skill_started", step_index=index, step=step, world_state=before)
             attempts = []
+            attempt_before = before
             result = self.skills.execute_plan([step])[0]
             attempts.append(result)
             # Reacquire a failed table pinch only while neither hand holds the object.
@@ -167,13 +169,15 @@ class TaskExecutor:
                     if emit:
                         emit("skill_retry", step_index=index, reason=result.get("error"))
                     self.controller.wait_gripper(arm, False)
+                    attempt_before = build_world_state(self.env)
                     retry = self.skills.approach_object(arm, obj, grasp_offset_x=step.get("grasp_offset_x", 0.))
                     if retry["success"] and step["skill"] == "grasp_object":
                         retry = self.skills.grasp_object(arm, obj)
                     result = retry
                     attempts.append(retry)
             result = {**result, "step_index": index, "action_index": step.get("action_index"), "arm": step["arm"],
-                      "object": step.get("object"), "attempts": attempts, "world_state": build_world_state(self.env)}
+                      "object": step.get("object"), "attempts": attempts, "before_world_state": attempt_before,
+                      "world_state": build_world_state(self.env)}
             # System 1, per step: a fast typed judgement about whether the hold is still there, recorded next
             # to the outcome. Advisory only - it cannot turn a failure into a success or the reverse; a
             # monitor that is absent, slow or wrong simply leaves the field out.

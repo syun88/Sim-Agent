@@ -78,6 +78,26 @@ uv run python scripts/check_task_contract.py --input case.json
 終了コードは、記録済みイベント成立が0、候補拒否・記録済みイベント不成立が1、証拠不足が2。
 テストは `backend/tests/test_task_contract.py` と `backend/tests/test_task_agent.py` を物理シーンなしで実行できる。
 
+## 失敗観測の共通receipt（S2）
+
+失敗した実行器の結果は `execution/failure_evidence.py` が一回だけ正規化する。IDはタスク、
+シーンepoch、試行、段階、操作・スキル位置に結び付ける。生の `evidence` と数値測定を分け、
+計測されない距離や接触リンクを0や推測で埋めない。IK失敗だけから到達距離不足と断定せず、
+明示的な距離の測定がある場合だけREACHABILITY、経路衝突のエラーはPATH_COLLISIONなど、
+観測できる範囲の分類に限定する。プラン検証の事前拒否も構造化して保存する。
+スキル内のIK/衝突エラーはスキル失敗として記録し、計画時拒否か動作中拒否かの区別が
+実行器から報告されない場合、段階を捏造しない。
+
+同じreceipt IDを `evidence_ledger`、試行、`agent_trace`、復旧判断への入力、再計画入力に渡す。
+失敗スキルの実行直前状態があればそれをfingerprintに使い、位置・保持・可視の障害物と手先を含める。
+説明文や時刻だけが変わっても同一値になる。ただしIK seed、連続した接触形状、関節制約などの
+未取得入力もあるため、同じfingerprintは「同じ計画が必ず失敗する」証明ではない。
+同じ失敗の再実行禁止、仮説・queryと統一budgetはS3の責務で、S2は自動復旧候補を変更しない。
+
+保存済みTaskAgent結果の読み取り専用照合は `python scripts/replay_failure_evidence.py result.json`。
+ID参照と保存した入力fingerprintを照合し、live Genesisやモデルを起動しない。
+保存済み記録の整合性検査であり、センサー値の独立した物理的証明ではない。
+
 ## シーンを引き継ぐタスク境界
 
 新しい指示の入口で必ず `executor.world_state()` を呼び、Genesisから現在の関節、物体の位置・姿勢、
