@@ -306,6 +306,10 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             if obj == "wine_bottle":
                 raise GroundingError("Bottle handover is not supported; pour with the current holder")
             receiver = action.receiver
+            if receiver is None and len(available_arms) == 2 and arm in available_arms:
+                receiver = next(side for side in available_arms if side != arm)
+                action.receiver = receiver
+                assumptions.append(f"Action {index + 1}: recipient hand unspecified; use the {receiver} robot hand opposite the {arm} holder")
             if receiver not in SIDES or receiver == arm:
                 raise GroundingError(f"Action {index + 1}: handover needs two different hands")
             acquire(obj, arm, index)

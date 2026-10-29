@@ -44,6 +44,54 @@ def test_sequential_set_down_releases_support_before_stack(text,support,subject,
     assert any(s.skill=='release_object' and s.object==support for s in plan.steps)
 
 
+@pytest.mark.parametrize('source,receiver', [('left','right'),('right','left')])
+def test_unspecified_handover_hand_uses_the_other_observed_robot_arm(source,receiver):
+    # Live failure c3d74b0f: grammar rejected an omitted recipient, then an invalid model
+    # "move" hid the actual problem behind an irrelevant direction/distance error.
+    world={**WORLD,'robot':{'available_arms':['left','right'],
+        'left_arm':{'held_object':'red_cube' if source=='left' else None},
+        'right_arm':{'held_object':'red_cube' if source=='right' else None}}}
+    text='赤いキューブを手に渡して右においてから、青いキューブを赤いキューブに乗せて'
+    plan=AgentPlanner().plan(text,world)
+    assert [(a['op'],a['object']) for a in plan.program['actions']]==[
+        ('handover','red_cube'),('place','red_cube'),('place','blue_cube')]
+    assert plan.program['actions'][0]['arm']==source
+    assert plan.program['actions'][0]['receiver']==receiver
+    assert plan.program['actions'][1]['target']=='right_side'
+    assert plan.program['actions'][2]['target']=='red_cube'
+    assert plan.program['actions'][2]['relation']=='on'
+    assert any('recipient hand unspecified' in assumption.lower()
+               for assumption in plan.assumptions)
+    assert not any(a['op']=='move' for a in plan.program['actions'])
+
+
+def test_invalid_model_move_cannot_hide_grounded_unspecified_handover(monkeypatch):
+    planner=AgentPlanner()
+    planner.enabled=planner.local_enabled=True
+    planner.capability_mode=True
+    monkeypatch.setattr(planner,'_ai_plan',lambda *args:{'payload':{
+        'actions':[{'op':'move','object':'red_cube'}]},'raw':'unmeasured move'})
+    plan=planner.plan('赤いキューブを手に渡して右においてから、青いキューブを赤いキューブに乗せて',WORLD)
+    assert plan.model_called and not plan.model_verdict['ok']
+    assert plan.provider=='deterministic_fallback'
+    assert [(a['op'],a['object']) for a in plan.program['actions']]==[
+        ('handover','red_cube'),('place','red_cube'),('place','blue_cube')]
+    assert not any(a['op']=='move' for a in plan.program['actions'])
+
+
+def test_explicit_human_recipient_is_not_replaced_with_another_robot_hand():
+    with pytest.raises(PlannerProviderError) as error:
+        AgentPlanner().plan('赤いキューブを私の手に渡して',WORLD)
+    assert error.value.category=='ROBOT_CAPABILITY'
+
+
+def test_unspecified_handover_requires_two_available_robot_arms():
+    from backend.app.planning.task_program import GroundingError, TaskProgram, compile_program
+    state={**WORLD,'robot':{'available_arms':['left']}}
+    with pytest.raises(GroundingError,match='two different hands'):
+        compile_program(TaskProgram(actions=[{'op':'handover','object':'red_cube'}]),state)
+
+
 def test_support_parking_cannot_erase_an_earlier_throw_event():
     from backend.app.planning.task_contract import intent_checks
     from backend.app.planning.task_program import TaskProgram, compile_program

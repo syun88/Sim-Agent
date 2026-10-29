@@ -509,6 +509,11 @@ class AgentPlanner:
             raise PlannerProviderError('REFERENCE_NOT_PRESENT',str(error)) from None
         if unsupported_group_request(instruction):
             raise PlannerProviderError('UNSUPPORTED_TASK', 'GROUP_GRASP_UNSUPPORTED: one-hand grouped or simultaneous multi-cube acquisition has no executable contact contract')
+        # An unnamed robot hand may be selected; an explicitly human recipient cannot
+        # be reinterpreted as the other gripper when no human-transfer skill exists.
+        if re.search(r'(?:人|私|あなた|ユーザー)(?:の)?手?(?:に|へ)[^。、,]*?(?:渡|手渡)|'
+                     r'\b(?:hand|pass|give)\b[^.!]*?\b(?:person|human|me|user)\b',instruction,re.I):
+            raise PlannerProviderError('ROBOT_CAPABILITY','Human handover is not a supported physical action')
         literal_holders = holding_conditions(instruction, state)
         for name in {c['object'] for c in literal_holders}:
             if len({c['arm'] for c in literal_holders if c['object']==name}) > 1:
