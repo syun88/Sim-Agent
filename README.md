@@ -440,6 +440,7 @@ OpenArm以外ではCellを読み込まず、地面・机・選択したURDF・IK
 
 フォルダー内の `genesis/*.urdf` を優先します。候補が複数ある場合はURDFファイルを指定してください。
 Web からの追加に加えて、リポジトリ側に準備スクリプトを持つロボットがあります。`uv run python scripts/prepare_open_manipulator_x.py` は上流を1コミットに pin し、取得した各ファイルの sha256 を検証したうえで、Web からの追加と同じ `outputs/robots/<robot-id>/` を生成します。
+Dual Scorpion は momoi-org の `dual_scorpion` @ `1f64c14bfe67f957b3c718ca9f9b06965502bd51` の Genesis URDF・メッシュを `third_party/momoiorg_dual_scorpion/` にライセンス・SHA-256 manifest とともに収録しています。`uv run python scripts/prepare_dual_scorpion.py` は各ファイルを検証し、元のURDF・メッシュを変更せず、上流が記載した隣接リンク除外をランタイム設定に明示したローカルオーバーレイから通常のURDF importerで登録します。これはモデルの読み込み確認であり、物理的な把持・実機安全性の検証ではありません。
 元のURDF・メッシュは変更せず、`outputs/robots/<robot-id>/` に次を生成します。このフォルダーは機械固有の絶対パスを含むためGit対象外です。
 
 - `robot.urdf`: 元メッシュへの絶対参照を解決したロード用URDF。
@@ -495,7 +496,7 @@ Scorpionでのワイン注ぎは検証対象にしていません。受け渡し
 
 インポート機では、運搬前の上昇量と解放後の退避高さを、物体と指の実測寸法から決めます。OpenArm用の追加6cm上昇を引き継ぎません。運搬の経由点も複数の高さから選び、相対移動は連続した手先経路を計画します。
 
-Scorpionの外部 `for_sim` は、表示メッシュ・質量・慣性・関節座標を保持し、2,029個の凸衝突形状と隣接リンクの接触を使います。URDF/SRDF・MJCF・USD・SDF・Genesis用設定の対応は `scripts/validate_collision_package.py` で構造検査できます。USD/Isaac SimとGazebo本体での動作検証は別です。修正前のパッケージは外部フォルダーの `old_no_use/for_sim_collision_before_20261021.zip` に残し、ロボットのURDF・メッシュ本体はSim-AgentのGitに含めません。
+Scorpionの外部 `for_sim` は、表示メッシュ・質量・慣性・関節座標を保持し、2,029個の凸衝突形状と隣接リンクの接触を使います。URDF/SRDF・MJCF・USD・SDF・Genesis用設定の対応は `scripts/validate_collision_package.py` で構造検査できます。USD/Isaac SimとGazebo本体での動作検証は別です。修正前のパッケージは外部フォルダーの `old_no_use/for_sim_collision_before_20261021.zip` に残します。Dual Scorpionでは、上流 momoi-org のライセンス付きGenesisサブツリーだけを `third_party/momoiorg_dual_scorpion/` に版管理し、その他の外部シミュレーターパッケージは引き続きGit対象外です。
 
 物理検証は `uv run python scripts/verify_auto_gripper.py <robot-id>` で実行します。標準では左右×通常配置・ランダム配置2回の6ケースを実行し、`--arm right --layouts 1` で右だけにも絞れます。`--seed` でランダム配置を再現できます。単体検証とネイティブ実行は、プロセス間の所有権ロックでも同時起動を防ぎます。
 
