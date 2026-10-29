@@ -455,7 +455,8 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
         raise SkillError("THROW_FAILED", f"Measured upward free flight did not reach {height_cm:g} cm "
                          f"(design {design}): {evidence}")
     return {"object": obj, "arm": arm, "requested_free_rise": height_cm / 100., "design": design,
-            "pinch_contacts_before_launch": initial_contacts, "trajectory": trace, **evidence,
+            "pinch_contacts_before_launch": initial_contacts, "trajectory": trace,
+            "target_position": None if target_point is None else np.asarray(target_point, float).tolist(), **evidence,
             "grasp_mode": env.grasp_mode}
 
 

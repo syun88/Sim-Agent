@@ -15,6 +15,8 @@ from backend.app.planning.agent_planner import PlannerProviderError
 from backend.app.planning.preparation import compile_prepared_program
 from backend.app.planning.spatial_language import preservation_spans
 from backend.app.planning.task_program import GroundingError, TaskProgram
+from backend.app.planning.task_contract import TaskContract, requested_program
+from backend.app.execution.contract_evidence import ContractEvidence, completed_prefix
 
 
 RECOVERABLE = {'IK_FAILURE','GRASP_FAILED','COLLISION_PATH','MOTION_BLOCKED','HOLD_LOST',
@@ -27,20 +29,10 @@ RECOVERABLE = {'IK_FAILURE','GRASP_FAILED','COLLISION_PATH','MOTION_BLOCKED','HO
 #: model writes approach/grasp/lift/throw as separate actions, so anything missing here makes whole plans
 #: unrestartable - measured 2026-10-27: a plan containing a throw never offered a recovery because `lift` was
 #: absent from this set.
+# Relative displacement cannot be restarted from an unknown partial endpoint: repeating the
+# same distance would change the original requested amount. It needs scoped effect evidence first.
 RESTARTABLE = {'pick', 'handover', 'place', 'approach', 'home', 'navigate', 'throw', 'pour', 'lift',
-               'retreat', 'move'}
-
-
-def completed_prefix(plan, result):
-    """A successful approach alone never marks a pick/handover as completed."""
-    count = 0
-    for index, _ in enumerate(plan.program.get('actions', [])):
-        expected = [s for s in plan.steps if s.action_index==index]
-        actual = [s for s in result.get('skills',[]) if s.get('action_index')==index]
-        if not expected or len(actual)!=len(expected) or not all(s['success'] for s in actual):
-            break
-        count += 1
-    return count
+               'retreat'}
 
 
 class TaskAgent:
@@ -58,6 +50,7 @@ class TaskAgent:
         staging_used=False
         replan_used=False
         alternate_used=False
+        contract = None
         def announce(decision):
             decisions.append(decision)
             if emit:
@@ -68,11 +61,15 @@ class TaskAgent:
                 'total_duration':time.perf_counter()-started}
             result['verification'] = {**result.get('verification',{}),'agent_attempts':len(attempts),
                 'scene_resets':resets,'all_agent_attempts_succeeded':all(a['result']['success'] for a in attempts)}
+            if contract is not None:
+                result['task_contract'] = contract.describe()
+                result['verification']['contract_id'] = contract.contract_id
             result['retry_count'] = sum(a['result'].get('retry_count',0) for a in attempts)+max(0,len(attempts)-1)
             return result
         def blocked(detail, category, diagnosis=None):
             return finish({'success':False,'status':'FAILED','detail':detail,'skills':[],
-                'diagnosis':diagnosis or {},'verification':{'success':False,'failure_category':category}})
+                'diagnosis':diagnosis or {},'verification':{'success':False,'failure_category':category,
+                    **({'contract_status':'UNKNOWN'} if category=='CONTRACT_UNVERIFIABLE' else {})}})
         if should_stop and should_stop():
             return finish({'success':False,'status':'STOPPED','skills':[],'verification':{'success':False}})
         announce({'kind':'scene_observed','explanation':'現在のシーンを観測し、この配置・支持関係・保持状態から新しい作業を計画します。',
@@ -103,20 +100,11 @@ class TaskAgent:
             plan.assumptions.append(decision['explanation'])
         # Replay is restricted to idempotent rigid-cube tasks. No automatic
         # double pour, second throw, joint increment or relative arm displacement.
-        source = TaskProgram.model_validate(original.goal_program or original.program)
-        if source.goals and (original.planning_evidence or {}).get('requested_program'):
-            source=TaskProgram.model_validate(original.planning_evidence['requested_program'])
-        if source.actions:
-            # Freeze resolved object IDs but separate the user's requested
-            # actions from occupancy preparation and incidental arm choices.
-            evidence = original.planning_evidence or {}
-            inserted = {i for p in evidence.get('preparations',[]) for i in (p['action_index'],p['action_index']+1)}
-            source.actions = [a for i,a in enumerate(source.actions) if i not in inserted]
-            requested = evidence.get('requested_program',{}).get('actions',[])
-            if len(requested)==len(source.actions):
-                for action, raw in zip(source.actions,requested):
-                    if raw.get('arm') is None and action.op in {'pick','place','approach'}:
-                        action.arm = None
+        source = requested_program(original)
+        contract = TaskContract.freeze(instruction, original, source)
+        receipts = ContractEvidence(contract)
+        announce({'kind':'task_contract_bound','explanation':'元の目的・対象・順序を固定し、以後の計画と実行証拠を別に管理します。',
+                  'task_contract':contract.describe()})
         restartable = bool(source.goals or source.actions) and (bool(source.goals) or all(a.op in RESTARTABLE for a in source.actions))
         restartable = restartable and all((not a.object or a.object.endswith('_cube')) for a in source.actions)
         reset_allowed = restartable and not source.keep_in_place and not preservation_spans(instruction, initial)
@@ -124,20 +112,20 @@ class TaskAgent:
         for iteration in range(self.max_attempts):
             if should_stop and should_stop():
                 return finish({'success':False,'status':'STOPPED','plan':plan.model_dump(),'skills':[], 'verification':{'success':False}})
+            try:
+                contract.admit(plan, receipts)
+                plan = contract.execution_plan(plan, receipts)
+            except GroundingError as error:
+                category = 'CONTRACT_UNVERIFIABLE' if str(error).startswith('CONTRACT_UNVERIFIABLE') else 'CONTRACT_VIOLATION'
+                return blocked(str(error), category)
+            plan.planning_evidence = {**(plan.planning_evidence or {}), 'task_contract':contract.describe()}
             if emit:
                 emit('plan_generated',status='VALIDATING',plan=plan.model_dump(),agent_trace=deepcopy(decisions))
             result = self.executor.run(plan,emit=emit,should_stop=should_stop,force_failure=force_failure and iteration==0)
-            if result['success'] and restartable:
-                from backend.app.verification.goal_verification import verify_task_goal
-                # Measure all final predicates against this scene epoch, not
-                # just the resumed suffix. Attempt history remains separate.
-                check = original.model_copy(deep=True)
-                check.steps = []
-                check.goal['allowed_object_motion'] = sorted({s.object for s in original.steps if s.object})
-                if resets:
-                    check.goal = deepcopy(plan.goal)
-                    check.goal['allowed_object_motion'] = sorted({s.object for s in original.steps if s.object})
-                final = verify_task_goal(self.executor.env,check,[],initial_state=epoch_initial)
+            receipts.record(plan, result, iteration + 1)
+            if result['success']:
+                # State predicates are observed now; events use task/epoch-scoped receipts.
+                final = receipts.verify(self.executor.env,plan,epoch_initial)
                 result['verification']['agent_final_postconditions'] = final
                 if not final['success']:
                     result.update(success=False,status='FAILED')
@@ -155,8 +143,8 @@ class TaskAgent:
                         result.update(success=False,status=home.get('status','FAILED'),
                             detail='作業の配置は維持していますが、空の腕のホーム復帰を完了できませんでした。')
                         result['verification'].update(success=False,failure_category='POST_TASK_HOME_FAILED')
-                    elif restartable:
-                        final=verify_task_goal(self.executor.env,check,[],initial_state=epoch_initial)
+                    else:
+                        final=receipts.verify(self.executor.env,plan,epoch_initial)
                         result['verification']['after_homing_postconditions']=final
                         if not final['success']:
                             result.update(success=False,status='FAILED',detail='ホーム復帰後に作業の最終状態を確認できませんでした。')
@@ -181,12 +169,11 @@ class TaskAgent:
                 prefix = 0
             elif prefix<len(plan.program['actions']):
                 try:
-                    remaining = TaskProgram(actions=plan.program['actions'][prefix:])
+                    remaining = TaskProgram(actions=source.actions[receipts.completed:])
                     continuation = compile_prepared_program(remaining,observed)
                     # Retain every original final predicate, including objects
                     # placed before this suffix. The scene has not been reset.
-                    continuation.goal = deepcopy(original.goal)
-                    continuation.goal['allowed_object_motion'] = sorted({s.object for s in original.steps if s.object})
+                    continuation.goal = contract.verification_plan(continuation).goal
                     # First try useful progress. With no completed action,
                     # clear/reposition free arms before another approach.
                     # Resuming assumes the world still matches the plan. After a throw the object has left the hand
@@ -225,7 +212,7 @@ class TaskAgent:
                                     or bool(evidence.get('levers')) or bool(evidence.get('unreachable_by_m')))
             if not replan_used and carries_measurements:
                 legal.append('replan')
-            if not legal and certificate and reset_allowed and resets<self.max_resets:
+            if not legal and certificate and reset_allowed and resets<self.max_resets and not receipts.receipts:
                 legal.append('reset_and_retry')
             if not legal:
                 result['detail'] = f'{category}: 同じシーン内で利用できる復旧案を試しました。配置を維持して停止します。'
@@ -247,9 +234,7 @@ class TaskAgent:
             elif assessment['decision']=='alternate_arm':
                 alternate_used=True
                 plan=alternate
-                # No arm was requested: the same cube may be held by either
-                # admitted arm. Preserve explicit ownership everywhere else.
-                original.goal=deepcopy(plan.goal)
+                # The contract records unspecified ownership as a choice, not a mutable goal.
             elif assessment['decision']=='replan':
                 replan_used=True
                 try:
@@ -267,7 +252,6 @@ class TaskAgent:
                     result['detail']=f'{category}: 失敗の数値を踏まえた再計画を作れませんでした。'
                     return finish(result)
                 plan=replanned
-                original=replanned
                 recovery['replanned_steps']=[step.skill for step in plan.steps]
             elif assessment['decision']=='recover_in_place':
                 staging_used=True
@@ -284,16 +268,15 @@ class TaskAgent:
                         # repositioning the arms is a real change before retrying.
                         plan=compile_prepared_program(source,observed)
                     else:
-                        # ``prefix`` counts completed actions; when it equals the list length there is nothing
-                        # left to re-compile, and TaskProgram refuses an empty action list (measured
-                        # 2026-10-27: the recovery surfaced as a raw ValidationError instead of a decision).
-                        remaining_actions = plan.program['actions'][prefix:]
+                        # Recover from user-action progress, never from compiler-inserted parking actions.
+                        # Idempotent state repair may need the full request if no suffix remains; the
+                        # contract gate still rejects replay of any already-executed event.
+                        remaining_actions = source.actions[receipts.completed:]
                         if not remaining_actions:
-                            remaining_actions = plan.program['actions']
+                            remaining_actions = source.actions
                         remaining=TaskProgram(actions=remaining_actions)
                         plan=compile_prepared_program(remaining,observed)
-                        plan.goal=deepcopy(original.goal)
-                    plan.goal['allowed_object_motion']=sorted({s.object for s in original.steps if s.object})
+                        plan.goal=contract.verification_plan(plan).goal
                 except GroundingError as error:
                     result['detail']='現状を維持した復旧後も計画できませんでした: '+str(error)
                     return finish(result)
@@ -304,6 +287,7 @@ class TaskAgent:
                 self.executor.reset_context()
                 self.executor.env.step(200)
                 resets += 1
+                receipts.reset_epoch()
                 epoch_initial = self.executor.world_state()
                 try:
                     plan = compile_prepared_program(source,epoch_initial)

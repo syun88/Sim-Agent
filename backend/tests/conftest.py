@@ -27,6 +27,13 @@ INSTALL_HINT = (
 _FRESH_STATE: dict[str, Any] = {}
 
 
+@pytest.fixture
+def upward_flight():
+    """Synthetic recorded ballistic measurements, not a live simulation success claim."""
+    return [{'t':.24+i*.002, 'position':[0.,0.,1.2+i*.002-4.905*(i*.002)**2],
+             'velocity':[0.,0.,1.-9.81*i*.002], 'contacts':[]} for i in range(65)]
+
+
 @pytest.fixture(scope="session")
 def genesis_env():
     if not genesis_available():

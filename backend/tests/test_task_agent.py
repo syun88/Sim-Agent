@@ -103,7 +103,7 @@ class FakeExecutor:
         outcome=next(self.outcomes)
         if callable(outcome):return outcome(self,plan)
         return {'success':outcome,'status':'SUCCEEDED' if outcome else 'FAILED','plan':plan.model_dump(),
-            'skills':[{'skill':s.skill,'action_index':s.action_index,'success':outcome,
+            'skills':[{'skill':s.skill,'object':s.object,'arm':s.arm,'action_index':s.action_index,'success':outcome,
                        'error':None if outcome else 'MOTION_BLOCKED'} for s in plan.steps[:None if outcome else 1]],
             'verification':{'success':outcome,'failure_category':None if outcome else 'MOTION_BLOCKED'},'retry_count':0}
 
@@ -236,6 +236,126 @@ def test_next_prompt_plans_from_previous_result_after_homing(world,postcondition
     assert second['initial_world_state']['discourse']['last_object']=='blue_cube'
 
 
+def test_verified_throw_survives_final_and_homing_checks_without_a_second_throw(world,upward_flight):
+    import numpy as np
+    def thrown(executor,plan):
+        return {'success':True,'status':'SUCCEEDED','skills':[
+            {'skill':s.skill,'object':s.object,'arm':s.arm,'action_index':s.action_index,'success':True,
+             **({'trajectory':upward_flight} if s.skill=='throw_object' else {})} for s in plan.steps],
+            'verification':{'success':True}}
+    executor=FakeExecutor(world,[thrown,False,False])
+    executor.env.name='genesis'
+    executor.env.grasp_mode='physical-friction-pinch'
+    executor.env.object_pose=lambda name:(np.array(next(o['position'] for o in executor.state['objects']
+                                                       if o['id']==name)),np.eye(3))
+    result=TaskAgent(executor,AgentPlanner()).run('右手で青いキューブを上に投げて')
+    assert result['success'],result.get('verification')
+    assert len(executor.calls)==1
+    assert result['verification']['agent_final_postconditions']['success']
+    assert result['verification']['after_homing_postconditions']['success']
+
+
+def test_a_partly_executed_relative_distance_is_not_automatically_replayed(world,postconditions):
+    from backend.app.planning.preparation import compile_prepared_program
+    from backend.app.planning.task_program import TaskProgram
+    source=TaskProgram(actions=[{'op':'move','arm':'right','direction':'up','distance_cm':5.}])
+    executor=FakeExecutor(world,[False,True])
+    result=TaskAgent(executor,AgentPlanner(),
+        plan_call=lambda *a:compile_prepared_program(source,world)).run('右手を上に5cm動かして')
+    assert not result['success'] and len(executor.calls)==1
+    assert not executor.resets and not executor.homes
+
+
+def test_goal_recovery_does_not_promote_newly_derived_protection_into_a_changed_request(world,postconditions):
+    from backend.app.planning.preparation import compile_prepared_program
+    from backend.app.planning.task_program import TaskProgram
+    world['robot']['left_arm']['held_object']='red_cube'
+    source=TaskProgram(goals=[{'type':'holding','object':'blue_cube','arm':'left'}])
+    def parked(executor,plan):
+        executor.state['robot']['left_arm']['held_object']=None
+        executor.state['objects'][0]['position']=[.46,.30,1.031]
+        return {'success':False,'status':'FAILED','skills':[{'skill':'approach_object','success':False,
+                    'error':'MOTION_BLOCKED'}], 'verification':{'success':False,'failure_category':'MOTION_BLOCKED'}}
+    executor=FakeExecutor(world,[parked,True])
+    result=TaskAgent(executor,AgentPlanner(),
+        plan_call=lambda *a:compile_prepared_program(source,world)).run('青を左手で保持して')
+    assert result['success'],result.get('detail')
+    assert len(executor.calls)==2 and not executor.resets
+    assert result['task_contract']['goals']==source.model_dump()['goals']
+
+
+def test_recovery_does_not_promote_inserted_preparation_into_user_intent(world,postconditions):
+    from backend.app.planning.preparation import compile_prepared_program
+    from backend.app.planning.task_program import TaskProgram
+    world['robot']['left_arm']['held_object']='red_cube'
+    source=TaskProgram(actions=[{'op':'pick','object':'blue_cube','arm':'right'},
+                                {'op':'handover','object':'blue_cube','arm':'right','receiver':'left'}])
+    executor=FakeExecutor(world,[False,True])
+    result=TaskAgent(executor,AgentPlanner(),
+        plan_call=lambda *a:compile_prepared_program(source,world)).run('右手で青を取って左手に渡して')
+    assert result['success'],result.get('detail')
+    assert len(executor.calls)==2 and not executor.resets
+    assert [a['op'] for a in result['task_contract']['actions']]==['pick','handover']
+
+
+def test_a_final_hold_does_not_certify_an_unobservable_during_condition(world):
+    executor=FakeExecutor(world,[])
+    planner=AgentPlanner()
+    result=TaskAgent(executor,planner,
+        plan_call=lambda *args:planner.plan('左手で赤を掴んで',world)).run('赤いキューブを持ったまま作業を続ける')
+    assert not result['success'] and not executor.calls
+    assert result['verification']['failure_category']=='CONTRACT_UNVERIFIABLE'
+    assert result['verification']['contract_status']=='UNKNOWN'
+
+
+def test_homing_reobserves_a_hold_instead_of_reusing_its_success(world):
+    import numpy as np
+    def picked(executor,plan):
+        executor.state['robot']['right_arm']['held_object']='blue_cube'
+        executor.state['objects'][1]['position'][2]=1.09
+        return {'success':True,'status':'SUCCEEDED','skills':[
+            {'skill':s.skill,'object':s.object,'arm':s.arm,'action_index':s.action_index,'success':True}
+            for s in plan.steps], 'verification':{'success':True}}
+    executor=FakeExecutor(world,[picked])
+    executor.env.name='recorded-state-test-double'
+    executor.env.grasp_mode='physical-friction-pinch'
+    executor.env.table_height=1.008
+    executor.env.object_pose=lambda name:(np.array(next(o['position'] for o in executor.state['objects']
+                                                       if o['id']==name)),np.eye(3))
+    executor.env.object_bounds=lambda name:np.array([executor.env.object_pose(name)[0]-.023,
+                                                    executor.env.object_pose(name)[0]+.023])
+    executor.env.pinch_established=lambda obj,arm:executor.state['robot'][arm+'_arm']['held_object']==obj
+    executor.env.object_contacts=lambda obj,arm:['finger1','finger2'] if executor.env.pinch_established(obj,arm) else []
+    def lose_hold(**kwargs):
+        executor.state['robot']['right_arm']['held_object']=None
+        return {'success':True,'status':'SUCCEEDED'}
+    executor.home_empty_arms=lose_hold
+    result=TaskAgent(executor,AgentPlanner()).run('右手で青を掴んで')
+    assert not result['success'] and len(executor.calls)==1
+    assert result['verification']['agent_final_postconditions']['success']
+    assert not result['verification']['after_homing_postconditions']['success']
+    assert result['verification']['failure_category']=='POST_TASK_SCENE_CHANGED'
+
+
+def test_replanning_cannot_replace_the_requested_object(world,postconditions):
+    def shortfall(executor,plan):
+        return {'success':False,'status':'FAILED','skills':[{
+            'skill':'grasp_object','success':False,'error':'GRASP_FAILED','action_index':0,
+            'evidence':{'levers':{'approach':'different route'}}}],
+            'verification':{'success':False,'failure_category':'GRASP_FAILED'}}
+    executor=FakeExecutor(world,[shortfall,True])
+    planner=AgentPlanner()
+    calls=[]
+    def planning(text,state,memory):
+        calls.append(text)
+        return planner.plan(text if len(calls)==1 else '左手で赤を掴んで',state)
+    result=TaskAgent(executor,planner,plan_call=planning,
+        recovery_call=lambda *args:{'decision':'replan','reason':'another route'}).run('右手で青を掴んで')
+    assert not result['success']
+    assert len(executor.calls)==1, 'reject changed intent before any new motion'
+    assert result['verification']['failure_category']=='CONTRACT_VIOLATION'
+
+
 def test_a_stack_is_resolved_to_its_upper_cube_and_the_choice_is_recorded(world):
     """'Grab the blue cube' with two blue cubes: only the upper one can be grasped, so proceed.
 
@@ -265,7 +385,7 @@ def test_two_cubes_at_the_same_height_still_stop_rather_than_guess(world):
         bind_scene_references('右手にある青いキューブを取って', world)
 
 
-def test_a_launch_that_never_reached_the_speed_retries_in_place(world,postconditions):
+def test_a_launch_that_never_reached_the_speed_retries_in_place(world,postconditions,upward_flight):
     """The jaws never opened, so the cube is still pinched: the same arm can retry it with another stroke.
 
     Measured 2026-10-28 on the cell: 12 cm reached 1.245 m/s and cleared 3 cm while 20 cm reached 0.472 m/s
@@ -277,7 +397,12 @@ def test_a_launch_that_never_reached_the_speed_retries_in_place(world,postcondit
                 'skills':[{'skill':s.skill,'action_index':s.action_index,'success':False,
                            'error':'THROW_SPEED_NOT_REACHED'} for s in plan.steps[:1]],
                 'verification':{'success':False,'failure_category':'THROW_SPEED_NOT_REACHED'},'retry_count':0}
-    executor=FakeExecutor(world,[held_cube_speed_shortfall,True])
+    def measured_throw(executor,plan):
+        return {'success':True,'status':'SUCCEEDED','skills':[
+            {'skill':s.skill,'object':s.object,'arm':s.arm,'action_index':s.action_index,'success':True,
+             **({'trajectory':upward_flight} if s.skill=='throw_object' else {})} for s in plan.steps],
+            'verification':{'success':True}}
+    executor=FakeExecutor(world,[held_cube_speed_shortfall,measured_throw])
     result=TaskAgent(executor,AgentPlanner()).run('青いキューブを投げて')
     assert result['success'] and executor.resets==0
     assert result['agent_recoveries'][0]['decision']=='recover_in_place'
