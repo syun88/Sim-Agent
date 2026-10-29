@@ -63,11 +63,54 @@ def placement_references(text, state):
                 if match:
                     references.append({"target": name, "relation": relation, "span": (match.start(), end)})
                     break
+    # Resolve object-relative pronouns only from a unique antecedent in the preceding clause.
+    # Never turn a lost support ('その上') into an unspecified table placement.
+    # 'その左手' refers to a hand, not the left of an object.
+    pronouns = r'(?:その|それの)(?:' + '|'.join(JAPANESE.values()) + r')(?!手|腕|アーム|グリッパー|ハンド)'
+    for match in re.finditer(pronouns, text):
+        prefix = re.split(r'[、,;。.!！\n]', text[:match.start()])
+        previous = next((part for part in reversed(prefix) if part.strip()), '')
+        candidates = set(named_objects(previous, state))
+        if len(candidates) != 1:
+            raise GroundingError('Unresolved object-relative reference: ' + match.group())
+        suffix = re.sub(r'^(?:その|それの)', '', match.group())
+        relation = next(key for key, pattern in JAPANESE.items() if re.fullmatch(pattern, suffix))
+        references.append({'target':next(iter(candidates)), 'relation':relation, 'span':match.span()})
     return references
 
 
-def validate_instruction_relations(plan, instruction, state):
+def resolve_relative_pronouns(text, state):
+    """Bind full-instruction context before a parser splits it into individual actions."""
+    for ref in sorted(placement_references(text, state), key=lambda item: item['span'][0], reverse=True):
+        start, end = ref['span']
+        phrase = text[start:end]
+        if phrase.startswith(('その', 'それの')):
+            suffix = re.sub(r'^(?:その|それの)', '', phrase)
+            text = text[:start] + ref['target'] + 'の' + suffix + text[end:]
+    return text
+
+
+def _prohibited_clause(clause):
+    return bool(re.search(r"\b(?:do\s+not|don't|never)\b|渡さない|投げない|置かない|"
+                          r"(?:積み)?重ね(?:ない|ず)", clause, re.I))
+
+
+def validate_instruction_relations(plan, instruction, state, *, required_holders=()):
+    from backend.app.planning.goal_language import relative_conditions
+    measured_holders = {(c.get('object'), c.get('arm')) for c in plan.goal.get('checks', [])
+                        if c.get('type') == 'holding'}
+    for holder in required_holders:
+        if (holder['object'], holder['arm']) not in measured_holders:
+            raise GroundingError('The success checks omit a requested final holder: ' + str(holder))
     references = placement_references(instruction, state)
+    roles = relative_conditions(instruction, state)
+    # A stacking verb asks for support, not two independent table placements. Explicit level roles
+    # ('red is bottom, blue is top') are also a support specification.
+    affirmative_support = any(re.search(r'重ね|積み重|\b(?:stack|atop)\b', clause, re.I)
+                              and not _prohibited_clause(clause)
+                              for clause in re.split(r'[。.!！,、;\n]+', instruction))
+    if affirmative_support and not any(ref['relation'] == 'on' for ref in [*references, *roles]):
+        raise GroundingError('Unresolved support relation: specify what is above what')
     requested = Counter((ref["target"], ref["relation"]) for ref in references)
     actual = Counter((action["target"], action["relation"]) for action in plan.program["actions"]
                      if action["op"] == "place" and action.get("relation"))
@@ -78,6 +121,25 @@ def validate_instruction_relations(plan, instruction, state):
             actual[(target, "near")] += sum(actual[(target, specific)] for specific in ("left_of", "right_of", "front_of", "behind"))
     if requested - actual:
         raise GroundingError("Preserve the requested object-relative placement: " + str(dict(requested)))
+    # Ordered actions carry intermediate obligations; only the last manipulation of each object
+    # describes its final relation. Do not demand 'left of' AND 'right of' after sequential moves.
+    last = {a['object']: a for a in plan.program['actions'] if a.get('object')}
+    final_relations = [a for a in last.values() if a['op'] == 'place' and a.get('relation')]
+    final_relations += [g for g in (plan.goal_program or {}).get('goals', [])
+                        if g['type'] == 'relative_placement']
+    def key(item):
+        return item.get('object'), item.get('target'), item.get('relation')
+    expected = {key(item) for item in final_relations}
+    measured = {key(check) for check in plan.goal.get('checks', [])
+                if check.get('type') == 'relative_placement'}
+    if expected - measured:
+        raise GroundingError('The success checks omit a final object-relative placement: ' + str(expected - measured))
+    # Explicit top/bottom roles have no reference span and express final-state obligations.
+    # Named-reference spans were checked against ordered actions above, not promoted to final goals.
+    if not references:
+        for role in roles:
+            if key(role) not in expected:
+                raise GroundingError('Preserve the requested relative subject and support: ' + str(role))
     # A noun in 'on the red cube' denotes the support, not a command to pick red.
     masked = list(instruction)
     for ref in references:
@@ -95,7 +157,7 @@ def validate_instruction_relations(plan, instruction, state):
     prohibited, positive = set(), set()
     for clause in re.split(r"[。.!！,、;]+", instruction):
         verbs = {match.lastgroup for match in VERBS.finditer(clause)}
-        if re.search(r"\b(?:do\s+not|don't|never)\b|渡さない|投げない|置かない", clause, re.I):
+        if _prohibited_clause(clause):
             prohibited.update(verbs)
         else:
             positive.update(verbs)

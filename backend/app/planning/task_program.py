@@ -361,7 +361,8 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
                 if objects[obj].get("type", "cube") != "cube" or objects[target].get("type", "cube") != "cube":
                     raise GroundingError("Relative placement currently requires two cubes")
                 if owner(target):
-                    raise GroundingError("Place the reference cube on the table before placing another cube relative to it")
+                    raise GroundingError("ROBOT_CAPABILITY: placement relative to a held reference cube is not supported; "
+                                         "placing the reference on the table would change the requested holding state")
             elif target not in targets:
                 raise GroundingError(f"Unknown placement target: {target}")
             if action.relation and owner(obj) is None and auto_arm(obj) != arm:

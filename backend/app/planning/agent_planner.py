@@ -10,7 +10,7 @@ import numpy as np
 from backend.app.models.schemas import AgentPlan
 from backend.app.planning.language_fallback import VERBS, arm_mentions, motion_distance_cm, named_objects, parse_fallback
 from backend.app.planning.task_program import ActionProposal, GroundingError, InstructionMeaning, TABLE_TARGETS, TaskProgram, compile_program
-from backend.app.planning.spatial_language import validate_instruction_relations, placement_references, preservation_spans, strip_preservation
+from backend.app.planning.spatial_language import validate_instruction_relations, placement_references, preservation_spans, strip_preservation, resolve_relative_pronouns
 from backend.app.planning.goal_language import holding_conditions, relative_conditions, unsupported_group_request
 from backend.app.planning.language_schema import meaning_schema
 from backend.app.planning.preparation import compile_prepared_program
@@ -517,10 +517,17 @@ class AgentPlanner:
         fallback = None
         fallback_source = None
         fallback_error = None
+        required_holders = []
         try:
-            fallback_source = parse_fallback(instruction, state)
-            fallback = compile_prepared_program(fallback_source, state)
-            validate_instruction_relations(fallback, instruction, state)
+            fallback_source = parse_fallback(resolve_relative_pronouns(instruction, state), state)
+            # Retain independently explicit holders even when another source action is infeasible.
+            # A later source placement supersedes acquisition; do not promote an intermediate pick.
+            last_source = {a.object: a for a in fallback_source.actions if a.object}
+            final_holders = {(a.object, a.arm) for a in last_source.values() if a.op in {'pick', 'lift'}}
+            required_holders = [c for c in literal_holders if (c['object'], c['arm']) in final_holders]
+            candidate_fallback = compile_prepared_program(fallback_source, state)
+            validate_instruction_relations(candidate_fallback, instruction, state, required_holders=required_holders)
+            fallback = candidate_fallback
         except (ValueError, KeyError) as exc:
             fallback_error = str(exc)
             if fallback_error.startswith("This scene has only"):
@@ -661,7 +668,7 @@ class AgentPlanner:
                         candidate.planning_evidence = {**(candidate.planning_evidence or {}),
                             'semantic_binding_repairs': binding_repairs}
                         candidate.assumptions.append('文章で指定された物体・保持者・支持物の対応を優先しました。補正内容は実行ログに記録します。')
-                    validate_instruction_relations(candidate, instruction, state)
+                    validate_instruction_relations(candidate, instruction, state, required_holders=required_holders)
                     missing = missing_obligations(instruction, candidate)
                     if missing:
                         raise GroundingError("The program omits an operation the instruction asks for: "
@@ -722,6 +729,8 @@ class AgentPlanner:
             # "instruction not understood", which points a reader at the wrong component.
             model_detail = self._repair_feedback if use_ai else None
             detail = str(model_detail or fallback_error or provider_error)
+            if model_detail and fallback_error and fallback_error.startswith('ROBOT_CAPABILITY:'):
+                detail = fallback_error + '; model repair rejected: ' + str(model_detail)
             if "ROBOT_CAPABILITY:" in detail:
                 category = "ROBOT_CAPABILITY"
             elif detail.startswith("GOAL_UNREACHABLE"):
