@@ -328,6 +328,19 @@ def test_goal_recovery_does_not_promote_newly_derived_protection_into_a_changed_
     assert result['task_contract']['goals']==source.model_dump()['goals']
 
 
+def test_temporary_support_placement_does_not_become_an_immutable_side_goal(world,postconditions):
+    executor=FakeExecutor(world,[True])
+    result=TaskAgent(executor,AgentPlanner()).run(
+        '赤いキューブを左手で持ち上げて、その上に右手で青いキューブを重ねて')
+    assert result['success'],result.get('detail')
+    assert len(executor.calls)==1
+    assert result['task_contract']['actions'][0]['op']=='pick'
+    assert [c for c in result['task_contract']['goal']['checks'] if c['object']=='red_cube']==[]
+    assert result['task_contract']['goal']['checks'][0]['object']=='blue_cube'
+    assert result['task_contract']['goal']['checks'][0]['target']=='red_cube'
+    assert result['agent_attempts'][0]['plan']['planning_evidence']['preparations'][0]['kind']=='ground_held_reference'
+
+
 def test_recovery_does_not_promote_inserted_preparation_into_user_intent(world,postconditions):
     from backend.app.planning.preparation import compile_prepared_program
     from backend.app.planning.task_program import TaskProgram

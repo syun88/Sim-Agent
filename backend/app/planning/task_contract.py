@@ -33,15 +33,26 @@ def source_actions(plan):
 def intent_checks(plan):
     # A compiler-added parking destination is a procedure choice, not a user final goal.
     evidence = plan.planning_evidence or {}
-    explicit = ({g['object'] for g in evidence.get('requested_program', {}).get('goals', [])}
-                if plan.goal_program else {a.get('object') for _,a in source_actions(plan)})
-    incidental = {p['object'] for p in evidence.get('preparations', [])
-                  if p.get('kind') in {'free_hand', 'free_hand_goal'} and p['object'] not in explicit}
+    # A requested intermediate pick is not a final table-placement obligation. Only an
+    # explicitly requested final placement/hold of that object can freeze its destination.
+    if plan.goal_program:
+        explicit = {g['object'] for g in evidence.get('requested_program', {}).get('goals', [])}
+    else:
+        actions = [a for _,a in source_actions(plan)]
+        last = {a.get('object'):(i,a) for i,a in enumerate(actions) if a.get('object')}
+        explicit = {obj for obj,(i,a) in last.items()
+                    if a['op'] == 'place' or (a['op'] in {'pick','handover'}
+                    and not any(later['op']=='place' and later.get('relation')
+                                and later.get('target')==obj for later in actions[i+1:]))}
+    incidental = {(p['object'],p['target']) for p in evidence.get('preparations', [])
+                  if p.get('kind') in {'free_hand', 'free_hand_goal','ground_held_reference'}
+                  and p['object'] not in explicit}
     requested = evidence.get('requested_program') or plan.goal_program or plan.program or {}
     explicit_preservation = set(requested.get('keep_in_place', []))
     # Derived protection is re-observed by the goal executor and the contract's untouched-object
     # check. Its new baseline after a legitimate parking operation is not a new user requirement.
-    return [c for c in plan.goal.get('checks', []) if c.get('object') not in incidental
+    return [c for c in plan.goal.get('checks', [])
+            if not (c['type']=='placement' and (c['object'],c.get('target')) in incidental)
             and (c['type'] != 'preserved' or c['object'] in explicit_preservation)]
 
 

@@ -522,8 +522,13 @@ class AgentPlanner:
             fallback_source = parse_fallback(resolve_relative_pronouns(instruction, state), state)
             # Retain independently explicit holders even when another source action is infeasible.
             # A later source placement supersedes acquisition; do not promote an intermediate pick.
-            last_source = {a.object: a for a in fallback_source.actions if a.object}
-            final_holders = {(a.object, a.arm) for a in last_source.values() if a.op in {'pick', 'lift'}}
+            last_source = {a.object: (i, a) for i, a in enumerate(fallback_source.actions) if a.object}
+            # A preceding acquisition is preparation when that object later becomes a
+            # placement support. It is not an order to finish while still holding it.
+            final_holders = {(a.object, a.arm) for i, a in last_source.values()
+                             if a.op in {'pick', 'lift'} and not any(
+                                 later.op == 'place' and later.relation and later.target == a.object
+                                 for later in fallback_source.actions[i + 1:])}
             required_holders = [c for c in literal_holders if (c['object'], c['arm']) in final_holders]
             candidate_fallback = compile_prepared_program(fallback_source, state)
             validate_instruction_relations(candidate_fallback, instruction, state, required_holders=required_holders)

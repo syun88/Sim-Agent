@@ -15,24 +15,121 @@ def no_provider(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
-def test_unresolved_support_never_becomes_a_table_side():
-    # Reported 2026-10-29: this request became pick red + place blue at right_side, SUCCEEDED.
-    # A held support is currently unsupported; refusing is honest, substituting is not.
-    with pytest.raises(PlannerProviderError) as error:
-        AgentPlanner().plan('赤いキューブを左手で持ち上げて、その上に右手で青いキューブを重ねて', WORLD)
-    assert error.value.category == 'ROBOT_CAPABILITY'
-    assert 'held reference cube' in str(error.value)
+def test_pronoun_support_is_grounded_without_substituting_a_table_side():
+    # An intermediate acquisition may be set down, but the requested final support cannot be lost.
+    plan=AgentPlanner().plan('赤いキューブを左手で持ち上げて、その上に右手で青いキューブを重ねて', WORLD)
+    assert plan.planning_evidence['preparations'][0]['kind']=='ground_held_reference'
+    assert any(a['op']=='place' and a['object']=='blue_cube' and a['target']=='red_cube'
+               and a['relation']=='on' for a in plan.program['actions'])
+    assert not any(c['type']=='holding' and c['object']=='red_cube' for c in plan.goal['checks'])
 
 
-def test_rejected_fallback_is_not_resurrected_when_the_model_fails(monkeypatch):
+@pytest.mark.parametrize('text,support,subject,side,receiver', [
+    ('青いキューブを右手に渡して右においてから、赤いキューブを青いキューブに乗せて',
+     'blue_cube','red_cube','right_side','right'),
+    ('赤いキューブを左手に渡して左においてから、青いキューブを赤いキューブに乗せて',
+     'red_cube','blue_cube','left_side','left'),
+])
+def test_sequential_set_down_releases_support_before_stack(text,support,subject,side,receiver):
+    # A completed handover is an intermediate step; its holder is not a final goal.
+    plan=AgentPlanner().plan(text,WORLD)
+    actions=plan.program['actions']
+    assert [(a['op'],a['object']) for a in actions]==[
+        ('handover',support),('place',support),('place',subject)]
+    assert actions[0]['receiver']==receiver and actions[1]['target']==side
+    assert actions[2]['target']==support and actions[2]['relation']=='on'
+    assert not any(c['type']=='holding' and c['object']==support for c in plan.goal['checks'])
+    assert any(c['type']=='relative_placement' and c['object']==subject
+               and c['target']==support and c['relation']=='on' for c in plan.goal['checks'])
+    assert any(s.skill=='release_object' and s.object==support for s in plan.steps)
+
+
+def test_support_parking_cannot_erase_an_earlier_throw_event():
+    from backend.app.planning.task_contract import intent_checks
+    from backend.app.planning.task_program import TaskProgram, compile_program
+    program=TaskProgram(actions=[{'op':'throw','object':'red_cube','arm':'left'},
+        {'op':'pick','object':'red_cube','arm':'left'},
+        {'op':'place','object':'red_cube','arm':'left','target':'left_side'},
+        {'op':'place','object':'blue_cube','arm':'right','target':'red_cube','relation':'on'}])
+    world={**WORLD,'objects':[{**o,'type':'cube'} for o in WORLD['objects']]}
+    plan=compile_program(program,world)
+    original=TaskProgram(actions=[program.actions[0],program.actions[1],program.actions[3]])
+    plan.planning_evidence={'requested_program':original.model_dump(),
+        'preparations':[{'kind':'ground_held_reference','object':'red_cube',
+                         'target':'left_side','action_index':2}]}
+    assert any(c['type']=='throw' and c['object']=='red_cube' for c in intent_checks(plan))
+
+
+def test_support_preparation_avoids_a_previously_placed_object():
+    from backend.app.planning.task_program import TaskProgram
+    from backend.app.planning.preparation import compile_prepared_program
+    program=TaskProgram(actions=[{'op':'place','object':'blue_cube','arm':'right','target':'left_side'},
+        {'op':'pick','object':'red_cube','arm':'left'},
+        {'op':'place','object':'blue_cube','arm':'right','target':'red_cube','relation':'on'}])
+    plan=compile_prepared_program(program,WORLD)
+    support=next(p for p in plan.planning_evidence['preparations']
+                 if p['kind']=='ground_held_reference')
+    assert support['target']!='left_side'
+
+
+def test_auxiliary_oite_is_not_misread_as_a_setdown():
+    from backend.app.planning.language_fallback import parse_fallback
+    source=parse_fallback('青いキューブを右手に渡しておいてから、赤いキューブを青いキューブに乗せて',WORLD)
+    assert [a.op for a in source.actions]==['handover','place']
+    assert source.actions[1].target=='blue_cube' and source.actions[1].relation=='on'
+    second=parse_fallback('赤いキューブを左手で掴んでおいてから、青いキューブを右手で取って',WORLD)
+    assert [a.op for a in second.actions]==['pick','pick']
+
+
+def test_temporary_held_support_can_be_grounded_before_a_relative_placement():
+    from backend.app.planning.task_program import GroundingError, TaskProgram, compile_program
+    from backend.app.planning.preparation import compile_prepared_program
+    program=TaskProgram(actions=[{'op':'pick','object':'red_cube','arm':'left'},
+                                  {'op':'place','object':'blue_cube','arm':'right','target':'red_cube','relation':'on'}])
+    with pytest.raises(GroundingError,match='REFERENCE_SUPPORT_HELD'):
+        compile_program(program,WORLD)
+    plan=compile_prepared_program(program,WORLD)
+    actions=plan.program['actions']
+    assert [(a['op'],a['object']) for a in actions]==[
+        ('pick','red_cube'),('place','red_cube'),('home',None),('place','blue_cube')]
+    assert actions[1]['target'] in {'left_side','right_side','center'}
+    assert actions[3]['target']=='red_cube' and actions[3]['relation']=='on'
+    assert plan.planning_evidence['preparations'][0]['kind']=='ground_held_reference'
+    assert plan.goal['checks'][-1]['type']=='relative_placement'
+
+
+def test_support_held_at_task_start_may_be_prepared_without_claiming_it_is_stationary():
+    from backend.app.planning.task_contract import TaskContract, requested_program
+    state={**WORLD,'robot':{'left_arm':{'held_object':'red_cube'},'right_arm':{'held_object':None}}}
+    plan=AgentPlanner().plan('青いキューブを赤いキューブの上に置いて',state)
+    assert plan.planning_evidence['preparations'][0]['kind']=='ground_held_reference'
+    contract=TaskContract.freeze('青いキューブを赤いキューブの上に置いて',plan,requested_program(plan))
+    assert contract.checks()[0]['object']=='blue_cube'
+    assert not any(c['type']=='holding' or c['object']=='red_cube' for c in contract.checks())
+
+
+def test_explicit_continuous_hold_is_not_silently_replaced_by_a_table_support():
+    from backend.app.agent.task_agent import TaskAgent
+    from tests.test_task_agent import FakeExecutor
+    world={**WORLD,'robot':{'left_arm':{'held_object':None},'right_arm':{'held_object':None}}}
+    executor=FakeExecutor(world,[])
+    result=TaskAgent(executor,AgentPlanner()).run('赤いキューブを左手で持ったまま、その上に青いキューブを乗せて')
+    assert not result['success'] and not executor.calls
+    assert result['verification']['failure_category']=='CONTRACT_UNVERIFIABLE'
+
+
+def test_rejected_model_cannot_replace_a_valid_support_plan_with_a_table_side(monkeypatch):
     planner = AgentPlanner()
     planner.enabled = planner.local_enabled = True
     planner.capability_mode = True
     monkeypatch.setattr(planner, '_ai_plan', lambda *args: {
         'payload': {'actions': [{'op': 'place', 'object': 'blue_cube', 'target': 'right_side'}]},
         'raw': 'lost the support'})
-    with pytest.raises(PlannerProviderError):
-        planner.plan('赤いキューブを左手で持ち上げて、その上に右手で青いキューブを重ねて', WORLD)
+    plan=planner.plan('赤いキューブを左手で持ち上げて、その上に右手で青いキューブを重ねて', WORLD)
+    assert plan.provider=='deterministic_fallback' and plan.model_called
+    assert plan.model_verdict['ok'] is False
+    assert any(c['type']=='relative_placement' and c['object']=='blue_cube'
+               and c['target']=='red_cube' for c in plan.goal['checks'])
 
 
 @pytest.mark.parametrize('support,subject,word,relation', [
@@ -48,7 +145,7 @@ def test_relative_pronouns_preserve_arbitrary_support_and_relation(support,subje
     assert [(r['target'], r['relation']) for r in refs] == [(expected, relation)]
 
 
-def test_model_cannot_put_down_a_required_held_support_to_make_the_task_feasible(monkeypatch):
+def test_model_extra_setdown_does_not_bypass_canonical_preparation(monkeypatch):
     planner = AgentPlanner()
     planner.enabled = planner.local_enabled = True
     planner.capability_mode = True
@@ -57,8 +154,11 @@ def test_model_cannot_put_down_a_required_held_support_to_make_the_task_feasible
         {'op': 'place', 'object': 'red_cube', 'arm': 'left', 'target': 'left_side'},
         {'op': 'place', 'object': 'blue_cube', 'arm': 'right', 'target': 'red_cube', 'relation': 'on'}]},
         'raw': 'put the held support down first'})
-    with pytest.raises(PlannerProviderError):
-        planner.plan('赤いキューブを左手で持ち上げて、その上に右手で青いキューブを重ねて', WORLD)
+    plan=planner.plan('赤いキューブを左手で持ち上げて、その上に右手で青いキューブを重ねて', WORLD)
+    assert plan.provider=='deterministic_fallback' and plan.model_called
+    assert plan.planning_evidence['preparations'][0]['kind']=='ground_held_reference'
+    assert [(a['op'],a['object']) for a in plan.program['actions']]==[
+        ('pick','red_cube'),('place','red_cube'),('home',None),('place','blue_cube')]
 
 
 def test_hand_reference_is_not_an_object_relative_position():

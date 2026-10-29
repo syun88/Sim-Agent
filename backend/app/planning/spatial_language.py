@@ -147,8 +147,11 @@ def validate_instruction_relations(plan, instruction, state, *, required_holders
         masked[start:end] = " " * (end - start)
     subjects = set(named_objects("".join(masked), state))
     anchors = {ref["target"] for ref in references} - subjects
-    for action in plan.program["actions"]:
-        if action["object"] in anchors:
+    preparations = {p['action_index']:p for p in (plan.planning_evidence or {}).get('preparations', [])
+                    if p.get('kind') == 'ground_held_reference'}
+    for index, action in enumerate(plan.program["actions"]):
+        if action["object"] in anchors and not (index in preparations
+                and action['op'] == 'place' and action['object'] == preparations[index]['object']):
             raise GroundingError(f"{action['object']} is only a placement reference; do not add a manipulation of it")
         if action["object"] in {name for _, _, name in preservation_spans(instruction, state)}:
             raise GroundingError(f"The instruction requires leaving {action['object']} in place")

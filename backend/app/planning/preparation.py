@@ -1,8 +1,9 @@
-"""Satisfy machine-reported empty-hand preconditions with real table placements.
+"""Satisfy machine-reported occupancy and support preconditions with real table placements.
 
 This is above the strict compiler: callers can still use compile_program to test
 whether a procedure is executable as stated. No object or hold state is written.
 """
+from copy import deepcopy
 from backend.app.planning.task_program import GroundingError, TABLE_TARGETS, TaskAction, TaskGoal, TaskProgram, compile_program, observed_holds
 
 
@@ -13,6 +14,31 @@ def buffer_clear(point, item, others):
     return all(other['id']==item['id'] or other.get('held_by') or
         any(abs(point[i]-other['position'][i]) > half(item,i)+half(other,i)+.015 for i in (0,1))
         for other in others)
+
+
+def projected_buffer_objects(state, actions, targets):
+    """Known preceding setdowns occupy buffers; unknown motion cannot justify parking.
+
+    This projection only chooses a preparation destination, never supplies a simulated
+    scene state for verification or permits a placement through an unknown motion.
+    """
+    objects = deepcopy(state['objects'])
+    by_id = {item['id']:item for item in objects}
+    for action in actions:
+        obj = by_id.get(action.object) if action.object else None
+        if action.op == 'place':
+            if obj is None or action.relation or (action.target or f'{action.arm}_side') not in targets:
+                return None
+            obj['position'] = list(targets[action.target or f'{action.arm}_side'])
+            obj['held_by'] = None
+        elif action.op in {'pick','lift','handover'}:
+            if obj is None:
+                return None
+            obj['held_by'] = action.receiver or action.arm
+        elif action.op in {'throw','pour','move','push','navigate','turn','rotate'}:
+            # A moving object's later position cannot be inferred from this static plan.
+            return None
+    return objects
 
 
 def compile_prepared_program(program: TaskProgram, state: dict):
@@ -49,16 +75,20 @@ def compile_prepared_program(program: TaskProgram, state: dict):
             return plan
         except GroundingError as error:
             requirement = error.preparation
-            if not requirement or requirement['kind'] != 'free_hand' or len(evidence)==4:
+            if not requirement or requirement['kind'] not in {'free_hand','ground_held_reference'} or len(evidence)==4:
                 raise
             obj, arm, index = (requirement[k] for k in ('object','arm','action_index'))
             item = next((o for o in state['objects'] if o['id']==obj), {})
             if item.get('type','cube') != 'cube' or obj in program.keep_in_place:
                 raise
             targets = {**TABLE_TARGETS, **{t['id']:t['position'] for t in state['targets']}}
+            projected = projected_buffer_objects(state, candidate.actions[:index], targets)
+            if projected is None:
+                raise GroundingError('PREPARATION_BLOCKED: earlier object motion has unknown destination',
+                                     preparation=requirement) from error
             preferred = arm+'_side'
             target = next((name for name in [preferred,'center',*sorted(targets)] if name in targets and
-                buffer_clear(targets[name],item,state['objects'])), None)
+                buffer_clear(targets[name],item,projected)), None)
             if target is None:
                 raise GroundingError('PREPARATION_BLOCKED: no clear known table buffer', preparation=requirement) from error
             # Freeze 'it'/held references before adding another object's place:
