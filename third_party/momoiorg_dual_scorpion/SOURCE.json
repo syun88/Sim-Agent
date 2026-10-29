@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "source_repo": "https://github.com/momoiorg-repository/dual_scorpion",
+  "source_revision": "1f64c14bfe67f957b3c718ca9f9b06965502bd51",
+  "source_ref_observed": "refs/heads/main",
+  "source_subtree": "dual_scorpion_Full_urdf/genesis",
+  "license": "Apache-2.0",
+  "license_file": "LICENSE",
+  "source_urdf": "dual_scorpion_Full_urdf/genesis/scorpion.urdf",
+  "source_urdf_sha256": "94097ff255ded808ccb287344d9d4fc28618388debcb2808e7a1bbd904b02a48",
+  "included_files": 393,
+  "included_bytes": 86286712,
+  "upstream_lfs_assets": 17,
+  "integrity_manifest": "dual_scorpion_Full_urdf/genesis/SHA256SUMS"
+}

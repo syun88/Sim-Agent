@@ -42,6 +42,10 @@ class GenericURDFEnvironment(SimulationBackend):
         # wheel joints no arm chain claims). Such a robot stands on the floor
         # and moves through its wheels; everything desk-shaped is skipped.
         self._mobile_base = self.profile.get("mobile_base")
+        # A fixed-base package can also stand on the floor (profile['mount'] == 'floor'). That is a
+        # different question from having wheels: the robot is still fixed to the world and still
+        # needs gravity handled like a fixed one, but there is no desk and props are authored.
+        self._floor_scene = bool(self._mobile_base) or self.profile.get("mount") == "floor"
         self.model = URDFModel(self.profile["urdf"])
         self.available_arms = list(self.profile["chains"])
         self.grippers = self.profile.get("grippers", {})
@@ -63,7 +67,7 @@ class GenericURDFEnvironment(SimulationBackend):
         # scene.json (registry imports them from floor_objects.json);
         # a desk scene samples them from the reachable-spawn layout.
         self.spawn_validation = ({"objects": scene_config.get("objects") or {}}
-                                 if self._mobile_base else self._spawn_sampler.layout())
+                                 if self._floor_scene else self._spawn_sampler.layout())
         self._adjacent_collision = bool(scene_config.get('adjacent_collision', True))
         self._dt = float(scene_config["physics_dt"])
         if self._mobile_base:
@@ -97,7 +101,7 @@ class GenericURDFEnvironment(SimulationBackend):
             viewer_options=gs.options.ViewerOptions(refresh_rate=60, realtime_factor=self.simulation_speed,
                 camera_pos=(1.1, -1.3, 1.5), camera_lookat=(0., 0., 1.)), show_viewer=show_viewer)
         self._scene.add_entity(gs.morphs.Plane(), material=gs.materials.Rigid(friction=.6))
-        self._table = None if self._mobile_base else self._scene.add_entity(gs.morphs.Box(size=tuple(scene_config["table_size"]),
+        self._table = None if self._floor_scene else self._scene.add_entity(gs.morphs.Box(size=tuple(scene_config["table_size"]),
             pos=(0., 0., scene_config["table_top"] - scene_config["table_size"][2] / 2.), fixed=True),
             material=gs.materials.Rigid(friction=.6), surface=gs.surfaces.Default(color=(.62, .58, .51)))
         self._root_transform = np.asarray(self.profile["root_transform"])
@@ -135,12 +139,38 @@ class GenericURDFEnvironment(SimulationBackend):
                       for side, chain in self.profile["chains"].items()}
         self._limits = {j["name"]: [-np.inf if j["lower"] is None else j["lower"],
                                    np.inf if j["upper"] is None else j["upper"]] for j in self.profile["joints"]}
-        self._entity.set_dofs_position(np.array([self.profile["home"][name] for name in self._all_names]), self._all_dofs)
-        inertia = np.maximum(np.diag(self._entity.get_mass_mat().cpu().numpy())[self._all_dofs], 1e-6)
+        initial = np.array([self.profile["home"][name] for name in self._all_names])
+        if not self._mobile_base:
+            # Size the fixed-robot servo at the same opened-jaw posture reset() will use.
+            for gripper in self.grippers.values():
+                for name, multiplier in {gripper['joint']: 1., **gripper['followers']}.items():
+                    initial[self._all_names.index(name)] = gripper['open_q'] * multiplier
+        self._entity.set_dofs_position(initial, self._all_dofs)
+        if not self._mobile_base:
+            # get_mass_mat() reads a cache: setting q updates FK, not the mass matrix. Ask
+            # Genesis to assemble the undamped matrix at this pose, without stepping physics.
+            # A stale zero-pose diagonal differed by 10.7x at one imported wrist joint.
+            from genesis.engine.solvers.rigid.abd.forward_dynamics import kernel_compute_mass_matrix
+            solver = self._scene.rigid_solver
+            kernel_compute_mass_matrix(self._scene._envs_idx, solver.dyn_state, solver.dyn_info,
+                                       solver.rigid_info, solver.rigid_config, False)
+        inertia = np.diag(self._entity.get_mass_mat().cpu().numpy())[self._all_dofs]
+        invalid = ~np.isfinite(inertia) | (inertia <= 0.)
+        if np.any(invalid):
+            raise ValueError('Non-positive or non-finite joint inertia: ' +
+                             ', '.join(name for name, bad in zip(self._all_names, invalid) if bad))
         arm_names={name for chain in self.profile['chains'].values() for name in chain['joints']}
         response=np.asarray([POLICY['arm_response_rad_s'] if name in arm_names else POLICY['finger_response_rad_s']
                              for name in self._all_names])
-        kp = np.clip(inertia * response**2,POLICY['kp_min'],POLICY['kp_max'])
+        if self._mobile_base:
+            # Mobile arms must hold their weight; retain their existing loaded-servo gains.
+            inertia = np.maximum(inertia, 1e-6)
+            kp = np.clip(inertia * response**2, POLICY['kp_min'], POLICY['kp_max'])
+        else:
+            # Gravity is cancelled for fixed robots. Keep the requested response as inertia
+            # shrinks: a fixed kp floor drove a 5e-8 kg m² wrist past 250 rad/s under a
+            # sub-1 rad/s reference. Flooring the inertia in kv also over-damps tiny joints.
+            kp = np.minimum(inertia * response**2, POLICY['kp_max'])
         kv = 2. * np.sqrt(kp * inertia)
         if self._mobile_base:
             # Desk scenes cancel gravity for the whole entity; a mobile
@@ -252,7 +282,7 @@ class GenericURDFEnvironment(SimulationBackend):
 
     def reset(self, randomize=False, object_positions=None, seed=None,shuffle_sides=True):
         self._resolved_zones = {}
-        placements = {"objects": dict(self._object_start)} if self._mobile_base else self._spawn_sampler.layout(randomize=randomize, object_positions=object_positions,
+        placements = {"objects": dict(self._object_start)} if self._floor_scene else self._spawn_sampler.layout(randomize=randomize, object_positions=object_positions,
             base=self._object_start,seed=seed,shuffle_sides=shuffle_sides,
             stop=getattr(self,'planning_pulse',lambda:False))
         self.spawn_validation = placements

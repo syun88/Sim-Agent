@@ -407,9 +407,17 @@ def import_robot(folder):
             vertices.append(points @ transform[:3, :3].T + transform[:3, 3])
     if vertices:
         minimum_z = float(np.concatenate(vertices)[:, 2].min())
+    # A package may say where it stands. A wheeled base always rests on the floor; a fixed-base
+    # package can ask for the same by recording {"mount": "floor"} beside its URDF. It matters
+    # because the desk scene samples props the robot must be able to reach, and a robot whose whole
+    # workspace is above its own base (measured 2026-10-26 on a dual-arm package: tool reach
+    # x <= 0.215 m) can never satisfy that.
+    setup_path = source.with_name("initial_state.json")
+    setup = json.loads(setup_path.read_text()) if setup_path.is_file() else {}
+    floor_scene = bool(mobile_base) or setup.get("mount") == "floor"
     root_transform = np.eye(4)
     root_transform[:3, :3] = Rotation.from_euler("z", yaw).as_matrix()
-    if mobile_base:
+    if floor_scene:
         # A wheeled base stands on the floor, not on the desk: rest the whole
         # robot's lowest measured point on z=0, using every link's visual
         # mesh transformed by the zero-pose forward kinematics.
@@ -459,6 +467,9 @@ def import_robot(folder):
                "profile_version": PROFILE_VERSION, "asset_sha256": asset_signature(source),
                "control_policy_sha256":policy_signature(),"control_policy":IMPORTED_ROBOT_POLICY,
                "grasp_calibrated": False, "warnings": warnings, "mesh_count": len(set(meshes))}
+    if floor_scene and not mobile_base:
+        profile['mount'] = 'floor'
+        warnings.append('Stands on the floor by declaration: the scene has no desk and props come from floor_objects.json.')
     if mobile_base:
         profile['mobile_base'] = mobile_base
         profile['capabilities'] += ['navigation']
@@ -469,7 +480,8 @@ def import_robot(folder):
         # dropped that warning from a package that had both files).
         profile['warnings'].append("Source masses, geometry and joint frames are preserved. Explicit actuators.json supplies motor effort and no-load speed limits.")
     scene = {"robot_id": robot_id, "openarm_cell": False,
-             "table_top": 0. if mobile_base else .76, "table_size": [0., 0., 0.] if mobile_base else [1.6, 1.4, .05],
+             "table_top": 0. if floor_scene else .76,
+             "table_size": [0., 0., 0.] if floor_scene else [1.6, 1.4, .05],
              "robot_root_transform": root_transform.tolist(), "physics_dt": IMPORTED_ROBOT_POLICY['physics_dt_max_s'],
              "physics_substeps":IMPORTED_ROBOT_POLICY['physics_substeps'],
              "robot_gravity_compensation": 1., "self_collision": True,
@@ -568,7 +580,7 @@ def import_robot(folder):
                  for side, seed in seeds.items()}
     (target / 'ik_validation.json').write_text(json.dumps(ik_checks, indent=2) + '\n')
     from backend.app.robots.spawn import ReachableDeskSpawns
-    if mobile_base:
+    if floor_scene:
         # A floor robot's props are authored, not desk-sampled: an optional
         # floor_objects.json next to the URDF maps object names to floor
         # positions ([x, y] or [x, y, z]; z defaults to half the scene's

@@ -8,6 +8,7 @@ node_modules/
 dist/
 outputs/*.json
 outputs/robots/
+outputs/dual_scorpion_source/
 *.log
 .venv/
 __pycache__/
