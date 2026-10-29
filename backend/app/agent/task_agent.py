@@ -21,6 +21,7 @@ RECOVERABLE = {'IK_FAILURE','GRASP_FAILED','COLLISION_PATH','MOTION_BLOCKED','HO
                'GOAL_NOT_SATISFIED','INVALID_PLAN','HANDOVER_FAILED','PARK_COLLISION','GRASP_LOST','GRASP_SLIP',
                'HANDOVER_UNREACHABLE','HANDOVER_APPROACH_COLLISION','HANDOVER_NO_RECEIVER_PINCH',
                'HANDOVER_DONOR_CONTACT','HANDOVER_LOST','HAND_CONTACT',
+               'THROW_SPEED_NOT_REACHED',
                'THROW_FAILED'}
 #: Operations a task may retry from the observed scene. All table-safe and re-derivable from world state. The
 #: model writes approach/grasp/lift/throw as separate actions, so anything missing here makes whole plans

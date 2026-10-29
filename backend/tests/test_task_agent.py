@@ -263,3 +263,21 @@ def test_two_cubes_at_the_same_height_still_stop_rather_than_guess(world):
     ]
     with pytest.raises(SceneReferenceError):
         bind_scene_references('右手にある青いキューブを取って', world)
+
+
+def test_a_launch_that_never_reached_the_speed_retries_in_place(world,postconditions):
+    """The jaws never opened, so the cube is still pinched: the same arm can retry it with another stroke.
+
+    Measured 2026-10-28 on the cell: 12 cm reached 1.245 m/s and cleared 3 cm while 20 cm reached 0.472 m/s
+    and could not, and the failure carries `stroke_cm` as the lever. What must not happen is a scene reset -
+    nothing about the desk changed.
+    """
+    def held_cube_speed_shortfall(executor,plan):
+        return {'success':False,'status':'FAILED','plan':plan.model_dump(),
+                'skills':[{'skill':s.skill,'action_index':s.action_index,'success':False,
+                           'error':'THROW_SPEED_NOT_REACHED'} for s in plan.steps[:1]],
+                'verification':{'success':False,'failure_category':'THROW_SPEED_NOT_REACHED'},'retry_count':0}
+    executor=FakeExecutor(world,[held_cube_speed_shortfall,True])
+    result=TaskAgent(executor,AgentPlanner()).run('青いキューブを投げて')
+    assert result['success'] and executor.resets==0
+    assert result['agent_recoveries'][0]['decision']=='recover_in_place'

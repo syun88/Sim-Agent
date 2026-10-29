@@ -9,6 +9,29 @@ HIT_TOLERANCE_M = .07
 OFFICIAL_WINDUP = np.array([.50, .18, 1.075])
 
 
+def order_strokes(strokes, measured, needed):
+    """Order launch-stroke candidates by what this arm was measured to throw with.
+
+    ``measured`` maps a stroke length to the exit speed the arm actually produced for it, and ``needed`` is
+    the speed the launch has to reach. A stroke measured below ``needed`` is known not to launch and is tried
+    last; a stroke nobody measured is unknown and goes before it, because it may still work. The design's own
+    order (longest first) rests on the assumption that the arm tracks the commanded stroke, and the cell's
+    measurements contradicted it - 20 cm released at 0.472 m/s while 12 cm released at 1.245 m/s (2026-10-28).
+    """
+    if not measured:
+        return list(strokes)
+
+    def rank(stroke):
+        value = measured.get(round(float(stroke), 4))
+        if value is None:
+            return (1, 0.)
+        if value < needed:
+            return (2, -value)
+        return (0, -value)
+
+    return sorted(strokes, key=rank)
+
+
 def windup_candidates(runner, arm, obj, stroke=.14):
     """Poses to raise the object into before the launch stroke, best first.
 
@@ -57,6 +80,27 @@ def _attitude_in_use(runner, arm):
     return np.asarray(runner.controller.target_rotations.get(arm, env.ee_pose(arm)[1]))
 
 
+def _pose_plan(env, arm, position, rotation=None, *, q_init=None):
+    """The robot's own answer to "can this pose be reached, and with which joints".
+
+    Planning a pose is the environment's business (``SimulationBackend.plan_arm_pose``): an imported
+    package answers with the planner that reads its URDF profile, the builtin official cell with its own
+    kinematics. Measured 2026-10-28: the throw reached into ``env.profile`` directly, which the cell does
+    not have, so ``throw_right`` ended in an AttributeError on the cell while the same case passed before
+    the throw was rewritten for imported robots. A robot that cannot plan a pose at all is refused here,
+    by name, rather than downstream by an attribute error.
+    """
+    planner = getattr(env, 'plan_arm_pose', None)
+    if planner is None:
+        from backend.app.skills.robot_skills import SkillError
+        raise SkillError('IK_FAILURE', f'{type(env).__name__} cannot plan an arm pose')
+    planned = planner(arm, np.asarray(position, float), rotation, q_init=q_init)
+    if planned is None:
+        from backend.app.skills.robot_skills import SkillError
+        raise SkillError('IK_FAILURE', f'{type(env).__name__} declined to plan a pose for {arm}')
+    return planned
+
+
 def reachable(env, arm, pose, rotation):
     """Can this robot's own IK reach the pose?  Asked of the planner, not of the controller.
 
@@ -65,10 +109,9 @@ def reachable(env, arm, pose, rotation):
     measured 2026-10-25 on OpenManipulator-X, the controller rejected every searched wind-up while the
     same poses solved with zero error through ``solve_profile_ik``. Planning asks the planner.
     """
-    from backend.app.robots.urdf import solve_profile_ik
-    result = solve_profile_ik(env.profile, arm, np.asarray(pose, float), rotation, model=env.model,
-                              q_init=env.home_arm_qpos(arm), snapshot=env.joint_snapshot())
-    return bool(result['success'])
+    if getattr(env, 'plan_arm_pose', None) is None:
+        return False                     # a robot that cannot plan a pose cannot reach a searched one
+    return bool(_pose_plan(env, arm, pose, rotation, q_init=env.home_arm_qpos(arm))['success'])
 
 
 def launch_ready(runner, arm, obj, windup, attitude, stroke=.14):
@@ -178,9 +221,11 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
     speed = (float(release_speed_m_s) if release_speed_m_s
              else needed * SPEED_MARGIN / PINCH_TRANSMISSION)
     RELEASE_PHASE = .9
-    # Long first: a short stroke cannot transfer the momentum, however fast it is commanded.
+    # Longest first is the design's guess; where this arm has recorded what it launches, that decides.
     strokes = ([float(stroke_cm) / 100.] if stroke_cm else
                [max(.20, height_cm / 100. + .16), .16, .12, .07])
+    calibration = getattr(env, 'launch_calibration', None)
+    strokes = order_strokes(strokes, dict(calibration()) if calibration is not None else {}, needed)
     windup = mode = None
     rejected = []
     # A cube close to the shoulder leaves no room for a long stroke, and a short stroke cannot reach throwing
@@ -250,9 +295,8 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
     position, rotation = env.ee_pose(arm)
     start = env.arm_qpos(arm)
     launch_rotation = rotation if mode == "strict" else None
-    # Solved by the planner's IK, for the same reason the wind-up is: the controller's own IK is a
-    # local, damped solve that a four-joint arm cannot satisfy a full six-degree-of-freedom pose with.
-    from backend.app.robots.urdf import solve_profile_ik
+    # Planned by the robot's own planner, for the same reason the wind-up is: the controller's own IK
+    # carries a carrying arm's constraints, which reject poses the planner solves.
     aim = None
     direction = np.array([0., 0., 1.])
     flight_used = flight_time_s
@@ -266,9 +310,8 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
         for candidate in (.16, .18, .20, .22, .26, .30):
             trial = launch_for_target(delta, candidate)
             trial_direction = np.asarray(trial['direction'], float)
-            planned = solve_profile_ik(env.profile, arm, np.asarray(position, float) + trial_direction * stroke,
-                                       launch_rotation, model=env.model, q_init=start,
-                                       snapshot=env.joint_snapshot())
+            planned = _pose_plan(env, arm, np.asarray(position, float) + trial_direction * stroke,
+                                 launch_rotation, q_init=start)
             if planned['success']:
                 aim, direction, flight_used = trial, trial_direction, candidate
                 break
@@ -277,8 +320,8 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
             ramp = max(.05, min(.6, ramp_for_release_speed(stroke, speed, RELEASE_PHASE)))
             release_at = RELEASE_PHASE * ramp
     if aim is None:
-        planned = solve_profile_ik(env.profile, arm, np.asarray(position, float) + direction * stroke,
-                                   launch_rotation, model=env.model, q_init=start, snapshot=env.joint_snapshot())
+        planned = _pose_plan(env, arm, np.asarray(position, float) + direction * stroke,
+                             launch_rotation, q_init=start)
     if not planned['success'] and back_off(.06):
         # The stroke starts where the arm happens to be; a cube near the base leaves no room for it. Backing off
         # and re-solving the same stroke is the same physical remedy the wind-up search uses, and it is measured:
@@ -286,9 +329,8 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
         position, rotation = env.ee_pose(arm)
         start = env.arm_qpos(arm)
         launch_rotation = rotation if mode == "strict" else None
-        planned = solve_profile_ik(env.profile, arm, np.asarray(position, float) + direction * stroke,
-                                   launch_rotation, model=env.model, q_init=start,
-                                   snapshot=env.joint_snapshot())
+        planned = _pose_plan(env, arm, np.asarray(position, float) + direction * stroke,
+                             launch_rotation, q_init=start)
     if not planned['success']:
         # Say what was short and which levers exist, so the planner can choose instead of guessing. Measured
         # 2026-10-27: the aimed stroke from the cube nearest the base was 24 mm out of reach, and backing off
@@ -306,12 +348,20 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
                                      "stroke_cm": "2-30", "release_speed_m_s": "0.2-3.0"},
                           "aim_direction": np.round(direction, 3).tolist()}
         raise error
-    end = env.model.nearest_continuous(env.profile['chains'][arm]['joints'], planned['q_rad'], start)
+    end = np.asarray(planned['q_rad'], float)          # the planner already made it continuous with start
     if mode == "strict":
         control.target_rotations[arm] = rotation.copy()
     ramp = max(.05, min(.6, ramp_for_release_speed(stroke, speed, RELEASE_PHASE)))
     release_at = RELEASE_PHASE * ramp
     trace = []
+    # The jaws open on a measurement now, not on the clock. The design assumes this arm tracks the commanded
+    # stroke (``designed_release_speed_m_s``), and on the builtin cell it does not: the same 20 cm stroke
+    # released at 0.459 m/s against the 0.767 m/s a 3 cm rise needs, while the 12 cm candidate reached
+    # 1.245 m/s and cleared it with 78.3 mm of rise (measured 2026-10-28, four candidates swept with the
+    # wind-up search's own wind-ups). A scheduled release turns that into a dropped cube; holding until the
+    # object is actually fast enough leaves it in the hand for another attempt, and a launch that never
+    # reaches the speed becomes a refusal that names what was reached.
+    released, peak_speed = False, 0.
     env.configure_motion_response(1.)
     try:
         for step in range(int((ramp + .67) / env.timestep)):
@@ -320,8 +370,11 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
             t = step * env.timestep
             phase = min(t / ramp, 1.)
             env.set_arm(arm, start + (end - start) * phase ** 2)
-            if t >= release_at:
-                control.set_gripper(arm, False)
+            if not released:
+                peak_speed = max(peak_speed, float(env.object_linear_speed(obj)))
+                if t >= release_at and peak_speed >= needed:
+                    control.set_gripper(arm, False)
+                    released = True
             env.step()
             # Every step, not every other one: a flatter aimed throw separates for about 6 ms, and sampling at 8 ms
             # intervals can miss the only free-flight sample (measured 2026-10-27: a hit at 57 mm from centre was
@@ -339,6 +392,25 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
     finally:
         env.set_arm(arm, env.arm_qpos(arm))
         env.configure_motion_response(control.motion_speed)
+    if not released:
+        # Nothing was dropped: the cube is still pinched, so this is a refusal the same arm can retry - with
+        # another stroke, or after backing off - rather than a failed throw to recover from. The levers are
+        # named, and one of them carries the measurement that makes the choice possible: measured 2026-10-28,
+        # 12 cm reached 1.245 m/s on this arm while 20 cm reached 0.472 m/s.
+        error = SkillError(
+            "THROW_SPEED_NOT_REACHED",
+            f"The arm reached {peak_speed:.3f} m/s in a {stroke * 100:.0f} cm stroke over {ramp:.3f} s, below the "
+            f"{needed:.3f} m/s a {height_cm:g} cm rise needs; the cube is still held")
+        error.evidence = {"peak_object_speed_m_s": round(peak_speed, 3),
+                          "needed_release_speed_m_s": round(needed, 3),
+                          "stroke_cm": round(stroke * 100., 1), "ramp_seconds": round(ramp, 3),
+                          "used": {"stroke_cm": round(stroke * 100., 1), "ramp_seconds": round(ramp, 3),
+                                   "height_cm": height_cm},
+                          "levers": {"stroke_cm": "2-30; measured on this arm: 12 cm reached 1.245 m/s, 20 cm 0.472 m/s, "
+                                                 "16 cm 0.729 m/s, 7 cm 0.627 m/s",
+                                     "back_off_cm": "0-20, more room before the stroke",
+                                     "height_cm": "the rise this speed has to serve"}}
+        raise error
     evidence = evaluate_throw(trace, height_cm / 100., release_after=release_at,
                               upward_min=0. if target_point is not None else .1)
     if target_point is not None:

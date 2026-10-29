@@ -180,6 +180,28 @@ class SimulationBackend(ABC):
         """Optional source velocity caps for a generated URDF motion profile."""
         return None
 
+    def plan_arm_pose(self, side: str, position: np.ndarray, rotation: np.ndarray | None = None,
+                      *, q_init: np.ndarray | None = None) -> dict | None:
+        """Plan a joint vector that reaches this pose, or ``None`` when this robot cannot plan one.
+
+        A skill that plans a pose - a throw's wind-up search and its launch stroke are the two - asks
+        here instead of assuming a shape of its own, because the two kinds of robot answer it with
+        different machinery: an imported package through the planner that reads its URDF profile, the
+        builtin official cell through its own kinematics. The result carries ``success``, ``q_rad``
+        (continuous with ``q_init`` where the joints can wrap), and the errors that justify the verdict.
+        """
+        return None
+
+    def launch_calibration(self) -> tuple[tuple[float, float], ...] | None:
+        """The launch strokes this arm was measured to throw with, as (stroke_m, exit_speed_m_s).
+
+        A throw's design assumes the arm tracks the commanded stroke; where it does not, the exit speed is a
+        property of the arm and its jaws rather than of the design, and the only honest way to know it is to
+        have measured it. ``None`` means no measurement is recorded for this robot, and callers keep their
+        own ordering.
+        """
+        return None
+
     @abstractmethod
     def kinematics(self) -> None:
         """Refresh forward kinematics after `set_arm_qpos`, without stepping physics."""

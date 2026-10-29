@@ -221,3 +221,67 @@ def test_a_long_physics_wait_can_be_interrupted_between_real_steps(env):
         assert env.frame().sim_time == pytest.approx(start + 7 * env.timestep)
     finally:
         env.step_observer = previous
+
+
+def test_a_robot_that_cannot_plan_a_pose_is_refused_by_name():
+    """Measured 2026-10-28: the throw read ``env.profile`` itself, so the builtin official cell - which
+    has no profile - ended a throw in ``AttributeError`` while the same case passed before the throw was
+    rewritten for imported robots. Planning a pose is the environment's business; a robot that cannot
+    answer is refused by name, and a wind-up search reads that as "not reachable" rather than crashing.
+    """
+    from backend.app.skills import dynamic_skills as ds
+    from backend.app.skills.robot_skills import SkillError
+
+    env = SimpleNamespace()                      # an environment with no pose planner at all
+    with pytest.raises(SkillError, match='cannot plan an arm pose'):
+        ds._pose_plan(env, 'right', [0., 0., 1.], np.eye(3))
+    assert ds.reachable(env, 'right', [0., 0., 1.], np.eye(3)) is False
+
+    def declining(side, position, rotation=None, *, q_init=None):
+        return None                              # a planner that exists and declines this pose
+
+    env = SimpleNamespace(plan_arm_pose=declining, home_arm_qpos=lambda side: np.zeros(7))
+    with pytest.raises(SkillError, match='declined to plan a pose'):
+        ds._pose_plan(env, 'right', [0., 0., 1.], np.eye(3))
+
+
+def test_the_throw_plans_through_the_robot_and_not_through_an_imported_profile():
+    """The regression this pins: only the imported half of the repository has a ``profile``.
+
+    Read from the parsed module rather than its text, so that the prose explaining the mistake does not
+    trip the guard.
+    """
+    import ast
+    import inspect
+    from backend.app.skills import dynamic_skills as ds
+
+    tree = ast.parse(inspect.getsource(ds))
+    reached = {node.attr for node in ast.walk(tree)
+               if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+               and node.value.id == 'env'}
+    assert 'profile' not in reached and 'model' not in reached, (
+        'the throw must ask env.plan_arm_pose, not the imported package interface')
+    assert [node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == '_pose_plan'], 'the throw plans through the robot'
+    assert any(isinstance(node, ast.Constant) and node.value == 'plan_arm_pose'
+               for node in ast.walk(tree)), 'and that is the capability it asks for'
+
+
+def test_the_launch_order_follows_what_the_arm_was_measured_to_launch():
+    """The design's longest-first guess was contradicted by measurement, so a recorded order decides.
+
+    Measured 2026-10-28 on the cell: 12 cm released at 1.245 m/s and cleared the 3 cm rise, while 20 cm
+    released at 0.472 m/s and could not - and the loss is in the jaws, so it cannot be predicted from the
+    length. A stroke nobody measured is unknown, and is tried before one measured too slow.
+    """
+    from backend.app.skills.dynamic_skills import order_strokes
+
+    candidates = [.20, .16, .12, .07]
+    needed = .767
+    assert order_strokes(candidates, {}, needed) == candidates, "no measurement keeps the design's order"
+    measured = {.12: 1.245, .16: .729, .07: .627, .20: .472}
+    assert order_strokes(candidates, measured, needed) == [.12, .16, .07, .20]
+    assert order_strokes([.19, .12, .20], {.12: 1.245, .20: .472}, needed) == [.12, .19, .20], (
+        "an unmeasured stroke is unknown, not known-bad")
+    assert order_strokes([.20], {.12: 1.245}, needed) == [.20], "a single candidate stays single"
