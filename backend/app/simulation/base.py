@@ -192,6 +192,16 @@ class SimulationBackend(ABC):
         """
         return None
 
+    def launch_calibration(self) -> tuple[tuple[float, float], ...] | None:
+        """The launch strokes this arm was measured to throw with, as (stroke_m, exit_speed_m_s).
+
+        A throw's design assumes the arm tracks the commanded stroke; where it does not, the exit speed is a
+        property of the arm and its jaws rather than of the design, and the only honest way to know it is to
+        have measured it. ``None`` means no measurement is recorded for this robot, and callers keep their
+        own ordering.
+        """
+        return None
+
     @abstractmethod
     def kinematics(self) -> None:
         """Refresh forward kinematics after `set_arm_qpos`, without stepping physics."""

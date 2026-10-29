@@ -266,3 +266,22 @@ def test_the_throw_plans_through_the_robot_and_not_through_an_imported_profile()
             and node.func.id == '_pose_plan'], 'the throw plans through the robot'
     assert any(isinstance(node, ast.Constant) and node.value == 'plan_arm_pose'
                for node in ast.walk(tree)), 'and that is the capability it asks for'
+
+
+def test_the_launch_order_follows_what_the_arm_was_measured_to_launch():
+    """The design's longest-first guess was contradicted by measurement, so a recorded order decides.
+
+    Measured 2026-10-28 on the cell: 12 cm released at 1.245 m/s and cleared the 3 cm rise, while 20 cm
+    released at 0.472 m/s and could not - and the loss is in the jaws, so it cannot be predicted from the
+    length. A stroke nobody measured is unknown, and is tried before one measured too slow.
+    """
+    from backend.app.skills.dynamic_skills import order_strokes
+
+    candidates = [.20, .16, .12, .07]
+    needed = .767
+    assert order_strokes(candidates, {}, needed) == candidates, "no measurement keeps the design's order"
+    measured = {.12: 1.245, .16: .729, .07: .627, .20: .472}
+    assert order_strokes(candidates, measured, needed) == [.12, .16, .07, .20]
+    assert order_strokes([.19, .12, .20], {.12: 1.245, .20: .472}, needed) == [.12, .19, .20], (
+        "an unmeasured stroke is unknown, not known-bad")
+    assert order_strokes([.20], {.12: 1.245}, needed) == [.20], "a single candidate stays single"

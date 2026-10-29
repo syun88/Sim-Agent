@@ -37,6 +37,7 @@ from backend.app.simulation.openarm_v2.definition import (
     EE_LINKS,
     EE_SITES,
     GRIPPER_JOINTS,
+    LAUNCH_STROKES_MEASURED,
     OBJECTS,
     SPAWN_ARM_QPOS,
     ZONES,
@@ -688,6 +689,10 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         """
         from backend.app.simulation.openarm_v2.pose_planning import plan_pose
         return plan_pose(self, side, position, rotation, q_init=q_init, planner_grade=True)
+
+    def launch_calibration(self):
+        """The launch strokes this cell was measured to throw with (see ``definition``)."""
+        return LAUNCH_STROKES_MEASURED
 
     def _observed_model_qpos(self) -> np.ndarray:
         qpos = self._meta.keyframe_qpos

@@ -9,6 +9,29 @@ HIT_TOLERANCE_M = .07
 OFFICIAL_WINDUP = np.array([.50, .18, 1.075])
 
 
+def order_strokes(strokes, measured, needed):
+    """Order launch-stroke candidates by what this arm was measured to throw with.
+
+    ``measured`` maps a stroke length to the exit speed the arm actually produced for it, and ``needed`` is
+    the speed the launch has to reach. A stroke measured below ``needed`` is known not to launch and is tried
+    last; a stroke nobody measured is unknown and goes before it, because it may still work. The design's own
+    order (longest first) rests on the assumption that the arm tracks the commanded stroke, and the cell's
+    measurements contradicted it - 20 cm released at 0.472 m/s while 12 cm released at 1.245 m/s (2026-10-28).
+    """
+    if not measured:
+        return list(strokes)
+
+    def rank(stroke):
+        value = measured.get(round(float(stroke), 4))
+        if value is None:
+            return (1, 0.)
+        if value < needed:
+            return (2, -value)
+        return (0, -value)
+
+    return sorted(strokes, key=rank)
+
+
 def windup_candidates(runner, arm, obj, stroke=.14):
     """Poses to raise the object into before the launch stroke, best first.
 
@@ -198,9 +221,11 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
     speed = (float(release_speed_m_s) if release_speed_m_s
              else needed * SPEED_MARGIN / PINCH_TRANSMISSION)
     RELEASE_PHASE = .9
-    # Long first: a short stroke cannot transfer the momentum, however fast it is commanded.
+    # Longest first is the design's guess; where this arm has recorded what it launches, that decides.
     strokes = ([float(stroke_cm) / 100.] if stroke_cm else
                [max(.20, height_cm / 100. + .16), .16, .12, .07])
+    calibration = getattr(env, 'launch_calibration', None)
+    strokes = order_strokes(strokes, dict(calibration()) if calibration is not None else {}, needed)
     windup = mode = None
     rejected = []
     # A cube close to the shoulder leaves no room for a long stroke, and a short stroke cannot reach throwing

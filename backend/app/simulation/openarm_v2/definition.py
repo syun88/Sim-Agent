@@ -67,6 +67,18 @@ FINGERTIP_MIDPOINT = {
     "right": np.array([-0.0066, 0.0, -0.1634]),
 }
 
+#: Which launch strokes this arm can actually throw with, measured rather than assumed, as
+#: ``(stroke_m, measured_exit_speed_m_s)`` best first.
+#:
+#: The throw's design assumes the arm tracks the commanded stroke - so a longer stroke is always faster and
+#: the search tries them longest-first - and this arm does not: each stroke's exit speed was measured on this
+#: cell (2026-10-28, the wind-up search's own wind-ups, the verifier's world) as 12 cm 1.245 m/s (cleared the
+#: 3 cm rise with 78.3 mm), 16 cm 0.729, 7 cm 0.627 and 20 cm 0.472, against the 0.767 m/s that rise needs.
+#: The loss is in the jaws, not the arm: the cube leaves 22 to 63 ms after the command and by then the hand
+#: has moved on, so the exit speed is neither the hand's speed nor predictable from the stroke's length.
+#: This is a property of *this* arm; re-measure it if the gripper or the finger drive changes.
+LAUNCH_STROKES_MEASURED = ((.12, 1.245), (.16, .729), (.07, .627), (.20, .472))
+
 #: Height at which the transport releases the object above the target zone (world z, metres).
 #: The carried object's bottom face stays about 4 cm above the cell table during transport, and
 #: the object then falls the rest of the way to rest under gravity.
