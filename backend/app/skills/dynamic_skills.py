@@ -329,6 +329,14 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
     ramp = max(.05, min(.6, ramp_for_release_speed(stroke, speed, RELEASE_PHASE)))
     release_at = RELEASE_PHASE * ramp
     trace = []
+    # The jaws open on a measurement now, not on the clock. The design assumes this arm tracks the commanded
+    # stroke (``designed_release_speed_m_s``), and on the builtin cell it does not: the same 20 cm stroke
+    # released at 0.459 m/s against the 0.767 m/s a 3 cm rise needs, while the 12 cm candidate reached
+    # 1.245 m/s and cleared it with 78.3 mm of rise (measured 2026-10-28, four candidates swept with the
+    # wind-up search's own wind-ups). A scheduled release turns that into a dropped cube; holding until the
+    # object is actually fast enough leaves it in the hand for another attempt, and a launch that never
+    # reaches the speed becomes a refusal that names what was reached.
+    released, peak_speed = False, 0.
     env.configure_motion_response(1.)
     try:
         for step in range(int((ramp + .67) / env.timestep)):
@@ -337,8 +345,11 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
             t = step * env.timestep
             phase = min(t / ramp, 1.)
             env.set_arm(arm, start + (end - start) * phase ** 2)
-            if t >= release_at:
-                control.set_gripper(arm, False)
+            if not released:
+                peak_speed = max(peak_speed, float(env.object_linear_speed(obj)))
+                if t >= release_at and peak_speed >= needed:
+                    control.set_gripper(arm, False)
+                    released = True
             env.step()
             # Every step, not every other one: a flatter aimed throw separates for about 6 ms, and sampling at 8 ms
             # intervals can miss the only free-flight sample (measured 2026-10-27: a hit at 57 mm from centre was
@@ -356,6 +367,25 @@ def _throw_once(runner, arm: str, obj: str, height_cm: float = 3., *,
     finally:
         env.set_arm(arm, env.arm_qpos(arm))
         env.configure_motion_response(control.motion_speed)
+    if not released:
+        # Nothing was dropped: the cube is still pinched, so this is a refusal the same arm can retry - with
+        # another stroke, or after backing off - rather than a failed throw to recover from. The levers are
+        # named, and one of them carries the measurement that makes the choice possible: measured 2026-10-28,
+        # 12 cm reached 1.245 m/s on this arm while 20 cm reached 0.472 m/s.
+        error = SkillError(
+            "THROW_SPEED_NOT_REACHED",
+            f"The arm reached {peak_speed:.3f} m/s in a {stroke * 100:.0f} cm stroke over {ramp:.3f} s, below the "
+            f"{needed:.3f} m/s a {height_cm:g} cm rise needs; the cube is still held")
+        error.evidence = {"peak_object_speed_m_s": round(peak_speed, 3),
+                          "needed_release_speed_m_s": round(needed, 3),
+                          "stroke_cm": round(stroke * 100., 1), "ramp_seconds": round(ramp, 3),
+                          "used": {"stroke_cm": round(stroke * 100., 1), "ramp_seconds": round(ramp, 3),
+                                   "height_cm": height_cm},
+                          "levers": {"stroke_cm": "2-30; measured on this arm: 12 cm reached 1.245 m/s, 20 cm 0.472 m/s, "
+                                                 "16 cm 0.729 m/s, 7 cm 0.627 m/s",
+                                     "back_off_cm": "0-20, more room before the stroke",
+                                     "height_cm": "the rise this speed has to serve"}}
+        raise error
     evidence = evaluate_throw(trace, height_cm / 100., release_after=release_at,
                               upward_min=0. if target_point is not None else .1)
     if target_point is not None:
