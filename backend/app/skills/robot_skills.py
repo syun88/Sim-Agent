@@ -482,8 +482,8 @@ class SkillRunner:
             desired = relative_destination(self.env, obj, target, relation, arm, distance_cm)
             travel = desired.copy()
             travel[2] = max(1.14, desired[2] + .035)
-            self._carry_to(arm, obj, travel)
-            placed = self._carry_to(arm, obj, desired)
+            self._carry_to(arm, obj, travel, exclude_target=target)
+            placed = self._carry_to(arm, obj, desired, exclude_target=target)
             return {**placed, "reference_object": target, "relation": relation,
                     "support_bounds": self.env.object_bounds(target).tolist()}
         return self._skill("move_to_object", run, time.perf_counter())
@@ -534,7 +534,8 @@ class SkillRunner:
             path.append(seed)
         return path, np.asarray(env.arm_kinematics(arm).evaluate(seed)[1], float)
 
-    def _carry_to(self, arm: str, obj: str, desired: np.ndarray, *, attitude: str = "pinned") -> dict:
+    def _carry_to(self, arm: str, obj: str, desired: np.ndarray, *, attitude: str = "pinned",
+                  exclude_target: str | None = None) -> dict:
         """Carry the held object to a pose. ``attitude="free"`` lets the arm choose its orientation.
 
         A six-joint arm carries the attitude its pinch was validated in, and that is the default. An arm
@@ -548,8 +549,11 @@ class SkillRunner:
         start = self.env.object_pose(obj)[0].copy()
         target, commanded_rotation, offset = self._carry_aim(arm, obj, desired, attitude=attitude)
         aim = rotation if commanded_rotation is None else commanded_rotation
+        ignored = {obj}
+        if exclude_target:
+            ignored.add(exclude_target)
         stationary = {name: self.env.object_pose(name)[0].copy()
-                      for name in self.env.frame().objects if name != obj}
+                      for name in self.env.frame().objects if name not in ignored}
         def guard_carry():
             self._require_hold(arm, obj)
             for name, position in stationary.items():
