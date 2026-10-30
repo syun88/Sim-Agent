@@ -471,17 +471,17 @@ class SkillRunner:
                     raise SkillError("REFERENCE_MOVING", "The placement reference must be resting stationary on the table or held stationary by the other arm")
             else:
                 # Bimanual in-hand stacking: if the held support is held far to one side (|y| > 0.04),
-                # stage the support arm toward the shared center workspace (y ≈ 0.0) so the placing arm can reach it!
+                # stage the support arm toward the shared center workspace (y ≈ 0.0, comfortable height z ≈ 1.06-1.08)
+                # so the placing arm can reach the top of it well within the 1.24m reach ceiling!
                 target_pos = self.env.object_pose(target)[0]
-                if abs(target_pos[1]) > 0.04:
-                    staging_x = float(np.clip(target_pos[0], 0.42, 0.48))
-                    staging_z = float(np.clip(target_pos[2], 1.12, 1.16))
-                    staging_pos = np.array([staging_x, 0.0, staging_z])
-                    self._carry_to(other_arm, target, staging_pos)
+                staging_x = float(np.clip(target_pos[0], 0.42, 0.46))
+                staging_z = 1.06
+                staging_pos = np.array([staging_x, 0.0, staging_z])
+                self._carry_to(other_arm, target, staging_pos)
             self._align_for_placement(arm, obj)
             desired = relative_destination(self.env, obj, target, relation, arm, distance_cm)
             travel = desired.copy()
-            travel[2] = max(1.14, desired[2] + .035)
+            travel[2] = min(1.18, desired[2] + .02 if is_held_stationary else max(1.14, desired[2] + .035))
             self._carry_to(arm, obj, travel, exclude_target=target)
             placed = self._carry_to(arm, obj, desired, exclude_target=target)
             return {**placed, "reference_object": target, "relation": relation,
