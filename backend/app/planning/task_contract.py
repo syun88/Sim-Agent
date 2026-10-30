@@ -30,9 +30,14 @@ def source_actions(plan):
     return [(i, a) for i, a in enumerate((plan.program or {}).get('actions', [])) if i not in inserted]
 
 
-def intent_checks(plan):
+def intent_checks(plan, instruction: str | None = None):
     # A compiler-added parking destination is a procedure choice, not a user final goal.
     evidence = plan.planning_evidence or {}
+    inst = instruction or evidence.get('requested_instruction', '')
+    maintains_hold = bool(re.search(
+        r'持ったまま|維持したまま|持っている状態|掴んだまま|つかんだまま|握ったまま|保持したまま|'
+        r'掴んでいる状態|つかんでいる状態|握っている状態|保持している状態|while\s+holding|keep\s+holding',
+        inst))
     # A requested intermediate pick is not a final table-placement obligation. Only an
     # explicitly requested final placement/hold of that object can freeze its destination.
     if plan.goal_program:
@@ -42,8 +47,8 @@ def intent_checks(plan):
         last = {a.get('object'):(i,a) for i,a in enumerate(actions) if a.get('object')}
         explicit = {obj for obj,(i,a) in last.items()
                     if a['op'] == 'place' or (a['op'] in {'pick','handover'}
-                    and not any(later['op']=='place' and later.get('relation')
-                                and later.get('target')==obj for later in actions[i+1:]))}
+                    and (maintains_hold or not any(later['op']=='place' and later.get('relation')
+                                and later.get('target')==obj for later in actions[i+1:])))}
     incidental = {(p['object'],p['target']) for p in evidence.get('preparations', [])
                   if p.get('kind') in {'free_hand', 'free_hand_goal','ground_held_reference'}
                   and p['object'] not in explicit}
@@ -80,8 +85,10 @@ class TaskContract:
 
     @classmethod
     def freeze(cls, instruction, plan, source):
+        if plan.planning_evidence is not None:
+            plan.planning_evidence['requested_instruction'] = instruction
         actions = [a.model_dump() for a in source.actions]
-        checks = deepcopy(intent_checks(plan))
+        checks = deepcopy(intent_checks(plan, instruction=instruction))
         goal = deepcopy(plan.goal)
         goal['checks'] = checks
         # Unspecified hands are choices, not constraints inherited from the first plan's default.

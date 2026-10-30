@@ -386,7 +386,10 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
                     if holder == arm:
                         raise GroundingError(f"Action {index + 1}: {arm} hand cannot place onto an object it is already holding")
                     inst = state.get('instruction', '')
-                    maintains_hold = bool(re.search(r'持ったまま|維持したまま|持っている状態|while\s+holding', inst))
+                    maintains_hold = bool(re.search(
+                        r'持ったまま|維持したまま|持っている状態|掴んだまま|つかんだまま|握ったまま|保持したまま|'
+                        r'掴んでいる状態|つかんでいる状態|握っている状態|保持している状態|while\s+holding|keep\s+holding',
+                        inst))
                     if not maintains_hold:
                         raise GroundingError("REFERENCE_SUPPORT_HELD: ground the reference before relative placement",
                             preparation={'kind':'ground_held_reference', 'arm':holder, 'object':target,

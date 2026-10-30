@@ -80,6 +80,34 @@ def test_placed_support_updates_projected_position_and_avoids_unnecessary_handov
     assert not any(s.skill == 'handover_object' and s.object == 'blue_cube' for s in plan.steps)
 
 
+def test_held_state_support_in_hand_stacking_never_places_support_on_table():
+    # User instruction: "右手でキューブを掴んでから、掴んでいる状態のキューブの上に赤いキューブを重ねて"
+    # Condition:
+    # 1. Right arm picks blue_cube.
+    # 2. Right arm NEVER places blue_cube on the table! It maintains its hold in the air!
+    # 3. Left arm picks red_cube and stacks it directly on top of the held blue_cube.
+    # 4. Final verification requires BOTH:
+    #    - blue_cube is still held by right arm
+    #    - red_cube is placed on blue_cube
+    plan = AgentPlanner().plan('右手でキューブを掴んでから、掴んでいる状態のキューブの上に赤いキューブを重ねて', WORLD)
+    actions = [(a['op'], a.get('object'), a.get('arm'), a.get('target'), a.get('relation'))
+               for a in plan.program['actions']]
+    # blue_cube must NEVER be placed on the table!
+    assert not any(a[0] == 'place' and a[1] == 'blue_cube' for a in actions), f"blue_cube was placed on table: {actions}"
+    # blue_cube is picked by right arm
+    assert any(a[0] == 'pick' and a[1] == 'blue_cube' and a[2] == 'right' for a in actions)
+    # red_cube is placed on blue_cube by left arm
+    assert actions[-1] == ('place', 'red_cube', 'left', 'blue_cube', 'on')
+    # Steps: right arm grasps blue_cube, left arm grasps red_cube and places on blue_cube
+    skills = [(s.skill, s.arm, s.object) for s in plan.steps]
+    assert ('release_object', 'right', 'blue_cube') not in skills, "blue_cube must NOT be released!"
+    assert any(s[0] == 'move_to_object' and s[1] == 'left' and s[2] == 'red_cube' for s in skills)
+    # Final goal checks: blue_cube is held by right arm, red_cube is on blue_cube!
+    checks = plan.goal['checks']
+    assert any(c['type'] == 'holding' and c['object'] == 'blue_cube' and c['arm'] == 'right' for c in checks)
+    assert any(c['type'] == 'relative_placement' and c['object'] == 'red_cube' and c['target'] == 'blue_cube' and c['relation'] == 'on' for c in checks)
+
+
 def test_arm_specific_uncolored_cube_and_held_state_support_reference_are_grounded():
     # User instruction: "右手でキューブを掴んでから、掴んでいる状態のキューブの上に赤いキューブを重ねて"
     # 1. "右手でキューブ": since right arm is specified, pick the cube on the right (blue_cube)
