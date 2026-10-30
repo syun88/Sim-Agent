@@ -5,6 +5,7 @@ the same transitions against Genesis contacts; a compiler's belief is not physic
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Literal
 
 from pydantic import field_validator, BaseModel, ConfigDict, Field, model_validator
@@ -190,8 +191,9 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
     if program.goals:
         from backend.app.planning.goal_search import compile_goal_program
         return compile_goal_program(program, state)
-    objects = {item["id"]: item for item in state["objects"]}
+    objects = {item["id"]: deepcopy(item) for item in state["objects"]}
     targets = {item["id"] for item in state["targets"]} | set(TABLE_TARGETS)
+    table_positions = {**TABLE_TARGETS, **{t["id"]: t["position"] for t in state.get("targets", []) if "position" in t}}
     held = observed_holds(state)
     discourse = state.get("discourse", {})
     last_object: str | None = discourse.get("last_object")
@@ -223,13 +225,14 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
 
     def auto_arm(obj: str) -> str:
         grippers = state.get("robot", {}).get("grippers")
-        admitted=objects[obj].get('admitted_grasp_arm')
-        if admitted in available_arms and (grippers is None or admitted in grippers):return admitted
+        position = objects[obj].get("position")
+        admitted = objects[obj].get('admitted_grasp_arm')
+        if admitted in available_arms and (grippers is None or admitted in grippers) and not objects[obj].get('_projected_moved'):
+            return admitted
         if grippers and len(grippers) == 1:
             return next(iter(grippers))
         if len(available_arms) == 1:
             return available_arms[0]
-        position = objects[obj].get("position")
         return ("left" if position[1] >= 0 else "right") if position else ("right" if obj == "blue_cube" else "left")
 
     def acquire(obj: str, arm: str, index: int, for_handover: bool = False):
@@ -285,7 +288,9 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             raise GroundingError(f"Unknown object: {obj}")
         arm = action.arm or ((owner(obj) or auto_arm(obj)) if obj else last_arm)
         if action.op == "place" and action.relation and action.arm is None and action.target in objects:
-            arm = auto_arm(action.target)
+            target_arm = auto_arm(action.target)
+            carrier_arm = owner(obj) or auto_arm(obj) if obj else None
+            arm = carrier_arm if (carrier_arm and carrier_arm == target_arm) else target_arm
         if action.op != "approach":
             checks.pop(f"approach:{arm}", None)
         action.object, action.arm = obj, arm
@@ -385,6 +390,14 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             if action.relation:
                 checks[obj].update(relation=action.relation, distance_cm=action.distance_cm, arm=arm)
             action.target = target
+            if action.relation:
+                ref_pos = objects[target].get("position")
+                if ref_pos:
+                    objects[obj]["position"] = [ref_pos[0], ref_pos[1], ref_pos[2] + 0.05]
+                    objects[obj]["_projected_moved"] = True
+            elif target in table_positions:
+                objects[obj]["position"] = list(table_positions[target])
+                objects[obj]["_projected_moved"] = True
         elif action.op == "approach":
             if held[arm]:
                 raise GroundingError(f"{arm} hand must be empty before approach")

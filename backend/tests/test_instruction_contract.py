@@ -65,6 +65,21 @@ def test_unspecified_handover_hand_uses_the_other_observed_robot_arm(source,rece
     assert not any(a['op']=='move' for a in plan.program['actions'])
 
 
+def test_placed_support_updates_projected_position_and_avoids_unnecessary_handover():
+    # When red_cube is placed at right_side, its projected position is on the right.
+    # blue_cube is also on the right. Stacking blue on red must be performed directly
+    # by the right arm without an absurd handover from right to left across the table!
+    text = '赤いキューブを手に渡して右においてから、青いキューブを赤いキューブに乗せて'
+    plan = AgentPlanner().plan(text, WORLD)
+    actions = plan.program['actions']
+    assert [(a['op'], a['object']) for a in actions] == [
+        ('handover', 'red_cube'), ('place', 'red_cube'), ('place', 'blue_cube')]
+    assert actions[1]['target'] == 'right_side'
+    assert actions[2]['target'] == 'red_cube' and actions[2]['relation'] == 'on'
+    assert actions[2]['arm'] == 'right'
+    assert not any(s.skill == 'handover_object' and s.object == 'blue_cube' for s in plan.steps)
+
+
 def test_invalid_model_move_cannot_hide_grounded_unspecified_handover(monkeypatch):
     planner=AgentPlanner()
     planner.enabled=planner.local_enabled=True
