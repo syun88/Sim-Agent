@@ -254,9 +254,16 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             emit("handover_object", source, index, object=obj, receiver=arm)
             held[source] = None
         else:
-            handover_next = for_handover or program.actions[index].op == "handover" or any((a.op == "handover" and a.object in {obj, "it", "それ", None}) or (a.op == "pick" and a.arm and a.arm != arm and a.object in {obj, "it", "それ"}) for a in program.actions[index + 1:])
+            picker = arm
+            is_pick_or_handover = program.actions[index].op in {"pick", "handover"}
+            if is_pick_or_handover and auto_arm(obj) != arm and len(available_arms) == 2 and auto_arm(obj) in available_arms:
+                picker = auto_arm(obj)
+            handover_next = for_handover or (picker != arm) or program.actions[index].op == "handover" or any((a.op == "handover" and a.object in {obj, "it", "それ", None}) or (a.op == "pick" and a.arm and a.arm != arm and a.object in {obj, "it", "それ"}) for a in program.actions[index + 1:])
             for skill in (("approach_object", "grasp_object") if obj == "wine_bottle" else ("approach_object", "grasp_object", "lift_object")):
-                emit(skill, arm, index, object=obj, grasp_offset_x=-.015 if skill == "approach_object" and handover_next else 0.)
+                emit(skill, picker, index, object=obj, grasp_offset_x=-.015 if skill == "approach_object" and handover_next else 0.)
+            if picker != arm:
+                emit("handover_object", picker, index, object=obj, receiver=arm)
+                assumptions.append(f"Action {index + 1}: acquire with reachable {picker} arm, then transfer to requested {arm} arm")
         held[arm] = obj
 
     for index, original in enumerate(program.actions):
