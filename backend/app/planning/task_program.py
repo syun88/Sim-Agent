@@ -6,6 +6,7 @@ the same transitions against Genesis contacts; a compiler's belief is not physic
 from __future__ import annotations
 
 from copy import deepcopy
+import re
 from typing import Literal
 
 from pydantic import field_validator, BaseModel, ConfigDict, Field, model_validator
@@ -295,9 +296,13 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             raise GroundingError(f"Unknown object: {obj}")
         arm = action.arm or ((owner(obj) or auto_arm(obj)) if obj else last_arm)
         if action.op == "place" and action.relation and action.arm is None and action.target in objects:
-            target_arm = auto_arm(action.target)
-            carrier_arm = owner(obj) or auto_arm(obj) if obj else None
-            arm = carrier_arm if (carrier_arm and carrier_arm == target_arm) else target_arm
+            holder = owner(action.target)
+            if holder:
+                arm = 'right' if holder == 'left' else 'left'
+            else:
+                target_arm = auto_arm(action.target)
+                carrier_arm = owner(obj) or auto_arm(obj) if obj else None
+                arm = carrier_arm if (carrier_arm and carrier_arm == target_arm) else target_arm
         if action.op != "approach":
             checks.pop(f"approach:{arm}", None)
         action.object, action.arm = obj, arm
@@ -378,9 +383,15 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
                     raise GroundingError("Relative placement currently requires two cubes")
                 holder = owner(target)
                 if holder:
-                    raise GroundingError("REFERENCE_SUPPORT_HELD: ground the reference before relative placement",
-                        preparation={'kind':'ground_held_reference', 'arm':holder, 'object':target,
-                                     'action_index':index, 'resolved_action':action.model_dump()})
+                    if holder == arm:
+                        raise GroundingError(f"Action {index + 1}: {arm} hand cannot place onto an object it is already holding")
+                    inst = state.get('instruction', '')
+                    maintains_hold = bool(re.search(r'持ったまま|維持したまま|持っている状態|while\s+holding', inst))
+                    if not maintains_hold:
+                        raise GroundingError("REFERENCE_SUPPORT_HELD: ground the reference before relative placement",
+                            preparation={'kind':'ground_held_reference', 'arm':holder, 'object':target,
+                                         'action_index':index, 'resolved_action':action.model_dump()})
+                    assumptions.append(f"Action {index + 1}: place directly onto {target} while {holder} arm maintains its in-hand hold")
             elif target not in targets:
                 raise GroundingError(f"Unknown placement target: {target}")
             if action.relation and owner(obj) is None and auto_arm(obj) != arm:

@@ -31,7 +31,7 @@ def bind_scene_references(instruction: str, state: dict) -> SceneBinding:
     decisions = []
     pattern = re.compile(
         r'(?P<jp>左|右)(?:手|腕)(?:にある|の|で(?:持って|掴んで|つかんで|握って|保持して)(?:いる|る)?|に(?:持って|持たせて|掴んで|つかんで|握って|保持して)(?:いる|る)?)'
-        r'(?P<object>(?:(?:赤|青)(?:い|の)?\s*|(?:red|blue)\s+)?(?:キューブ|ブロック|物体|物|cube))'
+        r'(?P<object>(?:(?:赤|青)(?:い|の)?\s*|(?:red|blue)\s+)?(?:キューブ|ブロック|物体|物|状態|もの|やつ|cube))'
         r'|(?:the\s+)?(?P<enobject>(?:(?:blue|red)\s+)?cube)\s+(?:in|held\s+by)\s+(?:your|the)\s+(?P<en>left|right)\s+(?:hand|gripper|arm)', re.I)
     def bind(match):
         arm = match.group('en') or ('left' if match.group('jp')=='左' else 'right')
@@ -72,9 +72,10 @@ def bind_scene_references(instruction: str, state: dict) -> SceneBinding:
         decisions.append({'kind':kind,'arm':arm,'object':chosen,'source':match.group(),
                           'candidates':candidates,'alternatives':alternatives,'explanation':explanation})
         suffix_spatial = re.match(r'(?:の)?(?:上|下|左|右|前|後|奥|真上|てっぺん|土台|近く|隣|そば| atop| on| under| next)', instruction[match.end():], re.I)
+        prefix_spatial = re.search(r'\b(?:on|atop|under|beside|next\s+to|left\s+of|right\s+of)\s+(?:(?:top|the)\s+of\s+)?$', instruction[:match.start()], re.I)
         has_earlier_actor = bool(re.search(r'[左右](?:手|腕)(?:で|が|は)', instruction[:match.start()]))
-        is_modifying_phrase = any(w in match.group() for w in ('で掴んで', 'でつかんで', 'で握って', 'で保持して', 'で持った', 'で掴んだ'))
-        if suffix_spatial or has_earlier_actor or is_modifying_phrase:
+        is_modifying_phrase = any(w in match.group().lower() for w in ('で掴んで', 'でつかんで', 'で握って', 'で保持して', 'で持った', 'で掴んだ', 'held by', 'in your', 'in the'))
+        if suffix_spatial or prefix_spatial or has_earlier_actor or is_modifying_phrase:
             return f'{chosen}'
         return f'{side}で{chosen}' if match.group('jp') else f'{chosen} with the {arm} hand'
     text = pattern.sub(bind, instruction)

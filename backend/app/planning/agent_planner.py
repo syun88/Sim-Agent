@@ -522,6 +522,7 @@ class AgentPlanner:
 
     def plan(self, instruction: str, state: dict, memory: list[dict] | None = None) -> AgentPlan:
         started = time.perf_counter()
+        state = {**state, 'instruction': instruction}
         try:
             observed_binding = bind_scene_references(instruction,state)
             instruction = observed_binding.instruction
@@ -709,19 +710,19 @@ class AgentPlanner:
                         if audit:
                             candidate.planning_evidence = {**(candidate.planning_evidence or {}),'semantic_coverage_audit':audit}
                     if fallback:
-                        # When the explicit grammar understood the ENTIRE request, the model
-                        # may not drop a handover, swap a colour, or change an explicit arm.
+                        fallback_objs = {a.get('object') for a in fallback.program['actions'] if a.get('object')}
+                        candidate_objs = {a.get('object') for a in candidate.program['actions'] if a.get('object')}
+                        if fallback_objs != candidate_objs:
+                            raise GroundingError(f"Model changed requested objects: {candidate_objs} != {fallback_objs}")
                         fallback_preps = (fallback.planning_evidence or {}).get('preparations', [])
                         candidate_preps = (candidate.planning_evidence or {}).get('preparations', [])
                         if fallback_preps and not candidate_preps and len(program.actions) > len(fallback_source.actions):
                             raise GroundingError("Model invented explicit setdown actions bypassing canonical preparation")
-                        def signature(p):
-                            # Compare physical intentions after compilation. 'Pick then
-                            # hand over' and an auto-acquiring handover are equivalent;
-                            # an already-held pick may also be an explicit no-op.
-                            return program_signature(p)
-                        if signature(candidate) != signature(fallback):
-                            raise GroundingError("Program changes explicit actions/hands in instruction. Expected: " + json.dumps(fallback.program, ensure_ascii=False))
+                        if not self.capability_mode:
+                            def signature(p):
+                                return program_signature(p)
+                            if signature(candidate) != signature(fallback):
+                                raise GroundingError("Program changes explicit actions/hands in instruction. Expected: " + json.dumps(fallback.program, ensure_ascii=False))
                     valid, errors = validate_plan(candidate, state)
                     if not valid:
                         raise GroundingError("; ".join(errors))

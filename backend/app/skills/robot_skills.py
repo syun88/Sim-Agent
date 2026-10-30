@@ -463,8 +463,12 @@ class SkillRunner:
             self._require_hold(arm, obj)
             if target == obj or target not in self.env.frame().objects:
                 raise SkillError("INVALID_TARGET", "Choose another observed cube as the reference")
-            if self.env.object_contacts(target) or self.env.object_linear_speed(target) > .02:
-                raise SkillError("REFERENCE_MOVING", "The placement reference must be resting on the table")
+            other_arm = "right" if arm == "left" else "left"
+            is_held_stationary = (self._pinch_established(target, other_arm)
+                                  and self.env.object_linear_speed(target) < .02)
+            if not is_held_stationary:
+                if self.env.object_contacts(target) or self.env.object_linear_speed(target) > .02:
+                    raise SkillError("REFERENCE_MOVING", "The placement reference must be resting stationary on the table or held stationary by the other arm")
             self._align_for_placement(arm, obj)
             desired = relative_destination(self.env, obj, target, relation, arm, distance_cm)
             travel = desired.copy()

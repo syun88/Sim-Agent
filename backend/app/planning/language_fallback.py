@@ -38,12 +38,15 @@ def acting_arm(text: str) -> str | None:
     'on the right ... with the left hand' contains two sides but only one actor.
     Keep the broad mentions helper for receiver/direction references.
     """
+    # Exclude passive holding condition clauses (e.g. "右手で持っている状態を維持したまま")
+    # which specify the held reference, not the acting arm performing the placement.
+    cleaned_text = re.sub(r'[左右](?:手|腕)(?:で[^\s、,]*?)?(?:状態)?(?:を維持したまま|のまま|の状態で|を持ったまま)', ' ', text)
     patterns = [r'([左右])(?:手|腕|アーム|ハンド)(?:で|が|は)',
                 r'\b(?:with|using|by)\s+(?:your\s+|the\s+)?(left|right)\s+(?:hand|arm|gripper)\b',
                 r'\b(?:the\s+)?(left|right)\s+(?:hand|arm|gripper)\s+(?:picks?|grabs?|grasps?|takes?|holds?|lifts?|moves?)\b']
     sides = []
     for pattern in patterns:
-        for match in re.finditer(pattern, text, re.I):
+        for match in re.finditer(pattern, cleaned_text, re.I):
             value = match.group(1).lower()
             sides.append('left' if value in {'left','左'} else 'right')
     if len(set(sides)) > 1:

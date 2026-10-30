@@ -80,6 +80,29 @@ def test_placed_support_updates_projected_position_and_avoids_unnecessary_handov
     assert not any(s.skill == 'handover_object' and s.object == 'blue_cube' for s in plan.steps)
 
 
+def test_stack_on_held_cube_maintains_hold_and_places_directly_without_table_setdown():
+    # User intent: "右手で持っている状態を維持したまま、そのキューブの上に左手で赤いキューブを重ねて"
+    # When right arm is holding blue_cube, the robot should NOT drop or park blue_cube on the table,
+    # but directly pick red_cube with left arm and stack it directly onto held blue_cube in-hand.
+    state = {
+        'objects': [{'id': 'red_cube', 'type': 'cube', 'position': [0.44, 0.15, 1.031]},
+                    {'id': 'blue_cube', 'type': 'cube', 'position': [0.40, -0.15, 1.12]}],
+        'targets': [],
+        'robot': {'available_arms': ['left', 'right'],
+                  'left_arm': {'held_object': None},
+                  'right_arm': {'held_object': 'blue_cube'}}
+    }
+    plan = AgentPlanner().plan('右手で持っている状態を維持したまま、そのキューブの上に左手で赤いキューブを重ねて', state)
+    actions = [(a['op'], a.get('object'), a.get('arm'), a.get('target'), a.get('relation'))
+               for a in plan.program['actions']]
+    # blue_cube must NOT be placed on the table!
+    assert not any(a[0] == 'place' and a[1] == 'blue_cube' for a in actions)
+    # red_cube is picked by left arm and placed directly on blue_cube in-hand
+    assert any(s.skill == 'grasp_object' and s.object == 'red_cube' and s.arm == 'left' for s in plan.steps)
+    assert any(s.skill == 'move_to_object' and s.object == 'red_cube' and s.arm == 'left' for s in plan.steps)
+    assert actions[-1] == ('place', 'red_cube', 'left', 'blue_cube', 'on')
+
+
 def test_held_cube_reference_with_explicit_acting_hand_does_not_create_duplicate_actors():
     # User instruction: "左手で、右手で掴んでいるキューブの上に赤いキューブを重ねて"
     # The reference "右手で掴んでいるキューブ" modifies the support noun.
