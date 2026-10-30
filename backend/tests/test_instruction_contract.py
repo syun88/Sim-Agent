@@ -80,6 +80,31 @@ def test_placed_support_updates_projected_position_and_avoids_unnecessary_handov
     assert not any(s.skill == 'handover_object' and s.object == 'blue_cube' for s in plan.steps)
 
 
+def test_held_cube_reference_with_explicit_acting_hand_does_not_create_duplicate_actors():
+    # User instruction: "左手で、右手で掴んでいるキューブの上に赤いキューブを重ねて"
+    # The reference "右手で掴んでいるキューブ" modifies the support noun.
+    # It must NOT inject a second conflicting actor "右手で" before the support,
+    # which broke grammar and caused "Multiple acting hands in one clause".
+    state = {
+        'objects': [{'id': 'red_cube', 'type': 'cube', 'position': [0.44, 0.15, 1.031]},
+                    {'id': 'blue_cube', 'type': 'cube', 'position': [0.40, -0.15, 1.12]}],
+        'targets': [],
+        'robot': {'available_arms': ['left', 'right'],
+                  'left_arm': {'held_object': None},
+                  'right_arm': {'held_object': 'blue_cube'}}
+    }
+    plan = AgentPlanner().plan('左手で、右手で掴んでいるキューブの上に赤いキューブを重ねて', state)
+    actions = [(a['op'], a.get('object'), a.get('arm'), a.get('target'), a.get('relation'))
+               for a in plan.program['actions']]
+    # blue_cube is grounded to table by right arm first
+    assert actions[0] == ('place', 'blue_cube', 'right', 'right_side', None)
+    # red_cube is placed on blue_cube by left arm
+    assert actions[-1] == ('place', 'red_cube', 'left', 'blue_cube', 'on')
+    # Execution steps must use left arm for red_cube
+    red_step = next(s for s in plan.steps if s.skill == 'move_to_object' and s.object == 'red_cube')
+    assert red_step.arm == 'left'
+
+
 @pytest.mark.parametrize('phrase', [
     '右手で掴んでいるキューブの上に赤いキューブを重ねて',
     '右手でつかんでいるキューブの上に赤いキューブを重ねて',

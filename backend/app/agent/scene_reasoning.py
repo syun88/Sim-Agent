@@ -71,6 +71,11 @@ def bind_scene_references(instruction: str, state: dict) -> SceneBinding:
                        f'把持できるため、いちばん高い{chosen}を対象にします（他: {", ".join(alternatives)}）。')
         decisions.append({'kind':kind,'arm':arm,'object':chosen,'source':match.group(),
                           'candidates':candidates,'alternatives':alternatives,'explanation':explanation})
+        suffix_spatial = re.match(r'(?:の)?(?:上|下|左|右|前|後|奥|真上|てっぺん|土台|近く|隣|そば| atop| on| under| next)', instruction[match.end():], re.I)
+        has_earlier_actor = bool(re.search(r'[左右](?:手|腕)(?:で|が|は)', instruction[:match.start()]))
+        is_modifying_phrase = any(w in match.group() for w in ('で掴んで', 'でつかんで', 'で握って', 'で保持して', 'で持った', 'で掴んだ'))
+        if suffix_spatial or has_earlier_actor or is_modifying_phrase:
+            return f'{chosen}'
         return f'{side}で{chosen}' if match.group('jp') else f'{chosen} with the {arm} hand'
     text = pattern.sub(bind, instruction)
     def table_reference(match):
