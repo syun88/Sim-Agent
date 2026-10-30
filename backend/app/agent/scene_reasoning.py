@@ -93,6 +93,23 @@ def bind_scene_references(instruction: str, state: dict) -> SceneBinding:
 
     # 照応・補集合・相対的手参照の解決
     cubes = sorted([o['id'] for o in objects.values() if o.get('type', 'cube') == 'cube'])
+
+    # 「右手でキューブを」「左手でキューブを」など、腕が指定されている無標キューブの解決
+    uncolored_hand_pattern = re.compile(r'(?P<arm>[左右])(?:手|腕)で(?P<cube>キューブ|ブロック|物体|物)(?=[をにへと、,\s])')
+    def bind_uncolored_hand(m):
+        arm = 'left' if m.group('arm') == '左' else 'right'
+        matched_cubes = [o['id'] for o in objects.values() if o.get('type', 'cube') == 'cube'
+                         and o['id'] not in held.values()
+                         and o['position'][1] * (1 if arm == 'left' else -1) > 0.02]
+        if len(matched_cubes) == 1:
+            chosen = matched_cubes[0]
+            decisions.append({
+                'kind': 'arm_reach_cube_binding', 'object': chosen, 'arm': arm,
+                'explanation': f'{m.group("arm")}手の作業域にある{chosen}を「{m.group()}」に対応付けました。'
+            })
+            return f'{m.group("arm")}手で{chosen}'
+        return m.group()
+    text = uncolored_hand_pattern.sub(bind_uncolored_hand, text)
     other_cube_pattern = re.compile(
         r'(?:もう(?:一つ|片方|1つ|1個)の|残りの|もう一方の)(?:キューブ|ブロック|物体|物)|\b(?:the\s+other|another)\s+cube\b', re.I)
     explicit_cubes = named_objects(text, state)

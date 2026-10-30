@@ -80,6 +80,18 @@ def test_placed_support_updates_projected_position_and_avoids_unnecessary_handov
     assert not any(s.skill == 'handover_object' and s.object == 'blue_cube' for s in plan.steps)
 
 
+def test_arm_specific_uncolored_cube_and_held_state_support_reference_are_grounded():
+    # User instruction: "右手でキューブを掴んでから、掴んでいる状態のキューブの上に赤いキューブを重ねて"
+    # 1. "右手でキューブ": since right arm is specified, pick the cube on the right (blue_cube)
+    # 2. "掴んでいる状態のキューブの上に": refers to the newly grasped support (blue_cube)
+    # 3. "赤いキューブを重ねて": red_cube is placed on blue_cube
+    plan = AgentPlanner().plan('右手でキューブを掴んでから、掴んでいる状態のキューブの上に赤いキューブを重ねて', WORLD)
+    actions = [(a['op'], a.get('object'), a.get('arm'), a.get('target'), a.get('relation'))
+               for a in plan.program['actions']]
+    assert actions[0][0] == 'pick' and actions[0][1] == 'blue_cube' and actions[0][2] == 'right'
+    assert actions[-1] == ('place', 'red_cube', 'left', 'blue_cube', 'on')
+
+
 def test_stack_on_held_cube_maintains_hold_and_places_directly_without_table_setdown():
     # User intent: "右手で持っている状態を維持したまま、そのキューブの上に左手で赤いキューブを重ねて"
     # When right arm is holding blue_cube, the robot should NOT drop or park blue_cube on the table,
