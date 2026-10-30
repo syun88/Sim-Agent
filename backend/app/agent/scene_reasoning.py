@@ -84,4 +84,58 @@ def bind_scene_references(instruction: str, state: dict) -> SceneBinding:
             'explanation':f'現在の物体位置から「{match.group()}」を{obj}に対応付けました。'})
         return obj
     text=re.sub(r'(?P<side>左|右)(?:側)?(?:にある|の)(?:方|ほう|やつ|物体|物|キューブ)',table_reference,text)
+
+    # 照応・補集合・相対的手参照の解決
+    cubes = sorted([o['id'] for o in objects.values() if o.get('type', 'cube') == 'cube'])
+    other_cube_pattern = re.compile(
+        r'(?:もう(?:一つ|片方|1つ|1個)の|残りの|もう一方の)(?:キューブ|ブロック|物体|物)|\b(?:the\s+other|another)\s+cube\b', re.I)
+    explicit_cubes = named_objects(text, state)
+    if other_cube_pattern.search(text) and len(cubes) >= 2:
+        if explicit_cubes:
+            first_cube = explicit_cubes[0]
+            remaining = [c for c in cubes if c != first_cube]
+            if len(remaining) == 1:
+                other_cube = remaining[0]
+                text = other_cube_pattern.sub(other_cube, text)
+                decisions.append({
+                    'kind': 'complement_cube_reference', 'object': other_cube,
+                    'explanation': f'指示の「もう一つのキューブ」を、未言及の{other_cube}に対応付けました。'
+                })
+        else:
+            # "キューブを、... もう一つのキューブを..." 対比構造
+            first_cube, other_cube = cubes[0], cubes[1]
+            text = other_cube_pattern.sub(other_cube, text)
+            unmarked_pattern = re.compile(r'(?<![赤青redbluetheotheranother\w])キューブ(?=[をにはへと、,\s])')
+            text = unmarked_pattern.sub(first_cube, text, count=1)
+            decisions.append({
+                'kind': 'unmarked_contrastive_resolution',
+                'object': first_cube, 'other_object': other_cube,
+                'explanation': f'未指定の2つのキューブ参照に対し、順に{first_cube}と{other_cube}を割り当てました。'
+            })
+
+    other_hand_pattern = re.compile(
+        r'(?:もう(?:一方|片方)の|反対の|逆の)(?:手|腕|アーム)|\b(?:the\s+other|opposite)\s+(?:hand|arm)\b', re.I)
+    if other_hand_pattern.search(text):
+        acting = None
+        if '左手' in text or '左腕' in text or 'left' in text.lower():
+            acting = 'left'
+        elif '右手' in text or '右腕' in text or 'right' in text.lower():
+            acting = 'right'
+        elif any(held.values()):
+            acting = next(arm for arm, obj in held.items() if obj)
+        opposite = 'right' if acting == 'left' else 'left' if acting == 'right' else None
+        if opposite is None and len(state.get('robot', {}).get('available_arms', ['left', 'right'])) == 2:
+            first_cube_id = named_objects(text, state)[0] if named_objects(text, state) else None
+            if first_cube_id:
+                pos = objects[first_cube_id].get('position')
+                prim_arm = 'left' if (pos and pos[1] >= 0) else 'right'
+                opposite = 'right' if prim_arm == 'left' else 'left'
+        if opposite:
+            side_str = '右手' if opposite == 'right' else '左手'
+            text = other_hand_pattern.sub(side_str, text)
+            decisions.append({
+                'kind': 'opposite_hand_reference', 'arm': opposite,
+                'explanation': f'指示の「もう一方の手」を、対向する{side_str}に対応付けました。'
+            })
+
     return SceneBinding(text, decisions)

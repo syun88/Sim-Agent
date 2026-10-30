@@ -80,6 +80,28 @@ def test_placed_support_updates_projected_position_and_avoids_unnecessary_handov
     assert not any(s.skill == 'handover_object' and s.object == 'blue_cube' for s in plan.steps)
 
 
+def test_referring_expressions_resolve_other_hand_and_other_cube():
+    # Instruction: "キューブを、もう一方の手に持たせて、そのキューブの上にもう一つのキューブを重ねて"
+    # The resolver must ground:
+    # 1. "キューブ": one candidate cube (e.g. red_cube)
+    # 2. "もう一方の手": the opposite hand
+    # 3. "そのキューブ": the first chosen cube as the support
+    # 4. "もう一つのキューブ": the remaining cube in the scene
+    # And execute with minimal orthogonal skills (no new ad-hoc skills)!
+    plan = AgentPlanner().plan('キューブを、もう一方の手に持たせて、そのキューブの上にもう一つのキューブを重ねて', WORLD)
+    actions = [(a['op'], a.get('object'), a.get('arm'), a.get('receiver'), a.get('target'), a.get('relation'))
+               for a in plan.program['actions']]
+    # Must involve both cubes in the scene
+    manipulated = {a[1] for a in actions if a[1]}
+    assert manipulated == {'red_cube', 'blue_cube'}
+    # The final action must place one cube on top of the other
+    last = actions[-1]
+    assert last[0] == 'place' and last[5] == 'on'
+    assert {last[1], last[4]} == {'red_cube', 'blue_cube'}
+    assert not any(c['type'] == 'holding' for c in plan.goal['checks'])
+    assert any(c['type'] == 'relative_placement' and c['relation'] == 'on' for c in plan.goal['checks'])
+
+
 def test_planner_error_reporting_preserves_instruction_grammar_failure_over_model_repair_syntax_error(monkeypatch):
     # Live failure c3d74b0f: grammar rejected an omitted hand in handover, but the user was told
     # "Relative motion requires a direction and distance (1–30 cm)" because the model guessed a bad move.

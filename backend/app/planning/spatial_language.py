@@ -66,14 +66,18 @@ def placement_references(text, state):
     # Resolve object-relative pronouns only from a unique antecedent in the preceding clause.
     # Never turn a lost support ('その上') into an unspecified table placement.
     # 'その左手' refers to a hand, not the left of an object.
-    pronouns = r'(?:その|それの)(?:' + '|'.join(JAPANESE.values()) + r')(?!手|腕|アーム|グリッパー|ハンド)'
+    pronouns = r'(?:その|それの)(?:(?:[ _-]*キューブ|物体|ブロック)(?:の)?)?(?:' + '|'.join(JAPANESE.values()) + r')(?!手|腕|アーム|グリッパー|ハンド)'
     for match in re.finditer(pronouns, text):
-        prefix = re.split(r'[、,;。.!！\n]', text[:match.start()])
-        previous = next((part for part in reversed(prefix) if part.strip()), '')
-        candidates = set(named_objects(previous, state))
+        clauses = [c for c in re.split(r'[、,;。.!！\n]', text[:match.start()]) if c.strip()]
+        candidates = set()
+        for clause in reversed(clauses):
+            found = set(named_objects(clause, state))
+            if found:
+                candidates = found
+                break
         if len(candidates) != 1:
             raise GroundingError('Unresolved object-relative reference: ' + match.group())
-        suffix = re.sub(r'^(?:その|それの)', '', match.group())
+        suffix = re.sub(r'^(?:その|それの)(?:(?:[ _-]*キューブ|物体|ブロック)(?:の)?)?', '', match.group())
         relation = next(key for key, pattern in JAPANESE.items() if re.fullmatch(pattern, suffix))
         references.append({'target':next(iter(candidates)), 'relation':relation, 'span':match.span()})
     return references
@@ -85,7 +89,7 @@ def resolve_relative_pronouns(text, state):
         start, end = ref['span']
         phrase = text[start:end]
         if phrase.startswith(('その', 'それの')):
-            suffix = re.sub(r'^(?:その|それの)', '', phrase)
+            suffix = re.sub(r'^(?:その|それの)(?:(?:[ _-]*キューブ|物体|ブロック)(?:の)?)?', '', phrase)
             text = text[:start] + ref['target'] + 'の' + suffix + text[end:]
     return text
 
