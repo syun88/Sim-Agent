@@ -80,6 +80,55 @@ def test_placed_support_updates_projected_position_and_avoids_unnecessary_handov
     assert not any(s.skill == 'handover_object' and s.object == 'blue_cube' for s in plan.steps)
 
 
+def test_in_hand_stacking_bimanually_stages_held_support_toward_center_workspace():
+    # User insight: "今回の場合、右腕をまんなからへんによせるひつようがあった"
+    # When support is held by right arm on the far right (y=-0.22), left arm cannot reach y=-0.22.
+    # The bimanual skill must autonomously stage the held support toward center workspace (y ≈ 0),
+    # enabling left arm to smoothly stack on it without reaching out of workspace bounds!
+    from backend.app.skills.robot_skills import SkillRunner
+    from types import SimpleNamespace
+    import numpy as np
+
+    target_pos = np.array([0.48, -0.22, 1.12])  # right arm holds cube on far right
+    placed_pos = np.array([0.44, 0.15, 1.12])   # left arm holds cube on left
+
+    moves = []
+    def mock_move(arm, target, rotation=None, **kwargs):
+        moves.append((arm, np.asarray(target).copy()))
+        if arm == 'right':
+            target_pos[:] = target[:3]
+        elif arm == 'left':
+            placed_pos[:] = target[:3]
+        return SimpleNamespace(success=True, final_position=list(target))
+
+    env = SimpleNamespace(
+        ee_pose=lambda side: (np.array([0.40, -0.22, 1.12]) if side == 'right' else np.array([0.40, 0.15, 1.12]), np.eye(3)),
+        object_pose=lambda name: (target_pos.copy() if name == 'blue_cube' else placed_pos.copy(), np.eye(3)),
+        object_bounds=lambda name: np.array([[target_pos[0]-.023, target_pos[1]-.023, target_pos[2]-.023],
+                                            [target_pos[0]+.023, target_pos[1]+.023, target_pos[2]+.023]]) if name == 'blue_cube' else np.array([[placed_pos[0]-.023, placed_pos[1]-.023, placed_pos[2]-.023], [placed_pos[0]+.023, placed_pos[1]+.023, placed_pos[2]+.023]]),
+        frame=lambda: SimpleNamespace(objects={'blue_cube': target_pos, 'red_cube': placed_pos}),
+        pinch_established=lambda obj, arm: (arm == 'right' and obj == 'blue_cube') or (arm == 'left' and obj == 'red_cube'),
+        object_linear_speed=lambda name: 0.0,
+        object_contacts=lambda name, arm=None: ['finger'],
+        step=lambda n: None,
+        timestep=0.002,
+        grasp_mode='physical-friction-pinch',
+    )
+    controller = SimpleNamespace(
+        motion_speed=6.,
+        target_rotations={},
+        move_to_site=mock_move,
+    )
+    skills = SkillRunner(env, controller)
+    # Execute move_to_object: left arm stacks red_cube on blue_cube held by right arm
+    result = skills.move_to_object('left', 'red_cube', 'blue_cube', 'on')
+    assert result['success']
+    # Check that right arm was commanded to stage blue_cube toward center (y ≈ 0)!
+    right_moves = [target for arm, target in moves if arm == 'right']
+    assert len(right_moves) > 0, "Right arm must stage the held support toward center"
+    assert abs(right_moves[-1][1]) < 0.05, f"Right arm should stage close to center line, got {right_moves[-1][1]}"
+
+
 def test_held_state_support_in_hand_stacking_never_places_support_on_table():
     # User instruction: "右手でキューブを掴んでから、掴んでいる状態のキューブの上に赤いキューブを重ねて"
     # Condition:
