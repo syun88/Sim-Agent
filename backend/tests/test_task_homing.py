@@ -102,6 +102,111 @@ def test_approach_recomputes_a_reachable_overflight_for_an_elevated_object():
     assert planning['approach_overfly_m']<.10
 
 
+def test_approach_searches_grasp_yaw_when_the_nominal_collision_route_is_blocked():
+    """Measured task 0347e1b4 attempt 2: placed red blocks blue's nominal right-hand route."""
+    from backend.app.control.motion import OpenArmV2Controller
+    from backend.app.skills.approach import cube_approach_frames, plan_cube_approach
+    from backend.app.simulation.openarm_v2.definition import GRASP_ROTATION,FINGERTIP_MIDPOINT
+    env,q,objects=_stack_environment()
+    q['right']=np.array([.0000271,-.0000299,.0000047,1.5707867,.0000001,-.0000016,-.0000003])
+    q['left']=np.array([.0068464,-.668628,.0894537,1.7181624,-.1766079,.7771122,-1.0942528])
+    objects['red_cube']=(np.array([.4603332877,-.2991182506,1.0309566259]),np.eye(3))
+    objects['blue_cube']=(np.array([.5,-.2199999988,1.0309567451]),np.eye(3))
+    env.arm_velocity_limits=lambda side:None
+    controller=OpenArmV2Controller(env,configure_motors=False)
+    center=objects['blue_cube'][0]
+    pinch=center-GRASP_ROTATION@FINGERTIP_MIDPOINT['right']
+    standoff=pinch-.06*(GRASP_ROTATION@np.array([0.,0.,-1.]))
+    nominal,why=plan_cube_approach(env,controller,'right','blue_cube',pinch,standoff,.10,1.24)
+    assert nominal is None and all(r['error']=='COLLISION_PATH' for r in why['rejected_routes'])
+    route,planning=plan_cube_approach(env,controller,'right','blue_cube',pinch,standoff,.10,1.24,
+        frames=cube_approach_frames('right',center,.06))
+    assert route is not None,planning
+    assert planning['grasp_yaw_deg'] == -60
+    assert planning['noncontact_clearance_m'] >= .020
+    assert len(route)>=4
+    assert planning['pinch_target'] != pinch.tolist()
+    assert all(r['error'] in {'COLLISION_PATH','IK_FAILURE'} for r in planning['rejected_routes'])
+
+
+def test_selected_approach_frame_survives_the_physical_hold_check(monkeypatch):
+    """A clear approach alone is not enough: the hold-verification lift must keep its frame."""
+    from scipy.spatial.transform import Rotation
+    from backend.app.skills.robot_skills import SkillRunner
+    from backend.app.simulation.openarm_v2.definition import GRASP_ROTATION,FINGERTIP_MIDPOINT
+    center=np.array([.5,-.22,1.031])
+    attitude=Rotation.from_euler('z',-45,degrees=True).as_matrix() @ GRASP_ROTATION
+    pinch=center-attitude@FINGERTIP_MIDPOINT['right']
+    ee=[np.array([.401,-.1535,1.12]),GRASP_ROTATION.copy()]
+    closed=[False]
+    motions=[]
+    def move(arm,target,rotation=None,**kwargs):
+        motions.append((np.asarray(rotation).copy(),kwargs.get('planned_joints')))
+        if kwargs.get('planned_joints') is not None:
+            assert kwargs.get('scale_speed') is False
+        target=np.asarray(target)
+        if closed[0]:
+            center[:]+=target-ee[0]
+        ee[0]=target.copy()
+        ee[1]=np.asarray(rotation).copy()
+        return SimpleNamespace(success=True,final_position=target.tolist())
+    env=SimpleNamespace(object_pose=lambda obj:(center.copy(),np.eye(3)),
+        frame=lambda:SimpleNamespace(objects={'blue_cube':center}),
+        ee_pose=lambda arm:(ee[0].copy(),ee[1].copy()),
+        pinch_established=lambda obj,arm:closed[0],
+        object_contacts=lambda obj,arm=None:[f'openarm_right_ee_{name}_finger|blue_cube'
+            for name in ('inner','outer')] if closed[0] else [],
+        grasp_mode='physical-friction-pinch',grasp_is_physical_contact=True)
+    controller=SimpleNamespace(motion_speed=6.,wait_gripper=lambda arm,value,seconds:closed.__setitem__(0,value),
+        move_to_site=move)
+    def admitted(*args,**kwargs):
+        assert any(frame['yaw_deg']==-45 and np.allclose(frame['pinch'],pinch)
+                   for frame in kwargs['frames'])
+        return [np.zeros(7),np.ones(7)],{
+            'grasp_yaw_deg':-45,'grasp_rotation':attitude.tolist(),'pinch_target':pinch.tolist()}
+    monkeypatch.setattr('backend.app.skills.approach.plan_cube_approach',admitted)
+    skills=SkillRunner(env,controller)
+    approached=skills.approach_object('right','blue_cube')
+    assert approached['success'],approached
+    assert np.allclose(approached['target'],pinch)
+    lifted=skills.grasp_object('right','blue_cube')
+    assert lifted['success'],lifted
+    assert all(np.allclose(rotation,attitude) for rotation,_ in motions)
+    assert motions[0][1] is not None
+    assert motions[1][1] is None
+
+
+def test_approach_stops_on_measured_displacement_during_the_trajectory(monkeypatch):
+    """Live task 57efa442 pushed two cubes 248 mm after a statically clear plan."""
+    from backend.app.skills.robot_skills import SkillRunner
+    from backend.app.simulation.openarm_v2.definition import GRASP_ROTATION,FINGERTIP_MIDPOINT
+    positions={'blue_cube':np.array([.5,-.22,1.031]),'red_cube':np.array([.46,-.30,1.031])}
+    pinch=positions['blue_cube']-GRASP_ROTATION@FINGERTIP_MIDPOINT['right']
+    def planned(*args,**kwargs):
+        return [np.zeros(7),np.ones(7)],{
+            'grasp_yaw_deg':-60,'grasp_rotation':GRASP_ROTATION.tolist(),
+            'pinch_target':pinch.tolist()}
+    monkeypatch.setattr('backend.app.skills.approach.plan_cube_approach',planned)
+    motions=[]
+    def move(arm,target,rotation,**kwargs):
+        motions.append(target)
+        assert callable(kwargs.get('on_sample'))
+        positions['blue_cube'][1]+=.006
+        kwargs['on_sample']()
+        raise AssertionError('the approach must stop when the cube moves')
+    env=SimpleNamespace(object_pose=lambda name:(positions[name].copy(),np.eye(3)),
+        frame=lambda:SimpleNamespace(objects=positions),
+        ee_pose=lambda arm:(np.array([.401,-.1535,1.12]),GRASP_ROTATION.copy()),
+        pinch_established=lambda *a:False)
+    controller=SimpleNamespace(motion_speed=6.,wait_gripper=lambda *a:None,move_to_site=move)
+    result=SkillRunner(env,controller).approach_object('right','blue_cube')
+    assert len(motions)==1
+    assert not result['success'] and result['error']=='APPROACH_COLLISION'
+    assert result['evidence']['object']=='blue_cube'
+    assert result['evidence']['grasp_yaw_deg']==-60
+    assert result['evidence']['displacement_m']>=.006-.000001
+
+
 def test_completion_homing_preserves_objects_and_does_not_release_requested_hold():
     state={'objects':[{'id':'blue_cube','position':[.44,.15,1.08]}],
         'robot':{'available_arms':['left','right'],'left_arm':{'held_object':None},'right_arm':{'held_object':'blue_cube'}}}

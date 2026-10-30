@@ -37,7 +37,8 @@ class OfficialArmKinematics:
                 self._linear[:, self._dofs].copy(), self._angular[:, self._dofs].copy())
 
     def empty_arm_path_is_clear(self, waypoints, objects, resolution=.025, *, allowed_contacts=None, curve=None,
-                                minimum_object_clearance=0., allow_clearance_exit=False):
+                                minimum_object_clearance=0., allow_clearance_exit=False,
+                                object_clearances=None):
         """Screen joint segments against the current scene in private FK data.
 
         Only geometric queries are performed. Free object joints are unnamed in
@@ -77,6 +78,7 @@ class OfficialArmKinematics:
             samples = curve(np.unique(np.r_[np.linspace(0.,1.,max(30,2*len(samples))),curve.x]))
         names = [mj.mj_id2name(model,mj.mjtObj.mjOBJ_BODY,int(b)) or '' for b in model.geom_bodyid]
         allowed_contacts = allowed_contacts or {}
+        object_clearances = object_clearances or {}
         prop_geoms = [i for i,name in enumerate(names) if name in objects]
         moving_geoms = np.flatnonzero(moving)
         initial_gaps = {}
@@ -84,9 +86,13 @@ class OfficialArmKinematics:
             data.qpos[self._positions] = waypoints[0]
             mj.mj_kinematics(model,data)
             for prop in prop_geoms:
+                clearance = object_clearances.get(names[prop], minimum_object_clearance)
                 for geom in moving_geoms:
-                    gap = mj.mj_geomDistance(model,data,int(geom),prop,minimum_object_clearance,None)
-                    initial_gaps[int(geom),prop] = min(minimum_object_clearance,max(0.,gap-.0001))
+                    if (names[prop] in allowed_contacts.get(names[int(geom)],set())
+                            or names[int(geom)] in allowed_contacts.get(names[prop],set())):
+                        continue
+                    gap = mj.mj_geomDistance(model,data,int(geom),prop,clearance,None)
+                    initial_gaps[int(geom),prop] = min(clearance,max(0.,gap-.0001))
         for index,joints in enumerate(samples):
             data.qpos[self._positions] = joints
             mj.mj_kinematics(model, data)
@@ -95,11 +101,14 @@ class OfficialArmKinematics:
                 # Endpoint tolerance and dynamic tracking need positive room,
                 # not merely the absence of nominal mesh penetration.
                 for prop in prop_geoms:
+                    clearance = object_clearances.get(names[prop], minimum_object_clearance)
                     nearby = moving_geoms[np.linalg.norm(data.geom_xpos[moving_geoms]-data.geom_xpos[prop],axis=1)
-                        < model.geom_rbound[moving_geoms]+model.geom_rbound[prop]+minimum_object_clearance]
-                    if any(mj.mj_geomDistance(model,data,int(g),prop,minimum_object_clearance,None)
-                           < (initial_gaps.get((int(g),prop),minimum_object_clearance)
-                              if index<len(samples)-1 else minimum_object_clearance) for g in nearby):
+                        < model.geom_rbound[moving_geoms]+model.geom_rbound[prop]+clearance]
+                    if any(mj.mj_geomDistance(model,data,int(g),prop,clearance,None)
+                           < (initial_gaps.get((int(g),prop),clearance)
+                              if index<len(samples)-1 else clearance)
+                           for g in nearby if not (names[prop] in allowed_contacts.get(names[int(g)],set())
+                               or names[int(g)] in allowed_contacts.get(names[prop],set()))):
                         return False
             for contact in data.contact:
                 if contact.dist >= -.0005 or not any(moving[int(g)] for g in contact.geom):

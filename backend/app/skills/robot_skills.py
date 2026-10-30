@@ -154,9 +154,10 @@ class SkillRunner:
         before = obj_pos.copy()
         # Reject an unreachable pinch before starting the approach. Faster
         # staging must not turn an invalid target into a later contact failure.
-        pinch_q, _, _ = self.controller.solve_ik(arm, pinch, GRASP_ROTATION)
-        if pinch_q is None:
-            raise SkillError("IK_FAILURE", "The requested fingertip pinch pose is unreachable")
+        if not obj.endswith('_cube'):
+            pinch_q, _, _ = self.controller.solve_ik(arm, pinch, GRASP_ROTATION)
+            if pinch_q is None:
+                raise SkillError("IK_FAILURE", "The requested fingertip pinch pose is unreachable")
         # 1) open the gripper
         self.controller.wait_gripper(arm, False, 0.35)
         # 2) rise to the staging altitude above the current pose, so the lateral swing that
@@ -176,24 +177,50 @@ class SkillRunner:
         if obj != "wine_bottle":
             waypoints += (("pregrasp_high", high), ("pregrasp", standoff), ("pinch", pinch))
         approach_evidence = {}
+        stationary = {name:self.env.object_pose(name)[0].copy() for name in self.env.frame().objects}
+        initial_joints = ({side:self.env.arm_qpos(side).tolist() for side in ('left','right')}
+                          if hasattr(self.env,'arm_qpos') else None)
+        def guard_undisturbed():
+            for name,position in stationary.items():
+                displacement=float(np.linalg.norm(self.env.object_pose(name)[0]-position))
+                if displacement > APPROACH_DISTURBANCE_TOLERANCE:
+                    error=SkillError('APPROACH_COLLISION',
+                        f'Approach displaced {name} by {displacement * 1000:.1f} mm; stopping the arm')
+                    error.evidence={**approach_evidence,'object':name,'displacement_m':displacement,
+                                    'initial_object_positions':{key:value.tolist() for key,value in stationary.items()},
+                                    'observed_object_positions':{key:self.env.object_pose(key)[0].tolist()
+                                                                 for key in stationary},
+                                    'initial_arm_joints':initial_joints,'phase':'approach_trajectory'}
+                    raise error
         if obj.endswith('_cube'):
-            from backend.app.skills.approach import plan_cube_approach
+            from backend.app.skills.approach import cube_approach_frames, plan_cube_approach
+            frames = cube_approach_frames(arm, obj_pos + shift, APPROACH_STANDOFF,
+                                          world_x_offset=fault_offset)
             route,approach_evidence=plan_cube_approach(self.env,self.controller,arm,obj,pinch,standoff,
-                                                       APPROACH_OVERFLY,STAGING_ALTITUDE)
+                                                       APPROACH_OVERFLY,STAGING_ALTITUDE,frames=frames)
             if route is None:
-                error=SkillError('IK_FAILURE','No reachable collision-screened cube approach from the current scene')
+                rejected=approach_evidence.get('rejected_routes',[])
+                category='COLLISION_PATH' if rejected and all(r['error']=='COLLISION_PATH' for r in rejected) else 'IK_FAILURE'
+                error=SkillError(category,'No reachable collision-screened cube approach in the bounded grasp-frame search')
                 error.evidence=approach_evidence
                 raise error
-            destinations=[('pinch',pinch)]
+            destinations=[('pinch',np.asarray(approach_evidence['pinch_target']))]
         else:
             destinations = waypoints if self.controller.motion_speed == 1. else [waypoints[-1]]
         for name, target in destinations:
             via = [point for _, point in waypoints[:-1]] if self.controller.motion_speed != 1. and not approach_evidence else None
-            result = self.controller.move_to_site(arm, target, progress=progress, via=via,
-                                                  planned_joints=route if approach_evidence else None)
+            result = self.controller.move_to_site(arm, target,
+                                                  np.asarray(approach_evidence['grasp_rotation']) if approach_evidence else None,
+                                                  progress=progress, via=via,
+                                                  planned_joints=route if approach_evidence else None,
+                                                  scale_speed=not approach_evidence or approach_evidence['grasp_yaw_deg']==0,
+                                                  on_sample=guard_undisturbed)
+            guard_undisturbed()
             if not result.success:
-                raise SkillError(result.error or "IK_FAILURE", f"Unable to reach the {name} pose "
+                error=SkillError(result.error or "IK_FAILURE", f"Unable to reach the {name} pose "
                                  f"(position error={result.position_error}, rotation error={result.rotation_error})")
+                error.evidence=approach_evidence
+                raise error
         after = self.env.object_pose(obj)[0]
         disturbance = float(np.linalg.norm(after - before))
         if disturbance > APPROACH_DISTURBANCE_TOLERANCE:
@@ -201,9 +228,10 @@ class SkillRunner:
                 "APPROACH_COLLISION",
                 f"The approach displaced {obj} by {disturbance * 1000:.1f} mm",
             )
-        midpoint_error = float(np.linalg.norm(after - (self.env.ee_pose(arm)[0] + GRASP_ROTATION @ FINGERTIP_MIDPOINT[arm])))
+        ee, measured_rotation = self.env.ee_pose(arm)
+        midpoint_error = float(np.linalg.norm(after - (ee + measured_rotation @ FINGERTIP_MIDPOINT[arm])))
         return {
-            "target": pinch.tolist(),
+            "target": destinations[-1][1].tolist(),
             "final": result.final_position,
             "fingertip_midpoint_error": midpoint_error,
             "object_displacement": disturbance,
@@ -233,6 +261,7 @@ class SkillRunner:
         # 5) verify the hold physically: a short lift must carry the object with the gripper
         ee_position = self.env.ee_pose(arm)[0]
         lift = self.controller.move_to_site(arm, ee_position + np.array([0.0, 0.0, VERIFICATION_LIFT]),
+                                            self.env.ee_pose(arm)[1],
                                             duration=.8 if obj == "wine_bottle" else None)
         if not lift.success:
             raise SkillError(lift.error or "IK_FAILURE", "The hold-verification lift failed")
