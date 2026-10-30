@@ -535,6 +535,15 @@ class SkillRunner:
         start = self.env.object_pose(obj)[0].copy()
         target, commanded_rotation, offset = self._carry_aim(arm, obj, desired, attitude=attitude)
         aim = rotation if commanded_rotation is None else commanded_rotation
+        stationary = {name: self.env.object_pose(name)[0].copy()
+                      for name in self.env.frame().objects if name != obj}
+        def guard_carry():
+            self._require_hold(arm, obj)
+            for name, position in stationary.items():
+                displacement = float(np.linalg.norm(self.env.object_pose(name)[0] - position))
+                if displacement > APPROACH_DISTURBANCE_TOLERANCE:
+                    raise SkillError("CARRY_COLLISION",
+                                     f"Carrying {obj} disturbed resting {name} by {displacement * 1000:.1f} mm; stopping")
         # Keep the carried cube on a Cartesian clearance path. A joint interpolation
         # between two high endpoints can still dip the palm through a table object.
         count = max(1, int(np.ceil(np.linalg.norm(np.asarray(desired) - start) / .025)))
@@ -542,10 +551,10 @@ class SkillRunner:
                for alpha in np.linspace(0., 1., count + 1)[1:-1]]
         if self.controller.motion_speed == 1.:
             for waypoint in via:
-                result = self.controller.move_to_site(arm, waypoint, commanded_rotation)
+                result = self.controller.move_to_site(arm, waypoint, commanded_rotation, on_sample=guard_carry)
                 if not result.success:
                     raise SkillError(result.error or "IK_FAILURE", "Cartesian carry was blocked")
-                self._require_hold(arm, obj)
+                guard_carry()
             via = []
         # An imported arm with fewer than six joints is carried along a planner-solved path: its own
         # solver cannot reach the wind-up candidates the planner accepts (see ``_planned_carry``).
@@ -559,10 +568,11 @@ class SkillRunner:
         for attempt in range(3):
             if attempt == 1 and planned is not None:
                 result = self.controller.move_to_site(arm, target, planned[1], planned_joints=planned[0],
-                                                      on_sample=lambda: self._require_hold(arm, obj))
+                                                      on_sample=guard_carry)
             else:
                 result = self.controller.move_to_site(arm, target, commanded_rotation,
-                    via=via if attempt == 0 else None, on_sample=lambda: self._require_hold(arm, obj))
+                    via=via if attempt == 0 else None, on_sample=guard_carry)
+            guard_carry()
             if not result.success:
                 # The controller's own solve failing is what the planner-solved path is for: without this
                 # the fallback sits behind a raise that never lets it run (measured: the residuals were

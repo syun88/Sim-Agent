@@ -711,6 +711,10 @@ class AgentPlanner:
                     if fallback:
                         # When the explicit grammar understood the ENTIRE request, the model
                         # may not drop a handover, swap a colour, or change an explicit arm.
+                        fallback_preps = (fallback.planning_evidence or {}).get('preparations', [])
+                        candidate_preps = (candidate.planning_evidence or {}).get('preparations', [])
+                        if fallback_preps and not candidate_preps and len(program.actions) > len(fallback_source.actions):
+                            raise GroundingError("Model invented explicit setdown actions bypassing canonical preparation")
                         def signature(p):
                             # Compare physical intentions after compilation. 'Pick then
                             # hand over' and an auto-acquiring handover are equivalent;

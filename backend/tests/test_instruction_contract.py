@@ -80,6 +80,50 @@ def test_placed_support_updates_projected_position_and_avoids_unnecessary_handov
     assert not any(s.skill == 'handover_object' and s.object == 'blue_cube' for s in plan.steps)
 
 
+def test_carry_guard_stops_on_disturbing_stationary_cube():
+    # If carrying an object bumps or displaces another resting table object,
+    # the carry skill must immediately raise CARRY_COLLISION and stop.
+    import numpy as np
+    from backend.app.skills.robot_skills import SkillRunner, SkillError
+    from types import SimpleNamespace
+    positions = {'red_cube': np.array([.44, .15, 1.15]), 'blue_cube': np.array([.46, -.20, 1.031])}
+    held_obj = 'red_cube'
+    def move(arm, target, rotation, **kwargs):
+        assert callable(kwargs.get('on_sample'))
+        # Simulate physical disturbance: bumping the stationary blue_cube
+        positions['blue_cube'][1] += .008
+        kwargs['on_sample']()
+        return SimpleNamespace(success=True, final_position=target.tolist())
+    env = SimpleNamespace(
+        object_pose=lambda name: (positions[name].copy(), np.eye(3)),
+        frame=lambda: SimpleNamespace(objects=positions),
+        ee_pose=lambda arm: (np.array([.40, .15, 1.15]), np.eye(3)),
+        pinch_established=lambda *a: True,
+        profile={},
+    )
+    controller = SimpleNamespace(
+        motion_speed=6., target_rotations={}, move_to_site=move, timestep=.002
+    )
+    skills = SkillRunner(env, controller)
+    with pytest.raises(SkillError) as err:
+        skills._carry_to('left', 'red_cube', np.array([.44, -.10, 1.15]))
+    assert err.value.category == 'CARRY_COLLISION'
+    assert 'blue_cube' in str(err.value)
+
+
+def test_sequential_different_arms_autonomously_parks_empty_arm_to_prevent_self_collision():
+    # When left arm finishes placing an object and right arm begins working,
+    # the planner must autonomously schedule park_empty_arm for left arm BEFORE
+    # right arm enters the workspace, preventing arm-to-arm self-collision.
+    plan = AgentPlanner().plan('赤いキューブを左手で左においてから、青いキューブを右手で右において', WORLD)
+    skills = [s.skill for s in plan.steps]
+    assert 'park_empty_arm' in skills
+    left_release_idx = next(i for i, s in enumerate(plan.steps) if s.skill == 'release_object' and s.arm == 'left')
+    right_approach_idx = next(i for i, s in enumerate(plan.steps) if s.skill == 'approach_object' and s.arm == 'right')
+    park_idx = next(i for i, s in enumerate(plan.steps) if s.skill == 'park_empty_arm' and s.arm == 'left')
+    assert left_release_idx < park_idx < right_approach_idx
+
+
 def test_handover_geometry_adapts_to_measured_cube_location():
     # Adaptive workspace: cube at x=0.49 should not be violently dragged to x=0.44.
     # The solver adapts the coupled handover location to the measured cube position.

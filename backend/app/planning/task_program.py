@@ -393,6 +393,12 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             for skill, args in (movement, ("release_object", {"object": obj}), ("retreat", {})):
                 emit(skill, arm, index, **args)
             held[arm] = None
+            # If a subsequent action uses a different arm, park the newly empty arm
+            # to clear the shared workspace and prevent arm-to-arm self-collision.
+            next_action = program.actions[index + 1] if index + 1 < len(program.actions) else None
+            next_arm = (next_action.arm or (auto_arm(next_action.object) if next_action.object else None)) if next_action else None
+            if next_arm and next_arm != arm and held[arm] is None:
+                emit("park_empty_arm", arm, index)
             checks[obj] = {"type": "relative_placement" if action.relation else "placement", "object": obj, "target": target}
             if action.relation:
                 checks[obj].update(relation=action.relation, distance_cm=action.distance_cm, arm=arm)
