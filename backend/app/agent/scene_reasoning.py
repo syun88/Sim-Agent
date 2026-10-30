@@ -30,9 +30,9 @@ def bind_scene_references(instruction: str, state: dict) -> SceneBinding:
     objects = {o['id']:o for o in state['objects']}
     decisions = []
     pattern = re.compile(
-        r'(?P<jp>左|右)(?:手|腕)(?:にある|の|で持って(?:いる|る)|に持って(?:いる|る))'
+        r'(?P<jp>左|右)(?:手|腕)(?:にある|の|で(?:持って|掴んで|つかんで|握って|保持して)(?:いる|る)?|に(?:持って|持たせて|掴んで|つかんで|握って|保持して)(?:いる|る)?)'
         r'(?P<object>(?:(?:赤|青)(?:い|の)?\s*|(?:red|blue)\s+)?(?:キューブ|ブロック|物体|物|cube))'
-        r'|(?:the\s+)?(?P<enobject>(?:(?:blue|red)\s+)?cube)\s+in\s+(?:your|the)\s+(?P<en>left|right)\s+(?:hand|gripper)', re.I)
+        r'|(?:the\s+)?(?P<enobject>(?:(?:blue|red)\s+)?cube)\s+(?:in|held\s+by)\s+(?:your|the)\s+(?P<en>left|right)\s+(?:hand|gripper|arm)', re.I)
     def bind(match):
         arm = match.group('en') or ('left' if match.group('jp')=='左' else 'right')
         arm = arm.lower()

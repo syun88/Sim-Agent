@@ -80,6 +80,35 @@ def test_placed_support_updates_projected_position_and_avoids_unnecessary_handov
     assert not any(s.skill == 'handover_object' and s.object == 'blue_cube' for s in plan.steps)
 
 
+@pytest.mark.parametrize('phrase', [
+    '右手で掴んでいるキューブの上に赤いキューブを重ねて',
+    '右手でつかんでいるキューブの上に赤いキューブを重ねて',
+    '右手で握っているキューブの上に赤いキューブを重ねて',
+    '右手で保持しているキューブの上に赤いキューブを重ねて',
+    'put the red cube on top of the cube held by the right hand',
+])
+def test_held_cube_reference_with_tsukandeiru_and_nigitteiru_is_grounded_and_stacked(phrase):
+    # User instruction: "右手で掴んでいるキューブの上に赤いキューブを重ねて"
+    # When right arm is holding blue_cube:
+    # 1. "右手で掴んでいるキューブ" must resolve to blue_cube
+    # 2. Preparation grounds blue_cube onto table as stationary support
+    # 3. red_cube is stacked on top of blue_cube
+    state = {
+        'objects': [{'id': 'red_cube', 'type': 'cube', 'position': [0.44, 0.15, 1.031]},
+                    {'id': 'blue_cube', 'type': 'cube', 'position': [0.40, -0.15, 1.12]}],
+        'targets': [],
+        'robot': {'available_arms': ['left', 'right'],
+                  'left_arm': {'held_object': None},
+                  'right_arm': {'held_object': 'blue_cube'}}
+    }
+    plan = AgentPlanner().plan(phrase, state)
+    actions = [(a['op'], a.get('object'), a.get('target'), a.get('relation')) for a in plan.program['actions']]
+    assert actions[0] == ('place', 'blue_cube', 'right_side', None)
+    assert actions[-1] == ('place', 'red_cube', 'blue_cube', 'on')
+    assert any(c['type'] == 'relative_placement' and c['object'] == 'red_cube' and c['target'] == 'blue_cube'
+               for c in plan.goal['checks'])
+
+
 def test_carry_guard_stops_on_disturbing_stationary_cube():
     # If carrying an object bumps or displaces another resting table object,
     # the carry skill must immediately raise CARRY_COLLISION and stop.
