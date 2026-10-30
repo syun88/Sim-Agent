@@ -20,6 +20,10 @@
 <p class="muted">元のメッシュを参照し、机のシーン・関節構成・IK設定を生成します。</p></details>
 <div id="jointControls" class="row" hidden><select id="jointSelect" aria-label="関節"></select><input id="jointAngle" type="number" value="5" step="1" aria-label="目標角度" style="width:75px">度 <button id="moveJoint">関節を動かす</button></div>
 </section>
+<section class="panel"><h2>LLM MODEL</h2>
+<div class="row"><select id="modelSelect" aria-label="推論モデル"></select><button id="switchModel">モデルを切り替える</button></div>
+<p id="modelInfo" class="muted">ローカル推論モデル（Ollama）</p>
+</section>
 <section class="panel"><label for="instruction">やってほしいこと</label>
 <textarea id="instruction" maxlength="2000">右手で青いキューブを取って左手に渡して左側の赤いキューブの上に乗せて</textarea>
 <div class="row examples" id="examples"></div>
@@ -87,5 +91,7 @@ $('switchRobot').onclick=async()=>{busy(true);status('ロボットと作業シ�
 $('moveJoint').onclick=()=>{$('instruction').value=`${$('jointSelect').value} を ${$('jointAngle').value} 度にして`;submit();};
 $('execute').onclick=submit;$('stop').onclick=async()=>{if(currentTaskId){await request(`/api/tasks/${currentTaskId}/stop`,{method:'POST'});status('停止を要求しました。');}};$('reset').onclick=()=>reset(false);$('randomize').onclick=()=>reset(true);
 for(const [label,text] of [['赤の上に重ねる','右手で青いキューブを取って左手に渡して左側の赤いキューブの上に乗せて'],['上に投げる','右手で青いキューブを上に投げて'],['ワインを注ぐ','ワインをグラスに20ml注いで'],['まず掴む','右手で青いキューブを掴んで'],['受け渡して置く','右手で青を取って左手に渡して左側に置く'],['2つを順番に置く','赤を青いゾーンに置いて、青を緑のゾーンに置いて'],['曖昧な指示','青いやつを右で拾って、空いてるほうの手にパスして、そっちの端に置いといて']]){const b=document.createElement('button');b.textContent=label;b.onclick=()=>{$('instruction').value=text;};$('examples').append(b);}
-loadRobots();refresh();setInterval(refresh,1500);
+async function loadModels(){try{const res=await request('/api/config/models');$('modelSelect').replaceChildren();for(const name of res.available){const o=document.createElement('option');o.value=name;o.textContent=name;if(name===res.current)o.selected=true;$('modelSelect').append(o);}$('modelInfo').textContent=`現在選択中: ${res.current}`;}catch(e){console.error(e);}}
+$('switchModel').onclick=async()=>{const chosen=$('modelSelect').value;try{await request('/api/config/model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:chosen})});status(`モデルを ${chosen} に切り替えました。`,'ok');await loadModels();}catch(e){status(e.message,'bad');}};
+loadRobots();loadModels();refresh();setInterval(refresh,1500);
 </script></body></html>

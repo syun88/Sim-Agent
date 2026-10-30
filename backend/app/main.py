@@ -314,6 +314,35 @@ def physics_evaluate(request: dict):
         raise HTTPException(status_code=400, detail=str(error)) from None
 
 
+@app.get('/api/config/models')
+def list_models():
+    """List available local models from Ollama and the currently active model."""
+    import urllib.request, json
+    current = os.getenv('OPENARM_OLLAMA_MODEL', 'qwen2.5:3b').strip()
+    available = []
+    try:
+        req = urllib.request.Request('http://127.0.0.1:11434/api/tags')
+        with urllib.request.urlopen(req, timeout=2) as res:
+            data = json.load(res)
+            available = [m['name'] for m in data.get('models', [])]
+    except Exception:
+        available = [current]
+    if current not in available:
+        available.insert(0, current)
+    return {'current': current, 'available': available}
+
+
+@app.post('/api/config/model')
+def set_model(request: dict):
+    model_name = request.get('model', '').strip()
+    if not model_name:
+        raise HTTPException(status_code=400, detail='Model name is required')
+    os.environ['OPENARM_OLLAMA_MODEL'] = model_name
+    if hasattr(app.state, 'viewer') and isinstance(app.state.viewer, dict):
+        app.state.viewer['model'] = model_name
+    return {'status': 'ok', 'selected_model': model_name}
+
+
 @app.get('/api/config/status')
 def config_status():
     # Report the planner's own switches. Without them an operator cannot tell a request that used the
