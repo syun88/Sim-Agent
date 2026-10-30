@@ -65,6 +65,24 @@ def missing_obligations(instruction: str, plan) -> list[str]:
     return [skill for skill, pattern in _OBLIGATIONS if pattern.search(instruction) and skill not in skills]
 
 
+def grounded_recovery_reason(decision: str, failure: dict, raw_reason: str | None = None) -> str:
+    category = failure.get('category') or 'TASK_FAILURE'
+    explanations = {
+        'resume': f'{category}の後、成立済みの配置・保持を維持し、残りの未完了手順を継続します。',
+        'recover_in_place': f'{category}を受け、接触のない空の腕を退避・初期化し、同じ配置から再計画します。',
+        'alternate_arm': f'{category}のため、未指定だった把持手をもう一方の利用可能な腕に切り替えて再試行します。',
+        'replan': f'{category}の測定値に基づき、新しい動作計画を作成して再試行します。',
+        'reset_and_retry': f'{category}により机上での継続が困難なため、シーンを初期化して再試行します。',
+    }
+    base = explanations.get(decision, f'{category}から復旧します。')
+    if raw_reason and isinstance(raw_reason, str):
+        cleaned = raw_reason.strip()
+        unsupported = ('握力', '力不足', '壊れ', '故障', 'カメラ', '見えない', '滑り落ちた', '重すぎ', 'パワー')
+        if not any(w in cleaned for w in unsupported) and len(cleaned) < 100:
+            return f"{base} ({cleaned})"
+    return base
+
+
 def compact_scene(state: dict) -> dict:
     """The part of a world state a planner needs: what exists, where it is, what the hands hold, what the
     robot can do. Everything else is evidence for verification, not context for choosing a skill."""
@@ -438,9 +456,11 @@ class AgentPlanner:
             assessment = self._extract_json(self._complete(messages,schema,timeout=12.,max_tokens=450))
             if assessment.get('decision') not in legal_actions or not isinstance(assessment.get('reason'),str):
                 raise ValueError('Invalid recovery choice')
-            return {**assessment,'provider':self.configured_provider,'monitor':verdict}
+            reason = grounded_recovery_reason(assessment['decision'], failure, assessment.get('reason'))
+            return {**assessment, 'reason': reason, 'provider': self.configured_provider, 'monitor': verdict}
         except Exception:
-            return {'decision':legal_actions[0],'reason':'モデルによる復旧案を検証できないため、観測状態と実行条件から復旧します。',
+            reason = grounded_recovery_reason(legal_actions[0], failure, None)
+            return {'decision':legal_actions[0],'reason':reason,
                     'provider':'deterministic_fallback','provider_error':'RECOVERY_REASONING_UNAVAILABLE',
                     'monitor':verdict}
 
@@ -738,9 +758,14 @@ class AgentPlanner:
             # fallback_verdict. Without this a scene the solver could not satisfy was reported as
             # "instruction not understood", which points a reader at the wrong component.
             model_detail = self._repair_feedback if use_ai else None
-            detail = str(model_detail or fallback_error or provider_error)
-            if model_detail and fallback_error and fallback_error.startswith('ROBOT_CAPABILITY:'):
-                detail = fallback_error + '; model repair rejected: ' + str(model_detail)
+            if model_detail and model_detail.startswith("model provider"):
+                detail = model_detail
+            elif fallback_error and model_detail:
+                detail = f"{fallback_error}; model repair rejected: {model_detail}"
+            elif model_detail:
+                detail = str(model_detail)
+            else:
+                detail = str(fallback_error or provider_error)
             if "ROBOT_CAPABILITY:" in detail:
                 category = "ROBOT_CAPABILITY"
             elif detail.startswith("GOAL_UNREACHABLE"):

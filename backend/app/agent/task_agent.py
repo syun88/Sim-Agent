@@ -11,7 +11,7 @@ import time
 
 from backend.app.agent.scene_reasoning import SceneReferenceError, bind_scene_references
 from backend.app.agent.recovery_policy import reset_evidence
-from backend.app.planning.agent_planner import PlannerProviderError
+from backend.app.planning.agent_planner import PlannerProviderError, grounded_recovery_reason
 from backend.app.planning.preparation import compile_prepared_program
 from backend.app.planning.spatial_language import preservation_spans
 from backend.app.planning.task_program import GroundingError, TaskProgram
@@ -247,7 +247,10 @@ class TaskAgent:
                  'completed_action_prefix':prefix,'attempt':iteration+1,'resets':resets,
                  'evidence_id':failure_receipt['id'],'failure_observation':deepcopy(failure_receipt)},legal)
             if assessment.get('decision') not in legal:
-                assessment = {'decision':legal[0],'reason':'観測状態で実行可能な復旧手順を選びます。','provider':'deterministic_fallback'}
+                default_reason = grounded_recovery_reason(legal[0], {'category': category, 'detail': failed.get('detail')})
+                assessment = {'decision': legal[0], 'reason': default_reason, 'provider': 'deterministic_fallback'}
+            else:
+                assessment['reason'] = grounded_recovery_reason(assessment['decision'], {'category': category, 'detail': failed.get('detail')}, assessment.get('reason'))
             if should_stop and should_stop():
                 result.update(success=False,status='STOPPED')
                 return finish(result)

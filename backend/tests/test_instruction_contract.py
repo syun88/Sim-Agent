@@ -80,6 +80,24 @@ def test_placed_support_updates_projected_position_and_avoids_unnecessary_handov
     assert not any(s.skill == 'handover_object' and s.object == 'blue_cube' for s in plan.steps)
 
 
+def test_planner_error_reporting_preserves_instruction_grammar_failure_over_model_repair_syntax_error(monkeypatch):
+    # Live failure c3d74b0f: grammar rejected an omitted hand in handover, but the user was told
+    # "Relative motion requires a direction and distance (1–30 cm)" because the model guessed a bad move.
+    # The reported error must retain the human instruction's actual deficit, not only the model's syntax error.
+    planner = AgentPlanner()
+    planner.enabled = planner.local_enabled = True
+    planner.capability_mode = True
+    monkeypatch.setattr(planner, '_ai_plan', lambda *args: {
+        'payload': {'actions': [{'op': 'move', 'object': 'red_cube'}]},
+        'raw': 'unmeasured move'})
+    state = {**WORLD, 'robot': {'available_arms': ['left']}} # only 1 arm, so handover fails
+    with pytest.raises(PlannerProviderError) as error:
+        planner.plan('赤いキューブを手に渡して', state)
+    msg = str(error.value)
+    assert 'handover needs two different hands' in msg
+    assert 'model repair rejected' in msg
+
+
 def test_invalid_model_move_cannot_hide_grounded_unspecified_handover(monkeypatch):
     planner=AgentPlanner()
     planner.enabled=planner.local_enabled=True

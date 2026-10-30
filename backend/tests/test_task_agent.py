@@ -114,6 +114,28 @@ def postconditions(monkeypatch):
                         lambda *a,**k:{'success':True,'failure_category':None})
 
 
+def test_recovery_trace_grounds_explanation_and_rejects_model_confabulation(world,postconditions):
+    # Live defect: model guessed "left hand lacked two-finger pinch strength" which is confabulation.
+    # The recovery explanation in trace must be grounded in actual measured failure facts.
+    def failed_handover(executor, plan):
+        return {'success': False, 'status': 'FAILED', 'skills': [{
+            'skill': 'handover_object', 'success': False, 'error': 'HANDOVER_NO_RECEIVER_PINCH', 'action_index': 0,
+            'evidence': {'rejected_routes': []}}],
+            'verification': {'success': False, 'failure_category': 'HANDOVER_NO_RECEIVER_PINCH'}}
+    executor = FakeExecutor(world, [failed_handover, True])
+    executor.env.object_contacts = lambda *a, **k: []
+    planner = AgentPlanner()
+    # A model that confabulates an unobserved mechanical failure:
+    fake_recovery = lambda *args: {'decision': 'recover_in_place', 'reason': '左の手が青いキューブを受けるための二本指の握力を持てなかったためです'}
+    result = TaskAgent(executor, planner, recovery_call=fake_recovery).run('青いキューブを右手に渡して')
+    assert result['success']
+    # Check trace explanations
+    recover_desc = next(d['explanation'] for d in result['agent_trace'] if d.get('kind') == 'recover_in_place')
+    assert 'HANDOVER_NO_RECEIVER_PINCH' in recover_desc
+    assert '握力' not in recover_desc
+    assert '接触のない空の腕を退避' in recover_desc
+
+
 def test_failed_attempt_is_retained_after_in_place_recovery(world,postconditions):
     executor=FakeExecutor(world,[False,True])
     result=TaskAgent(executor,AgentPlanner()).run('青いキューブを掴んで')
