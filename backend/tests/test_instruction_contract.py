@@ -201,6 +201,81 @@ def test_sequential_different_arms_autonomously_parks_empty_arm_to_prevent_self_
     assert left_release_idx < park_idx < right_approach_idx
 
 
+def test_handover_adapts_to_irregular_single_finger_contact_with_local_micro_adjustment():
+    # Irregular contact handling: when receiver initially establishes only a single-finger
+    # touch (e.g. outer finger touches, inner finger misses), the skill must NOT blindly crash.
+    # It must perform adaptive micro-adjustment (re-opening and adjusting depth) to secure the pinch.
+    from backend.app.skills.robot_skills import SkillRunner
+    from types import SimpleNamespace
+    import numpy as np
+
+    cube_pos = np.array([0.44, 0.0, 1.15])
+    pinch_status = [False, True]  # 1st attempt misses inner finger, 2nd attempt succeeds
+    attempts = []
+
+    def mock_wait_gripper(arm, closed, duration):
+        if arm == 'right' and closed:
+            attempts.append(closed)
+
+    def mock_move(arm, target, rotation=None, **kwargs):
+        if arm == 'right' and donor_released[0]:
+            # Cube follows right arm after transfer
+            cube_pos[2] = target[2] - 0.03
+        return SimpleNamespace(success=True, final_position=list(target))
+
+    contacts_seq = [
+        ['openarm_right_ee_outer_finger|blue_cube'],  # 1st attempt: single finger
+        ['openarm_right_ee_inner_finger|blue_cube', 'openarm_right_ee_outer_finger|blue_cube'],  # 2nd attempt: two fingers
+    ]
+
+    contact_idx = [0]
+    donor_released = [False]
+    def mock_contacts(obj, arm=None):
+        if arm == 'left':
+            return [] if donor_released[0] else ['openarm_left_ee_inner_finger|blue_cube', 'openarm_left_ee_outer_finger|blue_cube']
+        idx = min(contact_idx[0], len(contacts_seq) - 1)
+        return contacts_seq[idx]
+
+    def mock_pinch_established(obj, arm):
+        if arm == 'left':
+            return True
+        val = pinch_status[min(contact_idx[0], len(pinch_status) - 1)]
+        return val
+
+    env = SimpleNamespace(
+        ee_pose=lambda side: (np.array([0.40, 0.15, 1.15]) if side == 'left' else np.array([0.40, -0.15, 1.15]), np.eye(3)),
+        object_pose=lambda name: (cube_pos.copy(), np.eye(3)),
+        frame=lambda: SimpleNamespace(objects={'blue_cube': cube_pos}, grippers={'left': 0.02, 'right': 0.7854}),
+        object_contacts=mock_contacts,
+        pinch_established=mock_pinch_established,
+        step=lambda n: None,
+        timestep=0.002,
+        grasp_mode='physical-friction-pinch',
+    )
+    controller = SimpleNamespace(
+        motion_speed=6.,
+        wait_gripper=mock_wait_gripper,
+        move_to_site=mock_move,
+        target_rotations={},
+    )
+    skills = SkillRunner(env, controller)
+    # Monkeypatch contact_idx advancement on re-opening gripper
+    orig_wait = mock_wait_gripper
+    def adaptive_wait(arm, closed, duration):
+        orig_wait(arm, closed, duration)
+        if arm == 'left' and not closed:
+            donor_released[0] = True
+        if arm == 'right' and not closed and len(attempts) == 1:
+            contact_idx[0] += 1
+    controller.wait_gripper = adaptive_wait
+
+    # Handover blue_cube from left to right with irregular initial contact
+    result = skills._handover('left', 'blue_cube', 'right')
+    assert result['object'] == 'blue_cube'
+    assert result['receiver'] == 'right'
+    assert len(attempts) >= 2, "Adaptive handover must have retried the pinch after single-finger contact"
+
+
 def test_handover_geometry_adapts_to_measured_cube_location():
     # Adaptive workspace: cube at x=0.49 should not be violently dragged to x=0.44.
     # The solver adapts the coupled handover location to the measured cube position.

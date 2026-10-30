@@ -668,6 +668,20 @@ class SkillRunner:
             raise SkillError("HANDOVER_APPROACH_COLLISION", f"Receiver displaced the held cube by {displacement * 1000:.1f} mm")
         self.controller.wait_gripper(receiver, True, .65)
         receiving_contacts = sorted(self._contact_fingers(obj, receiver))
+        # Adaptive pinch recovery for irregular contact geometry:
+        # If the initial pinch touches only one finger pad (or misses slightly due to angle/offset),
+        # do not rigidly abort. Perform local adaptive micro-adjustments in depth before giving up.
+        if not self._pinch_established(obj, receiver):
+            for retry in range(3):
+                self.controller.wait_gripper(receiver, False, .35)
+                self.env.step(max(1, round(50 / self.controller.motion_speed)))
+                adjustment = receiving_rotation @ np.array([0., 0., 0.003 * (retry + 1)])
+                self.controller.move_to_site(receiver, site + adjustment, receiving_rotation,
+                                             on_sample=lambda: self._require_hold(arm, obj))
+                self.controller.wait_gripper(receiver, True, .65)
+                receiving_contacts = sorted(self._contact_fingers(obj, receiver))
+                if self._pinch_established(obj, receiver):
+                    break
         if not self._pinch_established(obj, receiver):
             raise SkillError("HANDOVER_NO_RECEIVER_PINCH", f"No two-finger pinch by {receiver}: {receiving_contacts}")
         donor_contacts = sorted(self._contact_fingers(obj, arm))
