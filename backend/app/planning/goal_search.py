@@ -17,6 +17,15 @@ from backend.app.planning.task_program import (
 )
 
 
+def arm_can_reach(arm: str, position: list[float] | tuple[float, ...]) -> bool:
+    """Conservative reachability screening for OpenArm table workspace."""
+    if arm == 'right' and position[1] > 0.22:
+        return False
+    if arm == 'left' and position[1] < -0.22:
+        return False
+    return True
+
+
 def action_key(action: TaskAction) -> tuple:
     return tuple(getattr(action, name) for name in
                  ('op', 'object', 'arm', 'receiver', 'target', 'relation', 'distance_cm'))
@@ -109,7 +118,9 @@ class GoalDomain:
             raise GroundingError('Two final objects cannot occupy one hand')
         if any(name not in self.objects for name in program.keep_in_place):
             raise GroundingError('Unknown keep_in_place object')
-        self.movable = set(self.goals)-set(program.keep_in_place)
+        reference_targets = {g.target for g in self.goals.values()
+                             if g.type == 'relative_placement' and g.target in self.objects}
+        self.movable = (set(self.goals) | reference_targets) - set(program.keep_in_place)
         initial = {x['id']: x for x in (initial_state or state)['objects']}
         self.protected = {name: initial[name]['position'] for name in self.names if name not in self.movable}
         self.assert_preserved(state)
@@ -213,7 +224,7 @@ class GoalDomain:
                 preferred = self.objects[name].get('admitted_grasp_arm') if loc[0] == 'initial' else None
                 preferred = preferred or ('left' if position[1] >= 0 else 'right')
                 for arm in self.arms:
-                    if arm not in occupied:
+                    if arm not in occupied and arm_can_reach(arm, position):
                         cost = 1. + (0. if arm == preferred else 4.)
                         yield TaskAction(op='pick', object=name, arm=arm), changed(name, ('held', arm), touched=[arm]), cost
                 continue
@@ -227,21 +238,23 @@ class GoalDomain:
             # Table regions serve as buffers, including when both hands are full.
             for target in sorted(self.targets):
                 point = self.targets[target]
-                if not self._buffer_clear(node, name, point):
+                if not self._buffer_clear(node, name, point) or not arm_can_reach(arm, point):
                     continue
                 action = TaskAction(op='place', object=name, arm=arm, target=target)
                 preferred = 'left' if point[1] >= 0 else 'right'
                 cross = 3. if abs(point[1]) > .12 and preferred != arm else 0.
                 yield action, changed(name, ('zone', target), touched=[arm]), 2.5+cross+math.dist(self._position(node, name)[:2], point[:2])
-            goal = self.goals[name]
-            if (goal.type == 'relative_placement' and self.enabled('move_to_object')
+            goal = self.goals.get(name)
+            if (goal and goal.type == 'relative_placement' and self.enabled('move_to_object')
                     and node[self.index[goal.target]][0] != 'held'
                     and (goal.relation != 'on' or self._clear(node, goal.target))):
-                action = TaskAction(op='place', object=name, arm=arm, target=goal.target,
-                                    relation=goal.relation, distance_cm=goal.distance_cm)
-                reference = self.objects[goal.target]
-                preferred = reference.get('admitted_grasp_arm') or ('left' if self._position(node, goal.target)[1] >= 0 else 'right')
-                yield action, changed(name, self.desired(goal), touched=[arm]), 1.5+(3. if preferred != arm else 0.)
+                target_pos = self._position(node, goal.target)
+                if arm_can_reach(arm, target_pos):
+                    action = TaskAction(op='place', object=name, arm=arm, target=goal.target,
+                                        relation=goal.relation, distance_cm=goal.distance_cm)
+                    reference = self.objects[goal.target]
+                    preferred = reference.get('admitted_grasp_arm') or ('left' if target_pos[1] >= 0 else 'right')
+                    yield action, changed(name, self.desired(goal), touched=[arm]), 1.5+(3. if preferred != arm else 0.)
 
 
 def compile_goal_program(program: TaskProgram, state: dict, *, initial_state=None,
