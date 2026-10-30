@@ -578,7 +578,17 @@ class SkillRunner:
             target += np.asarray(desired) - actual
         raise SkillError("GRASP_SLIP", f"{obj} deviated from carry target by {error * 1000:.1f} mm")
 
-    def handover_object(self, arm: str, obj: str, receiver: str) -> dict:
+    def handover_object(self, arm: str | None, obj: str, receiver: str | None = None) -> dict:
+        if arm is None:
+            arm = next((side for side in ("left", "right") if self.held_object(side) == obj), None)
+            if arm is None:
+                raise SkillError("HOLD_NOT_FOUND", f"Neither hand holds {obj} for handover")
+        if receiver is None:
+            available = ["left", "right"]
+            candidates = [side for side in available if side != arm and not self.held_object(side)]
+            if not candidates:
+                raise SkillError("NO_RECEIVER_AVAILABLE", f"No empty arm available opposite {arm} to receive {obj}")
+            receiver = candidates[0]
         return self._skill("handover_object", lambda: self._handover(arm, obj, receiver), time.perf_counter())
 
     def _handover(self, arm: str, obj: str, receiver: str) -> dict:

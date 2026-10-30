@@ -62,7 +62,12 @@ def plan_handover_geometry(env, giver: str, obj: str, receiver_bias: float = .01
         # this only changes the candidate grasp, never the object's pose.
         relative = min((relative,opposite@relative),
                        key=lambda candidate:float((grasp_rotation@candidate)[2,2]))
-    desired_cube = np.array([.44, 0., 1.15])
+    # Adapt the target handover position to the measured object location within the
+    # shared dual-arm workspace, rather than rigidly forcing a single center point.
+    desired_x = float(np.clip(cube[0], 0.40, 0.52))
+    desired_y = 0.0
+    desired_z = float(np.clip(cube[2], 1.10, 1.18))
+    desired_cube = np.array([desired_x, desired_y, desired_z])
 
     def poses(q):
         data.qpos[indices] = q
@@ -78,7 +83,7 @@ def plan_handover_geometry(env, giver: str, obj: str, receiver_bias: float = .01
         _, _, obj_p, receiving_r, receiving_p = poses(q)
         return np.r_[data.site_xpos[sites[receiver]] - receiving_p,
                      .2 * Rotation.from_matrix(receiving_r @ data.site_xmat[sites[receiver]].reshape(3, 3).T).as_rotvec(),
-                     .8 * (obj_p - desired_cube), .0005 * (q - home)]
+                     .4 * (obj_p - desired_cube), .0005 * (q - home)]
 
     rng = np.random.default_rng(17)
     best_error = float("inf")

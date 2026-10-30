@@ -80,6 +80,47 @@ def test_placed_support_updates_projected_position_and_avoids_unnecessary_handov
     assert not any(s.skill == 'handover_object' and s.object == 'blue_cube' for s in plan.steps)
 
 
+def test_handover_geometry_adapts_to_measured_cube_location():
+    # Adaptive workspace: cube at x=0.49 should not be violently dragged to x=0.44.
+    # The solver adapts the coupled handover location to the measured cube position.
+    import numpy as np
+    from backend.app.simulation.openarm_v2.handover import plan_handover_geometry
+    from types import SimpleNamespace
+    cube_pos = np.array([0.48, 0.02, 1.12])
+    env = SimpleNamespace(
+        ee_pose=lambda side: (np.array([0.40, 0.15, 1.12]), np.eye(3)),
+        object_pose=lambda name: (cube_pos.copy(), np.eye(3)),
+        frame=lambda: SimpleNamespace(grippers={'left': 0.7854, 'right': -0.7854})
+    )
+    geom = plan_handover_geometry(env, 'left', 'red_cube')
+    assert geom.residual < .003
+    assert 0.40 <= geom.position[0] <= 0.52
+    assert abs(geom.position[1]) < .02
+
+
+def test_handover_skill_accepts_minimal_arguments_and_infers_arms():
+    # Declarative / Minimal-information skill contract:
+    # handover_object should only require the object name ("red_cube").
+    # The skill runner must autonomously infer donor (holder) and receiver (empty arm).
+    from backend.app.skills.robot_skills import SkillRunner
+    from types import SimpleNamespace
+    holder = 'left'
+    held_state = {holder: 'red_cube', 'right': None}
+    calls = []
+    def fake_handover(arm, obj, receiver):
+        calls.append((arm, obj, receiver))
+        return {'success': True, 'giver': arm, 'receiver': receiver, 'object': obj}
+    skills = SkillRunner.__new__(SkillRunner)
+    skills.held_object = lambda arm: held_state[arm]
+    skills._require_hold = lambda arm, obj: None
+    skills._handover = fake_handover
+    skills._skill = lambda name, fn, started: fn()
+    # Call with minimal information: arm=None, receiver=None
+    result = skills.handover_object(None, 'red_cube')
+    assert result['success']
+    assert calls == [('left', 'red_cube', 'right')]
+
+
 def test_referring_expressions_resolve_other_hand_and_other_cube():
     # Instruction: "キューブを、もう一方の手に持たせて、そのキューブの上にもう一つのキューブを重ねて"
     # The resolver must ground:
