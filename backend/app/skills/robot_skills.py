@@ -886,7 +886,10 @@ class SkillRunner:
             elif skill == "park_empty_arm":
                 result = self.park_empty_arm(arm)
             elif skill == "approach_object":
-                result = self.approach_object(arm, step["object"], progress, step.get("fault_offset"), step.get("grasp_offset_x", 0.))
+                offset_z = float(step.get("grasp_offset_z") or 0.)
+                result = self.approach_object(arm, step["object"], progress, step.get("fault_offset"),
+                                              step.get("grasp_offset_x", 0.),
+                                              np.array([0., 0., offset_z]) if offset_z else None)
             elif skill == "grasp_object":
                 result = self.grasp_object(arm, step["object"])
             elif skill == "lift_object":

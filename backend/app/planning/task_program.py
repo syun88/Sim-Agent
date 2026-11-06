@@ -236,7 +236,7 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             return available_arms[0]
         return ("left" if position[1] >= 0 else "right") if position else ("right" if obj == "blue_cube" else "left")
 
-    def acquire(obj: str, arm: str, index: int, for_handover: bool = False):
+    def acquire(obj: str, arm: str, index: int, for_handover: bool = False, for_support: bool = False):
         if not objects[obj].get("graspable", True):
             raise GroundingError(f"ROBOT_CAPABILITY: {obj} is fixed or this robot has no detected opposed actuated jaws")
         grippers = state.get("robot", {}).get("grippers")
@@ -260,13 +260,25 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             if is_pick_or_handover and auto_arm(obj) != arm and len(available_arms) == 2 and auto_arm(obj) in available_arms:
                 picker = auto_arm(obj)
             handover_next = for_handover or (picker != arm) or program.actions[index].op == "handover" or any((a.op == "handover" and a.object in {obj, "it", "それ", None}) or (a.op == "pick" and a.arm and a.arm != arm and a.object in {obj, "it", "それ"}) for a in program.actions[index + 1:])
+            # A cube that must act as an in-hand support is gripped low: the finger pads rise above the
+            # centre they pinch, so a centred grip leaves pad material blocking the support's top face.
+            # Measured 2026-11-07: a centred grip left the stacked cube 7.15 mm above the support, resting
+            # on the holder's fingers instead of on the cube (support_contact=False).
+            support_bias = -.015 if (for_support and str(obj).endswith("_cube")) else 0.
             for skill in (("approach_object", "grasp_object") if obj == "wine_bottle" else ("approach_object", "grasp_object", "lift_object")):
-                emit(skill, picker, index, object=obj, grasp_offset_x=-.015 if skill == "approach_object" and handover_next else 0.)
+                emit(skill, picker, index, object=obj,
+                     grasp_offset_x=-.015 if skill == "approach_object" and handover_next and not support_bias else 0.,
+                     grasp_offset_z=support_bias if skill == "approach_object" else 0.)
             if picker != arm:
                 emit("handover_object", picker, index, object=obj, receiver=arm)
                 assumptions.append(f"Action {index + 1}: acquire with reachable {picker} arm, then transfer to requested {arm} arm")
         held[arm] = obj
 
+    held_supports = {a.target for a in program.actions
+                     if a.op == "place" and a.relation and a.target in objects} if re.search(
+        r'持ったまま|維持したまま|持っている状態|掴んだまま|つかんだまま|握ったまま|保持したまま|'
+        r'掴んでいる状態|つかんでいる状態|握っている状態|保持している状態|while\s+holding|keep\s+holding',
+        state.get('instruction', '')) else set()
     for index, original in enumerate(program.actions):
         action = original.model_copy(deep=True)
         if action.op != "handover":
@@ -314,7 +326,7 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             action.relation = None
         if action.op == "pick":
             previous_owner = owner(obj)
-            acquire(obj, arm, index)
+            acquire(obj, arm, index, for_support=obj in held_supports)
             if previous_owner and previous_owner != arm:
                 action.op, action.arm, action.receiver = "handover", previous_owner, arm
                 last_arm = arm

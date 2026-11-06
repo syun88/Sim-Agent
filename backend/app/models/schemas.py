@@ -32,6 +32,9 @@ class PlanStep(BaseModel):
     receiver: ArmName | None = None
     action_index: int | None = None
     grasp_offset_x: float = Field(default=0., ge=-.02, le=.02)
+    # World-frame vertical pinch bias. A cube that will be used as an in-hand support must be gripped low,
+    # because the finger pads rise above the centre they pinch and would otherwise block its top face.
+    grasp_offset_z: float = Field(default=0., ge=-.03, le=.03)
     height_cm: float | None = Field(default=None, ge=1, le=10)
     volume_ml: float | None = Field(default=None, ge=5, le=35)
     stroke_cm: float | None = Field(default=None, ge=2, le=30)

@@ -137,6 +137,20 @@ def test_in_hand_stacking_bimanually_stages_held_support_toward_center_workspace
     assert any(not np.allclose(r, np.eye(3)) for r in left_rotations)
 
 
+def test_in_hand_support_is_gripped_low_so_its_top_face_stays_clear():
+    # Measured 2026-11-07: with a centred pinch the stacked cube sat 7.15 mm above the support,
+    # resting on the holder's own finger pads (support_contact=False). The support must be gripped
+    # low so the pads clear its top face.
+    plan = AgentPlanner().plan('右手でキューブを掴んでから、掴んでいる状態のキューブの上に赤いキューブを重ねて', WORLD)
+    support_approach = next(s for s in plan.steps
+                            if s.skill == 'approach_object' and s.object == 'blue_cube' and s.arm == 'right')
+    assert support_approach.grasp_offset_z < 0, 'the in-hand support must be pinched below its centre'
+    # The stacking cube itself keeps the calibrated centred pinch.
+    stacking_approach = next(s for s in plan.steps
+                             if s.skill == 'approach_object' and s.object == 'red_cube')
+    assert stacking_approach.grasp_offset_z == 0
+
+
 def test_held_state_support_in_hand_stacking_never_places_support_on_table():
     # User instruction: "右手でキューブを掴んでから、掴んでいる状態のキューブの上に赤いキューブを重ねて"
     # Condition:
