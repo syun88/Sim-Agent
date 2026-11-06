@@ -38,6 +38,25 @@ RESTARTABLE = {'pick', 'handover', 'place', 'approach', 'home', 'navigate', 'thr
                'retreat'}
 
 
+#: Mechanisms that are produced by the arm's path meeting an object or the robot itself.
+CONTACT_MECHANISMS = frozenset({'APPROACH_CONTACT', 'CARRY_CONTACT', 'GEOMETRY'})
+
+
+def _repeats_measured_contact(mechanism, receipt):
+    """Whether resuming would drive the same arm through the same unchanged obstacle.
+
+    A contact mechanism plus an unchanged relevant-state fingerprint means nothing the contact depended on
+    moved, so the same suffix repeats it. A changed fingerprint (the object shifted, a hand let go) is new
+    evidence and may be resumed. This only withholds a candidate; it never turns a failure into success.
+    """
+    if mechanism not in CONTACT_MECHANISMS:
+        return False
+    before, after = receipt.get('before_fingerprint'), receipt.get('after_fingerprint')
+    if before is None or after is None:
+        return False
+    return before == after
+
+
 class TaskAgent:
     def __init__(self, executor, planner, *, plan_call=None, recovery_call=None, max_attempts=4, max_resets=1):
         self.executor, self.planner = executor, planner
@@ -225,9 +244,18 @@ class TaskAgent:
                     # measured 2026-10-27, the resumed approach found the cube in the air at z=0.93 and reported a
                     # collision, and on another run approached where the cube no longer was.
                     object_left_the_hand = str(failed.get('skill') or '') in {'throw_object', 'release_object'}
-                    if (prefix > 0 and not object_left_the_hand
+                    repeats_the_same_contact = _repeats_measured_contact(mechanism, failure_receipt)
+                    if (prefix > 0 and not object_left_the_hand and not repeats_the_same_contact
                             and not any(r.get('decision') == 'resume' for r in recoveries)):
                         legal.append('resume')
+                    elif repeats_the_same_contact:
+                        # The measurements show a contact the scene has not changed around; replaying the
+                        # same suffix would drive the same arm through the same obstacle.
+                        announce({'kind':'resume_withheld',
+                                  'explanation':('同じ接触が再発する条件が変わっていないため、残り手順の再開を見送ります'
+                                                 f'（機序: {mechanism}）。'),
+                                  'mechanism':mechanism,'mechanism_reason':failure_receipt.get('mechanism_reason'),
+                                  'evidence_id':failure_receipt['id']})
                 except GroundingError:
                     pass
             if not staging_used:

@@ -136,6 +136,75 @@ def test_recovery_trace_grounds_explanation_and_rejects_model_confabulation(worl
     assert '接触のない空の腕を退避' in recover_desc
 
 
+#: Two placements that use different arms, so a completed first action leaves a resumable suffix.
+TWO_STEP = '赤いキューブを左手で左においてから、青いキューブを右手で右において'
+
+
+def _two_action_outcome(error, evidence, detail, moved=False, category=None):
+    """A result whose first action completed and whose second failed, so a resume prefix exists."""
+    def outcome(executor, plan):
+        if moved:
+            for obj in executor.state['objects']:
+                if obj['id'] == 'blue_cube':
+                    obj['position'] = [obj['position'][0], obj['position'][1] - .02, obj['position'][2]]
+        first = [s for s in plan.steps if s.action_index == 0]
+        return {'success': False, 'status': 'FAILED',
+                'skills': [{**{'skill': s.skill, 'arm': s.arm, 'object': s.object, 'action_index': 0,
+                               'step_index': 0, 'success': True}, 'before_world_state': executor.world_state()}
+                           for s in first] + [
+                    {'skill': 'move_to_object', 'arm': 'left', 'object': 'red_cube', 'success': False,
+                     'error': error, 'action_index': 1, 'step_index': len(first),
+                     'evidence': evidence, 'detail': detail}],
+                'verification': {'success': False, 'failure_category': category or error}}
+    return outcome
+
+
+def test_an_unchanged_contact_withholds_resume(world,postconditions):
+    """A contact whose obstacle did not move must not be resumed into the same collision."""
+    executor = FakeExecutor(world, [_two_action_outcome(
+        'CARRY_COLLISION',
+        {'object': 'blue_cube', 'carrying': 'red_cube', 'displacement_m': 0.0074,
+         'tolerance_m': 0.005, 'phase': 'carry'},
+        'Carrying red_cube disturbed resting blue_cube by 7.4 mm')] * 4)
+    chosen = []
+    def recovery(*args):
+        chosen.append(args[-1])
+        return {'decision': args[-1][0], 'reason': 'fallback'}
+    result = TaskAgent(executor, AgentPlanner(), recovery_call=recovery, max_attempts=2).run(
+        TWO_STEP)
+    assert chosen, 'a recovery must still be offered'
+    assert 'resume' not in chosen[0], f'resume was offered despite an unchanged contact: {chosen[0]}'
+    assert any(d.get('kind') == 'resume_withheld' for d in result['agent_trace'])
+
+
+def test_a_contact_with_new_evidence_may_still_resume(world,postconditions):
+    """When the disturbed object moved, the scene changed, so resume is allowed again."""
+    executor = FakeExecutor(world, [_two_action_outcome(
+        'CARRY_COLLISION',
+        {'object': 'blue_cube', 'carrying': 'red_cube', 'displacement_m': 0.0074,
+         'tolerance_m': 0.005, 'phase': 'carry'},
+        'Carrying red_cube disturbed resting blue_cube by 7.4 mm', moved=True)] * 4)
+    chosen = []
+    def recovery(*args):
+        chosen.append(args[-1])
+        return {'decision': args[-1][0], 'reason': 'fallback'}
+    TaskAgent(executor, AgentPlanner(), recovery_call=recovery, max_attempts=2).run(TWO_STEP)
+    assert chosen and 'resume' in chosen[0]
+
+
+def test_a_non_contact_failure_still_offers_resume(world,postconditions):
+    """The gate is specific to contact mechanisms; an ordinary motion failure keeps every candidate."""
+    motion_failure = _two_action_outcome('MOTION_BLOCKED',
+                                        {'position_error': 0.02, 'rotation_error': 0.05}, 'blocked')
+    executor = FakeExecutor(world, [motion_failure] * 4)
+    chosen = []
+    def recovery(*args):
+        chosen.append(args[-1])
+        return {'decision': args[-1][0], 'reason': 'fallback'}
+    TaskAgent(executor, AgentPlanner(), recovery_call=recovery, max_attempts=2).run(TWO_STEP)
+    assert chosen and 'resume' in chosen[0]
+
+
 def test_the_trace_names_the_mechanism_the_measurements_show(world,postconditions):
     """A blocked carry that shoved another cube must say so, not leave the reader with the error code."""
     def failed_carry(executor, plan):
