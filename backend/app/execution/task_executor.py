@@ -170,9 +170,7 @@ class TaskExecutor:
                         emit("skill_retry", step_index=index, reason=result.get("error"))
                     self.controller.wait_gripper(arm, False)
                     attempt_before = build_world_state(self.env)
-                    retry_z = float(step.get("grasp_offset_z") or 0.)
-                    retry = self.skills.approach_object(arm, obj, grasp_offset_x=step.get("grasp_offset_x", 0.),
-                                                        grasp_offset=np.array([0., 0., retry_z]) if retry_z else None)
+                    retry = self.skills.approach_object(arm, obj, grasp_offset_x=step.get("grasp_offset_x", 0.))
                     if retry["success"] and step["skill"] == "grasp_object":
                         retry = self.skills.grasp_object(arm, obj)
                     result = retry
