@@ -182,6 +182,28 @@ VLMの画像認識は未接続であり、状態はGenesisの登録済み物体�
 準備の理由と対象は `planning_evidence.preparations`、元の要求は `requested_program` に残る。
 一時置きの候補は物体寸法と既知の位置から選ぶ。連続軌道の可否や実把持は実行時に別途検査する。
 
+## 実行ログを注釈データとして書き出す
+
+`scripts/export_lerobot_annotations.py` は、保存済みの実行記録から、方策学習で使う形の注釈
+（指示・サブタスク・対象物体・その時点の物体姿勢・結果）を JSONL で書き出す。学習は行わない。
+
+```bash
+uv run python scripts/export_lerobot_annotations.py \
+  --input <実行記録.json または ディレクトリ> --out annotations.jsonl --with-mechanisms
+```
+
+記録するものと、しないもの:
+
+- `subtask` は計画の語彙（`pick` / `hand_over` / `place` …）＋対象＋行き先。実行された step の
+  `before_world_state` / `world_state` から、各サブタスクの開始・終了時の物体位置・回転・AABB を取る。
+- `box_space` は `world_aabb`、`image_boxes` は **常に `null`**。実行記録にカメラ画像が含まれないため、
+  画像座標の箱を作れば捏造になる。3D の世界座標箱だけを書く。
+- `entity_grounding` はその物体について記録された接地決定（`planning_evidence.scene_bindings`）。
+  決定は**指示中の言及**を解決するもので、どの step がその決定で生まれたかは記録に無い。
+  そのため「この step を決めた決定」とは書かず、同じ物体についての決定を並べる。
+- 失敗は `evidence_ledger` の `mechanism` / `mechanism_reason` を `--with-mechanisms` で添付する。
+- step が1つも無い記録、読めないファイルは空の注釈を作らず、理由を stderr に出す。
+
 ## 接地は1か所で決め、記録し、検証する
 
 `planning/grounding.py` が、指示中の参照表現（「右手にあるキューブ」「もう一方の手」
