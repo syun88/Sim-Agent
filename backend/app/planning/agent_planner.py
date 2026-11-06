@@ -16,6 +16,7 @@ from backend.app.planning.language_schema import meaning_schema
 from backend.app.planning.preparation import compile_prepared_program
 from backend.app.agent.scene_reasoning import SceneReferenceError
 from backend.app.planning.grounding import ground
+from backend.app.planning.policy_provider import policy_backend_from_env
 
 
 class PlannerProviderError(Exception):
@@ -573,6 +574,43 @@ class AgentPlanner:
             fallback_error = str(exc)
             if fallback_error.startswith("This scene has only"):
                 raise PlannerProviderError("UNKNOWN_OBJECT", fallback_error) from None
+        # A configured learned backend proposes, and only as a proposal. It is compared against the same
+        # grounded interpretation the grammar produced and then goes through the relation, obligation and
+        # plan checks - it has no path that skips them, and Genesis still measures success.
+        policy_attempt = None
+        try:
+            backend = policy_backend_from_env()
+        except Exception as error:
+            backend, policy_attempt = None, {'ok': False, 'error': f'{type(error).__name__}: {error}'}
+        if backend is not None:
+            try:
+                proposed = compile_prepared_program(backend.propose(instruction, state), state)
+                validate_instruction_relations(proposed, instruction, state, required_holders=required_holders)
+                missing = missing_obligations(instruction, proposed)
+                if missing:
+                    raise GroundingError('policy proposal omits ' + ', '.join(missing))
+                if fallback is not None:
+                    requested_objects = {a.get('object') for a in fallback.program['actions'] if a.get('object')}
+                    proposed_objects = {a.get('object') for a in proposed.program['actions'] if a.get('object')}
+                    if requested_objects != proposed_objects:
+                        raise GroundingError(f'policy proposal changed the requested objects: '
+                                             f'{sorted(proposed_objects)} vs {sorted(requested_objects)}')
+                    if program_signature(proposed) != program_signature(fallback):
+                        raise GroundingError('policy proposal changes the grounded actions/hands; '
+                                             'refusing it rather than executing a different task')
+                valid, errors = validate_plan(proposed, state)
+                if not valid:
+                    raise GroundingError('; '.join(errors))
+                proposed.provider = f'policy:{backend.name}'
+                proposed.model_called = False
+                proposed.planning_evidence = {**(proposed.planning_evidence or {}),
+                                              'policy_backend': {'ok': True, 'backend': backend.name},
+                                              'grounding': {k: observed_binding[k] for k in
+                                                            ('original', 'instruction', 'steps', 'observed')}}
+                return proposed
+            except Exception as error:
+                policy_attempt = {'ok': False, 'backend': getattr(backend, 'name', 'unknown'),
+                                  'error': f'{type(error).__name__}: {str(error)[:300]}'}
         plan = None
         model_plan = None
         provider_error = None
@@ -790,6 +828,8 @@ class AgentPlanner:
             via = "after the model was asked" if use_ai else "without asking the model"
             raise PlannerProviderError(category, f"Cannot ground the full instruction ({via}): {detail[:600]}")
         plan.provider_error = provider_error
+        if policy_attempt is not None:
+            plan.planning_evidence = {**(plan.planning_evidence or {}), 'policy_backend': policy_attempt}
         if observed_binding['decisions']:
             plan.planning_evidence = {**(plan.planning_evidence or {}),
                                       'scene_bindings':observed_binding['decisions'],

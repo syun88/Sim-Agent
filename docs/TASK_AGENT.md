@@ -182,6 +182,21 @@ VLMの画像認識は未接続であり、状態はGenesisの登録済み物体�
 準備の理由と対象は `planning_evidence.preparations`、元の要求は `requested_program` に残る。
 一時置きの候補は物体寸法と既知の位置から選ぶ。連続軌道の可否や実把持は実行時に別途検査する。
 
+## 学習ポリシーの受け口（提案のみ・検証は既存層）
+
+`planning/policy_provider.py` は、LeRobot 系の学習ポリシー（例: 2026-11-03 に発表された Galaxea G0.5 は
+サブタスク＋物体BBoxを出してから行動チャンクを生成する）を**提案者としてだけ**受け入れる継ぎ目である。
+
+- 受け取れるのは `TaskProgram`（記号サブタスク）だけ。関節トルクや行動チャンクは**検証不能**として
+  `POLICY_OUTPUT_NOT_VERIFIABLE` で拒否する。このリポジトリには7次元チャンクを契約と突き合わせる手段がない。
+- 提案は文法解釈（fallback）と同じ接地・関係検査・義務検査・`validate_plan` を通る。加えて、
+  fallback が解けた指示では**対象集合と action/hand の署名が一致**しなければ拒否する。
+  学習側が別の作業に置き換える経路は存在しない。
+- 既定では無効（`OPENARM_POLICY_BACKEND` が空なら呼ばれない）。重みは自分で取得しない
+  （`OPENARM_POLICY_MODEL_PATH` 未設定なら `POLICY_WEIGHTS_ABSENT`）。
+- 却下された提案は `planning_evidence.policy_backend` に理由つきで残り、通常の計画経路が続く。
+- 成功判定は Genesis の実測のみ。ポリシーが「成功した」と言うことは証拠ではない。
+
 ## 実行ログを注釈データとして書き出す
 
 `scripts/export_lerobot_annotations.py` は、保存済みの実行記録から、方策学習で使う形の注釈
