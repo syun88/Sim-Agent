@@ -9,7 +9,8 @@ from __future__ import annotations
 from copy import deepcopy
 import time
 
-from backend.app.agent.scene_reasoning import SceneReferenceError, bind_scene_references
+from backend.app.agent.scene_reasoning import SceneReferenceError
+from backend.app.planning.grounding import ground
 from backend.app.agent.recovery_policy import reset_evidence
 from backend.app.planning.agent_planner import PlannerProviderError, grounded_recovery_reason
 from backend.app.planning.preparation import compile_prepared_program
@@ -80,10 +81,16 @@ class TaskAgent:
             'sim_time':initial.get('sim_time'),'objects':[{k:o.get(k) for k in ('id','position','held_by','touching')} for o in initial['objects']],
             'support_relations':initial.get('support_relations',[])})
         try:
-            binding = bind_scene_references(instruction, initial)
-            for decision in binding.decisions:
-                announce(decision)
-            plan = self.plan_call(binding.instruction, initial, decisions)
+            # One grounding pass, recorded. The planner receives the resolved text and its own copy of the
+            # decisions, so the same sentence is not rewritten twice with different offsets.
+            binding = ground(instruction, initial)
+            for decision in binding['decisions']:
+                announce({'kind':decision['kind'],'explanation':decision['explanation'],
+                          'object':decision['resolved'].get('object'),'arm':decision['resolved'].get('arm'),
+                          'basis':decision['basis'],'step':decision['step'],
+                          'surface':decision['surface'],'replacement':decision['replacement'],
+                          'candidates':decision['candidates'],'alternatives':decision['alternatives']})
+            plan = self.plan_call(binding['instruction'], initial, decisions)
         except SceneReferenceError as error:
             announce({'kind':'missing_reference','explanation':str(error),'observed':error.diagnosis})
             return blocked(str(error),'REFERENCE_NOT_PRESENT',error.diagnosis)
@@ -100,8 +107,9 @@ class TaskAgent:
             'support_relations':deepcopy(initial.get('support_relations',[]))}}
         for item in (plan.planning_evidence or {}).get('preparations',[]):
             announce({'kind':'prepare_precondition',**item})
-        for decision in binding.decisions:
-            plan.assumptions.append(decision['explanation'])
+        for decision in binding['decisions']:
+            if decision['explanation']:
+                plan.assumptions.append(decision['explanation'])
         # Replay is restricted to idempotent rigid-cube tasks. No automatic
         # double pour, second throw, joint increment or relative arm displacement.
         source = requested_program(original)

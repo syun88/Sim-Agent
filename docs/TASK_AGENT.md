@@ -182,6 +182,34 @@ VLMの画像認識は未接続であり、状態はGenesisの登録済み物体�
 準備の理由と対象は `planning_evidence.preparations`、元の要求は `requested_program` に残る。
 一時置きの候補は物体寸法と既知の位置から選ぶ。連続軌道の可否や実把持は実行時に別途検査する。
 
+## 接地は1か所で決め、記録し、検証する
+
+`planning/grounding.py` が、指示中の参照表現（「右手にあるキューブ」「もう一方の手」
+「掴んでいる状態のキューブの上」「もう一つのキューブ」）を解決する**唯一の所有者**である。
+
+以前はこの解決が2モジュールにまたがる文字列置換で、span も根拠も残さず、しかも
+`TaskAgent` と `AgentPlanner` の両方で適用されていた。2026-11-07 には
+「右手でblue_cube」という二重主語を作って `Multiple acting hands in one clause` を起こし、
+その書き換えは計画証拠からは見えなかった。
+
+現在の契約:
+
+- パスは `scene_hands` → `relative_pronouns` の固定順。各置換は**段（step）単位**で記録する。
+- `ground()` は各段について、記録された置換だけから入力を作り直し（`_replay`）、実際の出力と一致することを
+  **証明**する。一致しなければ `UNGROUNDED_EDIT` で計画出力を拒否する。記録だけして実際に
+  置換していない場合も同じく拒否する。
+- 各決定は `rule` / `step` / `kind` / `basis`（なぜその物体を選べたか）/ `span` / `surface` /
+  `replacement` / `resolved`（実際に書いた物体・腕）/ `candidates` / `alternatives` / `explanation` を持つ。
+- `observed` に、判断が読んでよかった観測（手の保持、物体位置、利用可能な腕、sim時刻）を残す。
+  読み手は同じ観測から決定を再導出できる。
+- 決定は `planning_evidence.grounding`（original / instruction / steps / observed）と
+  `planning_evidence.scene_bindings` に残り、`agent_trace` にも `basis` 付きで出る。
+- 置換は1回だけ適用する（解決済み文を再度 `ground()` しても決定は0件になることをテストで固定）。
+- 曖昧な場面（同側に同高の候補が2つ等）は従来どおり `SceneReferenceError` で止める。当て推量をしない。
+
+この層は「どの層で壊れたか」を言えるようにするためのものであり、任意の自然言語の理解を保証しない。
+学習モデルを後段に置く場合も、この決定集合が提案と検証の境界になる。
+
 ## 失敗の機序を測定値から名付ける
 
 `verification/failure_attribution.py` は、失敗したスキルの `SkillError.evidence` とコードから

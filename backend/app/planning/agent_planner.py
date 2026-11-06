@@ -14,7 +14,8 @@ from backend.app.planning.spatial_language import validate_instruction_relations
 from backend.app.planning.goal_language import holding_conditions, relative_conditions, unsupported_group_request
 from backend.app.planning.language_schema import meaning_schema
 from backend.app.planning.preparation import compile_prepared_program
-from backend.app.agent.scene_reasoning import SceneReferenceError, bind_scene_references
+from backend.app.agent.scene_reasoning import SceneReferenceError
+from backend.app.planning.grounding import ground
 
 
 class PlannerProviderError(Exception):
@@ -524,10 +525,13 @@ class AgentPlanner:
         started = time.perf_counter()
         state = {**state, 'instruction': instruction}
         try:
-            observed_binding = bind_scene_references(instruction,state)
-            instruction = observed_binding.instruction
+            observed_binding = ground(instruction, state)
+            instruction = observed_binding['instruction']
         except SceneReferenceError as error:
             raise PlannerProviderError('REFERENCE_NOT_PRESENT',str(error)) from None
+        except GroundingError as error:
+            # An unrecorded or contradictory rewrite is a planning refusal, not a parse quirk.
+            raise PlannerProviderError('INSTRUCTION_GROUNDING_INCONSISTENT', str(error)) from None
         if unsupported_group_request(instruction):
             raise PlannerProviderError('UNSUPPORTED_TASK', 'GROUP_GRASP_UNSUPPORTED: one-hand grouped or simultaneous multi-cube acquisition has no executable contact contract')
         # An unnamed robot hand may be selected; an explicitly human recipient cannot
@@ -545,7 +549,7 @@ class AgentPlanner:
         fallback_error = None
         required_holders = []
         try:
-            fallback_source = parse_fallback(resolve_relative_pronouns(instruction, state), state)
+            fallback_source = parse_fallback(instruction, state)
             # Retain independently explicit holders even when another source action is infeasible.
             # A later source placement supersedes acquisition; do not promote an intermediate pick.
             last_source = {a.object: (i, a) for i, a in enumerate(fallback_source.actions) if a.object}
@@ -786,9 +790,11 @@ class AgentPlanner:
             via = "after the model was asked" if use_ai else "without asking the model"
             raise PlannerProviderError(category, f"Cannot ground the full instruction ({via}): {detail[:600]}")
         plan.provider_error = provider_error
-        if observed_binding.decisions:
-            plan.planning_evidence = {**(plan.planning_evidence or {}),'scene_bindings':observed_binding.decisions}
-            plan.assumptions += [d['explanation'] for d in observed_binding.decisions]
+        if observed_binding['decisions']:
+            plan.planning_evidence = {**(plan.planning_evidence or {}),
+                                      'scene_bindings':observed_binding['decisions'],
+                                      'grounding':{k:observed_binding[k] for k in ('original','instruction','steps','observed')}}
+            plan.assumptions += [d['explanation'] for d in observed_binding['decisions'] if d['explanation']]
         plan.raw_response = raw
         plan.model_called = bool(use_ai)
         # 'skipped_because' answers one question only: why the model was not called.

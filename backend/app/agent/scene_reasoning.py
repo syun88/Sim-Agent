@@ -6,7 +6,7 @@ reported with candidates instead of silently choosing a colour or old discourse.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 
 from backend.app.planning.references import named_objects
@@ -23,6 +23,19 @@ class SceneReferenceError(ValueError):
 class SceneBinding:
     instruction: str
     decisions: list[dict]
+    #: One entry per rewrite step: `before`, `after` and the decisions that step recorded. Spans inside a
+    #: step are offsets into that step's `before` text, so a pass that rewrites more than once cannot hide
+    #: a shift in coordinates (caught 2026-11-07 by planning/grounding.py).
+    steps: list[dict] = field(default_factory=list)
+
+
+def _recorded(pattern, text: str, replace, steps: list[dict], label: str, decisions: list[dict]) -> str:
+    """Apply one substitution and record the step, so the edit can be replayed and checked."""
+    start = len(decisions)
+    result = pattern.sub(replace, text)
+    steps.append({'label': label, 'before': text, 'after': result,
+                  'decision_index': [start, len(decisions)]})
+    return result
 
 
 def bind_scene_references(instruction: str, state: dict) -> SceneBinding:
@@ -69,16 +82,20 @@ def bind_scene_references(instruction: str, state: dict) -> SceneBinding:
                        f'{side}は空です。現在の配置で対象候補は{chosen}だけなので、まず取得してから指示を続けます。' if kind=='acquire_missing_hold' else
                        f'{side}は空で、指示に合う候補が{len(candidates)}個あります。重なりでは上の物体だけが'
                        f'把持できるため、いちばん高い{chosen}を対象にします（他: {", ".join(alternatives)}）。')
-        decisions.append({'kind':kind,'arm':arm,'object':chosen,'source':match.group(),
-                          'candidates':candidates,'alternatives':alternatives,'explanation':explanation})
         suffix_spatial = re.match(r'(?:の)?(?:上|下|左|右|前|後|奥|真上|てっぺん|土台|近く|隣|そば| atop| on| under| next)', instruction[match.end():], re.I)
         prefix_spatial = re.search(r'\b(?:on|atop|under|beside|next\s+to|left\s+of|right\s+of)\s+(?:(?:top|the)\s+of\s+)?$', instruction[:match.start()], re.I)
         has_earlier_actor = bool(re.search(r'[左右](?:手|腕)(?:で|が|は)', instruction[:match.start()]))
         is_modifying_phrase = any(w in match.group().lower() for w in ('で掴んで', 'でつかんで', 'で握って', 'で保持して', 'で持った', 'で掴んだ', 'held by', 'in your', 'in the'))
         if suffix_spatial or prefix_spatial or has_earlier_actor or is_modifying_phrase:
-            return f'{chosen}'
-        return f'{side}で{chosen}' if match.group('jp') else f'{chosen} with the {arm} hand'
-    text = pattern.sub(bind, instruction)
+            replacement = f'{chosen}'
+        else:
+            replacement = f'{side}で{chosen}' if match.group('jp') else f'{chosen} with the {arm} hand'
+        decisions.append({'kind':kind,'arm':arm,'object':chosen,'source':match.group(),
+                          'candidates':candidates,'alternatives':alternatives,'explanation':explanation,
+                          'span':list(match.span()),'replacement':replacement})
+        return replacement
+    steps: list[dict] = []
+    text = _recorded(pattern, instruction, bind, steps, 'hand_reference', decisions)
     def table_reference(match):
         arm='left' if match.group('side')=='左' else 'right'
         cubes=sorted((o for o in objects.values() if o.get('type','cube')=='cube'),key=lambda o:o['position'][1])
@@ -87,9 +104,10 @@ def bind_scene_references(instruction: str, state: dict) -> SceneBinding:
                 {'category':'AMBIGUOUS_SPATIAL_REFERENCE','source':match.group(),'candidates':[o['id'] for o in cubes]})
         obj=cubes[-1 if arm=='left' else 0]['id']
         decisions.append({'kind':'observed_spatial_reference','object':obj,'source':match.group(),
-            'explanation':f'現在の物体位置から「{match.group()}」を{obj}に対応付けました。'})
+            'explanation':f'現在の物体位置から「{match.group()}」を{obj}に対応付けました。',
+            'span':list(match.span()),'replacement':obj})
         return obj
-    text=re.sub(r'(?P<side>左|右)(?:側)?(?:にある|の)(?:方|ほう|やつ|物体|物|キューブ)',table_reference,text)
+    text=_recorded(re.compile(r'(?P<side>左|右)(?:側)?(?:にある|の)(?:方|ほう|やつ|物体|物|キューブ)'),text,table_reference,steps,'table_side',decisions)
 
     # 照応・補集合・相対的手参照の解決
     cubes = sorted([o['id'] for o in objects.values() if o.get('type', 'cube') == 'cube'])
@@ -103,13 +121,15 @@ def bind_scene_references(instruction: str, state: dict) -> SceneBinding:
                          and o['position'][1] * (1 if arm == 'left' else -1) > 0.02]
         if len(matched_cubes) == 1:
             chosen = matched_cubes[0]
+            replacement = f'{m.group("arm")}手で{chosen}'
             decisions.append({
                 'kind': 'arm_reach_cube_binding', 'object': chosen, 'arm': arm,
-                'explanation': f'{m.group("arm")}手の作業域にある{chosen}を「{m.group()}」に対応付けました。'
+                'explanation': f'{m.group("arm")}手の作業域にある{chosen}を「{m.group()}」に対応付けました。',
+                'span': list(m.span()), 'replacement': replacement,
             })
-            return f'{m.group("arm")}手で{chosen}'
+            return replacement
         return m.group()
-    text = uncolored_hand_pattern.sub(bind_uncolored_hand, text)
+    text = _recorded(uncolored_hand_pattern, text, bind_uncolored_hand, steps, 'uncolored_hand', decisions)
     other_cube_pattern = re.compile(
         r'(?:もう(?:一つ|片方|1つ|1個)の|残りの|もう一方の)(?:キューブ|ブロック|物体|物)|\b(?:the\s+other|another)\s+cube\b', re.I)
     explicit_cubes = named_objects(text, state)
@@ -119,22 +139,38 @@ def bind_scene_references(instruction: str, state: dict) -> SceneBinding:
             remaining = [c for c in cubes if c != first_cube]
             if len(remaining) == 1:
                 other_cube = remaining[0]
-                text = other_cube_pattern.sub(other_cube, text)
-                decisions.append({
-                    'kind': 'complement_cube_reference', 'object': other_cube,
-                    'explanation': f'指示の「もう一つのキューブ」を、未言及の{other_cube}に対応付けました。'
-                })
+                def _complement(m):
+                    decisions.append({
+                        'kind': 'complement_cube_reference', 'object': other_cube,
+                        'explanation': f'指示の「もう一つのキューブ」を、未言及の{other_cube}に対応付けました。',
+                        'span': list(m.span()), 'replacement': other_cube,
+                    })
+                    return other_cube
+                text = _recorded(other_cube_pattern, text, _complement, steps, 'complement_cube', decisions)
         else:
             # "キューブを、... もう一つのキューブを..." 対比構造
             first_cube, other_cube = cubes[0], cubes[1]
-            text = other_cube_pattern.sub(other_cube, text)
+            def _other(m):
+                # The entity this edit actually writes, not the pair's first member: a decision that
+                # reports the wrong object makes the grounding record unreadable (found 2026-11-07).
+                decisions.append({
+                    'kind': 'unmarked_contrastive_resolution',
+                    'object': other_cube, 'paired_object': first_cube,
+                    'explanation': f'未指定の2つのキューブ参照に対し、順に{first_cube}と{other_cube}を割り当てました。',
+                    'span': list(m.span()), 'replacement': other_cube,
+                })
+                return other_cube
+            text = _recorded(other_cube_pattern, text, _other, steps, 'contrastive_other', decisions)
             unmarked_pattern = re.compile(r'(?<![赤青redbluetheotheranother\w])キューブ(?=[をにはへと、,\s])')
-            text = unmarked_pattern.sub(first_cube, text, count=1)
-            decisions.append({
-                'kind': 'unmarked_contrastive_resolution',
-                'object': first_cube, 'other_object': other_cube,
-                'explanation': f'未指定の2つのキューブ参照に対し、順に{first_cube}と{other_cube}を割り当てました。'
-            })
+            def _first(m):
+                decisions.append({
+                    'kind': 'unmarked_contrastive_resolution',
+                    'object': first_cube, 'paired_object': other_cube,
+                    'explanation': f'未指定の2つのキューブ参照に対し、順に{first_cube}と{other_cube}を割り当てました。',
+                    'span': list(m.span()), 'replacement': first_cube,
+                })
+                return first_cube
+            text = _recorded(unmarked_pattern, text, _first, steps, 'contrastive_first', decisions)
 
     other_hand_pattern = re.compile(
         r'(?:もう(?:一方|片方)の|反対の|逆の)(?:手|腕|アーム)|\b(?:the\s+other|opposite)\s+(?:hand|arm)\b', re.I)
@@ -155,10 +191,13 @@ def bind_scene_references(instruction: str, state: dict) -> SceneBinding:
                 opposite = 'right' if prim_arm == 'left' else 'left'
         if opposite:
             side_str = '右手' if opposite == 'right' else '左手'
-            text = other_hand_pattern.sub(side_str, text)
-            decisions.append({
-                'kind': 'opposite_hand_reference', 'arm': opposite,
-                'explanation': f'指示の「もう一方の手」を、対向する{side_str}に対応付けました。'
-            })
+            def _opposite(m):
+                decisions.append({
+                    'kind': 'opposite_hand_reference', 'arm': opposite,
+                    'explanation': f'指示の「もう一方の手」を、対向する{side_str}に対応付けました。',
+                    'span': list(m.span()), 'replacement': side_str,
+                })
+                return side_str
+            text = _recorded(other_hand_pattern, text, _opposite, steps, 'opposite_hand', decisions)
 
-    return SceneBinding(text, decisions)
+    return SceneBinding(text, decisions, steps)

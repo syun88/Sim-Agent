@@ -83,14 +83,24 @@ def placement_references(text, state):
     return references
 
 
-def resolve_relative_pronouns(text, state):
-    """Bind full-instruction context before a parser splits it into individual actions."""
+def resolve_relative_pronouns(text, state, decisions=None):
+    """Bind full-instruction context before a parser splits it into individual actions.
+
+    ``decisions`` is an output list: each rewrite is recorded with the span it replaced and the text it
+    wrote, so `planning/grounding.py` can prove that every byte that changed is a recorded decision
+    (an unrecorded rewrite is what let a duplicated actor particle slip through on 2026-11-07).
+    """
     for ref in sorted(placement_references(text, state), key=lambda item: item['span'][0], reverse=True):
         start, end = ref['span']
         phrase = text[start:end]
         if phrase.startswith(('その', 'それの', '掴んでいる', 'つかんでいる', '持っている')):
             suffix = re.sub(r'^(?:その|それの|掴んでいる(?:状態の)?|つかんでいる(?:状態の)?|持っている(?:状態の)?)(?:(?:[ _-]*キューブ|物体|ブロック)(?:の)?)?', '', phrase)
-            text = text[:start] + ref['target'] + 'の' + suffix + text[end:]
+            replacement = ref['target'] + 'の' + suffix
+            text = text[:start] + replacement + text[end:]
+            if decisions is not None:
+                decisions.append({'kind': 'pronoun_reference', 'target': ref['target'],
+                                  'object': ref['target'], 'relation': ref['relation'],
+                                  'span': [start, end], 'source': phrase, 'replacement': replacement})
     return text
 
 
