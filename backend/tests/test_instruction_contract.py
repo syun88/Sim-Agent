@@ -93,8 +93,11 @@ def test_in_hand_stacking_bimanually_stages_held_support_toward_center_workspace
     placed_pos = np.array([0.44, 0.15, 1.12])   # left arm holds cube on left
 
     moves = []
+    rotations = []
     def mock_move(arm, target, rotation=None, **kwargs):
         moves.append((arm, np.asarray(target).copy()))
+        if rotation is not None:
+            rotations.append((arm, np.asarray(rotation).copy()))
         if arm == 'right':
             target_pos[:] = target[:3]
         elif arm == 'left':
@@ -118,6 +121,7 @@ def test_in_hand_stacking_bimanually_stages_held_support_toward_center_workspace
         motion_speed=6.,
         target_rotations={},
         move_to_site=mock_move,
+        solve_ik=lambda arm, site, rot, **kw: (np.zeros(7), 0.004, 0.01),
     )
     skills = SkillRunner(env, controller)
     # Execute move_to_object: left arm stacks red_cube on blue_cube held by right arm
@@ -127,6 +131,10 @@ def test_in_hand_stacking_bimanually_stages_held_support_toward_center_workspace
     right_moves = [target for arm, target in moves if arm == 'right']
     assert len(right_moves) > 0, "Right arm must stage the held support toward center"
     assert abs(right_moves[-1][1]) < 0.05, f"Right arm should stage close to center line, got {right_moves[-1][1]}"
+    # The placing hand must not reuse the holder's approach side: it picks another reachable yaw.
+    left_rotations = [r for arm, r in rotations if arm == 'left']
+    assert left_rotations, 'the placing arm must be reoriented before entering the holder corridor'
+    assert any(not np.allclose(r, np.eye(3)) for r in left_rotations)
 
 
 def test_held_state_support_in_hand_stacking_never_places_support_on_table():

@@ -436,26 +436,73 @@ class SkillRunner:
         self._carry_to(arm, obj, travel)
         return self._carry_to(arm, obj, desired_object)
 
-    def _align_for_placement(self, arm: str, obj: str) -> None:
+    def _align_for_placement(self, arm: str, obj: str, rotation=None) -> None:
+        """Rotate the held object's grasp to the placement attitude while it is still clear.
+
+        The calibrated table attitude is the default. An in-hand support held by the other arm needs the
+        opposite attitude instead: both hands approach a cube along their fingers' closing axis, so two
+        grippers meeting the same cube from the same side collide. Mirroring the attitude (180 deg about
+        world z) sends the placing hand in from the side the holder's palm is not on, which is the same
+        opposed-approach rule the handover already uses.
+        """
+        target_rotation = GRASP_ROTATION if rotation is None else np.asarray(rotation, float)
         _, rotation = self.env.ee_pose(arm)
-        if np.linalg.norm(rotation - GRASP_ROTATION) > .1:
-            # The handover attitude fits the shared centre workspace. Return to the
-            # calibrated table attitude while the cube is still high and clear.
-            ee, rotation = self.env.ee_pose(arm)
-            center = self.env.object_pose(obj)[0]
-            offset = rotation.T @ (center - ee)
-            from scipy.spatial.transform import Rotation, Slerp
-            arc = Slerp([0., 1.], Rotation.from_matrix(np.stack([rotation, GRASP_ROTATION])))
-            orientations = [arc(alpha).as_matrix() for alpha in np.linspace(0., 1., 9)[1:]]
-            positions = [center - attitude @ offset for attitude in orientations]
-            for index in range(len(positions)) if self.controller.motion_speed == 1. else [len(positions) - 1]:
-                result = self.controller.move_to_site(arm, positions[index], orientations[index],
-                    via=positions[:-1] if self.controller.motion_speed != 1. else None,
-                    via_rotations=orientations[:-1] if self.controller.motion_speed != 1. else None,
-                    on_sample=lambda: self._require_hold(arm, obj))
-                if not result.success:
-                    raise SkillError(result.error or "IK_FAILURE", "Cannot reorient the physical grasp for table placement")
-                self._require_hold(arm, obj)
+        if np.linalg.norm(rotation - target_rotation) <= .1:
+            return
+        # Return to the calibrated attitude while the cube is still high and clear.
+        ee, rotation = self.env.ee_pose(arm)
+        center = self.env.object_pose(obj)[0]
+        offset = rotation.T @ (center - ee)
+        from scipy.spatial.transform import Rotation, Slerp
+        arc = Slerp([0., 1.], Rotation.from_matrix(np.stack([rotation, target_rotation])))
+        orientations = [arc(alpha).as_matrix() for alpha in np.linspace(0., 1., 9)[1:]]
+        positions = [center - attitude @ offset for attitude in orientations]
+        for index in range(len(positions)) if self.controller.motion_speed == 1. else [len(positions) - 1]:
+            result = self.controller.move_to_site(arm, positions[index], orientations[index],
+                via=positions[:-1] if self.controller.motion_speed != 1. else None,
+                via_rotations=orientations[:-1] if self.controller.motion_speed != 1. else None,
+                on_sample=lambda: self._require_hold(arm, obj))
+            if not result.success:
+                raise SkillError(result.error or "IK_FAILURE", "Cannot reorient the physical grasp for placement")
+            self._require_hold(arm, obj)
+
+    def _stacking_attitude(self, arm: str, obj: str, holder_arm: str, support_center):
+        """A grasp attitude that reaches the top of a held support from a different side than its holder.
+
+        Two grippers cannot share one approach axis: the placing hand's fingers and the holding hand's
+        fingers would occupy the same corridor. Measured 2026-11-07, the placing arm reached the top pose
+        kinematically (3.2 mm, 0.8 deg) yet the live motion stopped with an 11.7 deg attitude residual
+        because the holding hand was in that corridor. Sweeping the grasp yaw and keeping the reachable
+        candidate whose end effector sits farthest from the holder picks the opposed side from the arms'
+        own geometry, rather than hard-coding an angle for this cell.
+        """
+        from scipy.spatial.transform import Rotation
+
+        try:
+            holder_ee, _ = self.env.ee_pose(holder_arm)
+        except Exception:
+            return None
+        solve = getattr(self.controller, 'solve_ik', None)
+        if not callable(solve):
+            return None
+        offset_z = 0.
+        try:
+            bounds = self.env.object_bounds(obj)
+            offset_z = float(bounds[1][2] - bounds[0][2])
+        except Exception:
+            pass
+        support_top = np.asarray(support_center, float) + np.array([0., 0., offset_z])
+        best, best_gap = None, -1.
+        for yaw in (0., 90., 180., 270.):
+            candidate = Rotation.from_euler('z', yaw, degrees=True).as_matrix() @ GRASP_ROTATION
+            site = support_top - candidate @ FINGERTIP_MIDPOINT[arm]
+            solved, error, _ = solve(arm, site, candidate)
+            if solved is None or error > .012:
+                continue
+            gap = float(np.linalg.norm(site - np.asarray(holder_ee, float)))
+            if gap > best_gap:
+                best, best_gap = candidate, gap
+        return best
 
     def move_to_object(self, arm, obj, target, relation, distance_cm=None):
         def run():
@@ -469,18 +516,20 @@ class SkillRunner:
             if not is_held_stationary:
                 if self.env.object_contacts(target) or self.env.object_linear_speed(target) > .02:
                     raise SkillError("REFERENCE_MOVING", "The placement reference must be resting stationary on the table or held stationary by the other arm")
+                self._align_for_placement(arm, obj)
             else:
-                # Bimanual in-hand stacking: if the held support is held far to one side (|y| > 0.04),
-                # stage the support arm toward the shared sweet spot: x ≈ 0.45, y ≈ -0.04, z ≈ 1.06
-                # (both arms achieve <3.2mm pos error and <0.8deg rotation error in this pose!)
-                target_pos = self.env.object_pose(target)[0]
+                # Bimanual in-hand stacking: stage the held support at the shared sweet spot
+                # (x ≈ 0.45, y ≈ -0.04, z ≈ 1.06; both arms solve it to <3.2 mm and <0.8 deg),
+                # then choose a placing attitude that reaches the top from the holder's opposite side.
                 staging_pos = np.array([0.45, -0.04, 1.06])
                 self._carry_to(other_arm, target, staging_pos, exclude_target=obj)
-            self._align_for_placement(arm, obj)
+                staged_support = self.env.object_pose(target)[0]
+                attitude = self._stacking_attitude(arm, obj, other_arm, staged_support)
+                self._align_for_placement(arm, obj, rotation=attitude)
             desired = relative_destination(self.env, obj, target, relation, arm, distance_cm)
             travel = desired.copy()
             travel[2] = min(1.15, desired[2] + .02 if is_held_stationary else max(1.14, desired[2] + .035))
-            self._carry_to(arm, obj, travel, attitude="free" if is_held_stationary else "pinned", exclude_target=target)
+            self._carry_to(arm, obj, travel, exclude_target=target)
             placed = self._carry_to(arm, obj, desired, exclude_target=target)
             return {**placed, "reference_object": target, "relation": relation,
                     "support_bounds": self.env.object_bounds(target).tolist()}
