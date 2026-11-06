@@ -180,9 +180,19 @@ class TaskAgent:
             failed = next((s for s in reversed(result.get('skills',[])) if not s['success']),{})
             category = failed.get('error') or category
             observed = self.executor.world_state()
-            announce({'kind':'execution_failed','explanation':f'{category}。現在の保持・接触と残りの作業を再確認します。',
+            # The code names the layer that raised the failure; the mechanism names what the recorded
+            # measurements show. Say both, so a reader does not chase 'IK_FAILURE' when the numbers say
+            # the arm was blocked short of a commanded attitude (see verification/failure_attribution).
+            mechanism = failure_receipt.get('mechanism')
+            mechanism_reason = failure_receipt.get('mechanism_reason')
+            explanation = f'{category}。'
+            if mechanism and mechanism != 'UNKNOWN':
+                explanation += f'計測からの機序は{mechanism}（{mechanism_reason}）。'
+            explanation += '現在の保持・接触と残りの作業を再確認します。'
+            announce({'kind':'execution_failed','explanation':explanation,
                 'failure_category':category,'evidence_id':failure_receipt['id'],
                 'classification':failure_receipt['classification'],
+                'mechanism':mechanism,'mechanism_reason':mechanism_reason,
                 'observed_hands':{s:observed.get('robot',{}).get(s+'_arm',{}).get('held_object') for s in ('left','right')}})
             if iteration+1==self.max_attempts or category not in RECOVERABLE or not restartable:
                 result['detail'] = result.get('detail') or f'{category}: 自動復旧できる操作の範囲または試行上限に達しました。'

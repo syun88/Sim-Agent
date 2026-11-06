@@ -10,6 +10,8 @@ import hashlib
 import json
 import math
 
+from backend.app.verification.failure_attribution import attribute
+
 
 def _canonical(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False, default=str)
@@ -42,7 +44,10 @@ def state_fingerprint(state, *, obj=None, arm=None):
 
 
 def _classification(code, raw, phase):
-    if code == 'COLLISION_PATH' or code in {'MOTION_BLOCKED', 'PARK_COLLISION'} and raw.get('collision'):
+    if (code in {'COLLISION_PATH', 'APPROACH_COLLISION', 'CARRY_COLLISION'}
+            or code in {'MOTION_BLOCKED', 'PARK_COLLISION'} and raw.get('collision')):
+        # A contact made while moving along the path (approach or carry) is a path collision, not a hold
+        # fault: the grasp was fine and the route was not. Measured 2026-11-07 (CARRY_COLLISION, 7.4 mm).
         return 'PATH_COLLISION'
     if code in {'GRASP_FAILED', 'GRASP_LOST', 'GRASP_SLIP', 'HOLD_LOST', 'HAND_CONTACT'}:
         return 'HOLD'
@@ -83,11 +88,16 @@ def failure_observation(contract, epoch, attempt, result, before, after):
     if time_observed is None:
         time_observed = after.get('sim_time')
     numbers = {k: v for k, v in raw.items() if _finite(v)}
+    mechanism, mechanism_reason = attribute(code, raw)
     return {'id': f"{contract.task_id}/epoch/{epoch}/attempt/{attempt}/"
                   f"{phase}/{action if action is not None else 'unknown'}/{step if step is not None else 'unknown'}",
             **provenance, 'skill': (failed or {}).get('skill'), 'object': obj, 'arm': arm,
             'observed_sim_time': time_observed, 'code': code,
-            'classification': _classification(code, raw, phase), 'measurement': numbers,
+            'classification': _classification(code, raw, phase),
+            # The code names the layer that raised the failure; the mechanism names what the
+            # measurements show. They can disagree on purpose (MOTION_BLOCKED / TRACKING).
+            'mechanism': mechanism, 'mechanism_reason': mechanism_reason,
+            'measurement': numbers,
             'raw': raw, 'detail': (failed or {}).get('detail') or result.get('detail'),
             'before_fingerprint': state_fingerprint(skill_before, obj=obj, arm=arm),
             'after_fingerprint': state_fingerprint(skill_after, obj=obj, arm=arm),

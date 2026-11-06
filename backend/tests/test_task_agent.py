@@ -136,6 +136,26 @@ def test_recovery_trace_grounds_explanation_and_rejects_model_confabulation(worl
     assert '接触のない空の腕を退避' in recover_desc
 
 
+def test_the_trace_names_the_mechanism_the_measurements_show(world,postconditions):
+    """A blocked carry that shoved another cube must say so, not leave the reader with the error code."""
+    def failed_carry(executor, plan):
+        return {'success': False, 'status': 'FAILED',
+                'skills': [{'skill': 'move_to_object', 'arm': 'left', 'object': 'red_cube', 'success': False,
+                            'error': 'CARRY_COLLISION', 'action_index': 0, 'step_index': 0,
+                            'evidence': {'object': 'blue_cube', 'carrying': 'red_cube', 'displacement_m': 0.0074,
+                                         'tolerance_m': 0.005, 'phase': 'carry'},
+                            'detail': 'Carrying red_cube disturbed resting blue_cube by 7.4 mm'}],
+                'verification': {'success': False, 'failure_category': 'CARRY_COLLISION'}}
+    executor = FakeExecutor(world, [failed_carry, failed_carry, failed_carry, failed_carry])
+    planner = AgentPlanner()
+    result = TaskAgent(executor, planner, max_attempts=1).run('赤を左手で青の上に置いて')
+    failed = next(d for d in result['agent_trace'] if d.get('kind') == 'execution_failed')
+    assert failed['mechanism'] == 'CARRY_CONTACT'
+    assert '7.4 mm' in failed['mechanism_reason']
+    assert 'CARRY_CONTACT' in failed['explanation']
+    assert result['evidence_ledger'][0]['mechanism'] == 'CARRY_CONTACT'
+
+
 def test_failed_attempt_is_retained_after_in_place_recovery(world,postconditions):
     executor=FakeExecutor(world,[False,True])
     result=TaskAgent(executor,AgentPlanner()).run('青いキューブを掴んで')

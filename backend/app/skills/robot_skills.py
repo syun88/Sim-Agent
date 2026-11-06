@@ -124,6 +124,20 @@ class SkillRunner:
             return {"skill": name, "success": False, "duration": time.perf_counter() - started, "error": exc.category,
                     "detail": str(exc), **({"evidence": exc.evidence} if exc.evidence else {})}
 
+    def _motion_evidence(self, result, **extra):
+        """The residuals a blocked motion was judged with, so its mechanism can be named from numbers.
+
+        `control/motion.py` decides success from these residuals against the environment's tolerances;
+        copying them (and the tolerances that applied) into `SkillError.evidence` is what lets
+        `verification/failure_attribution` separate servo lag from an unreachable or occupied attitude
+        instead of repeating the error code.
+        """
+        evidence = {'position_error': getattr(result, 'position_error', None),
+                    'rotation_error': getattr(result, 'rotation_error', None),
+                    'position_tolerance_m': getattr(self.env, 'motion_position_tolerance', .012),
+                    'rotation_tolerance_m': getattr(self.env, 'motion_rotation_tolerance', .15)}
+        return {**{k: v for k, v in evidence.items() if v is not None}, **extra}
+
     # -- skills ------------------------------------------------------------------
 
     def approach_object(self, arm: str, obj: str, progress=None, fault_offset: float | None = None,
@@ -219,15 +233,19 @@ class SkillRunner:
             if not result.success:
                 error=SkillError(result.error or "IK_FAILURE", f"Unable to reach the {name} pose "
                                  f"(position error={result.position_error}, rotation error={result.rotation_error})")
-                error.evidence=approach_evidence
+                error.evidence={**(approach_evidence or {}), **self._motion_evidence(result, phase='approach')}
                 raise error
         after = self.env.object_pose(obj)[0]
         disturbance = float(np.linalg.norm(after - before))
         if disturbance > APPROACH_DISTURBANCE_TOLERANCE:
-            raise SkillError(
+            error = SkillError(
                 "APPROACH_COLLISION",
                 f"The approach displaced {obj} by {disturbance * 1000:.1f} mm",
             )
+            # The mechanism is named from these numbers, not from the code (see verification/failure_attribution).
+            error.evidence = {'object': obj, 'displacement_m': disturbance,
+                              'tolerance_m': APPROACH_DISTURBANCE_TOLERANCE, 'phase': 'approach'}
+            raise error
         ee, measured_rotation = self.env.ee_pose(arm)
         midpoint_error = float(np.linalg.norm(after - (ee + measured_rotation @ FINGERTIP_MIDPOINT[arm])))
         return {
@@ -606,8 +624,11 @@ class SkillRunner:
             for name, position in stationary.items():
                 displacement = float(np.linalg.norm(self.env.object_pose(name)[0] - position))
                 if displacement > APPROACH_DISTURBANCE_TOLERANCE:
-                    raise SkillError("CARRY_COLLISION",
-                                     f"Carrying {obj} disturbed resting {name} by {displacement * 1000:.1f} mm; stopping")
+                    error = SkillError("CARRY_COLLISION",
+                                       f"Carrying {obj} disturbed resting {name} by {displacement * 1000:.1f} mm; stopping")
+                    error.evidence = {'object': name, 'carrying': obj, 'displacement_m': displacement,
+                                      'tolerance_m': APPROACH_DISTURBANCE_TOLERANCE, 'phase': 'carry'}
+                    raise error
         # Keep the carried cube on a Cartesian clearance path. A joint interpolation
         # between two high endpoints can still dip the palm through a table object.
         count = max(1, int(np.ceil(np.linalg.norm(np.asarray(desired) - start) / .025)))
@@ -643,7 +664,9 @@ class SkillRunner:
                 # bit-identical with and without the plan, which is how the dead path was found).
                 if attempt == 0 and planned is not None:
                     continue
-                raise SkillError(result.error or "IK_FAILURE", f"Cannot carry {obj} to {np.round(desired, 4).tolist()} (EE {np.round(target, 4).tolist()}, position residual {result.position_error}, rotation residual {result.rotation_error})")
+                error = SkillError(result.error or "IK_FAILURE", f"Cannot carry {obj} to {np.round(desired, 4).tolist()} (EE {np.round(target, 4).tolist()}, position residual {result.position_error}, rotation residual {result.rotation_error})")
+                error.evidence = self._motion_evidence(result, object=obj, phase='carry')
+                raise error
             self._require_hold(arm, obj)
             actual = self.env.object_pose(obj)[0]
             error = float(np.linalg.norm(actual - desired))
@@ -699,7 +722,9 @@ class SkillRunner:
             q_init=geometry.donor_seed, via=donor_positions, via_rotations=donor_rotations,
             on_sample=lambda: self._require_hold(arm, obj))
         if not moved.success:
-            raise SkillError(moved.error or "IK_FAILURE", "Donor could not reach the coupled handover pose")
+            error = SkillError(moved.error or "IK_FAILURE", "Donor could not reach the coupled handover pose")
+            error.evidence = self._motion_evidence(moved, object=obj, phase='handover_donor')
+            raise error
         self.env.step(max(1, round(600 / self.controller.motion_speed)))
         self._require_hold(arm, obj)
         self.controller.wait_gripper(receiver, False, .5)
@@ -711,7 +736,9 @@ class SkillRunner:
         # First stay outside the donor, then insert along a measured Cartesian line.
         result = self.controller.move_to_site(receiver, pregrasp, receiving_rotation, q_init=geometry.receiver_seed)
         if not result.success:
-            raise SkillError(result.error or "IK_FAILURE", "Receiver could not reach the handover standoff")
+            error = SkillError(result.error or "IK_FAILURE", "Receiver could not reach the handover standoff")
+            error.evidence = self._motion_evidence(result, object=obj, phase='handover_receiver')
+            raise error
         self.env.step(max(1, round(200 / self.controller.motion_speed)))
         self._require_hold(arm, obj)
         insertion = [(1 - alpha) * pregrasp + alpha * site for alpha in np.linspace(0., 1., 13)[1:]]

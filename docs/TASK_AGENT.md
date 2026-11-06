@@ -182,6 +182,32 @@ VLMの画像認識は未接続であり、状態はGenesisの登録済み物体�
 準備の理由と対象は `planning_evidence.preparations`、元の要求は `requested_program` に残る。
 一時置きの候補は物体寸法と既知の位置から選ぶ。連続軌道の可否や実把持は実行時に別途検査する。
 
+## 失敗の機序を測定値から名付ける
+
+`verification/failure_attribution.py` は、失敗したスキルの `SkillError.evidence` とコードから
+**機序**（`GEOMETRY` / `APPROACH_CONTACT` / `CARRY_CONTACT` / `GRASP_CONTACT` / `GRASP_FRAME` /
+`TRACKING` / `PLANNING` / `LANGUAGE` / `UNKNOWN`）と、その根拠文を返す。
+同じコードが別の層を指すため、コードだけを読むと次の試行が誤った層へ向かう。
+
+- `MOTION_BLOCKED` は「届かない」ではなく、指令した姿勢に届かず止まったサーボ（`TRACKING`）でありうる。
+  回転残差が大きい場合は「到達不能または進入路が塞がれている」可能性を根拠文に明記し、断定しない。
+- `APPROACH_COLLISION` / `CARRY_COLLISION` の変位は接触（`APPROACH_CONTACT` / `CARRY_CONTACT`）であり、
+  把持の不成立ではない。運搬中に別の物体を動かした場合は、運んでいる物体名も根拠文に入る。
+- 把持系は、指の接触が記録されていれば `GRASP_CONTACT`（力・面の問題）、接触ゼロなら `GRASP_FRAME`
+  （指の枠が対象に届いていない）として区別する。
+- 投擲は「実際に出た速度」と「必要だった速度」の2値で判定し、届いていなければサーボ側（`TRACKING`）とする。
+
+判定は**記録された測定値だけで**行い、コード単独から機序を作らない。
+`displacement_m` が無い、または 0 の場合は接触と断定せず `UNKNOWN` を返す。
+残差が「その記録が申告した許容値」の内側なら、サーボ起因とも言わず `UNKNOWN` とする。
+許容値は `control/motion.py` の既定値と同じ値を初期値に持ち、記録が `position_tolerance_m` /
+`rotation_tolerance_m` を持つ場合はそちらを優先する（分類はするが、検査は緩めない）。
+
+機序は `failure_evidence.failure_observation` の receipt に `mechanism` / `mechanism_reason` として入り、
+`TaskAgent` の `agent_trace`（`execution_failed`）にも同じ値が載る。
+`classification`（`PATH_COLLISION` などの粗い分類）は従来どおり別に保持し、
+接近・運搬中の接触は `PATH_COLLISION` として扱う。
+
 ## 失敗した後の判断
 
 実行結果と最新の接触・保持・位置を読み、既存の操作だけで復旧できる候補を作る。
