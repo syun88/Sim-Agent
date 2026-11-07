@@ -569,8 +569,16 @@ class SkillRunner:
             desired = relative_destination(self.env, obj, target, relation, arm, distance_cm)
             travel = desired.copy()
             travel[2] = min(1.15, desired[2] + .02 if is_held_stationary else max(1.14, desired[2] + .035))
-            self._carry_to(arm, obj, travel, exclude_target=target)
-            placed = self._carry_to(arm, obj, desired, exclude_target=target)
+            try:
+                self._carry_to(arm, obj, travel, exclude_target=target)
+                placed = self._carry_to(arm, obj, desired, exclude_target=target)
+            except SkillError as error:
+                # Keep what the preparation step measured. A placement that fails later must not hide
+                # whether the support regrasp happened (measured 2026-11-07: it did, and the report lost it).
+                if regrasp is not None:
+                    error.evidence = {**(error.evidence or {}), 'support_regrasp': regrasp,
+                                      'reference_object': target, 'relation': relation}
+                raise
             return {**placed, "reference_object": target, "relation": relation,
                     "support_bounds": self.env.object_bounds(target).tolist(),
                     "support_regrasp": regrasp if is_held_stationary else None}

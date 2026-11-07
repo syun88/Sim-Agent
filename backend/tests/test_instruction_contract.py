@@ -128,6 +128,46 @@ def _regrasp_fixture(pinch_survives_relief=True, puzzle_drop=False, sideways=0.0
     return env, controller, calls, cube
 
 
+def test_a_failed_placement_still_reports_whether_the_support_was_regrasped():
+    """The preparation's measurement must survive the failure that follows it."""
+    from types import SimpleNamespace
+    from backend.app.skills.robot_skills import SkillRunner
+    import numpy as np
+    support = np.array([0.45, 0.04, 1.06])
+    held = np.array([0.44, 0.15, 1.12])
+
+    left_moves = {'count': 0}
+    def move(arm, target, rotation=None, **kwargs):
+        # Reorienting the grasp is allowed; the placement carry after it is blocked, as measured live.
+        if arm == 'left':
+            left_moves['count'] += 1
+            if left_moves['count'] > 2:
+                return SimpleNamespace(success=False, error='MOTION_BLOCKED',
+                                       position_error=0.02, rotation_error=0.11)
+        return SimpleNamespace(success=True, final_position=list(target))
+
+    env = SimpleNamespace(
+        ee_pose=lambda side: (np.array([0.40, 0.04, 1.10]) if side == 'right' else np.array([0.40, 0.15, 1.12]), np.eye(3)),
+        object_pose=lambda name: (support.copy() if name == 'blue_cube' else held.copy(), np.eye(3)),
+        object_bounds=lambda name: np.array([[.42, .01, 1.03], [.48, .07, 1.09]]),
+        frame=lambda: SimpleNamespace(objects={'blue_cube': support, 'red_cube': held}),
+        pinch_established=lambda obj, arm: (arm == 'right' and obj == 'blue_cube') or (arm == 'left' and obj == 'red_cube'),
+        object_linear_speed=lambda name: 0.0, object_contacts=lambda name, arm=None: ['finger'],
+        gripper_position=lambda arm: 0.02, gripper_target=lambda arm, closed: 0.02 if closed else 0.7854,
+        set_gripper=lambda arm, value: None, step=lambda n: None, timestep=0.002,
+        grasp_mode='physical-friction-pinch')
+    controller = SimpleNamespace(motion_speed=6., target_rotations={}, move_to_site=move,
+                                 wait_gripper=lambda arm, closed, seconds: SimpleNamespace(success=True),
+                                 solve_ik=lambda arm, site, rot, **kw: (np.zeros(7), 0.004, 0.01))
+    skills = SkillRunner(env, controller)
+    skills.held_object = lambda arm: 'blue_cube' if arm == 'right' else ('red_cube' if arm == 'left' else None)
+    skills._regrasp = lambda arm, obj, drop_m: {'object': obj, 'arm': arm, 'drop_m': drop_m, 'relief_fraction': 0.1}
+    result = skills.move_to_object('left', 'red_cube', 'blue_cube', 'on')
+    assert result['success'] is False and result['error'] == 'MOTION_BLOCKED'
+    assert result['evidence']['support_regrasp']['relief_fraction'] == 0.1
+    assert result['evidence']['reference_object'] == 'blue_cube'
+
+
 def test_a_regrasp_slides_the_pinch_down_without_dropping_the_object():
     from backend.app.skills.robot_skills import SkillRunner, SUPPORT_REGRASP_DROP_M
     env, controller, calls, cube = _regrasp_fixture()
