@@ -40,8 +40,13 @@ def main(argv=None):
     report = {'records': len(paths), 'examples': len(examples), 'skipped': skipped}
     if len(examples) < 2 or len({example['label'] for example in examples}) < 2:
         report['adopted'] = False
-        report['reason'] = 'NOT_ENOUGH_CLASSES'
-        print(json.dumps(report, ensure_ascii=False, indent=1))
+        report['reason'] = ('NOT_ENOUGH_CLASSES: a predictor needs at least two mechanisms to separate; '
+                            f'{len(examples)} example(s) with {len({e["label"] for e in examples})} class(es)')
+        if args.report:
+            Path(args.report).write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding='utf-8')
+        print(json.dumps({'records': report['records'], 'examples': report['examples'],
+                          'adopted': report['adopted'], 'reason': report['reason']},
+                         ensure_ascii=False, indent=1))
         return 0
 
     scores = leave_one_out(examples)
