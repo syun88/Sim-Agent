@@ -60,6 +60,15 @@ APPROACH_OVERFLY = 0.10
 STAGING_ALTITUDE = 1.24
 #: A rise shorter than this is not worth a waypoint.
 MIN_STAGING_RISE = 0.02
+#: How far an in-hand support's pinch is slid down before another cube is stacked on it (m).
+#: A centred pinch leaves pad material 7.15 mm above the support's top face (measured 2026-11-07),
+#: so the stacked cube cannot reach it; 15 mm clears the pads while keeping the object between them.
+SUPPORT_REGRASP_DROP_M = 0.015
+#: Fraction of the way to full open that the jaws are relieved during a regrasp. Enough to unload the
+#: pads, not enough to let the object leave them.
+SUPPORT_REGRASP_RELEASE = 0.35
+#: A regrasp must not walk the object sideways; this is the tolerated lateral shift (m).
+SUPPORT_REGRASP_SHIFT_TOLERANCE = 0.010
 #: The approach may not displace the object by more than this (m); the object is only pinched
 #: after this check, so a shove here would fake nothing anyway, but the plan still fails loudly.
 APPROACH_DISTURBANCE_TOLERANCE = 0.005
@@ -541,6 +550,9 @@ class SkillRunner:
                 # then choose a placing attitude that reaches the top from the holder's opposite side.
                 staging_pos = np.array([0.45, -0.04, 1.06])
                 self._carry_to(other_arm, target, staging_pos, exclude_target=obj)
+                # Free the support's top face before the placing arm arrives: the holder's pads sit above
+                # the centre they pinch, so a centred grip would leave the stacked cube resting on them.
+                self._regrasp(other_arm, target, -SUPPORT_REGRASP_DROP_M)
                 staged_support = self.env.object_pose(target)[0]
                 attitude = self._stacking_attitude(arm, obj, other_arm, staged_support)
                 self._align_for_placement(arm, obj, rotation=attitude)
@@ -674,6 +686,60 @@ class SkillRunner:
                 return {"object": obj, "target": np.asarray(desired).tolist(), "position": actual.tolist(), "position_error": error}
             target += np.asarray(desired) - actual
         raise SkillError("GRASP_SLIP", f"{obj} deviated from carry target by {error * 1000:.1f} mm")
+
+    def regrasp_object(self, arm: str, obj: str, drop_m: float = -SUPPORT_REGRASP_DROP_M) -> dict:
+        """Slide this arm's pinch down the held object, so its top face becomes reachable.
+
+        A cube gripped at its centre is held by pads that stand above that centre, so a second cube
+        placed on top cannot reach the top face: measured 2026-11-07, the stacked cube stopped 7.15 mm
+        above the support and rested on the holder's own fingers (`support_contact=false`). Gripping the
+        support low is not possible while it rests on the table (the pads would hit the table), so the
+        grip is lowered **after** the object is in the air.
+
+        The jaws are opened only part way, so the object stays between the pads; the arm then slides
+        down and closes again. Every step is verified: if the pinch is lost while opening, the skill stops
+        before moving, and if the object shifts or does not follow a short lift, it raises rather than
+        reporting a regrasp it did not achieve.
+        """
+        return self._skill("regrasp_object", lambda: self._regrasp(arm, obj, drop_m), time.perf_counter())
+
+    def _regrasp(self, arm: str, obj: str, drop_m: float) -> dict:
+        self._require_hold(arm, obj)
+        if drop_m >= 0.:
+            raise SkillError("INVALID_PLAN", "A regrasp lowers the pinch; the offset must be negative")
+        before = self.env.object_pose(obj)[0].copy()
+        closed_aperture = self.env.gripper_position(arm)
+        open_aperture = self.env.gripper_target(arm, False)
+        partial = closed_aperture + SUPPORT_REGRASP_RELEASE * (open_aperture - closed_aperture)
+        self.env.set_gripper(arm, partial)
+        self.env.step(max(1, round(200 / self.controller.motion_speed)))
+        if not self._pinch_established(obj, arm):
+            # Never slide on a lost pinch: close again and report, leaving the object where it was.
+            self.controller.wait_gripper(arm, True, .5)
+            raise SkillError("REGRASP_LOST", f"{obj} left the pinch when the jaws were relieved; not sliding")
+        ee, rotation = self.env.ee_pose(arm)
+        slide = self.controller.target_rotations.get(arm, rotation)
+        result = self.controller.move_to_site(arm, ee + np.array([0., 0., drop_m]), slide,
+                                              on_sample=lambda: self._require_hold(arm, obj))
+        if not result.success:
+            raise SkillError(result.error or "IK_FAILURE", "Could not slide the pinch along the object")
+        self.controller.wait_gripper(arm, True, .5)
+        if not self._pinch_established(obj, arm):
+            raise SkillError("REGRASP_NO_PINCH", f"{obj} is no longer pinched after closing at the lower point")
+        after = self.env.object_pose(obj)[0]
+        shifted = float(np.linalg.norm((after - before)[:2]))
+        if shifted > SUPPORT_REGRASP_SHIFT_TOLERANCE:
+            raise SkillError("REGRASP_MOVED", f"{obj} moved {shifted * 1000:.1f} mm sideways during the regrasp")
+        lift = self.controller.move_to_site(arm, self.env.ee_pose(arm)[0] + np.array([0., 0., VERIFICATION_LIFT]),
+                                           self.env.ee_pose(arm)[1], on_sample=lambda: self._require_hold(arm, obj))
+        if not lift.success:
+            raise SkillError(lift.error or "IK_FAILURE", "The hold did not survive the regrasp verification lift")
+        self.controller.move_to_site(arm, self.env.ee_pose(arm)[0] - np.array([0., 0., VERIFICATION_LIFT]),
+                                     self.env.ee_pose(arm)[1], on_sample=lambda: self._require_hold(arm, obj))
+        self._require_hold(arm, obj)
+        return {"object": obj, "arm": arm, "drop_m": drop_m,
+                "aperture_before": closed_aperture, "aperture_relieved": partial, "aperture_open": open_aperture,
+                "sideways_shift_m": shifted, "pinch_contacts": sorted(self._contact_fingers(obj, arm))}
 
     def handover_object(self, arm: str | None, obj: str, receiver: str | None = None) -> dict:
         if arm is None:

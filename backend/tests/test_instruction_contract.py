@@ -80,6 +80,152 @@ def test_placed_support_updates_projected_position_and_avoids_unnecessary_handov
     assert not any(s.skill == 'handover_object' and s.object == 'blue_cube' for s in plan.steps)
 
 
+def _regrasp_fixture(pinch_survives_relief=True, puzzle_drop=False, sideways=0.0):
+    from types import SimpleNamespace
+    import numpy as np
+    cube = np.array([0.45, -0.04, 1.10])
+    ee = np.array([0.30, -0.04, 1.10])
+    calls = {'set_gripper': [], 'moves': [], 'closed': 0}
+    state = {'pinched': True}
+
+    def set_gripper(arm, value):
+        calls['set_gripper'].append(value)
+        if not pinch_survives_relief:
+            state['pinched'] = False
+        if puzzle_drop:
+            # The object slips sideways out of the pads while they are relieved.
+            cube[1] += sideways or 0.02
+
+    def move(arm, target, rotation=None, **kwargs):
+        calls['moves'].append(np.asarray(target).copy())
+        if kwargs.get('on_sample'):
+            kwargs['on_sample']()
+        return SimpleNamespace(success=True, final_position=list(target))
+
+    def wait_gripper(arm, closed, seconds):
+        if closed:
+            calls['closed'] += 1
+            state['pinched'] = pinch_survives_relief
+        return SimpleNamespace(success=True)
+
+    env = SimpleNamespace(
+        object_pose=lambda name: (cube.copy(), np.eye(3)),
+        frame=lambda: SimpleNamespace(objects={'blue_cube': cube}, grippers={'left': 0.02, 'right': 0.7854}),
+        ee_pose=lambda arm: (ee.copy(), np.eye(3)),
+        pinch_established=lambda obj, arm: state['pinched'] if arm in ('left', 'right') else False,
+        object_contacts=lambda obj, arm=None: (["openarm_right_ee_inner_finger|blue_cube",
+                                                "openarm_right_ee_outer_finger|blue_cube"]
+                                               if arm == 'right' and state['pinched'] else []),
+        gripper_position=lambda arm: 0.02 if arm == 'right' else -0.02,
+        gripper_target=lambda arm, closed: (0.02 if closed else 0.7854) if arm == 'right' else (-0.02 if closed else -0.7854),
+        set_gripper=set_gripper,
+        step=lambda n: None,
+        timestep=0.002,
+        grasp_mode='physical-friction-pinch',
+    )
+    controller = SimpleNamespace(motion_speed=6., target_rotations={}, move_to_site=move,
+                                 wait_gripper=wait_gripper)
+    return env, controller, calls, cube
+
+
+def test_a_regrasp_slides_the_pinch_down_without_dropping_the_object():
+    from backend.app.skills.robot_skills import SkillRunner, SUPPORT_REGRASP_DROP_M
+    env, controller, calls, cube = _regrasp_fixture()
+    skills = SkillRunner(env, controller)
+    skills.held_object = lambda arm: 'blue_cube' if arm == 'right' else None
+    result = skills.regrasp_object('right', 'blue_cube')
+    assert result['success'], result
+    assert result['drop_m'] == -SUPPORT_REGRASP_DROP_M
+    # The jaws were relieved part way, never opened fully.
+    assert 0.02 < calls['set_gripper'][0] < 0.7854
+    # The arm slid down by the drop, then lifted and returned for the hold check.
+    drops = [round(float(target[2] - cube[2]), 4) for target in calls['moves']]
+    assert any(abs(drop + SUPPORT_REGRASP_DROP_M) < 1e-4 for drop in drops)
+
+
+def test_a_regrasp_refuses_to_slide_on_a_lost_pinch():
+    from backend.app.skills.robot_skills import SkillRunner
+    env, controller, calls, cube = _regrasp_fixture(pinch_survives_relief=False)
+    skills = SkillRunner(env, controller)
+    skills.held_object = lambda arm: 'blue_cube' if arm == 'right' else None
+    result = skills.regrasp_object('right', 'blue_cube')
+    assert result['success'] is False and result['error'] == 'REGRASP_LOST'
+    assert calls['moves'] == [], 'the arm must not move after the pinch was lost'
+
+
+def test_a_regrasp_reports_an_object_that_slips_sideways():
+    from backend.app.skills.robot_skills import SkillRunner
+    env, controller, calls, cube = _regrasp_fixture(sideways=0.02)
+
+    def move(arm, target, rotation=None, **kwargs):
+        calls['moves'].append(list(target))
+        if len(calls['moves']) == 1:
+            cube[1] += 0.02          # slips only while the pinch slides
+        if kwargs.get('on_sample'):
+            kwargs['on_sample']()
+        from types import SimpleNamespace as NS
+        return NS(success=True, final_position=list(target))
+
+    controller.move_to_site = move
+    skills = SkillRunner(env, controller)
+    skills.held_object = lambda arm: 'blue_cube' if arm == 'right' else None
+    result = skills.regrasp_object('right', 'blue_cube')
+    assert result['success'] is False and result['error'] == 'REGRASP_MOVED'
+
+
+def test_in_hand_stacking_regrasps_the_held_support_before_placing():
+    """The measured 7.15 mm gap is avoided by lowering the holder's pinch before the stack."""
+    from types import SimpleNamespace
+    from backend.app.skills.robot_skills import SkillRunner
+    import numpy as np
+    target_pos = np.array([0.48, -0.22, 1.12])
+    placed_pos = np.array([0.44, 0.15, 1.12])
+    regrasps = []
+
+    mode = {'sliding': False}
+    def mock_move(arm, target, rotation=None, **kwargs):
+        # A carry takes the object with the hand. A regrasp slide is different: the hand moves down the
+        # object while the object stays where it is, which is the whole point of the operation.
+        if not mode['sliding']:
+            if arm == 'right':
+                target_pos[:] = target[:3]
+            else:
+                placed_pos[:] = target[:3]
+        return SimpleNamespace(success=True, final_position=list(target))
+
+    env = SimpleNamespace(
+        ee_pose=lambda side: (np.array([0.40, -0.22, 1.12]) if side == 'right' else np.array([0.40, 0.15, 1.12]), np.eye(3)),
+        object_pose=lambda name: (target_pos.copy() if name == 'blue_cube' else placed_pos.copy(), np.eye(3)),
+        object_bounds=lambda name: np.array([[.45, -.25, 1.10], [.51, -.19, 1.15]]) if name == 'blue_cube'
+        else np.array([[.41, .12, 1.10], [.47, .18, 1.15]]),
+        frame=lambda: SimpleNamespace(objects={'blue_cube': target_pos, 'red_cube': placed_pos}),
+        pinch_established=lambda obj, arm: (arm == 'right' and obj == 'blue_cube') or (arm == 'left' and obj == 'red_cube'),
+        object_linear_speed=lambda name: 0.0,
+        object_contacts=lambda name, arm=None: ['finger'],
+        gripper_position=lambda arm: 0.02,
+        gripper_target=lambda arm, closed: 0.02 if closed else 0.7854,
+        set_gripper=lambda arm, value: None,
+        step=lambda n: None, timestep=0.002, grasp_mode='physical-friction-pinch',
+    )
+    controller = SimpleNamespace(motion_speed=6., target_rotations={}, move_to_site=mock_move,
+                                 wait_gripper=lambda arm, closed, seconds: SimpleNamespace(success=True))
+    skills = SkillRunner(env, controller)
+    skills.held_object = lambda arm: 'blue_cube' if arm == 'right' else ('red_cube' if arm == 'left' else None)
+    original = skills._regrasp
+    def spy(arm, obj, drop_m):
+        regrasps.append((arm, obj, drop_m))
+        mode['sliding'] = True
+        try:
+            return original(arm, obj, drop_m)
+        finally:
+            mode['sliding'] = False
+    skills._regrasp = spy
+    result = skills.move_to_object('left', 'red_cube', 'blue_cube', 'on')
+    assert result['success'], result
+    assert regrasps and regrasps[0][0] == 'right' and regrasps[0][1] == 'blue_cube'
+    assert regrasps[0][2] < 0
+
+
 def test_in_hand_stacking_bimanually_stages_held_support_toward_center_workspace():
     # User insight: "今回の場合、右腕をまんなからへんによせるひつようがあった"
     # When support is held by right arm on the far right (y=-0.22), left arm cannot reach y=-0.22.
@@ -94,14 +240,17 @@ def test_in_hand_stacking_bimanually_stages_held_support_toward_center_workspace
 
     moves = []
     rotations = []
+    mode = {'sliding': False}
     def mock_move(arm, target, rotation=None, **kwargs):
         moves.append((arm, np.asarray(target).copy()))
         if rotation is not None:
             rotations.append((arm, np.asarray(rotation).copy()))
-        if arm == 'right':
-            target_pos[:] = target[:3]
-        elif arm == 'left':
-            placed_pos[:] = target[:3]
+        # A carry carries; a regrasp slide moves the hand along the object and leaves it in place.
+        if not mode['sliding']:
+            if arm == 'right':
+                target_pos[:] = target[:3]
+            elif arm == 'left':
+                placed_pos[:] = target[:3]
         return SimpleNamespace(success=True, final_position=list(target))
 
     env = SimpleNamespace(
@@ -116,21 +265,34 @@ def test_in_hand_stacking_bimanually_stages_held_support_toward_center_workspace
         step=lambda n: None,
         timestep=0.002,
         grasp_mode='physical-friction-pinch',
+        gripper_position=lambda arm: 0.02 if arm == 'right' else -0.02,
+        gripper_target=lambda arm, closed: (0.02 if closed else 0.7854) if arm == 'right' else (-0.02 if closed else -0.7854),
+        set_gripper=lambda arm, value: None,
     )
     controller = SimpleNamespace(
         motion_speed=6.,
         target_rotations={},
         move_to_site=mock_move,
         solve_ik=lambda arm, site, rot, **kw: (np.zeros(7), 0.004, 0.01),
+        wait_gripper=lambda arm, closed, seconds: SimpleNamespace(success=True),
     )
     skills = SkillRunner(env, controller)
+    sliding = skills._regrasp
+    def regrasp_spy(arm, obj, drop_m):
+        mode['sliding'] = True
+        try:
+            return sliding(arm, obj, drop_m)
+        finally:
+            mode['sliding'] = False
+    skills._regrasp = regrasp_spy
     # Execute move_to_object: left arm stacks red_cube on blue_cube held by right arm
     result = skills.move_to_object('left', 'red_cube', 'blue_cube', 'on')
     assert result['success']
     # Check that right arm was commanded to stage blue_cube toward center (y ≈ 0)!
     right_moves = [target for arm, target in moves if arm == 'right']
     assert len(right_moves) > 0, "Right arm must stage the held support toward center"
-    assert abs(right_moves[-1][1]) < 0.05, f"Right arm should stage close to center line, got {right_moves[-1][1]}"
+    staged_y = min(abs(float(target[1])) for target in right_moves)
+    assert staged_y < 0.05, f"Right arm should stage close to center line, closest was {staged_y}"
     # The placing hand must not reuse the holder's approach side: it picks another reachable yaw.
     left_rotations = [r for arm, r in rotations if arm == 'left']
     assert left_rotations, 'the placing arm must be reoriented before entering the holder corridor'
