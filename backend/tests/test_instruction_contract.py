@@ -80,7 +80,7 @@ def test_placed_support_updates_projected_position_and_avoids_unnecessary_handov
     assert not any(s.skill == 'handover_object' and s.object == 'blue_cube' for s in plan.steps)
 
 
-def _regrasp_fixture(pinch_survives_relief=True, puzzle_drop=False, sideways=0.0):
+def _regrasp_fixture(pinch_survives_relief=True, puzzle_drop=False, sideways=0.0, relief_limit=1.0):
     from types import SimpleNamespace
     import numpy as np
     cube = np.array([0.45, -0.04, 1.10])
@@ -89,11 +89,11 @@ def _regrasp_fixture(pinch_survives_relief=True, puzzle_drop=False, sideways=0.0
     state = {'pinched': True}
 
     def set_gripper(arm, value):
+        # The pinch survives only while the jaws stay closed enough for this object; closing restores it.
         calls['set_gripper'].append(value)
-        if not pinch_survives_relief:
-            state['pinched'] = False
+        fraction = (value - 0.02) / (0.7854 - 0.02)
+        state['pinched'] = pinch_survives_relief and fraction <= relief_limit
         if puzzle_drop:
-            # The object slips sideways out of the pads while they are relieved.
             cube[1] += sideways or 0.02
 
     def move(arm, target, rotation=None, **kwargs):
@@ -136,8 +136,9 @@ def test_a_regrasp_slides_the_pinch_down_without_dropping_the_object():
     result = skills.regrasp_object('right', 'blue_cube')
     assert result['success'], result
     assert result['drop_m'] == -SUPPORT_REGRASP_DROP_M
-    # The jaws were relieved part way, never opened fully.
-    assert 0.02 < calls['set_gripper'][0] < 0.7854
+    # The jaws were relieved in searched steps, never opened fully.
+    assert 0.02 < max(calls['set_gripper']) < 0.7854
+    assert 0. < result['relief_fraction'] <= 0.25
     # The arm slid down by the drop, then lifted and returned for the hold check.
     drops = [round(float(target[2] - cube[2]), 4) for target in calls['moves']]
     assert any(abs(drop + SUPPORT_REGRASP_DROP_M) < 1e-4 for drop in drops)
@@ -151,6 +152,35 @@ def test_a_regrasp_refuses_to_slide_on_a_lost_pinch():
     result = skills.regrasp_object('right', 'blue_cube')
     assert result['success'] is False and result['error'] == 'REGRASP_LOST'
     assert calls['moves'] == [], 'the arm must not move after the pinch was lost'
+
+
+def test_a_regrasp_keeps_the_largest_relief_that_still_pinches():
+    """Measured 2026-11-07: 35% relief dropped the cube; the search must stop below that."""
+    from backend.app.skills.robot_skills import SkillRunner
+    env, controller, calls, cube = _regrasp_fixture(relief_limit=0.12)
+    skills = SkillRunner(env, controller)
+    skills.held_object = lambda arm: 'blue_cube' if arm == 'right' else None
+    result = skills.regrasp_object('right', 'blue_cube')
+    assert result['success'], result
+    assert result['relief_fraction'] <= 0.12
+
+
+def test_a_regrasp_that_cannot_slide_reports_that_instead_of_claiming_success():
+    """If the object rides down with the hand, the grip point on it never moved."""
+    from backend.app.skills.robot_skills import SkillRunner
+    env, controller, calls, cube = _regrasp_fixture()
+    def move(arm, target, rotation=None, **kwargs):
+        calls['moves'].append(list(target))
+        cube[2] = float(target[2]) - 0.11      # object follows the hand down
+        if kwargs.get('on_sample'):
+            kwargs['on_sample']()
+        from types import SimpleNamespace as NS
+        return NS(success=True, final_position=list(target))
+    controller.move_to_site = move
+    skills = SkillRunner(env, controller)
+    skills.held_object = lambda arm: 'blue_cube' if arm == 'right' else None
+    result = skills.regrasp_object('right', 'blue_cube')
+    assert result['success'] is False and result['error'] == 'REGRASP_NO_SLIDE'
 
 
 def test_a_regrasp_reports_an_object_that_slips_sideways():
@@ -224,6 +254,7 @@ def test_in_hand_stacking_regrasps_the_held_support_before_placing():
     assert result['success'], result
     assert regrasps and regrasps[0][0] == 'right' and regrasps[0][1] == 'blue_cube'
     assert regrasps[0][2] < 0
+    assert result['support_regrasp'], 'the support regrasp outcome must be recorded, achieved or not'
 
 
 def test_in_hand_stacking_bimanually_stages_held_support_toward_center_workspace():

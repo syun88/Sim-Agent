@@ -64,9 +64,9 @@ MIN_STAGING_RISE = 0.02
 #: A centred pinch leaves pad material 7.15 mm above the support's top face (measured 2026-11-07),
 #: so the stacked cube cannot reach it; 15 mm clears the pads while keeping the object between them.
 SUPPORT_REGRASP_DROP_M = 0.015
-#: Fraction of the way to full open that the jaws are relieved during a regrasp. Enough to unload the
-#: pads, not enough to let the object leave them.
-SUPPORT_REGRASP_RELEASE = 0.35
+#: Relief steps (fraction of the travel to full open) tried during a regrasp, smallest first. The
+#: largest step that still pinches is kept, because how much relief an object takes is not a constant.
+SUPPORT_REGRASP_RELIEF_STEPS = (0.05, 0.10, 0.15, 0.20, 0.25)
 #: A regrasp must not walk the object sideways; this is the tolerated lateral shift (m).
 SUPPORT_REGRASP_SHIFT_TOLERANCE = 0.010
 #: The approach may not displace the object by more than this (m); the object is only pinched
@@ -538,6 +538,7 @@ class SkillRunner:
             if target == obj or target not in self.env.frame().objects:
                 raise SkillError("INVALID_TARGET", "Choose another observed cube as the reference")
             other_arm = "right" if arm == "left" else "left"
+            regrasp = None
             is_held_stationary = (self._pinch_established(target, other_arm)
                                   and self.env.object_linear_speed(target) < .02)
             if not is_held_stationary:
@@ -552,7 +553,13 @@ class SkillRunner:
                 self._carry_to(other_arm, target, staging_pos, exclude_target=obj)
                 # Free the support's top face before the placing arm arrives: the holder's pads sit above
                 # the centre they pinch, so a centred grip would leave the stacked cube resting on them.
-                self._regrasp(other_arm, target, -SUPPORT_REGRASP_DROP_M)
+                # Best effort and recorded: a regrasp this robot cannot achieve leaves the grip as it was,
+                # and the placement then has to prove itself against the verifier like any other.
+                try:
+                    regrasp = {'success': True, **self._regrasp(other_arm, target, -SUPPORT_REGRASP_DROP_M)}
+                except SkillError as error:
+                    regrasp = {'success': False, 'error': error.category, 'detail': str(error),
+                               **({'evidence': error.evidence} if error.evidence else {})}
                 staged_support = self.env.object_pose(target)[0]
                 attitude = self._stacking_attitude(arm, obj, other_arm, staged_support)
                 self._align_for_placement(arm, obj, rotation=attitude)
@@ -562,7 +569,8 @@ class SkillRunner:
             self._carry_to(arm, obj, travel, exclude_target=target)
             placed = self._carry_to(arm, obj, desired, exclude_target=target)
             return {**placed, "reference_object": target, "relation": relation,
-                    "support_bounds": self.env.object_bounds(target).tolist()}
+                    "support_bounds": self.env.object_bounds(target).tolist(),
+                    "support_regrasp": regrasp if is_held_stationary else None}
         return self._skill("move_to_object", run, time.perf_counter())
 
     def _carry_aim(self, arm: str, obj: str, desired, *, attitude: str = "pinned"):
@@ -710,13 +718,24 @@ class SkillRunner:
         before = self.env.object_pose(obj)[0].copy()
         closed_aperture = self.env.gripper_position(arm)
         open_aperture = self.env.gripper_target(arm, False)
-        partial = closed_aperture + SUPPORT_REGRASP_RELEASE * (open_aperture - closed_aperture)
-        self.env.set_gripper(arm, partial)
-        self.env.step(max(1, round(200 / self.controller.motion_speed)))
-        if not self._pinch_established(obj, arm):
+        # How far the jaws may be relieved is a property of this object and this grip, not a constant:
+        # measured 2026-11-07, relieving 35% of the travel dropped the cube from the pinch entirely.
+        # Search upward in small steps and keep the last relief that still pinched.
+        kept, kept_fraction = closed_aperture, 0.
+        for step in SUPPORT_REGRASP_RELIEF_STEPS:
+            candidate = closed_aperture + step * (open_aperture - closed_aperture)
+            self.env.set_gripper(arm, candidate)
+            self.env.step(max(1, round(120 / self.controller.motion_speed)))
+            if not self._pinch_established(obj, arm):
+                break
+            kept, kept_fraction = candidate, step
+        self.env.set_gripper(arm, kept)
+        self.env.step(max(1, round(120 / self.controller.motion_speed)))
+        if kept_fraction == 0. or not self._pinch_established(obj, arm):
             # Never slide on a lost pinch: close again and report, leaving the object where it was.
             self.controller.wait_gripper(arm, True, .5)
             raise SkillError("REGRASP_LOST", f"{obj} left the pinch when the jaws were relieved; not sliding")
+        partial = kept
         ee, rotation = self.env.ee_pose(arm)
         slide = self.controller.target_rotations.get(arm, rotation)
         result = self.controller.move_to_site(arm, ee + np.array([0., 0., drop_m]), slide,
@@ -730,6 +749,12 @@ class SkillRunner:
         shifted = float(np.linalg.norm((after - before)[:2]))
         if shifted > SUPPORT_REGRASP_SHIFT_TOLERANCE:
             raise SkillError("REGRASP_MOVED", f"{obj} moved {shifted * 1000:.1f} mm sideways during the regrasp")
+        dropped = float(before[2] - after[2])
+        if dropped > SUPPORT_REGRASP_SHIFT_TOLERANCE:
+            # The object rode down with the hand: the pads never slid along it, so the grip point on the
+            # object is unchanged and the top face is still blocked.
+            raise SkillError("REGRASP_NO_SLIDE",
+                             f"{obj} followed the hand down {dropped * 1000:.1f} mm instead of staying put")
         lift = self.controller.move_to_site(arm, self.env.ee_pose(arm)[0] + np.array([0., 0., VERIFICATION_LIFT]),
                                            self.env.ee_pose(arm)[1], on_sample=lambda: self._require_hold(arm, obj))
         if not lift.success:
@@ -737,9 +762,10 @@ class SkillRunner:
         self.controller.move_to_site(arm, self.env.ee_pose(arm)[0] - np.array([0., 0., VERIFICATION_LIFT]),
                                      self.env.ee_pose(arm)[1], on_sample=lambda: self._require_hold(arm, obj))
         self._require_hold(arm, obj)
-        return {"object": obj, "arm": arm, "drop_m": drop_m,
+        return {"object": obj, "arm": arm, "drop_m": drop_m, "relief_fraction": kept_fraction,
                 "aperture_before": closed_aperture, "aperture_relieved": partial, "aperture_open": open_aperture,
-                "sideways_shift_m": shifted, "pinch_contacts": sorted(self._contact_fingers(obj, arm))}
+                "sideways_shift_m": shifted, "vertical_shift_m": dropped,
+                "pinch_contacts": sorted(self._contact_fingers(obj, arm))}
 
     def handover_object(self, arm: str | None, obj: str, receiver: str | None = None) -> dict:
         if arm is None:
