@@ -21,6 +21,11 @@ from backend.app.learning.mechanism_dataset import FEATURES
 
 #: Below this many examples a held-out score is noise, and the training report says NOT_ADOPTED.
 MIN_EXAMPLES_FOR_ADOPTION = 40
+#: A class with at least this much support must be recognised at least MIN_CLASS_RECALL of the time.
+#: Without this, an overall accuracy can rise on the easy classes while a mechanism nobody detects
+#: (measured 2026-11-08: APPROACH_CONTACT 0/7) still passes as "adopted".
+MIN_CLASS_SUPPORT = 3
+MIN_CLASS_RECALL = 0.5
 
 
 def _matrix(examples):
@@ -117,9 +122,24 @@ def leave_one_out(examples) -> dict:
     majority = max(set(labels), key=labels.count) if labels else None
     baseline = sum(1 for label in labels if label == majority)
     scored = [item for item in predictions if item]
+    # A single accuracy number hid a blind spot when this was first run on real traces: the model scored
+    # 0.54 against a 0.28 baseline while never once predicting APPROACH_CONTACT (0/7), and its confidence
+    # was the same whether it was right (0.54) or wrong (0.55). Per-class recall and the confidence split
+    # are what make that visible, so they are part of the report.
+    per_class = {}
+    for label in sorted(set(labels)):
+        hits = sum(1 for item in scored if item['actual'] == label and item['predicted'] == label)
+        total = sum(1 for item in scored if item['actual'] == label)
+        per_class[label] = {'hit': hits, 'total': total,
+                            'recall': (hits / total) if total else None}
+    right = [item['probability'] for item in scored if item['actual'] == item['predicted']]
+    wrong = [item['probability'] for item in scored if item['actual'] != item['predicted']]
     return {'examples': len(examples), 'scored': len(scored), 'correct': correct,
             'accuracy': (correct / len(scored)) if scored else None,
             'majority_class': majority,
             'baseline_accuracy': (baseline / len(labels)) if labels else None,
             'class_counts': {name: labels.count(name) for name in sorted(set(labels))},
+            'per_class': per_class,
+            'confidence_when_right': (sum(right) / len(right)) if right else None,
+            'confidence_when_wrong': (sum(wrong) / len(wrong)) if wrong else None,
             'predictions': predictions}

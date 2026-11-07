@@ -19,8 +19,12 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from backend.app.learning.mechanism_dataset import load_examples
-from backend.app.learning.mechanism_model import (MIN_EXAMPLES_FOR_ADOPTION, MechanismModel,
+from backend.app.learning.mechanism_model import (MIN_CLASS_RECALL, MIN_CLASS_SUPPORT,
+                                                 MIN_EXAMPLES_FOR_ADOPTION, MechanismModel,
                                                  leave_one_out)
+
+#: How much better the probability must be on correct predictions than on wrong ones to be informative.
+CONFIDENCE_MARGIN = 0.05
 
 
 def main(argv=None):
@@ -62,6 +66,16 @@ def main(argv=None):
                        f'held-out score to mean anything')
     if gain is None or gain <= 0.:
         reasons.append('the held-out score does not beat the majority baseline')
+    # Accuracy alone let a model be adopted while it never predicted the mechanism that matters. A class
+    # with enough support must be detectable, or the gain is coming from the easy classes only.
+    for label, stats in (scores.get('per_class') or {}).items():
+        if stats['total'] >= MIN_CLASS_SUPPORT and (stats['recall'] or 0.) < MIN_CLASS_RECALL:
+            reasons.append(f'{label} is never recognised well enough '
+                           f'({stats["hit"]}/{stats["total"]} recalled)')
+    right, wrong = scores.get('confidence_when_right'), scores.get('confidence_when_wrong')
+    if right is not None and wrong is not None and right <= wrong + CONFIDENCE_MARGIN:
+        reasons.append(f'the stated probability does not separate right from wrong '
+                       f'({right:.2f} vs {wrong:.2f})')
     report['adopted'] = not reasons
     report['reason'] = '; '.join(reasons) if reasons else 'beats the baseline on a large enough sample'
 
@@ -75,7 +89,8 @@ def main(argv=None):
         Path(args.report).write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding='utf-8')
     print(json.dumps({key: report[key] for key in
                       ('records', 'examples', 'accuracy', 'baseline_accuracy', 'gain_over_baseline',
-                       'class_counts', 'adopted', 'reason')}, ensure_ascii=False, indent=1))
+                       'class_counts', 'per_class', 'confidence_when_right', 'confidence_when_wrong',
+                       'adopted', 'reason')}, ensure_ascii=False, indent=1))
     return 0
 
 
