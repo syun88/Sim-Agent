@@ -549,7 +549,10 @@ class SkillRunner:
                 # Bimanual in-hand stacking: stage the held support at the shared sweet spot
                 # (x ≈ 0.45, y ≈ -0.04, z ≈ 1.06; both arms solve it to <3.2 mm and <0.8 deg),
                 # then choose a placing attitude that reaches the top from the holder's opposite side.
-                staging_pos = np.array([0.45, -0.04, 1.06])
+                # Stage the support on the *placing* arm's own side: measured 2026-11-07, a support held
+                # at y=-0.04 could not be reached by the left arm at all (its transit stopped at y=+0.09),
+                # so the holder brings the cube to where the placer already is instead.
+                staging_pos = np.array([0.45, 0.04 if arm == 'left' else -0.04, 1.06])
                 self._carry_to(other_arm, target, staging_pos, exclude_target=obj)
                 # Free the support's top face before the placing arm arrives: the holder's pads sit above
                 # the centre they pinch, so a centred grip would leave the stacked cube resting on them.
