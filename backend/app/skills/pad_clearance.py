@@ -124,8 +124,11 @@ def support_face_clearance(env, arm: str, support_center, support_half_xy: float
         over.append(float(high[2]))
         count += 1
     if not count:
-        return {'clearance_m': float(support_top_z - float('-inf')), 'pad_over_face_m': None,
-                'support_top_m': float(support_top_z), 'pad_geoms_over_face': 0}
+        # Nothing stands over the face. That is a measurement ("no pad material there"), not an infinite
+        # clearance: returning `inf` aborted 11 of 24 live tasks when the evidence was serialised as JSON
+        # (measured 2026-11-08, "Out of range float values are not JSON compliant").
+        return {'clearance_m': None, 'pad_over_face_m': None, 'support_top_m': float(support_top_z),
+                'pad_geoms_over_face': 0, 'note': 'no pad geometry over the support face'}
     highest = max(over)
     return {'clearance_m': float(support_top_z - highest), 'pad_over_face_m': highest,
             'support_top_m': float(support_top_z), 'pad_geoms_over_face': count}

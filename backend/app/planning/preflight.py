@@ -12,10 +12,25 @@ environment without the queries is reported as unavailable rather than as "no pr
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from backend.app.planning.capability_queries import (ATTITUDE_YAWS_DEG, pad_blocks_support_face,
                                                     pinch_point, reachable)
+
+
+def _finite(value):
+    """A measurement that a JSON reader can consume: non-finite values are reported as absent.
+
+    A single `inf` from a geometry query aborted 11 of 24 live tasks at serialisation time (measured
+    2026-11-08). Sanitising here means one bad measurement can never cost a run.
+    """
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(float(value)) else None
+    return value
 
 
 def _placement_questions(actions):
@@ -62,5 +77,5 @@ def run_preflight(env, controller, plan) -> dict:
         except Exception as error:
             row['reachable_yaws'] = None
             row['reach_error'] = f'{type(error).__name__}: {error}'
-        answers.append(row)
+        answers.append({key: _finite(value) for key, value in row.items()})
     return {'available': True, 'questions': answers}

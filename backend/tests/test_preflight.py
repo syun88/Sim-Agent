@@ -33,3 +33,29 @@ def test_it_asks_pad_and_reachability_questions_without_moving(monkeypatch):
     assert row['arm'] == 'left' and row['target'] == 'blue_cube'
     assert row['pad_blocks_face'] is True and row['pad_clearance_m'] == -0.0405
     assert row['reachable_yaws'] == 1 and row['reachable_asked'] == 4
+
+
+def test_an_unmeasurable_pad_clearance_never_returns_infinity():
+    """Measured 2026-11-08: `inf` in the evidence aborted 11 of 24 live tasks at JSON serialisation."""
+    import json
+    from backend.app.skills.pad_clearance import support_face_clearance
+    from backend.app.simulation.openarm_v2.spawn import private_spawn_environment
+
+    env = private_spawn_environment()
+    env.arm_kinematics = lambda side: (_ for _ in ()).throw(RuntimeError('no model'))
+    measured = support_face_clearance(env, 'right', np.zeros(3), 0.026, 1.05)
+    assert measured['clearance_m'] is None
+    json.dumps(measured, allow_nan=False)
+
+
+def test_preflight_sanitises_a_non_finite_measurement(monkeypatch):
+    import json
+    monkeypatch.setattr(preflight, 'pad_blocks_support_face',
+                        lambda env, arm, support: {'blocks': None, 'clearance_m': float('inf')})
+    monkeypatch.setattr(preflight, 'reachable', lambda *a, **k: {'ok': True, 'position_error_m': float('nan')})
+    env = SimpleNamespace(object_pose=lambda name: (np.zeros(3), np.eye(3)),
+                          frame=lambda: SimpleNamespace(objects={'blue_cube': np.zeros(3)}))
+    answer = preflight.run_preflight(env, SimpleNamespace(), PLAN.model_dump())
+    row = answer['questions'][0]
+    assert row['pad_clearance_m'] is None
+    json.dumps(answer, allow_nan=False)
