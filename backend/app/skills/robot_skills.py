@@ -67,6 +67,19 @@ SUPPORT_REGRASP_DROP_M = 0.015
 #: Relief steps (fraction of the travel to full open) tried during a regrasp, smallest first. The
 #: largest step that still pinches is kept, because how much relief an object takes is not a constant.
 SUPPORT_REGRASP_RELIEF_STEPS = (0.05, 0.10, 0.15, 0.20, 0.25)
+#: A held support whose own fingers stand more than this above its top face cannot receive a cube.
+#: Measured live 2026-11-07: 40.5 mm, and no regrasp depth changed it.
+SUPPORT_FACE_BLOCKED_M = 0.004
+#: Whether to try lowering the pinch before refusing. The live measurement says the pad bodies stay
+#: ~40 mm above the face whatever the grip depth, so this is off by default and the refusal is immediate.
+SUPPORT_REGRASP_ENABLED = False
+
+
+def clearances_blocks(clearance_m: float) -> bool:
+    """Whether a measured clearance means the support's top face is occupied by its own grip."""
+    return clearance_m < -SUPPORT_FACE_BLOCKED_M
+
+
 #: A regrasp must not walk the object sideways; this is the tolerated lateral shift (m).
 SUPPORT_REGRASP_SHIFT_TOLERANCE = 0.010
 #: The approach may not displace the object by more than this (m); the object is only pinched
@@ -132,6 +145,28 @@ class SkillRunner:
         except SkillError as exc:
             return {"skill": name, "success": False, "duration": time.perf_counter() - started, "error": exc.category,
                     "detail": str(exc), **({"evidence": exc.evidence} if exc.evidence else {})}
+
+    def _raise_support_face_blocked(self, arm: str, support: str, clearance: dict, regrasp) -> None:
+        """Refuse a placement the hand's own geometry cannot allow, naming the measured reason."""
+        measured = clearance.get('clearance_m')
+        reason = ("the hand's own geometry was not measurable" if measured is None
+                  else f"{arm} hand's fingers rise {-measured * 1000:.1f} mm above {support}'s top face")
+        error = SkillError('SUPPORT_FACE_BLOCKED',
+                           f"a cube cannot land on {support} while it is held: {reason}")
+        error.evidence = {'clearance': clearance, 'support_regrasp': regrasp,
+                          'reference_object': support, 'phase': 'support_face'}
+        raise error
+
+    def _support_face_clearance(self, arm: str, support: str) -> dict:
+        """Measured room above a held support's top face, from the model's own finger geometry."""
+        from backend.app.skills.pad_clearance import support_face_clearance
+        try:
+            bounds = self.env.object_bounds(support)
+            centre = self.env.object_pose(support)[0]
+            half = float(max(bounds[1][0] - bounds[0][0], bounds[1][1] - bounds[0][1])) / 2.
+            return support_face_clearance(self.env, arm, centre, half, float(bounds[1][2]))
+        except Exception as error:
+            return {'clearance_m': None, 'unknown': f'{type(error).__name__}: {error}'}
 
     def _motion_evidence(self, result, **extra):
         """The residuals a blocked motion was judged with, so its mechanism can be named from numbers.
@@ -546,6 +581,15 @@ class SkillRunner:
                     raise SkillError("REFERENCE_MOVING", "The placement reference must be resting stationary on the table or held stationary by the other arm")
                 self._align_for_placement(arm, obj)
             else:
+                # Ask the model's own geometry, before moving anything, whether the holder's fingers leave
+                # room above the face the cube must land on. Measured live 2026-11-07: the pads stand
+                # 40.5 mm above a held cube's top face, so the placement would fail at the last step for a
+                # reason that has nothing to do with the plan; naming it here is cheaper and honest.
+                clearance = self._support_face_clearance(other_arm, target)
+                blocked_by_grip = (clearance.get('clearance_m') is not None
+                                   and clearances_blocks(clearance['clearance_m']))
+                if blocked_by_grip and not SUPPORT_REGRASP_ENABLED:
+                    self._raise_support_face_blocked(other_arm, target, clearance, None)
                 # Bimanual in-hand stacking: stage the held support at the shared sweet spot
                 # (x ≈ 0.45, y ≈ -0.04, z ≈ 1.06; both arms solve it to <3.2 mm and <0.8 deg),
                 # then choose a placing attitude that reaches the top from the holder's opposite side.
@@ -563,6 +607,19 @@ class SkillRunner:
                 except SkillError as error:
                     regrasp = {'success': False, 'error': error.category, 'detail': str(error),
                                **({'evidence': error.evidence} if error.evidence else {})}
+                # Ask the model's own geometry whether the holder's fingers leave room above the face the
+                # cube must land on. Measured live 2026-11-07: the pads stand 40.5 mm above a held cube's
+                # top face, so no grip depth clears it and the placement fails at the last step for a
+                # reason that has nothing to do with the plan. Naming it here is cheaper and honest.
+                clearance = self._support_face_clearance(other_arm, target)
+                if clearance.get('clearance_m') is not None and clearances_blocks(clearance['clearance_m']):
+                    error = SkillError('SUPPORT_FACE_BLOCKED',
+                                       f"{other_arm} hand's fingers rise "
+                                       f"{-clearance['clearance_m'] * 1000:.1f} mm above {target}'s top face; "
+                                       f"a cube cannot land there while it is held")
+                    error.evidence = {'clearance': clearance, 'support_regrasp': regrasp,
+                                      'reference_object': target}
+                    raise error
                 staged_support = self.env.object_pose(target)[0]
                 attitude = self._stacking_attitude(arm, obj, other_arm, staged_support)
                 self._align_for_placement(arm, obj, rotation=attitude)

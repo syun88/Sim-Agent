@@ -888,3 +888,51 @@ def test_success_oracle_must_contain_the_requested_relation():
     plan.goal['checks'] = [{'type': 'placement', 'object': 'blue_cube', 'target': 'right_side'}]
     with pytest.raises(GroundingError, match='success'):
         validate_instruction_relations(plan, '青を赤の上に置いて', WORLD)
+
+
+def test_a_held_support_whose_own_fingers_cover_its_top_face_is_refused_before_moving():
+    """Measured live 2026-11-07: 40.5 mm of finger above the face; no regrasp depth clears it."""
+    from types import SimpleNamespace
+    from backend.app.skills.robot_skills import SkillRunner
+    import numpy as np
+    support = np.array([0.4363, -0.0152, 1.0294])
+    held = np.array([0.44, 0.15, 1.12])
+
+    def move(arm, target, rotation=None, **kwargs):
+        return SimpleNamespace(success=True, final_position=list(target))
+
+    env = SimpleNamespace(
+        ee_pose=lambda side: (np.array([0.40, -0.02, 1.10]) if side == 'right' else np.array([0.40, 0.15, 1.12]), np.eye(3)),
+        object_pose=lambda name: (support.copy() if name == 'blue_cube' else held.copy(), np.eye(3)),
+        object_bounds=lambda name: np.array([[.41, -.041, 1.003], [.462, .011, 1.056]]) if name == 'blue_cube'
+        else np.array([[.414, .124, 1.09], [.466, .176, 1.15]]),
+        frame=lambda: SimpleNamespace(objects={'blue_cube': support, 'red_cube': held}),
+        pinch_established=lambda obj, arm: (arm == 'right' and obj == 'blue_cube') or (arm == 'left' and obj == 'red_cube'),
+        object_linear_speed=lambda name: 0.0, object_contacts=lambda name, arm=None: ['finger'],
+        gripper_position=lambda arm: 0.02, gripper_target=lambda arm, closed: 0.02 if closed else 0.7854,
+        set_gripper=lambda arm, value: None, step=lambda n: None, timestep=0.002,
+        grasp_mode='physical-friction-pinch')
+    controller = SimpleNamespace(motion_speed=6., target_rotations={}, move_to_site=move,
+                                 wait_gripper=lambda arm, closed, seconds: SimpleNamespace(success=True),
+                                 solve_ik=lambda arm, site, rot, **kw: (np.zeros(7), 0.004, 0.01))
+    skills = SkillRunner(env, controller)
+    skills.held_object = lambda arm: 'blue_cube' if arm == 'right' else ('red_cube' if arm == 'left' else None)
+    skills._regrasp = lambda arm, obj, drop_m: {'object': obj, 'arm': arm, 'drop_m': drop_m}
+    # The live measurement: pads 40.5 mm above the support's top face.
+    skills._support_face_clearance = lambda arm, obj: {'clearance_m': -0.0405,
+                                                       'pad_over_face_m': 1.0969, 'support_top_m': 1.0563,
+                                                       'pad_geoms_over_face': 12}
+    result = skills.move_to_object('left', 'red_cube', 'blue_cube', 'on')
+    assert result['success'] is False and result['error'] == 'SUPPORT_FACE_BLOCKED'
+    assert '40.5 mm' in result['detail']
+    assert result['evidence']['clearance']['clearance_m'] == -0.0405
+    # The refusal happens before any motion, so no regrasp is claimed.
+    assert result['evidence']['support_regrasp'] is None
+    assert result['evidence']['phase'] == 'support_face'
+
+
+def test_an_unmeasured_clearance_does_not_block_a_placement():
+    """No geometry, no claim: an unknown clearance must not stop a placement."""
+    from backend.app.skills.robot_skills import clearances_blocks
+    assert clearances_blocks(-0.0405) is True
+    assert clearances_blocks(0.02) is False
