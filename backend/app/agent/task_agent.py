@@ -126,6 +126,17 @@ class TaskAgent:
             'support_relations':deepcopy(initial.get('support_relations',[]))}}
         for item in (plan.planning_evidence or {}).get('preparations',[]):
             announce({'kind':'prepare_precondition',**item})
+        # Cheap geometrical questions about the plan, answered before anything moves. Stored with the plan
+        # so a later predictor has contact/path information that does not depend on the outcome.
+        preflight = None
+        try:
+            from backend.app.planning.preflight import run_preflight
+            preflight = run_preflight(getattr(self.executor, 'env', None),
+                                      getattr(self.executor, 'controller', None), plan.program)
+            plan.planning_evidence = {**(plan.planning_evidence or {}), 'preflight': preflight}
+        except Exception as error:
+            preflight = {'available': False, 'reason': f'{type(error).__name__}: {error}'}
+            plan.planning_evidence = {**(plan.planning_evidence or {}), 'preflight': preflight}
         for decision in binding['decisions']:
             if decision['explanation']:
                 plan.assumptions.append(decision['explanation'])

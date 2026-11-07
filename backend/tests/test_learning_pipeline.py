@@ -27,6 +27,27 @@ RECORD = {
 }
 
 
+def test_a_record_without_preflight_says_so_instead_of_assuming_no_obstacle():
+    features = mechanism_dataset.features_of(RECORD)
+    assert features['preflight_missing'] == 1
+    assert features['pad_blocks_face'] == 0
+
+
+def test_preflight_answers_reach_the_features():
+    with_preflight = {**RECORD, 'agent_attempts': [{
+        **RECORD['agent_attempts'][0],
+        'plan': {**RECORD['agent_attempts'][0]['plan'],
+                 'planning_evidence': {'preflight': {
+                     'available': True,
+                     'questions': [{'arm': 'left', 'target': 'blue_cube', 'pad_blocks_face': True,
+                                    'pad_clearance_m': -0.0405, 'reachable_yaws': 1, 'reachable_asked': 4}]}}}}]}
+    features = mechanism_dataset.features_of(with_preflight)
+    assert features['preflight_missing'] == 0
+    assert features['pad_blocks_face'] == 1
+    assert features['pad_clearance_mm'] == pytest.approx(-40.5)
+    assert features['reachable_yaws'] == 1 and features['reachable_asked'] == 4
+
+
 def test_features_come_from_the_plan_and_the_scene_not_from_the_failure():
     features = mechanism_dataset.features_of(RECORD)
     assert set(features) == set(FEATURES)

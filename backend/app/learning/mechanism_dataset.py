@@ -19,6 +19,9 @@ FEATURES = (
     'action_count', 'pick_count', 'place_count', 'handover_count', 'approach_count',
     'relative_placements', 'uses_left', 'uses_right', 'both_arms', 'support_held_at_start',
     'mentions_maintain_hold', 'instruction_chars', 'object_count', 'model_called',
+    # Pre-execution geometry (`planning/preflight.py`). Plan shape alone could not tell the contact
+    # mechanism apart (APPROACH_CONTACT 0/7, measured 2026-11-08); these are answered before motion.
+    'preflight_missing', 'pad_blocks_face', 'pad_clearance_mm', 'reachable_yaws', 'reachable_asked',
 )
 
 #: A successful run is a label too: a predictor that only knows failures cannot say "this will work".
@@ -44,6 +47,25 @@ def _support_of(actions):
         if action.get('op') == 'place' and action.get('relation') and action.get('target'):
             return action['target']
     return None
+
+
+def _preflight_features(plan) -> dict:
+    evidence = (plan.get('planning_evidence') or {}).get('preflight') or {}
+    questions = evidence.get('questions') or []
+    rows = [row for row in questions if isinstance(row, dict)] if isinstance(questions, list) else []
+    if not evidence.get('available') or not rows:
+        # Older records predate the preflight pass. A missing measurement is a fact about the record, so
+        # it gets its own feature instead of being silently imputed as "nothing was blocking".
+        return {'preflight_missing': 1, 'pad_blocks_face': 0, 'pad_clearance_mm': 0.,
+                'reachable_yaws': 0, 'reachable_asked': 0}
+    blocks = [row.get('pad_blocks_face') for row in rows if row.get('pad_blocks_face') is not None]
+    clearances = [row.get('pad_clearance_m') for row in rows if isinstance(row.get('pad_clearance_m'), (int, float))]
+    reachable_yaws = sum(int(row.get('reachable_yaws') or 0) for row in rows)
+    asked = sum(int(row.get('reachable_asked') or 0) for row in rows)
+    return {'preflight_missing': 0,
+            'pad_blocks_face': int(any(blocks)),
+            'pad_clearance_mm': (min(clearances) * 1000.) if clearances else 0.,
+            'reachable_yaws': reachable_yaws, 'reachable_asked': asked}
 
 
 def features_of(record: dict) -> dict | None:
@@ -72,6 +94,7 @@ def features_of(record: dict) -> dict | None:
         'instruction_chars': len(instruction),
         'object_count': len((record.get('initial_world_state') or {}).get('objects') or []),
         'model_called': int(bool((plan.get('model_called')))),
+        **_preflight_features(plan),
     }
 
 
