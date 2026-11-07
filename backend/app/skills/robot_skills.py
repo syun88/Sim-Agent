@@ -28,6 +28,7 @@ import numpy as np
 from backend.app.control.motion import OpenArmV2Controller
 from backend.app.control.navigation import BasePose, WaypointController, clearance_to_aabbs
 from backend.app.simulation.base import SimulationBackend
+from backend.app.planning.capability_queries import attitude as attitude_for_yaw
 from backend.app.simulation.openarm_v2.definition import (
     FINGERTIP_MIDPOINT,
     GRASP_ROTATION,
@@ -574,6 +575,8 @@ class SkillRunner:
                 raise SkillError("INVALID_TARGET", "Choose another observed cube as the reference")
             other_arm = "right" if arm == "left" else "left"
             regrasp = None
+            strategy = None
+            planner_yaw = None
             is_held_stationary = (self._pinch_established(target, other_arm)
                                   and self.env.object_linear_speed(target) < .02)
             if not is_held_stationary:
@@ -593,10 +596,26 @@ class SkillRunner:
                 # Bimanual in-hand stacking: stage the held support at the shared sweet spot
                 # (x ≈ 0.45, y ≈ -0.04, z ≈ 1.06; both arms solve it to <3.2 mm and <0.8 deg),
                 # then choose a placing attitude that reaches the top from the holder's opposite side.
-                # Stage the support on the *placing* arm's own side: measured 2026-11-07, a support held
-                # at y=-0.04 could not be reached by the left arm at all (its transit stopped at y=+0.09),
-                # so the holder brings the cube to where the placer already is instead.
-                staging_pos = np.array([0.45, 0.04 if arm == 'left' else -0.04, 1.06])
+                # Ask the body where this stack can happen, instead of inheriting the last measurement as
+                # a constant: the staging point, the placing attitude and whether the holder's own fingers
+                # cover the face are queries now (planning/strategy_search.py).
+                from backend.app.planning.strategy_search import plan_stack_on_held_support
+                strategy = plan_stack_on_held_support(self.env, self.controller, arm, target)
+                if strategy.get('ok') is False:
+                    if strategy['reason'] == 'SUPPORT_FACE_BLOCKED':
+                        self._raise_support_face_blocked(other_arm, target,
+                                                         {'clearance_m': strategy.get('clearance_m'),
+                                                          'measured': strategy.get('measured')}, None)
+                    error = SkillError(strategy['reason'], strategy.get('detail') or strategy['reason'])
+                    error.evidence = {'strategy': strategy, 'reference_object': target}
+                    raise error
+                if strategy.get('ok') is True:
+                    staging_pos = np.array(strategy['staging'], float)
+                    planner_yaw = strategy['placer_yaw_deg']
+                else:
+                    # Unmeasured: keep the previous staging point rather than inventing a refusal.
+                    staging_pos = np.array([0.45, 0.04 if arm == 'left' else -0.04, 1.06])
+                    planner_yaw = None
                 self._carry_to(other_arm, target, staging_pos, exclude_target=obj)
                 # Free the support's top face before the placing arm arrives: the holder's pads sit above
                 # the centre they pinch, so a centred grip would leave the stacked cube resting on them.
@@ -607,21 +626,13 @@ class SkillRunner:
                 except SkillError as error:
                     regrasp = {'success': False, 'error': error.category, 'detail': str(error),
                                **({'evidence': error.evidence} if error.evidence else {})}
-                # Ask the model's own geometry whether the holder's fingers leave room above the face the
-                # cube must land on. Measured live 2026-11-07: the pads stand 40.5 mm above a held cube's
-                # top face, so no grip depth clears it and the placement fails at the last step for a
-                # reason that has nothing to do with the plan. Naming it here is cheaper and honest.
-                clearance = self._support_face_clearance(other_arm, target)
-                if clearance.get('clearance_m') is not None and clearances_blocks(clearance['clearance_m']):
-                    error = SkillError('SUPPORT_FACE_BLOCKED',
-                                       f"{other_arm} hand's fingers rise "
-                                       f"{-clearance['clearance_m'] * 1000:.1f} mm above {target}'s top face; "
-                                       f"a cube cannot land there while it is held")
-                    error.evidence = {'clearance': clearance, 'support_regrasp': regrasp,
-                                      'reference_object': target}
-                    raise error
+                if regrasp is not None and regrasp.get('success'):
+                    after = self._support_face_clearance(other_arm, target)
+                    if after.get('clearance_m') is not None and clearances_blocks(after['clearance_m']):
+                        self._raise_support_face_blocked(other_arm, target, after, regrasp)
                 staged_support = self.env.object_pose(target)[0]
-                attitude = self._stacking_attitude(arm, obj, other_arm, staged_support)
+                attitude = (attitude_for_yaw(planner_yaw) if planner_yaw is not None
+                            else self._stacking_attitude(arm, obj, other_arm, staged_support))
                 self._align_for_placement(arm, obj, rotation=attitude)
             desired = relative_destination(self.env, obj, target, relation, arm, distance_cm)
             travel = desired.copy()
@@ -638,7 +649,8 @@ class SkillRunner:
                 raise
             return {**placed, "reference_object": target, "relation": relation,
                     "support_bounds": self.env.object_bounds(target).tolist(),
-                    "support_regrasp": regrasp if is_held_stationary else None}
+                    "support_regrasp": regrasp if is_held_stationary else None,
+                    "stack_strategy": strategy if is_held_stationary else None}
         return self._skill("move_to_object", run, time.perf_counter())
 
     def _carry_aim(self, arm: str, obj: str, desired, *, attitude: str = "pinned"):
