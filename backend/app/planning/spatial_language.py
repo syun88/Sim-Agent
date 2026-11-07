@@ -100,7 +100,8 @@ def resolve_relative_pronouns(text, state, decisions=None):
             if decisions is not None:
                 decisions.append({'kind': 'pronoun_reference', 'target': ref['target'],
                                   'object': ref['target'], 'relation': ref['relation'],
-                                  'span': [start, end], 'source': phrase, 'replacement': replacement})
+                                  'span': [start, end], 'source': phrase, 'replacement': replacement,
+                                  'explanation': f'直前の節で名指された{ref["target"]}を「{phrase}」に対応付けました。'})
     return text
 
 

@@ -524,7 +524,10 @@ class AgentPlanner:
 
     def plan(self, instruction: str, state: dict, memory: list[dict] | None = None) -> AgentPlan:
         started = time.perf_counter()
-        state = {**state, 'instruction': instruction}
+        # Keep the caller's original wording available to the compiler: grounding rewrites the
+        # sentence, and phrases like 掴んでいる状態の disappear from the resolved text, so a maintain-hold
+        # request would stop being recognised if this were overwritten with the resolved form.
+        state = {**state, 'instruction': state.get('instruction') or instruction}
         try:
             observed_binding = ground(instruction, state)
             instruction = observed_binding['instruction']

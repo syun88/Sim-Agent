@@ -112,3 +112,23 @@ def test_an_ambiguous_scene_still_refuses_rather_than_guessing():
                            'left_arm': {'held_object': None}, 'right_arm': {'held_object': None}}}
     with pytest.raises(SceneReferenceError):
         ground('右手にあるキューブを取って', two_right)
+
+
+def test_resolving_the_sentence_does_not_hide_a_maintain_hold_request(monkeypatch):
+    monkeypatch.setattr('backend.app.verification.goal_verification.verify_task_goal',
+                        lambda *a, **k: {'success': True, 'failure_category': None})
+    """Grounding rewrites 「掴んでいる状態の」 away; the compiler must still see the original phrase.
+
+    Regression (2026-11-07): with only the resolved text visible, the compiler stopped recognising a
+    maintain-hold request and inserted a ground-the-support preparation, which the contract then refused.
+    """
+    from backend.app.agent.task_agent import TaskAgent
+    from tests.test_task_agent import FakeExecutor
+    executor = FakeExecutor(WORLD, [True])
+    result = TaskAgent(executor, AgentPlanner()).run(
+        '右手でキューブを掴んでから、掴んでいる状態のキューブの上に赤いキューブを重ねて')
+    plan = result['agent_attempts'][0]['plan']
+    actions = [(a['op'], a['object'], a['target']) for a in plan['program']['actions']]
+    assert ('pick', 'blue_cube', None) in actions
+    assert not any(op == 'place' and obj == 'blue_cube' for op, obj, _ in actions), actions
+    assert result['success'], result.get('detail')

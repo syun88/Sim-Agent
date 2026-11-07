@@ -109,7 +109,7 @@ class TaskAgent:
                           'basis':decision['basis'],'step':decision['step'],
                           'surface':decision['surface'],'replacement':decision['replacement'],
                           'candidates':decision['candidates'],'alternatives':decision['alternatives']})
-            plan = self.plan_call(binding['instruction'], initial, decisions)
+            plan = self.plan_call(binding['instruction'], {**initial, 'instruction': instruction}, decisions)
         except SceneReferenceError as error:
             announce({'kind':'missing_reference','explanation':str(error),'observed':error.diagnosis})
             return blocked(str(error),'REFERENCE_NOT_PRESENT',error.diagnosis)
