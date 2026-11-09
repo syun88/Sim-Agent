@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
@@ -64,6 +65,21 @@ def main() -> None:
     print(f'Building {robot_id} on Genesis...', flush=True)
     env = create_backend(args.scene if robot_id == 'openarm_v2' else 'cubes', robot_id=robot_id)
     env.step(200)
+    # Ask the body itself whether it answers everything the skills will drive it with, and leave the answer
+    # where a person or a port can read it. A real arm's backend is validated the same way.
+    try:
+        from backend.app.simulation import conformance
+        problems = conformance.check(env)
+        report = {'robot_id': robot_id, 'scene': args.scene, 'problems': problems,
+                  'contract_operations': len(conformance.describe())}
+        path = os.environ.get('SIM_AGENT_CONFORMANCE_OUT', '/tmp/sim-agent-conformance.json')
+        with open(path, 'w') as handle:
+            json.dump(report, handle, ensure_ascii=False, indent=2)
+        print(f'Body conformance: {len(problems)} problem(s) -> {path}', flush=True)
+        for problem in problems[:6]:
+            print(f'  {problem["operation"]}: {problem["problem"]} {problem["detail"]}', flush=True)
+    except Exception as error:  # a conformance failure must never stop the cell from running
+        print(f'Body conformance could not run: {type(error).__name__}: {error}', flush=True)
     executor = make_executor(env)
     active_id = None
     last_publish = 0.0
