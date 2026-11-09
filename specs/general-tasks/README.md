@@ -63,7 +63,28 @@
   測った値。実機では同じ query を実機の身体で走らせる。
 - 受け入れ: 同じ指示・同じ計画で、実機が「把持→配置」を検証付きで完了する。
 
-## S4 データ取りの汎用化（未着手）
+## S4 データ取りの汎用化（実装済み・2026-11-09）
+
+`scripts/export_lerobot_annotations.py` を **skill 非依存**にした（`schema: sim-agent.annotation/2`）:
+
+- **`capability`**（`grasp` / `reach` / `carry` / `place` / `hand_over` / `throw` / `pour` / `home` /
+  `actuate_gripper` / `actuate_joint` / `navigate`）を各サブタスクと各スキルに付与。未知の op は
+  `capability: null` + `capability_unmapped: true` として**落とさない**。
+- **`measurements`** = スキルが記録した測定値（`grasp_yaw_deg` / `grasp_tilt_deg` / `approach_overfly_m` /
+  `measured_clearance_m` / `staging` / `placer_yaw_deg` / `relief_fraction` …）と、その出所スキル。
+  **無い測定値は 0 ではなく不在**のまま。
+- **`body`** = `{id, source}`。`world_state.robot.type` から取る。記録が無ければ
+  `{id: null, source: 'unrecorded'}` で**推測しない**（sim と real を混同しない）。
+- **`episode`** = サブタスク外の記録（後片付けの `home_mode` / 必要余裕 / 観測誤差、retry 数、status）。
+
+実測（既存 387 レコード）: `capability` は `place 279 / grasp 38 / home 35 / hand_over 35`、
+**145 レコードに測定値が入る**（以前は 0）。body は `openarm_v2`（`world_state.robot.type`）。
+
+受け入れ: `backend/tests/test_annotation_export_body.py` 6件（capability / 未知 op / 測定値と出所 /
+欠測は不在 / body 不明は不明 / episode）。テスト全体 530 passed。
+
+残り: 実機レコードは `body` を `real:<robot_id>` として書き出す実装（`SimulationBackend` 実装側）。
+
 
 - エクスポートを skill 非依存に: `skill` 名だけでなく `capability`（reach/grasp/carry/place/pour）と
   測定値（クリアランス、残差、regrasp 緩め量、会議点）を1レコードに。身体の別を `body` で持つ。

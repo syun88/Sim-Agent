@@ -417,6 +417,20 @@ uv run python scripts/export_lerobot_annotations.py \
 この層は「どの層で壊れたか」を言えるようにするためのものであり、任意の自然言語の理解を保証しない。
 学習モデルを後段に置く場合も、この決定集合が提案と検証の境界になる。
 
+## アノテーションは身体とスキルに依存しない（2026-11-09）
+
+`scripts/export_lerobot_annotations.py` の出力を `schema: sim-agent.annotation/2` にした。方針は
+「**記録が無いものは推測しない**」:
+
+- `capability`（grasp / reach / carry / place / hand_over / throw / pour / home / actuate_* / navigate）を
+  サブタスクとスキルの両方に付ける。未知の op は `capability: null` + `capability_unmapped: true`。
+- `measurements` は「測定値 + 出所スキル」。欠測は 0 にせず**不在**のまま。
+- `body` は `{id, source}`。不明なら `{id: null, source: 'unrecorded'}`。**sim と real を推測で混ぜない。**
+- `episode` はサブタスク外の記録（後片付けの `home_mode` / 必要余裕 / 観測誤差 / retry / status）。
+
+実測: 既存 387 レコード中 145 に測定値が入る（旧出力では 0）。`capability` 内訳は
+`place 279 / grasp 38 / home 35 / hand_over 35`。
+
 ## タスクを足すのをデータ編集にする（2026-11-09）
 
 「いろいろなタスク」をやるのに邪魔だったのは、**語彙が5箇所に散っていた**こと:

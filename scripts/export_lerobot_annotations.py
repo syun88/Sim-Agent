@@ -29,10 +29,82 @@ import json
 import sys
 from pathlib import Path
 
+#: The schema this exporter writes. Bump it when a field changes meaning, not when one is added.
+SCHEMA = 'sim-agent.annotation/2'
+
 #: Planner verb -> the subtask word a policy dataset usually uses.
 SUBTASK_VERBS = {'pick': 'pick', 'handover': 'hand_over', 'place': 'place', 'approach': 'approach',
                  'move': 'move', 'throw': 'throw', 'pour': 'pour', 'home': 'home', 'open': 'open',
                  'close': 'close', 'joint': 'move_joint', 'navigate': 'navigate'}
+
+#: Planner verb -> what the robot is being asked to do, independent of this repo's skill names. A dataset
+#: that has to be reusable across bodies cannot be keyed on `move_to_object` or `park_empty_arm`.
+CAPABILITIES = {'pick': 'grasp', 'handover': 'hand_over', 'place': 'place', 'approach': 'reach',
+                'move': 'move', 'throw': 'throw', 'pour': 'pour', 'home': 'home', 'open': 'actuate_gripper',
+                'close': 'actuate_gripper', 'joint': 'actuate_joint', 'navigate': 'navigate'}
+
+#: Skill name -> capability, for the steps recorded with their own skill names.
+SKILL_CAPABILITIES = {'approach_object': 'reach', 'grasp_object': 'grasp', 'lift_object': 'carry',
+                      'move_to_object': 'place', 'move_to_target': 'place', 'release_object': 'release',
+                      'handover_object': 'hand_over', 'retreat': 'retreat', 'return_home': 'home',
+                      'park_empty_arm': 'home', 'throw_object': 'throw', 'pour_liquid': 'pour',
+                      'navigate_to_object': 'navigate'}
+
+#: Measurements the skills record, by the field they appear under. Only measured values travel; a missing
+#: one stays absent rather than becoming a zero.
+MEASUREMENT_FIELDS = ('grasp_yaw_deg', 'grasp_tilt_deg', 'approach_overfly_m', 'measured_clearance_m',
+                      'measured_clearance_whole_path_m', 'noncontact_clearance_m', 'target_body_clearance_m',
+                      'staging', 'placer_yaw_deg', 'home_clearance_required_m',
+                      'observed_positioning_error_m', 'deviation_m', 'joint_error_rad',
+                      'relief_fraction', 'drop_m', 'clearance_height_m')
+
+
+def _body(record: dict) -> dict:
+    """Which body produced this episode. Unrecorded stays unrecorded: sim and real must not be guessed."""
+    for key in ('body', 'robot', 'robot_id'):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return {'id': value, 'source': key}
+        if isinstance(value, dict) and value.get('id'):
+            return {'id': value['id'], 'source': key}
+    candidates = [record.get('final_world_state'), record.get('initial_world_state')]
+    candidates += [((attempt.get('result') or {}).get('final_world_state'))
+                   for attempt in (record.get('agent_attempts') or [])]
+    candidates += [((attempt.get('result') or {}).get('initial_world_state'))
+                   for attempt in (record.get('agent_attempts') or [])]
+    for world in candidates:
+        robot = (world.get('robot') or {}) if isinstance(world, dict) else {}
+        if robot.get('type'):
+            return {'id': str(robot['type']), 'source': 'world_state.robot.type'}
+    return {'id': None, 'source': 'unrecorded'}
+
+
+def _episode(record: dict) -> dict:
+    """What happened outside the subtasks: the tidy-up that runs after them, and how many attempts ran."""
+    homing = record.get('post_task_homing') or {}
+    arms = []
+    for arm in homing.get('arms') or []:
+        arms.append({'arm': arm.get('arm'), 'success': arm.get('success'), 'route': arm.get('route'),
+                     'home_mode': arm.get('home_mode'),
+                     'home_clearance_required_m': arm.get('home_clearance_required_m'),
+                     'observed_positioning_error_m': arm.get('observed_positioning_error_m'),
+                     'error': arm.get('error'), 'detail': arm.get('detail')})
+    return {'post_task_homing': {'success': homing.get('success'), 'arms': arms} if homing else None,
+            'retry_count': record.get('retry_count'), 'status': record.get('status')}
+
+
+def _measurements(steps_here: list) -> dict:
+    """Every measured number the skills recorded for this subtask, with the skill it came from."""
+    found, sources = {}, {}
+    for step in steps_here:
+        for container in (step, step.get('evidence') or {}, step.get('planning') or {}):
+            if not isinstance(container, dict):
+                continue
+            for field in MEASUREMENT_FIELDS:
+                if field in container and container[field] is not None:
+                    found[field] = container[field]
+                    sources[field] = step.get('skill')
+    return {'values': found, 'sources': sources}
 
 
 def _objects(state):
@@ -103,21 +175,32 @@ def records_from_execution(record: dict) -> list[dict]:
             by_index.setdefault(step.get('action_index'), []).append(step)
         if not actions and not steps:
             continue
+        executed_all = [step for step in (result.get('skills') or []) if isinstance(step, dict)]
         for index, action in enumerate(actions):
             steps_here = by_index.get(index, [])
+            executed = [step for step in executed_all if step.get('action_index') == index]
             before = next((s.get('before_world_state') for s in steps_here if s.get('before_world_state')), None)
             after = next((s.get('world_state') for s in reversed(steps_here) if s.get('world_state')), None)
             failures = [s for s in steps_here if s.get('success') is False]
+            evidence_steps = executed or steps_here
+            capability = CAPABILITIES.get(action.get('op'))
             out.append({
+                'schema': SCHEMA,
+                'body': _body(record),
                 'task_id': record.get('task_id'),
                 'attempt': attempt.get('attempt'),
                 'instruction': record.get('instruction'),
                 'subtask_index': index,
                 'subtask': _subtask_label(action),
                 'action': action,
+                'capability': capability,
+                **({'capability_unmapped': True} if capability is None else {}),
+                'measurements': _measurements(evidence_steps),
                 'entity_grounding': _entity_grounding(record, action),
-                'skills': [{'skill': s.get('skill'), 'arm': s.get('arm'), 'object': s.get('object'),
-                            'success': s.get('success'), 'error': s.get('error')} for s in steps_here],
+                'skills': [{'skill': s.get('skill'), 'capability': SKILL_CAPABILITIES.get(s.get('skill')),
+                            'arm': s.get('arm'), 'object': s.get('object'),
+                            'success': s.get('success'), 'error': s.get('error')}
+                           for s in evidence_steps],
                 'objects_before': _objects(before) or _objects(initial),
                 'objects_after': _objects(after) or _objects(result.get('final_world_state')),
                 'box_space': 'world_aabb',
@@ -125,6 +208,7 @@ def records_from_execution(record: dict) -> list[dict]:
                 'outcome': {'success': all(s.get('success') for s in steps_here) if steps_here else None,
                             'failed_skill': (failures[0].get('skill') if failures else None),
                             'error': (failures[0].get('error') if failures else None)},
+                'episode': _episode(record),
                 'provenance': {'source': 'sim-agent execution record',
                                'sim_time': (before or {}).get('sim_time'),
                                'scene_epoch': 0 if attempt.get('attempt') == 1 else attempt.get('attempt')},
