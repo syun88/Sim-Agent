@@ -122,6 +122,18 @@ def diagnose_pinch(object: str = 'red_cube', arm: str = 'left', observer: bool =
                      'instruction': f'pinch diagnostic: {object}'})
 
 
+@app.get('/api/catalog')
+def catalog_vocabulary():
+    """What exists and what each thing is called - the page labels itself from here."""
+    from backend.app.planning import catalog
+    loaded = catalog.load()
+    return {'source': loaded.source,
+            'objects': [{'id': entry.id, 'kind': entry.kind, 'graspable': entry.graspable,
+                         'label': entry.label, 'aliases': entry.aliases} for entry in loaded.objects],
+            'zones': [{'id': entry.id, 'label': entry.label, 'aliases': entry.aliases}
+                      for entry in loaded.zones]}
+
+
 @app.post('/api/scene/reset')
 def reset_scene(randomize: bool = False,seed:int|None=Query(default=None,ge=0,le=2**32-1),shuffle_sides:bool=True):
     seed=resolve_seed(seed) if randomize else None

@@ -1,0 +1,23 @@
+{
+  "_comment": "What exists in this scene. Add an object or a zone here (id + what it is called) and the parser, the planner prompt, the spawn assignment and the web labels all see it - no code change. Set graspable=false for a fixed vessel (a glass you pour into).",
+  "objects": [
+    {"id": "red_cube", "kind": "cube", "size_m": 0.04, "spawn_arm": "left",
+     "aliases": {"ja": ["赤", "あか", "赤いキューブ", "赤いブロック"], "en": ["red", "red cube"]},
+     "label": {"ja": "赤いキューブ", "en": "red cube"}},
+    {"id": "blue_cube", "kind": "cube", "size_m": 0.04, "spawn_arm": "right",
+     "aliases": {"ja": ["青", "あお", "青いキューブ", "青いブロック"], "en": ["blue", "blue cube"]},
+     "label": {"ja": "青いキューブ", "en": "blue cube"}},
+    {"id": "wine_bottle", "kind": "vessel",
+     "aliases": {"ja": ["ワインボトル", "ボトル", "瓶"], "en": ["wine", "wine bottle", "bottle"]},
+     "label": {"ja": "ワインボトル", "en": "wine bottle"}},
+    {"id": "wine_glass", "kind": "vessel", "graspable": false,
+     "aliases": {"ja": ["グラス", "ワイングラス"], "en": ["glass", "wine glass"]},
+     "label": {"ja": "グラス", "en": "wine glass"}}
+  ],
+  "zones": [
+    {"id": "blue_zone", "label": {"ja": "青いゾーン", "en": "blue zone"},
+     "aliases": {"ja": ["青いゾーン", "青のエリア"], "en": ["blue zone", "blue target"]}},
+    {"id": "green_zone", "label": {"ja": "緑のゾーン", "en": "green zone"},
+     "aliases": {"ja": ["緑のゾーン", "緑のエリア"], "en": ["green zone", "green target"]}}
+  ]
+}

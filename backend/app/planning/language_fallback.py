@@ -55,10 +55,17 @@ def acting_arm(text: str) -> str | None:
 
 
 def target_in(text: str) -> str | None:
+    from backend.app.planning import catalog as scene_catalog
+
     if re.search(r"グラス|\bglass\b", text, re.I):
         return "wine_glass"
     if re.search(r"そこに|同じ場所|\bthere\b|\bsame (?:place|target)\b", text):
         return "there"
+    # Catalog zones first: a zone the scene declares is reachable by any of its names, and the wording
+    # below is the spatial vocabulary that is not a zone in the catalog.
+    for target, pattern in scene_catalog.alias_patterns(scene_catalog.load().zones).items():
+        if re.search(pattern, text, re.I):
+            return target
     for target, pattern in {
         "blue_zone": r"blue[ _]*(?:zone|target)|青(?:い|の)?(?:ゾーン|エリア)",
         "green_zone": r"green[ _]*(?:zone|target)|緑(?:の|色の)?(?:ゾーン|エリア)",

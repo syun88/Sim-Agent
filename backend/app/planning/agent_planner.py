@@ -163,6 +163,20 @@ class AgentPlanner:
         return json.loads(match.group())
 
     def _ai_plan(self, instruction: str, state: dict, memory: list[dict]) -> dict:
+        # What exists is read from the scene, with the catalog as the vocabulary: a new object needs a
+        # catalog entry, not another sentence in this prompt.
+        from backend.app.planning import catalog as scene_catalog
+        vocabulary = scene_catalog.load()
+        observed = [item.get('id') for item in (state or {}).get('objects', []) if item.get('id')]
+        if not observed:
+            observed = [entry.id for entry in vocabulary.objects]
+        # Same wording the model has always been given (absent objects stay qualified as "when present"), but
+        # built from the catalog: adding a cup does not require editing this sentence.
+        absent = [entry.id for entry in vocabulary.objects if entry.id not in observed]
+        objects = ', '.join(entry.id for entry in vocabulary.objects if entry.id in observed)
+        if absent:
+            objects += ', and when present ' + ', '.join(absent)
+        zones = vocabulary.prompt_zones()
         system = (
             "Translate informal Japanese, English or mixed language into an ordered task program for the robot in world_state. "
             "Return one JSON envelope with mode, items, assumptions and error. Never return separate actions/goals arrays or keep_in_place. "
@@ -190,8 +204,8 @@ class AgentPlanner:
             "Operation joint uses joint=<exact URDF joint name>,position_deg=<requested rotary angle>. "
             "Honor negations and preservation: 'do not pass' forbids a handover; 'leave red where it is' is not a placement. "
             "A request to move a cube INTO a zone means place. A request just to pick means hold. "
-            "Use only objects in world_state: red_cube, blue_cube, and when present wine_bottle, wine_glass. "
-            "Destinations blue_zone, green_zone, left_side, right_side, center, wine_glass for pour. "
+            f"Use only objects in world_state: {objects}. "
+            f"Destinations {zones}, left_side, right_side, center, wine_glass for pour. "
             "For a placement relative to a cube, target is that cube's ID and relation is one of "
             "on, left_of, right_of, front_of, behind, near. 'On', 'on top', 'stack', '上に乗せる', "
             "'重ねる' mean place with relation=on. A support/reference noun is NEVER another pick command. "
