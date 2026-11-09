@@ -516,13 +516,24 @@ class SkillRunner:
         for other, position in self.env.frame().objects.items():
             if other != obj and np.linalg.norm(np.asarray(position)[:2] - zone[:2]) < .075 and abs(position[2] - zone[2]) < .06:
                 raise SkillError("TARGET_OCCUPIED", f"{other} occupies {target}; refusing to stack cubes accidentally")
-        desired_object = zone.copy()
-        desired_object[2] = RELEASE_HEIGHT
+        requested = zone.copy()
+        requested[2] = RELEASE_HEIGHT
+        # The zone centre is a request, not a target the arm is assumed to reach: the same region search the
+        # relational placements use decides where inside the zone this body can actually put the object.
+        # Measured 2026-11-09: zone placements were the dominant failure (10 of 12) because this path carried
+        # to the centre with no reachability search at all.
+        desired_object, search = self._search_destination(arm, obj, target, requested, 'in')
+        if search.get('chosen') == 'unreachable':
+            error = SkillError('DESTINATION_UNREACHABLE',
+                               f'No reachable point inside {target} for this arm')
+            error.evidence = {'destination_search': search, 'reference_object': target, 'relation': 'in'}
+            raise error
         self._align_for_placement(arm, obj)
         travel = desired_object.copy()
         travel[2] = 1.14
         self._carry_to(arm, obj, travel)
-        return self._carry_to(arm, obj, desired_object)
+        placed = self._carry_to(arm, obj, desired_object)
+        return {**placed, 'destination_search': search}
 
     def _align_for_placement(self, arm: str, obj: str, rotation=None) -> None:
         """Rotate the held object's grasp to the placement attitude while it is still clear.
@@ -914,6 +925,10 @@ class SkillRunner:
         """
         from backend.app.skills.spatial_placement import relative_destination
         requested = relative_destination(self.env, obj, target, relation, arm, distance_cm)
+        return self._search_destination(arm, obj, target, requested, relation)
+
+    def _search_destination(self, arm: str, obj: str, target: str, requested, relation: str):
+        """The same measurement for any requested placement point: a zone centre, a support offset, ..."""
         search = {'requested': np.asarray(requested, float).tolist(), 'chosen': 'requested', 'considered': []}
         solve = getattr(self.controller, 'solve_ik', None)
         if not callable(solve):

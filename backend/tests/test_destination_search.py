@@ -99,3 +99,44 @@ def test_stacking_onto_a_same_size_cube_does_not_have_that_room():
     feasibility = search['feasibility']
     assert feasibility['required_m'] == pytest.approx(0.02, abs=.002)
     assert feasibility['feasible'] is False, '28 mm cannot be guaranteed onto a 20 mm support half-extent'
+
+
+def test_a_zone_placement_searches_inside_the_zone_instead_of_carrying_to_the_centre():
+    """Measured 2026-11-09: zone placements failed 10 of 12 because this path had no search at all."""
+    from types import SimpleNamespace
+    from backend.app.skills.robot_skills import RELEASE_HEIGHT
+
+    zone = np.array([0.48, 0.18, 1.0])
+    carried = []
+
+    def solve(arm, target, rotation, **kwargs):
+        point = np.asarray(target, float) + OFFSET
+        offset = float(np.linalg.norm(point[:2] - zone[:2]))
+        return np.zeros(7), 0.001 if offset > 0.004 else 0.05, 0.0
+
+    def move(arm, target, rotation, **kwargs):
+        carried.append(np.asarray(target, float).copy())
+        return SimpleNamespace(success=True, final_position=list(target))
+
+    env = type('E', (), {})()
+    env.object_pose = lambda name: (SUPPORT.copy(), np.eye(3))
+    env.object_bounds = lambda name: (HELD if name == 'red_cube' else REGION).copy()
+    env.ee_pose = lambda arm: (np.array([0.40, 0.0, 1.15]), np.eye(3))
+    env.zone_position = lambda name: zone.copy()
+    env.frame = lambda: type('F', (), {'objects': {'red_cube': SUPPORT.copy()}, 'zones': {'blue_zone': zone}})()
+    skills = SkillRunner.__new__(SkillRunner)
+    skills.env = env
+    skills.held_object = lambda arm: 'red_cube'
+    skills.controller = type('C', (), {'solve_ik': staticmethod(solve), 'target_rotations': {},
+                                       'move_to_site': staticmethod(move), 'motion_speed': 1.})()
+    skills._require_hold = lambda *a, **k: None
+    skills._align_for_placement = lambda *a, **k: None
+    skills._carry_to = lambda arm, obj, desired, **k: {'object': obj, 'position': np.asarray(desired).tolist(),
+                                                      'position_error': 0.0}
+    result = skills._move_to_zone('left', 'blue_zone')
+    search = result['destination_search']
+    assert search['chosen'] == 'offset_inside_region'
+    chosen = np.asarray(search['chosen_point'], float)
+    assert np.linalg.norm(chosen - np.asarray(search['requested'], float)) > 1e-6, \
+        'the zone centre was not reachable; a point inside it was'
+    assert REGION[0][0] <= chosen[0] <= REGION[1][0] and REGION[0][1] <= chosen[1] <= REGION[1][1]
