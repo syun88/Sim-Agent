@@ -79,7 +79,12 @@ def test_home_route_screens_the_current_stack_instead_of_the_original_layout():
     assert route is not None, evidence
     assert not np.array_equal(route[-1],home)
     assert kin.empty_arm_path_is_clear(route,objects)
-    assert evidence['route'] in {'free_attitude_lift_then_home','high_home'}
+    # The return is chosen by measurement now: any screened candidate may win, including a retreat away
+    # from the object before climbing, and the choice is the roomiest of the ones that passed.
+    assert evidence['route'] in {item['route'] for item in evidence['considered']}
+    chosen = next(item for item in evidence['considered'] if item['route'] == evidence['route'])
+    assert chosen['clearance_m'] == evidence['measured_clearance_m']
+    assert chosen['clearance_m'] == max(item['clearance_m'] for item in evidence['considered'])
     assert evidence['home_mode']=='scene_clearance_home'
 
 

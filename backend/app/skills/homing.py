@@ -1,4 +1,12 @@
-"""Home routes from the measured posture and current objects, without physics writes."""
+"""Home routes from the measured posture and current objects, without physics writes.
+
+Getting the arm home is a *search*, not a fixed lift. Measured 2026-11-09: after placing a cube, the only
+candidate that solved was a vertical lift to 1.24 m, and it brushed the cube it had just released by 1.1 mm
+(`PARK_COLLISION`, `displacement_m: 0.0011`) - the arm never moved away from the object first. The candidates
+below therefore include a retreat *away* from the nearest object before any lift, and every candidate is
+screened and then ranked by the measured clearance of its whole path, so the return is the roomiest route the
+body can actually reach rather than the first one that happens to solve.
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -17,35 +25,20 @@ def plan_empty_arm_home(env, controller, arm):
     sizes = [float(np.max(env.object_bounds(name)[1]-env.object_bounds(name)[0]))
              for name in objects]
     clearance = max(.08, 2*max(sizes, default=.04))
-    # A retreat can leave the wrist close to the base: a vertical lift with its
-    # current attitude may be unreachable even though a high home route exists.
-    # Compile and screen complete alternatives BEFORE moving the live robot.
     heights = list(dict.fromkeys([target[2]+clearance,
                                  max(start[2], target[2])+clearance, target[2]+clearance/2]))
     check = getattr(kin, 'empty_arm_path_is_clear', None)
+    measure = getattr(kin, 'path_minimum_clearance', None)
     nominal_clear = check is None or check([home, home], objects, minimum_object_clearance=.03)
-    candidates = []
-    for height in heights:
-        high_start, high_target = start.copy(), target.copy()
-        high_start[2] = high_target[2] = height
-        candidates.extend([
-            ('lift_then_home', [(high_start, rotation), (high_target, target_rotation)], height),
-            ('free_attitude_lift_then_home', [(high_start, None), (high_target, target_rotation)], height),
-            ('high_home', [(high_target, target_rotation)], height),
-        ])
-    if nominal_clear:
-        candidates.append(('direct_home', [], float(target[2])))
-    rejected = []
-    for name, poses, height in candidates:
-        if controller.stop_requested():
-            return None, {'error':'STOPPED', 'rejected_routes':rejected}
+
+    def build(poses):
+        """Solve a joint route through these (position, attitude) poses; None if IK cannot."""
         route = [start_q]
         for point, attitude in poses:
             solved = None
             if attitude is None:
-                # An empty arm may rotate while clearing vertically. Fixing its
-                # original wrist attitude can make a perfectly reachable lift
-                # impossible near the base of a redundant arm.
+                # An empty arm may rotate while clearing vertically. Fixing its original wrist attitude can
+                # make a perfectly reachable lift impossible near the base of a redundant arm.
                 limits = env.arm_limits(arm)
                 def residual(q):
                     return np.r_[kin.evaluate(q)[0]-point, (q-route[-1])*.0002]
@@ -62,28 +55,79 @@ def plan_empty_arm_home(env, controller, arm):
                     solved = q
                     break
             if solved is None:
-                break
+                return None
             route.append(solved)
-        else:
-            if nominal_clear:
-                route.append(home)
-            # Keep the canonical home when possible. If the task's current
-            # objects occupy it, park above that frame instead of erasing or
-            # pushing the result to force the original configuration.
-            # The official model query includes both arms, the cell, and the
-            # latest object poses. It never integrates a second simulation.
-            if check is not None and not check(route, objects, minimum_object_clearance=.03,allow_clearance_exit=True):
-                rejected.append({'route':name, 'height_m':height, 'error':'COLLISION_PATH'})
-                continue
-            planner = getattr(env, 'plan_joint_waypoints', None)
-            if planner is not None:
-                route = planner(arm, route, controller.stop_requested)
-                if route is None:
-                    rejected.append({'route':name, 'height_m':height, 'error':'COLLISION_PATH'})
-                    continue
-            return route, {'route':name,'clearance_height_m':height,'rejected_routes':rejected,
-                           'target_joint_positions':np.asarray(route[-1]).tolist(),
-                           'home_mode':'model_home' if nominal_clear else 'scene_clearance_home',
-                           'home_adjustment_reason':None if nominal_clear else 'Current objects occupy the model home clearance'}
-        rejected.append({'route':name,'height_m':height,'error':'IK_FAILURE'})
-    return None, {'error':'HOME_PATH_UNAVAILABLE','rejected_routes':rejected}
+        # Keep the canonical home when it is clear; otherwise park above that frame rather than erasing or
+        # pushing the result to force the original configuration.
+        if nominal_clear:
+            route.append(home)
+        return route
+
+    # How to get away from the object before climbing: the direction that leaves the object behind. The
+    # straight-up lift is kept as a candidate, but it is no longer the assumption.
+    def retreat_directions():
+        directions = []
+        if objects:
+            nearest = min(objects.items(), key=lambda item: float(np.linalg.norm(item[1][0]-start)))
+            away = start - np.asarray(nearest[1][0], float)
+            away[2] = 0.
+            if np.linalg.norm(away) > 1e-6:
+                directions.append(('away_from_nearest', away / np.linalg.norm(away)))
+            centroid = np.mean([np.asarray(pose[0], float) for pose in objects.values()], axis=0)
+            outward = start - centroid
+            outward[2] = 0.
+            if np.linalg.norm(outward) > 1e-6:
+                directions.append(('away_from_objects', outward / np.linalg.norm(outward)))
+        directions.extend([('lateral_left', np.array([0., 1., 0.])),
+                           ('lateral_right', np.array([0., -1., 0.]))])
+        return directions
+
+    candidates = []
+    for height in heights:
+        high_target = target.copy()
+        high_target[2] = height
+        candidates.extend([
+            ('lift_then_home', [(start.copy(), rotation), (high_target, target_rotation)], height),
+            ('free_attitude_lift_then_home', [(start.copy(), None), (high_target, target_rotation)], height),
+            ('high_home', [(high_target, target_rotation)], height),
+        ])
+        for name, direction in retreat_directions():
+            for distance in (.03, .06):
+                retreat = start + direction * distance
+                candidates.append((f'retreat_{name}_{int(distance*1000)}mm_then_home',
+                                   [(retreat, rotation), (high_target, target_rotation)], height))
+    if nominal_clear:
+        candidates.append(('direct_home', [], float(target[2])))
+
+    rejected, considered = [], []
+    best = None
+    for name, poses, height in candidates:
+        if controller.stop_requested():
+            return None, {'error':'STOPPED', 'rejected_routes':rejected, 'considered':considered}
+        route = build(poses)
+        if route is None:
+            rejected.append({'route':name, 'height_m':height, 'error':'IK_FAILURE'})
+            continue
+        if check is not None and not check(route, objects, minimum_object_clearance=.03,allow_clearance_exit=True):
+            rejected.append({'route':name, 'height_m':height, 'error':'COLLISION_PATH'})
+            continue
+        clearance_measured = (measure(route, objects, ceiling=.05) if measure is not None else None)
+        considered.append({'route':name, 'height_m':height, 'clearance_m':clearance_measured})
+        if best is None or (clearance_measured is not None and
+                            (best[3] is None or clearance_measured > best[3])):
+            best = (name, height, route, clearance_measured)
+    if best is None:
+        return None, {'error':'HOME_PATH_UNAVAILABLE','rejected_routes':rejected,'considered':considered}
+    name, height, route, clearance_measured = best
+    planner = getattr(env, 'plan_joint_waypoints', None)
+    if planner is not None:
+        planned = planner(arm, route, controller.stop_requested)
+        if planned is None:
+            rejected.append({'route':name, 'height_m':height, 'error':'COLLISION_PATH'})
+            return None, {'error':'HOME_PATH_UNAVAILABLE','rejected_routes':rejected,'considered':considered}
+        route = planned
+    return route, {'route':name,'clearance_height_m':height,'measured_clearance_m':clearance_measured,
+                   'rejected_routes':rejected,'considered':considered,
+                   'target_joint_positions':np.asarray(route[-1]).tolist(),
+                   'home_mode':'model_home' if nominal_clear else 'scene_clearance_home',
+                   'home_adjustment_reason':None if nominal_clear else 'Current objects occupy the model home clearance'}
