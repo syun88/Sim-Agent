@@ -11,7 +11,8 @@ import time
 
 from backend.app.agent.scene_reasoning import SceneReferenceError
 from backend.app.planning.grounding import ground
-from backend.app.agent.recovery_policy import reset_evidence
+from backend.app.agent.recovery_policy import admit_reset, reset_evidence
+from backend.app.verification.failure_attribution import cross_check, withholds
 from backend.app.planning.agent_planner import PlannerProviderError, grounded_recovery_reason
 from backend.app.planning.preparation import compile_prepared_program
 from backend.app.planning.spatial_language import preservation_spans
@@ -58,17 +59,25 @@ def _repeats_measured_contact(mechanism, receipt):
 
 
 class TaskAgent:
-    def __init__(self, executor, planner, *, plan_call=None, recovery_call=None, max_attempts=4, max_resets=1):
+    def __init__(self, executor, planner, *, plan_call=None, recovery_call=None, max_attempts=4, max_resets=1,
+                 mechanism_reviewer=None):
         self.executor, self.planner = executor, planner
         self.plan_call = plan_call or planner.plan
         self.recovery_call = recovery_call or planner.assess_failure
         self.max_attempts, self.max_resets = max_attempts, max_resets
+        #: Optional second opinion on a failure's mechanism. It can only withhold the irreversible
+        #: recovery (see `verification.failure_attribution.cross_check`); None disables it, which is the
+        #: default because it costs a model call per failure.
+        self.mechanism_reviewer = mechanism_reviewer
 
     def run(self, instruction, *, emit=None, should_stop=None, force_failure=False):
         started = time.perf_counter()
         initial = self.executor.world_state()
         epoch_initial = initial
         decisions, attempts, recoveries, resets = [], [], [], 0
+        #: Reviewer verdicts and reset admissions, kept across attempts: a decision taken on an earlier
+        #: attempt must not disappear when a later attempt produces the final result.
+        mechanism_reviews, reset_decisions = [], []
         evidence_ledger = []
         staging_used=False
         replan_used=False
@@ -82,6 +91,8 @@ class TaskAgent:
             result = {**result,'agent_trace':decisions,'agent_attempts':attempts,'agent_recoveries':recoveries,
                 'initial_world_state':initial,'final_world_state':self.executor.world_state(),
                 'evidence_ledger':deepcopy(evidence_ledger),
+                'mechanism_reviews':deepcopy(mechanism_reviews),
+                'reset_decisions':deepcopy(reset_decisions),
                 'total_duration':time.perf_counter()-started}
             result['verification'] = {**result.get('verification',{}),'agent_attempts':len(attempts),
                 'scene_resets':resets,'all_agent_attempts_succeeded':all(a['result']['success'] for a in attempts)}
@@ -285,6 +296,11 @@ class TaskAgent:
                     except GroundingError:
                         pass
             certificate=reset_evidence(observed,source)
+            # A second opinion, asked once per failure and only able to withhold: if it disagrees with the
+            # rule table's mechanism, the scene is not restarted - an uncertain cause is not a licence to
+            # throw the layout away. Every other recovery stays available.
+            review = cross_check(failure_receipt.get('mechanism') or 'UNKNOWN',
+                                 failure_receipt.get('raw'), self.mechanism_reviewer)
             # Measured failures can be answered with a different plan; only when they carry numbers, so the
             # agent can still run out of options.
             # Replanning is offered when the failure carries something a different plan could use: a design, or
@@ -295,10 +311,25 @@ class TaskAgent:
                                     or bool(evidence.get('levers')) or bool(evidence.get('unreachable_by_m')))
             if not replan_used and carries_measurements:
                 legal.append('replan')
-            if not legal and certificate and reset_allowed and resets<self.max_resets and not receipts.receipts:
+            offered, why_not = admit_reset(
+                certificate if not receipts.receipts else None, review,
+                legal_is_empty=not legal, reset_allowed=reset_allowed, resets=resets,
+                max_resets=self.max_resets)
+            if certificate is not None:
+                # Why the irreversible option was or was not offered, recorded rather than discarded:
+                # "no reset" and "reset refused for a contested mechanism" are different states.
+                reset_decisions.append({'attempt': iteration + 1, 'offered': offered, 'reason': why_not})
+            if review.get('verdict') != 'unavailable':
+                mechanism_reviews.append({'attempt': iteration + 1, **review})
+            if offered:
                 legal.append('reset_and_retry')
             if not legal:
-                result['detail'] = f'{category}: 同じシーン内で利用できる復旧案を試しました。配置を維持して停止します。'
+                if withholds(review, action='reset_and_retry') and certificate:
+                    result['detail'] = (f'{category}: 機序の判定が一致しないため配置を維持して停止します'
+                                        f'（rule={review["mechanism"]}, '
+                                        f'reviewer={review["reviewer_mechanism"]}）。')
+                else:
+                    result['detail'] = f'{category}: 同じシーン内で利用できる復旧案を試しました。配置を維持して停止します。'
                 return finish(result)
             assessment = self.recovery_call(instruction,observed,
                 {'category':category,'detail':failed.get('detail') or result.get('detail'),

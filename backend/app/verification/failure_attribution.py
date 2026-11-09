@@ -137,3 +137,69 @@ def attribute(code, evidence=None):
     if any(marker in code or marker in detail.upper() for marker in LANGUAGE_MARKERS):
         return "LANGUAGE", "instruction could not be turned into a supported task"
     return "UNKNOWN", "the recorded evidence does not decide the mechanism"
+
+
+#: Our mechanism names are finer than a reviewer's: two of ours are both "the arm touched the object",
+#: and a reviewer may use another vocabulary entirely. This is the only mapping between them.
+CRITERIA = {'GEOMETRY': 'geometry', 'GRASP_FRAME': 'frame', 'GRASP_CONTACT': 'contact',
+            'APPROACH_CONTACT': 'contact', 'CARRY_CONTACT': 'contact', 'TRACKING': 'tracking',
+            'PLANNING': 'planning', 'LANGUAGE': 'language', 'UNKNOWN': None}
+
+
+def cross_check(mechanism, evidence, reviewer=None):
+    """Ask a second opinion about a mechanism and let it only *withhold*, never authorise.
+
+    The rule table is deterministic and owns the vocabulary; a reviewer (a decision model, a
+    human-in-the-loop, anything callable) is asked to confirm it. The asymmetry is deliberate:
+
+    * `agree` — the reviewer's top mechanism matches ours.
+    * `abstain` — the reviewer names nothing, or is not confident enough to say.
+    * `disagree` — the reviewer names a different mechanism.
+    * `unavailable` — no reviewer was supplied, or it failed.
+
+    Only `disagree` changes anything, and it changes it in one direction: a caller may refuse a
+    destructive step (a scene reset is the one irreversible recovery here). A reviewer can never add a
+    recovery candidate or make a refusal succeed - a second opinion that could authorise is a second
+    authority, and then neither is accountable.
+
+    `reviewer` is called with `{'mechanism': ..., 'criterion': ..., 'evidence': ...}` and returns
+    `{'mechanism': str | None, 'confidence': float, 'evidence_strength': str | None}` where `mechanism`
+    is in the reviewer's own vocabulary, compared through `CRITERIA`.
+    """
+    criterion = CRITERIA.get(mechanism)
+    verdict = {'reviewed': reviewer is not None, 'verdict': 'unavailable',
+               'mechanism': mechanism, 'criterion': criterion,
+               'reviewer_mechanism': None, 'reviewer_confidence': None,
+               'reviewer_evidence_strength': None, 'reason': 'no reviewer was supplied'}
+    if reviewer is None:
+        return verdict
+    try:
+        answer = reviewer({'mechanism': mechanism, 'criterion': criterion,
+                           'evidence': evidence if isinstance(evidence, dict) else {}})
+    except Exception as error:                      # a reviewer that fails must not decide anything
+        verdict.update(verdict='unavailable', reason=f'the reviewer failed: {error!r}')
+        return verdict
+    if not isinstance(answer, dict):
+        verdict.update(verdict='unavailable', reason='the reviewer returned no answer')
+        return verdict
+    named = answer.get('mechanism')
+    verdict.update(reviewer_mechanism=named,
+                   reviewer_confidence=answer.get('confidence'),
+                   reviewer_evidence_strength=answer.get('evidence_strength'))
+    if not named:
+        verdict.update(verdict='abstain', reason='the reviewer did not name a mechanism')
+        return verdict
+    if criterion is None:
+        verdict.update(verdict='disagree',
+                       reason=f'the reviewer named {named} for a record whose mechanism is undecided')
+        return verdict
+    if str(named).lower() == criterion:
+        verdict.update(verdict='agree', reason=f'both name {criterion}')
+        return verdict
+    verdict.update(verdict='disagree', reason=f'ours is {criterion}, the reviewer names {named}')
+    return verdict
+
+
+def withholds(verdict, *, action):
+    """Whether this cross-check forbids `action`. Only a disagreement withholds anything."""
+    return verdict.get('verdict') == 'disagree' and action == 'reset_and_retry'
