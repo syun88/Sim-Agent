@@ -113,9 +113,14 @@ class TaskContract:
                                    'resolution':'grounded_initial_plan_not_independent_language_proof'},
                 'goal': goal, 'actions': actions,
                 'goals': [g.model_dump() for g in source.goals], 'choices': choices,
-                'allowed_object_motion': sorted({s.object for s in plan.steps if s.object} |
-                                               {s.target for s in plan.steps if s.skill == 'pour_liquid' and s.target} |
-                                               {g.object for g in source.goals}),
+                # The goal's own object is requested even when this attempt needs no step for it (a
+                # placement whose condition already holds). Measured 2026-11-09: without it, that plan froze
+                # an empty set and the next attempt was refused as manipulating an unrequested object.
+                'allowed_object_motion': sorted(({s.object for s in plan.steps if s.object} |
+                                                 {s.target for s in plan.steps
+                                                  if s.skill == 'pour_liquid' and s.target} |
+                                                 {g.object for g in source.goals} |
+                                                 ({goal.get('object')} if goal.get('object') else set())) - {None}),
                 'keep_in_place': list(source.keep_in_place), 'temporal': temporal, 'event_actions':event_actions}
         payload = canonical_json(data)
         return cls(str(uuid.uuid4()), hashlib.sha256(payload.encode()).hexdigest(), payload)

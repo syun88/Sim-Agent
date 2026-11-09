@@ -871,10 +871,16 @@ class AgentPlanner:
         plan.planning_latency = time.perf_counter() - started
         if language_stages:
             plan.planning_evidence = {**(plan.planning_evidence or {}), 'language_stages': language_stages}
-        # Keep the established idempotent place behaviour, but verify it physically at execution.
+        # An idempotent place: the requested condition already holds, so there is nothing to move, but the
+        # request itself is unchanged. Measured 2026-11-09: rewriting the goal to `already_at_target` and
+        # planning only a return_home froze a contract whose allowed motion was empty, so the next attempt
+        # ("place blue into the green zone", already inside it) was refused as manipulating an unrequested
+        # object. The goal stays a placement, the steps become empty, and the physical check still runs.
         if plan.goal["type"] == "place_in_zone" and self._already_at_target(state, plan.goal["object"], plan.goal["target"]):
+            plan.goal["already_satisfied"] = True
+            plan.goal["already_satisfied_basis"] = self._already_at_target_basis(state, plan.goal["object"], plan.goal["target"])
+            # Nothing to move, so the only action is bringing the arm home: a plan with no steps is not a plan.
             from backend.app.models.schemas import PlanStep
-            plan.goal["type"] = "already_at_target"
             plan.steps = [PlanStep(skill="return_home", arm=plan.arm)]
         return plan
 
@@ -888,11 +894,25 @@ class AgentPlanner:
 
     @staticmethod
     def _already_at_target(state: dict, obj: str, target: str) -> bool:
+        return AgentPlanner._already_at_target_basis(state, obj, target).get('satisfied') is True
+
+    @staticmethod
+    def _already_at_target_basis(state: dict, obj: str, target: str) -> dict:
+        """Whether the placement already holds, and the numbers that decided it."""
         a = next((x.get("position") for x in state["objects"] if x["id"] == obj), None)
         b = next((x.get("position") for x in state["targets"] if x["id"] == target), None)
         if a is None or b is None:
-            return False
-        return sum((a[i] - b[i]) ** 2 for i in (0, 1)) ** .5 <= .04 and abs(a[2] - b[2]) <= .05 and not any(state.get("robot", {}).get(f"{s}_arm", {}).get("held_object") == obj for s in ("left", "right"))
+            return {'satisfied': False, 'reason': 'NOT_OBSERVED'}
+        held = next((s for s in ("left", "right")
+                     if state.get("robot", {}).get(f"{s}_arm", {}).get("held_object") == obj), None)
+        planar = sum((a[i] - b[i]) ** 2 for i in (0, 1)) ** .5
+        basis = {'satisfied': bool(planar <= .04 and abs(a[2] - b[2]) <= .05 and held is None),
+                 'distance_m': float(planar), 'height_offset_m': float(abs(a[2] - b[2])),
+                 'tolerance_m': .04, 'height_tolerance_m': .05, 'object_position': list(a),
+                 'target_position': list(b), 'held_by': held}
+        if held is not None:
+            basis['reason'] = 'HELD_BY_ARM'
+        return basis
 
 
 def validate_plan(plan: AgentPlan, state: dict) -> tuple[bool, list[str]]:

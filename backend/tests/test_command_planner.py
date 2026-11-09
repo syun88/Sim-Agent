@@ -90,5 +90,30 @@ def test_repeated_place_goal_is_not_reexecuted_when_already_satisfied():
     plan = AgentPlanner().plan("Move the red cube into the blue zone.", state)
     valid, errors = validate_plan(plan, state)
     assert valid, errors
-    assert plan.goal["type"] == "already_at_target"
+    # The request is still a placement - the goal is a condition, not a status - and the state already
+    # satisfies it, so the only action is homing. Keeping the goal type is what lets the contract know the
+    # object was requested at all (measured 2026-11-09: the old rewrite froze an empty allowed-motion set and
+    # the next attempt on that object was refused).
+    assert plan.goal["type"] == "place_in_zone"
+    assert plan.goal["already_satisfied"] is True
+    basis = plan.goal["already_satisfied_basis"]
+    assert basis["satisfied"] is True and basis["distance_m"] <= .04
     assert [step.skill for step in plan.steps] == ["return_home"]
+
+
+def test_a_satisfied_placement_still_permits_the_object_it_asked_about():
+    """Measured 2026-11-09: 'place blue into the green zone' (blue already inside) was refused as
+    manipulating an unrequested object, because the satisfied plan froze an empty allowed-motion set."""
+    from backend.app.planning.task_contract import TaskContract, requested_program
+
+    state = {
+        "objects": [{"id": "blue_cube", "position": [0.50, -0.22, 1.031]}],
+        "targets": [{"id": "green_zone", "position": [0.48, -0.20, 1.008]}],
+        "robot": {"left_arm": {"held_object": None}, "right_arm": {"held_object": None}},
+    }
+    plan = AgentPlanner().plan("青いキューブを右手で緑のゾーンに置いて", state)
+    assert plan.goal["type"] == "place_in_zone"
+    contract = TaskContract.freeze("青いキューブを右手で緑のゾーンに置いて", plan, requested_program(plan))
+    assert "blue_cube" in contract.describe()["allowed_object_motion"]
+    # The requested condition is still checked, even though there is nothing to execute for it.
+    assert any(check.get("object") == "blue_cube" for check in contract.checks())
