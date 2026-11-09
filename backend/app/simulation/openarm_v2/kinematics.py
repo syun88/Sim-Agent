@@ -104,6 +104,76 @@ class OfficialArmKinematics:
         # Nothing within the ceiling radius is not an unknown: it is the ceiling, saturated.
         return float(ceiling) if smallest is None else float(smallest)
 
+    def path_clearance_detail(self, waypoints, objects, resolution=.025, *, allowed_contacts=None,
+                              curve=None, ceiling=.05):
+        """Where the path is tightest: the gap, which geoms, and which sample.
+
+        A single number cannot answer "the model says 30 mm but the finger touched". This returns the pair and
+        the configuration so the disagreement can be located instead of argued about.
+        """
+        from backend.app.simulation.transform import mat_to_quat
+        mj, model = self._mj, self._model
+        data = mj.MjData(model)
+        data.qpos[:] = self._data.qpos
+        placed = 0
+        for name, (position, rotation) in objects.items():
+            body = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, name)
+            if body < 0 or not model.body_jntnum[body]:
+                continue
+            joint = model.body_jntadr[body]
+            if model.jnt_type[joint] != mj.mjtJoint.mjJNT_FREE:
+                continue
+            address = model.jnt_qposadr[joint]
+            data.qpos[address:address+3] = position
+            data.qpos[address+3:address+7] = mat_to_quat(rotation)
+            placed += 1
+        if not placed:
+            return None
+        root = model.jnt_bodyid[model.dof_jntid[self._dofs[0]]]
+        descendants = set()
+        for body in range(model.nbody):
+            ancestor = body
+            while ancestor and ancestor != root:
+                ancestor = model.body_parentid[ancestor]
+            if ancestor == root:
+                descendants.add(body)
+        moving = np.array([int(b) in descendants for b in model.geom_bodyid])
+        moving_geoms = np.flatnonzero(moving)
+        if not len(moving_geoms):
+            return None
+        names = [mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, int(b)) or '' for b in model.geom_bodyid]
+        geom_names = [mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, int(g)) or '' for g in range(model.ngeom)]
+        allowed_contacts = allowed_contacts or {}
+        prop_geoms = np.flatnonzero([name in objects for name in names])
+        samples = []
+        for start, end in zip(waypoints, waypoints[1:]):
+            count = max(2, int(np.ceil(np.max(abs(end - start)) / resolution)) + 1)
+            samples.extend(np.linspace(start, end, count))
+        if curve is not None:
+            samples = curve(np.unique(np.r_[np.linspace(0., 1., max(30, 2 * len(samples))), curve.x]))
+        smallest, at_sample, at_pair = None, None, None
+        for index, joints in enumerate(samples):
+            data.qpos[self._positions] = joints
+            mj.mj_kinematics(model, data)
+            for geom in moving_geoms:
+                for prop in prop_geoms:
+                    if np.linalg.norm(data.geom_xpos[geom] - data.geom_xpos[prop]) > (
+                            model.geom_rbound[geom] + model.geom_rbound[prop] + ceiling):
+                        continue
+                    a, b = names[int(geom)], names[int(prop)]
+                    if b in allowed_contacts.get(a, set()) or a in allowed_contacts.get(b, set()):
+                        continue
+                    gap = float(mj.mj_geomDistance(model, data, int(geom), int(prop), ceiling, None))
+                    if smallest is None or gap < smallest:
+                        smallest = gap
+                        at_sample = index
+                        at_pair = (geom_names[int(geom)], geom_names[int(prop)],
+                                   str(names[int(geom)]), str(names[int(prop)]))
+        if smallest is None:
+            return {'gap_m': float(ceiling), 'pair': None, 'sample': None, 'samples': len(samples)}
+        return {'gap_m': float(smallest), 'pair': at_pair, 'sample': int(at_sample),
+                'samples': len(samples)}
+
     def empty_arm_path_is_clear(self, waypoints, objects, resolution=.025, *, allowed_contacts=None, curve=None,
                                 minimum_object_clearance=0., allow_clearance_exit=False,
                                 object_clearances=None):

@@ -1040,16 +1040,24 @@ class SkillRunner:
                 error = SkillError(planning['error'], 'No reachable clear route to the model home posture')
                 error.evidence = planning
                 raise error
+            executed = []
+
             def guard():
                 for other, obj in others.items():
                     if obj:
                         self._require_hold(other, obj)
+                # Where the arm actually is at this instant: a model that says the route has 30 mm has to be
+                # checked against what the pads did, not against itself.
+                ee, _ = self.env.ee_pose(arm)
+                executed.append([float(value) for value in ee])
                 for obj, position in stationary.items():
                     if (self.env.object_contacts(obj, arm)
                             or np.linalg.norm(self.env.object_pose(obj)[0]-position) > .002):
                         error = SkillError('PARK_COLLISION', f'Empty-arm parking disturbed {obj}')
                         error.evidence = {**planning,'object':obj,'contacts':self.env.object_contacts(obj,arm),
-                                          'displacement_m':float(np.linalg.norm(self.env.object_pose(obj)[0]-position))}
+                                          'displacement_m':float(np.linalg.norm(self.env.object_pose(obj)[0]-position)),
+                                          'executed_ee_path':executed[-200:],
+                                          'object_position':[float(v) for v in self.env.object_pose(obj)[0]]}
                         raise error
             # Execute only an admitted route. Exact final joint targets preserve
             # the canonical home branch of a redundant arm; normal motors move it.

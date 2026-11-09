@@ -118,11 +118,13 @@ def plan_empty_arm_home(env, controller, arm):
         # The whole-path minimum is dominated by the final home posture, which every candidate shares, so it
         # cannot tell a retreat from a straight lift. The segment that actually brushes the object just
         # released is the first one, so that is measured separately - and it is what gets ranked first.
+        detail = (getattr(kin, 'path_clearance_detail', None) or (lambda *a, **k: None))(route, objects, ceiling=.05)
         clearance_all = (measure(route, objects, ceiling=.05) if measure is not None else None)
         clearance_first = (measure(route[:2], objects, ceiling=.05)
                            if measure is not None and len(route) >= 2 else None)
         considered.append({'route':name, 'height_m':height, 'clearance_m':clearance_all,
-                           'clearance_first_segment_m':clearance_first})
+                           'clearance_first_segment_m':clearance_first,
+                           'tightest': detail})
         score = (clip_first(clearance_first), clip_first(clearance_all))
         if best is None or score > best[3]:
             best = (name, height, route, score, clearance_all, clearance_first)
@@ -138,6 +140,8 @@ def plan_empty_arm_home(env, controller, arm):
         route = planned
     return route, {'route':name,'clearance_height_m':height,'measured_clearance_m':clearance_first,
                    'measured_clearance_whole_path_m':clearance_all,
+                   'tightest': next((item['tightest'] for item in considered
+                                     if item['route'] == name and item['height_m'] == height), None),
                    'rejected_routes':rejected,'considered':considered,
                    'target_joint_positions':np.asarray(route[-1]).tolist(),
                    'home_mode':'model_home' if nominal_clear else 'scene_clearance_home',
