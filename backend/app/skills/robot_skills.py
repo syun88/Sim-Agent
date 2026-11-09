@@ -258,11 +258,21 @@ class SkillRunner:
                                     'initial_arm_joints':initial_joints,'phase':'approach_trajectory'}
                     raise error
         if obj.endswith('_cube'):
-            from backend.app.skills.approach import cube_approach_frames, plan_cube_approach
-            frames = cube_approach_frames(arm, obj_pos + shift, APPROACH_STANDOFF,
-                                          world_x_offset=fault_offset)
+            from backend.app.skills.approach import (cube_approach_frames, plan_cube_approach,
+                                                     two_axis_frames)
+            centre = obj_pos + shift
+            frames = cube_approach_frames(arm, centre, APPROACH_STANDOFF, world_x_offset=fault_offset)
             route,approach_evidence=plan_cube_approach(self.env,self.controller,arm,obj,pinch,standoff,
                                                        APPROACH_OVERFLY,STAGING_ALTITUDE,frames=frames)
+            if route is None:
+                # The calibrated attitude with quarter turns is the cheap search. Only when it finds no
+                # corridor does the leaning search run, which costs 20 candidates instead of 14 and would
+                # otherwise change the attitude the existing layouts are measured with.
+                leaning = two_axis_frames(arm, centre, APPROACH_STANDOFF, world_x_offset=fault_offset)
+                route, approach_evidence = plan_cube_approach(
+                    self.env, self.controller, arm, obj, pinch, standoff, APPROACH_OVERFLY,
+                    STAGING_ALTITUDE, frames=leaning)
+                approach_evidence = {**approach_evidence, 'search': 'two_axis'}
             if route is None:
                 rejected=approach_evidence.get('rejected_routes',[])
                 category='COLLISION_PATH' if rejected and all(r['error']=='COLLISION_PATH' for r in rejected) else 'IK_FAILURE'

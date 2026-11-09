@@ -19,6 +19,31 @@ NONCONTACT_CLEARANCE_M = .020
 TARGET_BODY_CLEARANCE_M = .003
 
 
+def two_axis_frames(arm, center, standoff_m, *, world_x_offset=None):
+    """The same candidates as ``cube_approach_frames``, plus a lean of the approach axis.
+
+    Rotating about the vertical changes which side the hand comes from; leaning in the vertical plane
+    changes the angle it comes down at, and with it how high the hand sits while the fingers are beside the
+    object. Measured 2026-10-27: rotating about the frame's own approach axis was refused at every angle
+    from 15 to 90 degrees because the hand keeps the same height while it spins, so the lean is the axis
+    worth searching. Every candidate keeps the invariant that makes it the same grasp: the fingertip
+    midpoint still lands on the object centre.
+    """
+    from backend.app.skills.pinch_frames import pinch_frames
+
+    frames = []
+    for tilt, azimuth, rotation in pinch_frames():
+        offset = rotation @ FINGERTIP_MIDPOINT[arm]
+        if world_x_offset is not None:
+            offset = offset.copy()
+            offset[0] = world_x_offset
+        pinch = np.asarray(center, float) - offset
+        finger_direction = rotation @ np.array([0., 0., -1.])
+        frames.append({'yaw_deg': azimuth, 'tilt_deg': tilt, 'rotation': rotation, 'pinch': pinch,
+                       'standoff': pinch - standoff_m * finger_direction})
+    return frames
+
+
 def cube_approach_frames(arm, center, standoff_m, *, world_x_offset=None):
     frames = []
     for yaw in CUBE_GRASP_YAWS_DEG:
@@ -74,6 +99,7 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
                                       'noncontact_clearance_m':NONCONTACT_CLEARANCE_M,
                                       'target_body_clearance_m':TARGET_BODY_CLEARANCE_M,
                                       'grasp_yaw_deg':frame['yaw_deg'],
+                                      'grasp_tilt_deg':frame.get('tilt_deg', 0.),
                                       'grasp_rotation':attitude.tolist(),
                                       'pinch_target':pinch_target.tolist(),
                                       'rejected_routes':rejected}
