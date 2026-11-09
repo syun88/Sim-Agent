@@ -29,7 +29,13 @@ def plan_empty_arm_home(env, controller, arm):
                                  max(start[2], target[2])+clearance, target[2]+clearance/2]))
     check = getattr(kin, 'empty_arm_path_is_clear', None)
     measure = getattr(kin, 'path_minimum_clearance', None)
-    nominal_clear = check is None or check([home, home], objects, minimum_object_clearance=.03)
+    # How much room the home posture needs is a property of this body: the clearance a target must have is
+    # derived from how far the arm actually lands from where it was told to go (measured), not from a
+    # constant. Measured 2026-11-09: a 30 mm margin lost to a ~35 mm positioning difference.
+    from backend.app.skills import motion_accuracy
+    home_clearance_required = motion_accuracy.required_clearance(arm)
+    nominal_clear = (check is None
+                     or check([home, home], objects, minimum_object_clearance=home_clearance_required))
 
     def build(poses):
         """Solve a joint route through these (position, attitude) poses; None if IK cannot."""
@@ -112,7 +118,10 @@ def plan_empty_arm_home(env, controller, arm):
         if route is None:
             rejected.append({'route':name, 'height_m':height, 'error':'IK_FAILURE'})
             continue
-        if check is not None and not check(route, objects, minimum_object_clearance=.03,allow_clearance_exit=True):
+        # The travelled route keeps the ordinary clearance; it is the *home target* that needs the bigger
+        # margin, because that is the pose the arm has to land on.
+        if check is not None and not check(route, objects, minimum_object_clearance=.03,
+                                            allow_clearance_exit=True):
             rejected.append({'route':name, 'height_m':height, 'error':'COLLISION_PATH'})
             continue
         # The whole-path minimum is dominated by the final home posture, which every candidate shares, so it
@@ -145,4 +154,7 @@ def plan_empty_arm_home(env, controller, arm):
                    'rejected_routes':rejected,'considered':considered,
                    'target_joint_positions':np.asarray(route[-1]).tolist(),
                    'home_mode':'model_home' if nominal_clear else 'scene_clearance_home',
-                   'home_adjustment_reason':None if nominal_clear else 'Current objects occupy the model home clearance'}
+                   'home_clearance_required_m':home_clearance_required,
+                   'observed_positioning_error_m':motion_accuracy.observed_error(arm),
+                   'home_adjustment_reason':None if nominal_clear
+                   else f'Home needs {home_clearance_required*1000:.0f} mm of clearance for this body'}

@@ -1133,6 +1133,9 @@ class SkillRunner:
                                       'arrived_joints': np.asarray(arrived).tolist(),
                                       'traversed': travelled, **planning}
                     raise error
+                # Every arrival is a free measurement of how far this body lands from its command.
+                from backend.app.skills import motion_accuracy
+                motion_accuracy.record(arm, deviation, source='park_arrival')
                 previous = arrived
                 guard()
             joint_error = float(np.max(abs(self.env.arm_qpos(arm)-route[-1])))
