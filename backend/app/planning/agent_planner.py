@@ -173,6 +173,12 @@ class AgentPlanner:
         # Same wording the model has always been given (absent objects stay qualified as "when present"), but
         # built from the catalog: adding a cup does not require editing this sentence.
         absent = [entry.id for entry in vocabulary.objects if entry.id not in observed]
+        from backend.app.planning import task_templates
+        # Only offer a procedure when the instruction hints at one: the prompt for every other request stays
+        # byte-identical, which is what keeps the model's established behaviour (and its tests) stable.
+        entries = task_templates.load()
+        hinted = task_templates.phrase_hint(instruction, entries)
+        templates_line = task_templates.prompt_line({name: entries[name] for name in hinted}) if hinted else ''
         objects = ', '.join(entry.id for entry in vocabulary.objects if entry.id in observed)
         if absent:
             objects += ', and when present ' + ', '.join(absent)
@@ -217,6 +223,7 @@ class AgentPlanner:
             "Pour automatically returns the bottle upright to its starting table position and releases it; no extra place action is needed for that. "
             "Object 'it' means the last mentioned object; held:left/held:right mean what that hand actually holds. "
             "Optional arm null means current holder or nearer arm. A hand can hold one cube. "
+            f"{templates_line}"
             "For handover, arm is the GIVER and receiver is the destination hand. Read hand_occupancy. "
             "If right holds blue and user says give it to left, arm MUST be right, receiver left. Never use the same arm twice. "
             "If another hand takes a held cube, use handover, never a second independent table pick. "
@@ -332,6 +339,21 @@ class AgentPlanner:
         messages = [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]
         content = self._complete(messages, schema)
         payload = self._extract_json(content)
+        # A composite procedure may be requested by name. It is expanded here and then goes through the same
+        # grounding, compiler and contract as any other plan: a template cannot widen what the body can do.
+        if payload.get('template'):
+            from backend.app.planning import task_templates
+            templates = task_templates.load()
+            chosen = templates.get(payload['template'])
+            if chosen is None:
+                raise PlannerProviderError('PROVIDER_INVALID_PROGRAM',
+                                           f'Unknown template {payload["template"]!r}; known: {sorted(templates)}')
+            try:
+                expansion = task_templates.expand(chosen, payload.get('slots') or {}, state,
+                                                  (state or {}).get('capabilities') or {})
+            except task_templates.TemplateError as error:
+                raise PlannerProviderError('PROVIDER_INVALID_PROGRAM', str(error)) from None
+            payload = expansion['envelope']
         if self._interpret_meaning:
             for goal in payload.get('goals',[]):
                 # "on" is a support/contact predicate, not a configurable gap.

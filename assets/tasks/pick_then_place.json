@@ -1,0 +1,12 @@
+{
+  "id": "pick_then_place",
+  "description": "pick one object and place it in a zone",
+  "phrases": ["拾って置いて", "取って置いて", "pick it up and put it"],
+  "slots": {"object": "object", "zone": "zone", "arm": "arm"},
+  "requires": ["grasp", "place"],
+  "goal": {"type": "place_in_zone", "object": "{object}", "target": "{zone}"},
+  "actions": [
+    {"op": "pick", "object": "{object}", "arm": "{arm}"},
+    {"op": "place", "object": "{object}", "target": "{zone}"}
+  ]
+}

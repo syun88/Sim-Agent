@@ -1,0 +1,14 @@
+{
+  "id": "two_on_one",
+  "description": "place both objects on the same support, in this order",
+  "phrases": ["両方とも", "二つとも", "both onto", "both on"],
+  "slots": {"first": "object", "second": "object", "support": "object"},
+  "requires": ["grasp", "place", "stack"],
+  "goal": {"type": "relative_placement", "object": "{second}", "target": "{support}", "relation": "on"},
+  "actions": [
+    {"op": "pick", "object": "{first}"},
+    {"op": "place", "object": "{first}", "target": "{support}", "relation": "on"},
+    {"op": "pick", "object": "{second}"},
+    {"op": "place", "object": "{second}", "target": "{support}", "relation": "on"}
+  ]
+}
