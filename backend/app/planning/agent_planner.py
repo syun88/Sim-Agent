@@ -879,9 +879,9 @@ class AgentPlanner:
         if plan.goal["type"] == "place_in_zone" and self._already_at_target(state, plan.goal["object"], plan.goal["target"]):
             plan.goal["already_satisfied"] = True
             plan.goal["already_satisfied_basis"] = self._already_at_target_basis(state, plan.goal["object"], plan.goal["target"])
-            # Nothing to move, so the only action is bringing the arm home: a plan with no steps is not a plan.
-            from backend.app.models.schemas import PlanStep
-            plan.steps = [PlanStep(skill="return_home", arm=plan.arm)]
+            # Nothing to move, so nothing is planned. Homing is not part of this request: measured
+            # 2026-11-09, a homing step made an already-satisfied placement fail when the arm could not home.
+            plan.steps = []
         return plan
 
     @staticmethod
@@ -923,7 +923,8 @@ def validate_plan(plan: AgentPlan, state: dict) -> tuple[bool, list[str]]:
     object_skills = {"approach_object", "grasp_object", "lift_object", "release_object", "handover_object", "throw_object", "pour_liquid", "move_to_object"}
     held = observed_holds(state)
     approached = {}
-    if not plan.steps or len(plan.steps) > 144:
+    satisfied_without_motion = plan.goal.get('already_satisfied') is True and plan.goal.get('type') == 'place_in_zone'
+    if (not plan.steps and not satisfied_without_motion) or len(plan.steps) > 144:
         errors.append("Plan must contain 1–144 compiled skills")
     for i, step in enumerate(plan.steps):
         allowed = state.get("capabilities", {}).get("skills")

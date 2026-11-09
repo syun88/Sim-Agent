@@ -98,7 +98,9 @@ def test_repeated_place_goal_is_not_reexecuted_when_already_satisfied():
     assert plan.goal["already_satisfied"] is True
     basis = plan.goal["already_satisfied_basis"]
     assert basis["satisfied"] is True and basis["distance_m"] <= .04
-    assert [step.skill for step in plan.steps] == ["return_home"]
+    # Nothing is planned: homing is not part of the request, and an unrelated motion must not be able to
+    # fail a task that has nothing to do.
+    assert plan.steps == []
 
 
 def test_a_satisfied_placement_still_permits_the_object_it_asked_about():
