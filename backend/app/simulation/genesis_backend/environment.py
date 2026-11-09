@@ -564,6 +564,16 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         return self._link_pose(name)
 
     def object_bounds(self, name: str) -> np.ndarray:
+        if name not in self._links:
+            # A zone is a site, not a link: its extent comes from the model file's site radius, so a
+            # placement can be judged against the region it actually has instead of against a constant.
+            from backend.app.simulation.openarm_v2.scene import zone_site_radius
+            radius = zone_site_radius(name)
+            if radius is None:
+                raise KeyError(name)
+            centre = self.zone_position(name)
+            half = np.array([radius, radius, .001])
+            return np.stack([centre - half, centre + half])
         return self._links[name].get_AABB().cpu().numpy().astype(float).reshape(2, 3)
 
     def zone_position(self, name: str) -> np.ndarray:

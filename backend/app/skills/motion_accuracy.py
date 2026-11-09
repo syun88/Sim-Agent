@@ -54,16 +54,29 @@ def observed_error(arm: str, *, sources: tuple = FREE_SPACE_SOURCES) -> float:
     return max([DEFAULT_OBSERVED_ERROR_M] + recorded)
 
 
+#: How many recordings a phase needs before its median is trusted over the default.
+MIN_SAMPLES_FOR_ESTIMATE = 3
 #: What a phase is expected to land within when nothing has been recorded for it yet. A carry lands worse
 #: than a free-space move: it ends against a support, at a pose the arm reached while holding something.
 PHASE_DEFAULTS = {'carry': 0.012, 'move_to_site': 0.010, 'park_arrival': DEFAULT_OBSERVED_ERROR_M}
 
 
 def expected_error(arm: str, phase: str, *, default: float | None = None) -> float:
-    """How far this arm lands from its command in this phase - recorded if possible, else that phase's floor."""
+    """How far this arm typically lands from its command in this phase.
+
+    The **median** of what was recorded, floored by the phase's default. A single blocked carry (measured
+    2026-11-09: 50 mm) must not raise the expectation for every later placement and gate them all off, which
+    is what a maximum would do. Safety margins elsewhere (`observed_error`) deliberately use the maximum -
+    a home target may only be made stricter - but a feasibility estimate has to describe the usual case.
+    """
+    import statistics
+
     recorded = [entry['position_error_m'] for entry in samples(arm, sources=(phase,))]
     floor = PHASE_DEFAULTS.get(phase, default if default is not None else 0.012)
-    return max([floor] + recorded)
+    if len(recorded) < MIN_SAMPLES_FOR_ESTIMATE:
+        # One blocked carry is not a measurement of the body's usual accuracy.
+        return floor
+    return max(floor, float(statistics.median(recorded)))
 
 
 def required_clearance(arm: str, *, gain: float = GAIN, floor: float = FLOOR_M,

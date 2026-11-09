@@ -24,7 +24,8 @@ def _runner(accept):
     env.object_pose = lambda name: (SUPPORT.copy(), np.eye(3))
     env.object_bounds = lambda name: (HELD if name == 'red_cube' else REGION).copy()
     env.ee_pose = lambda arm: (np.array([0.40, 0.0, 1.15]), np.eye(3))
-    env.frame = lambda: type('F', (), {'objects': {'red_cube': SUPPORT.copy()}})()
+    env.frame = lambda: type('F', (), {'objects': {'red_cube': SUPPORT.copy()},
+                                       'zones': {'blue_zone': np.array([0.45, 0.0, 1.0])}})()
     skills = SkillRunner.__new__(SkillRunner)
     skills.env = env
     skills.controller = type('C', (), {'solve_ik': staticmethod(solve), 'target_rotations': {}})()
@@ -65,32 +66,36 @@ def test_a_region_no_wider_than_the_object_offers_no_alternative():
     assert len(search['considered']) == 1
 
 
-def test_the_carry_error_is_recorded_with_the_choice_so_the_risk_is_visible():
-    """The probe and the landing error answer different questions; both are kept with the decision."""
+def test_the_region_measures_whether_the_landing_error_fits_not_a_global_tolerance():
+    """A zone has tens of mm of freedom; a cube stacked on a cube has only its support half-extent."""
     from backend.app.skills import motion_accuracy
 
     motion_accuracy.reset()
-    motion_accuracy.record('left', 0.020, source='carry')
+    for _ in range(3):
+        motion_accuracy.record('left', 0.020, source='carry')
     skills = _runner(lambda distance: True)
     skills.controller.solve_ik = staticmethod(
         lambda arm, target, rotation, **kwargs: (np.zeros(7), 0.008, 0.0))
     _desired, search = skills._reachable_destination('red_cube', 'blue_zone', 'on', 'left')
     assert search['expected_carry_error_m'] == pytest.approx(0.020)
-    assert search['feasible_within_tolerance'] is False, '8 mm probe + 20 mm landing exceeds the 12 mm tolerance'
-    assert search['chosen'] == 'requested', 'the carry is still the authority; the risk is recorded, not guessed'
+    feasibility = search['feasibility']
+    assert feasibility['required_m'] == pytest.approx(0.03, abs=.002), 'zone freedom = half zone - half object'
+    assert feasibility['estimated_landing_error_m'] == pytest.approx(0.028)
+    assert feasibility['feasible'] is True, '28 mm of landing error still fits a 30 mm region'
+    assert search['chosen'] == 'requested'
 
 
-def test_the_default_carry_floor_already_costs_the_whole_motion_tolerance():
-    """12 mm expected carry error + any probe residual exceeds the 12 mm tolerance.
-
-    That is exactly why this stays a recorded flag and not a gate: a hard gate would call every practical
-    placement infeasible. A gate needs a per-task placement accuracy, which is not measured yet.
-    """
+def test_stacking_onto_a_same_size_cube_does_not_have_that_room():
     from backend.app.skills import motion_accuracy
 
     motion_accuracy.reset()
+    for _ in range(3):
+        motion_accuracy.record('left', 0.020, source='carry')
     skills = _runner(lambda distance: True)
-    _desired, search = skills._reachable_destination('red_cube', 'blue_zone', 'on', 'left')
-    assert search['expected_carry_error_m'] == pytest.approx(motion_accuracy.PHASE_DEFAULTS['carry'])
-    assert search['feasible_within_tolerance'] is False
-    assert search['chosen'] == 'requested', 'the placement still runs; the risk is on the record'
+    skills.controller.solve_ik = staticmethod(
+        lambda arm, target, rotation, **kwargs: (np.zeros(7), 0.008, 0.0))
+    skills.env.object_bounds = lambda name: HELD.copy()      # support the same size as the held cube
+    _desired, search = skills._reachable_destination('red_cube', 'blue_cube', 'on', 'left')
+    feasibility = search['feasibility']
+    assert feasibility['required_m'] == pytest.approx(0.02, abs=.002)
+    assert feasibility['feasible'] is False, '28 mm cannot be guaranteed onto a 20 mm support half-extent'

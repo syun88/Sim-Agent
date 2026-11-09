@@ -128,3 +128,25 @@ def test_ordinary_moves_never_lower_the_bar_below_the_measured_baseline():
     assert motion_accuracy.required_clearance('left') == baseline
     motion_accuracy.record('left', 0.05, source='move_to_site')
     assert motion_accuracy.required_clearance('left') > baseline
+
+
+def test_one_blocked_carry_does_not_disable_every_later_placement():
+    """A 50 mm blocked carry is an outlier, not the body's usual accuracy."""
+    motion_accuracy.reset()
+    for value in (0.006, 0.008, 0.010):
+        motion_accuracy.record('left', value, source='carry')
+    motion_accuracy.record('left', 0.050, source='carry')
+    assert motion_accuracy.expected_error('left', 'carry') == motion_accuracy.PHASE_DEFAULTS['carry']
+
+
+def test_one_recording_is_not_an_estimate():
+    motion_accuracy.reset()
+    motion_accuracy.record('left', 0.080, source='carry')
+    assert motion_accuracy.expected_error('left', 'carry') == motion_accuracy.PHASE_DEFAULTS['carry']
+
+
+def test_the_phase_expectation_follows_a_consistently_worse_body():
+    motion_accuracy.reset()
+    for value in (0.020, 0.022, 0.024):
+        motion_accuracy.record('left', value, source='carry')
+    assert motion_accuracy.expected_error('left', 'carry') == 0.022

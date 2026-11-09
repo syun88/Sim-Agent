@@ -51,3 +51,24 @@ def resolved_scene_xml(path: Path | str = DEMO_SCENE_PATH) -> str:
     return text.replace(CELL_XML_TOKEN, official_cell_xml()).replace(
         ASSETS_DIR_TOKEN, official_assets_dir()
     )
+
+
+def zone_site_radius(name: str) -> float | None:
+    """The radius the model file gives this zone's site, so a zone's extent can be measured.
+
+    Zones are MJCF sites, not links, so they have no axis-aligned box to read back. The radius is in the
+    model (`<site name="blue_zone_site" size="0.055 0.001">`), which is where the extent actually comes from.
+    """
+    import re
+
+    try:
+        xml = resolved_scene_xml()
+    except Exception:
+        return None
+    match = re.search(rf'<site\s+name="{re.escape(name)}_site"[^>]*size="([0-9.eE+-]+)', xml)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None

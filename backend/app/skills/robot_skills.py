@@ -931,8 +931,16 @@ class SkillRunner:
         # hard gate needs a per-task placement accuracy, which is not measured yet.
         expected_carry_error = motion_accuracy.expected_error(arm, 'carry')
         search['expected_carry_error_m'] = expected_carry_error
-        search['feasible_within_tolerance'] = None
         headroom = PLACEMENT_REACH_TOLERANCE_M
+
+        def _feasible(probe_margin):
+            """Whether landing here would be precise enough for this region (unknown counts as pass)."""
+            from backend.app.skills import placement_accuracy
+            answer = placement_accuracy.feasibility(
+                self.env, obj, target, relation, probe_residual_m=-probe_margin,
+                expected_error_m=expected_carry_error)
+            verdict = answer.get('feasible')
+            return True if verdict is None else bool(verdict)
 
         def margin(point):
             aim, rotation, _offset = self._carry_aim(arm, obj, np.asarray(point, float))
@@ -947,13 +955,18 @@ class SkillRunner:
         best_point, best_margin = np.asarray(requested, float), margin(requested)
         search['considered'].append({'offset': [0., 0.], 'margin_m': best_margin})
         if best_margin is not None:
-            search['feasible_within_tolerance'] = bool(
-                -best_margin + expected_carry_error <= PLACEMENT_REACH_TOLERANCE_M)
+            from backend.app.skills import placement_accuracy
+            # How precisely this placement has to land, measured from the region it lands on: a zone has
+            # tens of millimetres of freedom, a cube stacked on a cube needs its centre over the support.
+            search['feasibility'] = placement_accuracy.feasibility(
+                self.env, obj, target, relation, probe_residual_m=-best_margin,
+                expected_error_m=expected_carry_error)
+            search['feasible_within_tolerance'] = search['feasibility']['feasible']
         if best_margin is None:
             # Reachability could not be measured here; the carry itself is the authority, as before.
             search['chosen'] = 'unmeasured'
             return requested, search
-        if best_margin >= -headroom:
+        if best_margin >= -headroom and _feasible(best_margin):
             return requested, search
         # How much room the region itself has: a zone's own extent, or the support face minus the object.
         try:
@@ -984,10 +997,10 @@ class SkillRunner:
                 search['considered'].append({'offset': offset.tolist(), 'margin_m': value})
                 if value is not None and (best_margin is None or value > best_margin):
                     best_point, best_margin = point, value
-            if best_margin is not None and best_margin >= -headroom:
+            if best_margin is not None and best_margin >= -headroom and _feasible(best_margin):
                 break
         requested_margin = margin(requested)
-        if (best_margin is not None and best_margin >= -headroom
+        if (best_margin is not None and best_margin >= -headroom and _feasible(best_margin)
                 and (requested_margin is None or best_margin > requested_margin)):
             search['chosen'] = 'offset_inside_region'
             search['chosen_point'] = best_point.tolist()
