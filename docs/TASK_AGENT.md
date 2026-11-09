@@ -417,6 +417,20 @@ uv run python scripts/export_lerobot_annotations.py \
 この層は「どの層で壊れたか」を言えるようにするためのものであり、任意の自然言語の理解を保証しない。
 学習モデルを後段に置く場合も、この決定集合が提案と検証の境界になる。
 
+## 身体の契約（2026-11-09）
+
+`simulation/conformance.py` が「skills が駆動する前に身体が答えるべき操作」を宣言し、検査する。実機に
+載せ替えるときの受け入れ基準がこれになる（`scripts/check_body_conformance.py --describe` で一覧）。
+
+見ているのは形だけではない:
+
+- 読み取り専用の操作は計画から何度でも呼ばれる（シーンを動かさない前提）。
+- `step` が**実際に時間を進めるか**。進めないバックエンドは「動いた」と報告できてしまう。
+- `arm_kinematics.evaluate(q)` が姿勢を返すか、`home_arm_qpos` が `arm_qpos` と同じ長さか。
+
+Genesis セルは起動時に自分を検査して結果を `/tmp/sim-agent-conformance.json` に残す。実測（`5d64ec8`）:
+**16 操作 / 0 問題**。
+
 ## アノテーションは身体とスキルに依存しない（2026-11-09）
 
 `scripts/export_lerobot_annotations.py` の出力を `schema: sim-agent.annotation/2` にした。方針は

@@ -54,14 +54,32 @@
 
 残り: 決定論パス（モデル無し）からもテンプレートを引けるようにするか、は未着手。
 
-## S3 実機バックエンド（未着手）
+## S3 身体の契約と適合検査（実装済み・2026-11-09）／実機実装は未着手
 
-- `SimulationBackend` を実装する `RealArmBackend`（ROS2 ブリッジ or ベンダ SDK）。skills が触る
-  `env.*` は25種なので、実装すべき面は既に列挙されている。`object_pose` は認識（マーカー/点群）、
-  `object_contacts` は把持センサ（電流・圧力）に写す。
-- 安全側は**実機で測り直す**: 接近クリアランス 20 mm、積載可否（パッド 40.5 mm）は Genesis の身体で
-  測った値。実機では同じ query を実機の身体で走らせる。
-- 受け入れ: 同じ指示・同じ計画で、実機が「把持→配置」を検証付きで完了する。
+`simulation/conformance.py` が**身体に要求する操作**を宣言し、その契約を検査する。
+
+- 読み取り専用（計画が何度でも問える）: `frame` / `object_pose` / `object_bounds` /
+  `object_contacts` / `object_linear_speed` / `ee_pose` / `arm_qpos` / `home_arm_qpos` / `arm_limits` /
+  `arm_kinematics`
+- 命令: `set_arm` / `step` / `set_gripper` / `gripper_position` / `gripper_target`
+- 形状だけでなく性質も見る: `step` が**実際に時間を進めるか**（進めない身体が「動いた」と報告できない）、
+  `arm_kinematics.evaluate(q)` が姿勢を返すか、`home_arm_qpos` が `arm_qpos` と同じ長さか。
+
+ライブ実測（`5d64ec8`、Genesis セル）: `run_genesis_gui.py` が起動時に自分を検査し
+`/tmp/sim-agent-conformance.json` に書き出す →
+
+```
+robot: openarm_v2 | operations: 16 | problems: 0
+```
+
+同じ検査で通常タスクも SUCCEEDED（`placement: True` / `undisturbed: True`）。
+
+実機に必要なのはこの 16 操作の実装だけ（`scripts/check_body_conformance.py --describe` で一覧）。
+`object_pose` は認識、`object_contacts` は把持センサ、`step` は制御周期に対応する。**安全しきい値は
+Genesis の身体で測った値なので、実機では同じ query を実機で走らせて測り直す**（`motion_accuracy` の
+着地誤差も同様に実機で記録される）。
+
+未着手: 実機ブリッジの実装そのもの、`body` を `real:<robot_id>` として書き出す経路。
 
 ## S4 データ取りの汎用化（実装済み・2026-11-09）
 
