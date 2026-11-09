@@ -39,20 +39,25 @@ AZIMUTHS_DEGREES = (0., 90., -90., 180.)
 _TILT_AXIS = np.array([0., 1., 0.])
 
 
-def pinch_frames(tilts=TILTS_DEGREES, azimuths=AZIMUTHS_DEGREES):
-    """Candidate jaw frames, nominal first, each as (tilt_degrees, azimuth_degrees, rotation).
+def grasp_rotation(tilt_deg, azimuth_deg):
+    """The jaw rotation at any lean and any side. One composition, used by every candidate and search.
 
-    The tilt is applied to the nominal frame about a horizontal axis so the approach leaves vertical,
-    then the azimuth rotates the result about the vertical so the hand can come from any side. The
-    composition is deliberately fixed and reported: a search whose candidates are not named cannot say
-    afterwards which angle worked.
+    The tilt is applied to the nominal frame about a horizontal axis so the approach leaves vertical, then
+    the azimuth rotates the result about the vertical so the hand can come from any side. The composition
+    is deliberately fixed and reported: a search whose candidates are not named cannot say afterwards
+    which angle worked.
     """
     nominal = np.asarray(GRASP_ROTATION, float)
+    lean = Rotation.from_rotvec(np.deg2rad(float(tilt_deg)) * _TILT_AXIS).as_matrix()
+    spin = Rotation.from_rotvec(np.deg2rad(float(azimuth_deg)) * np.array([0., 0., 1.])).as_matrix()
+    return spin @ lean @ nominal
+
+
+def pinch_frames(tilts=TILTS_DEGREES, azimuths=AZIMUTHS_DEGREES):
+    """Candidate jaw frames, nominal first, each as (tilt_degrees, azimuth_degrees, rotation)."""
     for tilt in tilts:
-        lean = Rotation.from_rotvec(np.deg2rad(tilt) * _TILT_AXIS).as_matrix()
         for azimuth in azimuths:
-            spin = Rotation.from_rotvec(np.deg2rad(azimuth) * np.array([0., 0., 1.])).as_matrix()
-            yield float(tilt), float(azimuth), spin @ lean @ nominal
+            yield float(tilt), float(azimuth), grasp_rotation(tilt, azimuth)
 
 
 def approach_axis(frame):

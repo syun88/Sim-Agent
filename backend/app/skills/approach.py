@@ -48,8 +48,10 @@ def two_axis_frames(arm, center, standoff_m, *, world_x_offset=None):
 
 
 def frame_at(arm, center, standoff_m, yaw_deg, *, world_x_offset=None, tilt_deg=0.):
-    """The grasp frame at one yaw. Any angle is a real frame, not an interpolation of listed ones."""
-    rotation = Rotation.from_euler('z', yaw_deg, degrees=True).as_matrix() @ GRASP_ROTATION
+    """The grasp frame at one azimuth and lean. Any angle is a real frame, not an interpolation."""
+    from backend.app.skills.pinch_frames import grasp_rotation
+
+    rotation = grasp_rotation(tilt_deg, yaw_deg)
     offset = rotation @ FINGERTIP_MIDPOINT[arm]
     if world_x_offset is not None:
         offset[0] = world_x_offset
@@ -71,6 +73,8 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
     kin = env.arm_kinematics(arm)
     objects = {name:env.object_pose(name) for name in env.frame().objects}
     check = getattr(kin,'empty_arm_path_is_clear',None)
+    # The clearance query ranks candidates; the route screen still decides. Where the two disagree the
+    # trace says so (rejected_by), because a measured win the screen refuses is not an improvement.
     measure = getattr(kin,'path_minimum_clearance',None)
     allowed = {obj:{f'openarm_{arm}_ee_inner_finger',f'openarm_{arm}_ee_outer_finger'}}
     rejected = []
@@ -140,36 +144,54 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
     refinements = []
     if measure is not None:
         centre = frame['pinch'] + frame['rotation'] @ FINGERTIP_MIDPOINT[arm]
-        offset_vector = frame['standoff'] - frame['pinch']
+        standoff_distance = float(np.linalg.norm(frame['standoff'] - frame['pinch']))
+        yaw_now = float(frame['yaw_deg'])
+        tilt_now = float(frame.get('tilt_deg', 0.))
 
-        def frame_with(yaw_deg):
-            candidate = frame_at(arm, centre, 0., yaw_deg)
-            return {**candidate, 'standoff': candidate['pinch'] + offset_vector}
+        def frame_with(yaw_deg, tilt_deg):
+            return frame_at(arm, centre, standoff_distance, yaw_deg, tilt_deg=tilt_deg)
 
-        for name, from_value, span, step, rebuild in (
-                ('refine_overfly', rise, max(rise/2., .01), max(rise/4., .005),
-                 lambda value: (frame, value)),
-                ('refine_grasp_yaw', float(frame['yaw_deg']), 15., 5.,
-                 lambda value: (frame_with(value), rise))):
+        # Lean and side are separate axes because they move the hand differently: the azimuth spins it about
+        # the vertical at one height, the lean changes that height. Each is searched against the same
+        # measurement, so whichever the body can actually reach better wins.
+        for name, axis, from_value, span, step in (
+                ('refine_grasp_yaw', 'yaw', yaw_now, 15., 5.),
+                ('refine_grasp_tilt', 'tilt', tilt_now, 15., 5.),
+                ('refine_overfly', 'overfly', rise, max(rise/2., .01), max(rise/4., .005))):
+            def rebuild(value, axis=axis):
+                if axis == 'yaw':
+                    return frame_with(value, tilt_now), rise
+                if axis == 'tilt':
+                    return frame_with(yaw_now, value), rise
+                return frame, value
+
             trace = refine(lambda value: clearance_of(*rebuild(value), staged),
                            from_value, span, step=step)
-            refinements.append({'query': name, **trace})
+            entry = {'query': name, **trace, 'accepted': False}
+            refinements.append(entry)
             if trace['best_value'] is None or trace['best_score'] is None:
+                entry['rejected_by'] = 'UNMEASURED'
                 continue
             if accepted_clearance is not None and trace['best_score'] <= accepted_clearance:
+                entry['rejected_by'] = 'NOT_BETTER_THAN_ACCEPTED'
                 continue
             candidate_frame, candidate_rise = rebuild(trace['best_value'])
             built = route_for(candidate_frame, candidate_rise, staged)
             if built is None:
+                entry['rejected_by'] = 'IK_FAILURE'
                 continue
             candidate_route, candidate_curve = built
             if check is not None and not check(candidate_route, objects, allowed_contacts=allowed,
                                                curve=candidate_curve,
                                                minimum_object_clearance=NONCONTACT_CLEARANCE_M,
                                                object_clearances={obj:TARGET_BODY_CLEARANCE_M}):
+                entry['rejected_by'] = 'COLLISION_PATH'
                 continue
+            entry['accepted'] = True
             frame, rise, route, curve = candidate_frame, candidate_rise, candidate_route, candidate_curve
             accepted_clearance = trace['best_score']
+            yaw_now = float(frame['yaw_deg'])
+            tilt_now = float(frame.get('tilt_deg', 0.))
 
     attitude = frame['rotation']
     return route, {'approach_overfly_m':float(rise),'staging':staged,
