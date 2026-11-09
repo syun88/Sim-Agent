@@ -48,6 +48,7 @@ class OfficialArmKinematics:
         measured against, which a caller must treat as unknown rather than clear.
         """
         from backend.app.simulation.transform import mat_to_quat
+        waypoints = [np.asarray(point, float) for point in waypoints]
         mj, model = self._mj, self._model
         data = mj.MjData(model)
         data.qpos[:] = self._data.qpos
@@ -112,6 +113,7 @@ class OfficialArmKinematics:
         the configuration so the disagreement can be located instead of argued about.
         """
         from backend.app.simulation.transform import mat_to_quat
+        waypoints = [np.asarray(point, float) for point in waypoints]
         mj, model = self._mj, self._model
         data = mj.MjData(model)
         data.qpos[:] = self._data.qpos
