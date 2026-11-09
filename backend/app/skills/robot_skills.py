@@ -90,6 +90,9 @@ SUPPORT_REGRASP_SHIFT_TOLERANCE = 0.010
 #: Softening the servo instead deepens the penetration, because a softer servo lags further behind.
 APPROACH_TRAJECTORY_SPEED = 0.5
 #: A parked arm must land on the planned waypoint: the same tolerance the route was admitted with.
+#: How close a placement point has to be for the arm to be considered able to hold it: the same acceptance
+#: the capability queries use, so "reachable" means one thing in this codebase.
+PLACEMENT_REACH_TOLERANCE_M = 0.012
 PARK_ARRIVAL_TOLERANCE_M = 0.005
 PARK_ARRIVAL_TOLERANCE_RAD = 0.04
 #: The approach may not displace the object by more than this (m); the object is only pinched
@@ -657,7 +660,16 @@ class SkillRunner:
                 attitude = (attitude_for_yaw(planner_yaw) if planner_yaw is not None
                             else self._stacking_attitude(arm, obj, other_arm, staged_support))
                 prepared_attitude = attitude
-            desired = relative_destination(self.env, obj, target, relation, arm, distance_cm)
+            desired, destination_search = self._reachable_destination(obj, target, relation, arm, distance_cm)
+            if destination_search.get('chosen') == 'unreachable':
+                # Nothing inside the region could be reached: refuse with the measurements, do not place
+                # somewhere else and call it the same task.
+                error = SkillError('DESTINATION_UNREACHABLE',
+                                   f'No reachable point inside {target} for this arm')
+                error.evidence = {'destination_search': destination_search, 'reference_object': target,
+                                  'relation': relation,
+                                  **({'support_regrasp': regrasp} if regrasp is not None else {})}
+                raise error
             travel = desired.copy()
             travel[2] = min(1.15, desired[2] + .02 if is_held_stationary else max(1.14, desired[2] + .035))
             try:
@@ -675,6 +687,7 @@ class SkillRunner:
                                       'reference_object': target, 'relation': relation}
                 raise
             return {**placed, "reference_object": target, "relation": relation,
+                    "destination_search": destination_search,
                     "support_bounds": self.env.object_bounds(target).tolist(),
                     "support_regrasp": regrasp if is_held_stationary else None,
                     "stack_strategy": strategy if is_held_stationary else None}
@@ -886,6 +899,81 @@ class SkillRunner:
                 raise SkillError("NO_RECEIVER_AVAILABLE", f"No empty arm available opposite {arm} to receive {obj}")
             receiver = candidates[0]
         return self._skill("handover_object", lambda: self._handover(arm, obj, receiver), time.perf_counter())
+
+    def _reachable_destination(self, obj: str, target: str, relation: str, arm: str, distance_cm=None):
+        """Where to put the object, choosing among measured options inside the requested region.
+
+        `relative_destination` gives the point the instruction asks for. It is used when the arm can reach it.
+        When it cannot, the request is still satisfiable *inside the same region* (a zone has an area, a
+        support has a face), so nearby points are tried and the one with the best measured IK margin wins.
+        A point outside the region is never tried: that would be a different task.
+        """
+        from backend.app.skills.spatial_placement import relative_destination
+        requested = relative_destination(self.env, obj, target, relation, arm, distance_cm)
+        search = {'requested': np.asarray(requested, float).tolist(), 'chosen': 'requested', 'considered': []}
+        solve = getattr(self.controller, 'solve_ik', None)
+        if not callable(solve):
+            return requested, search
+
+        def margin(point):
+            aim, rotation, _offset = self._carry_aim(arm, obj, np.asarray(point, float))
+            try:
+                solution, error, _ = solve(arm, aim, rotation)
+            except Exception:
+                return None
+            if solution is None or error is None:
+                return None
+            return -float(error)
+
+        best_point, best_margin = np.asarray(requested, float), margin(requested)
+        search['considered'].append({'offset': [0., 0.], 'margin_m': best_margin})
+        if best_margin is None:
+            # Reachability could not be measured here; the carry itself is the authority, as before.
+            search['chosen'] = 'unmeasured'
+            return requested, search
+        # The same acceptance the capability query uses for "this arm can hold a pinch here" (12 mm).
+        if best_margin >= -PLACEMENT_REACH_TOLERANCE_M:
+            return requested, search
+        # How much room the region itself has: a zone's own extent, or the support face minus the object.
+        try:
+            region = np.asarray(self.env.object_bounds(target), float)
+            half = (region[1, :2] - region[0, :2]) / 2.
+        except Exception:
+            half = np.zeros(2)
+        if relation == 'on':
+            try:
+                support = np.asarray(self.env.object_bounds(target), float)
+                held = np.asarray(self.env.object_bounds(obj), float)
+                half = np.maximum(0., (support[1, :2] - support[0, :2] - (held[1, :2] - held[0, :2])) / 2. - .003)
+            except Exception:
+                half = np.zeros(2)
+        reach = float(min(.02, np.max(half))) if np.any(half > 0) else 0.
+        if reach <= 0:
+            # The region has no room beyond the object, so there is no alternative to measure: the requested
+            # point is the only one, and it is not reachable.
+            search['chosen'] = 'unreachable'
+            search['reason'] = 'REGION_HAS_NO_ALTERNATIVE'
+            return requested, search
+        for step in (reach, reach / 2.):
+            for axis, sign in ((0, 1.), (0, -1.), (1, 1.), (1, -1.)):
+                offset = np.zeros(3)
+                offset[axis] = sign * step
+                point = np.asarray(requested, float) + offset
+                value = margin(point)
+                search['considered'].append({'offset': offset.tolist(), 'margin_m': value})
+                if value is not None and (best_margin is None or value > best_margin):
+                    best_point, best_margin = point, value
+            if best_margin is not None and best_margin >= -PLACEMENT_REACH_TOLERANCE_M:
+                break
+        requested_margin = margin(requested)
+        if (best_margin is not None and best_margin >= -PLACEMENT_REACH_TOLERANCE_M
+                and (requested_margin is None or best_margin > requested_margin)):
+            search['chosen'] = 'offset_inside_region'
+            search['chosen_point'] = best_point.tolist()
+            search['margin_m'] = best_margin
+            return best_point, search
+        search['chosen'] = 'unreachable'
+        return requested, search
 
     def _handover(self, arm: str, obj: str, receiver: str) -> dict:
         if receiver not in {"left", "right"} or receiver == arm:
