@@ -56,3 +56,37 @@ def test_an_unmeasurable_arm_says_so_instead_of_guessing():
     answer = rows[0]['alternatives']['left']
     assert answer['asked_yaws'] == 0, 'nothing was measurable, which is not the same as reachable'
     assert 'RuntimeError' in (answer.get('unknown') or '')
+
+
+def test_the_arm_question_is_asked_with_the_approach_planner_not_only_the_ik():
+    """Measured 2026-11-09: an IK probe called the hand reachable while the approach search found no route."""
+    import numpy as np
+    from backend.app.planning import preflight
+    from backend.app.planning.capability_queries import approach_feasible
+
+    env, controller = _env([0.45, 0.0, 1.03], right_error=.002, left_error=.002)
+
+    def screened(env_, controller_, arm, obj):
+        return {'feasible': arm == 'left', 'reason': None if arm == 'left' else 'APPROACH_PATH_UNAVAILABLE'}
+    original = approach_feasible
+    try:
+        import backend.app.planning.capability_queries as queries
+        queries.approach_feasible = screened
+        rows = preflight.arm_feasibility(env, controller, [{'op': 'pick', 'object': 'red_cube', 'arm': 'right'}])
+    finally:
+        queries.approach_feasible = original
+    row = rows[0]
+    assert row['screen']['right']['feasible'] is False
+    assert row['verdict'] == 'REQUESTED_ARM_UNREACHABLE'
+    assert row['reachable_arms'] == ['left']
+
+
+def test_a_body_that_cannot_answer_the_route_question_is_unknown_not_unreachable():
+    from types import SimpleNamespace
+    from backend.app.planning.capability_queries import approach_feasible
+
+    class Bare:
+        def object_pose(self, name):
+            return np.array([0.45, 0., 1.03]), np.eye(3)
+    answer = approach_feasible(Bare(), SimpleNamespace(), 'left', 'red_cube')
+    assert answer['feasible'] is None and 'unknown' in answer

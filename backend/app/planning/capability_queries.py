@@ -77,3 +77,31 @@ def pad_blocks_support_face(env, holder_arm: str, support: str) -> dict:
     if clearance is None:
         return {'blocks': None, 'unknown': measured.get('unknown', 'unmeasured'), 'measured': measured}
     return {'blocks': clearance < 0., 'clearance_m': float(clearance), 'measured': measured}
+
+
+def approach_feasible(env, controller, arm: str, obj: str) -> dict:
+    """Whether this arm has a *screened route* to the object, not merely an IK solution for its pinch pose.
+
+    Measured 2026-11-09: an IK probe called the requested hand reachable while the approach search found no
+    collision-free route six times in one round, so the arm question has to be asked with the same planner
+    that will execute it.
+    """
+    try:
+        from backend.app.skills.approach import cube_approach_frames, plan_cube_approach
+        from backend.app.skills.robot_skills import APPROACH_OVERFLY, APPROACH_STANDOFF, STAGING_ALTITUDE
+
+        centre = np.asarray(env.object_pose(obj)[0], float)
+        frames = cube_approach_frames(arm, centre, APPROACH_STANDOFF)
+        route, planning = plan_cube_approach(env, controller, arm, obj, frames[0]['pinch'],
+                                            frames[0]['standoff'], APPROACH_OVERFLY, STAGING_ALTITUDE,
+                                            frames=frames)
+        return {'feasible': route is not None,
+                'reason': planning.get('error'),
+                'route_found': None if route is None else planning.get('grasp_yaw_deg'),
+                'rejected_routes': len(planning.get('rejected_routes') or [])}
+    except AttributeError as error:
+        # A body that cannot answer the planner's own questions is not thereby unable to approach: report the
+        # question as unknown rather than turning a missing method into a refusal.
+        return {'feasible': None, 'unknown': f'{type(error).__name__}: {error}'}
+    except Exception as error:
+        return {'feasible': None, 'unknown': f'{type(error).__name__}: {error}'}

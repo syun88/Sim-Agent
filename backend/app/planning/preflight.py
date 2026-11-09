@@ -58,6 +58,19 @@ def arm_feasibility(env, controller, actions, *, arms=('left', 'right')) -> list
             continue
         row = {'op': action.get('op'), 'object': action.get('object'), 'arm': arm, 'alternatives': {}}
         for candidate in (arm, *(name for name in arms if name != arm)):
+            # The route the approach will actually need, which is a stronger question than "can the IK reach
+            # the pinch pose": that weaker probe called an unreachable arm reachable six times in one round.
+            try:
+                from backend.app.planning.capability_queries import approach_feasible
+                screened = approach_feasible(env, controller, candidate, action['object'])
+            except Exception as error:
+                screened = {'feasible': None, 'unknown': f'{type(error).__name__}: {error}'}
+            row.setdefault('screen', {})[candidate] = screened
+            if screened.get('feasible') is False:
+                row.setdefault('alternatives', {})[candidate] = {
+                    'reachable_yaws': 0, 'asked_yaws': 1, 'best_position_error_m': None,
+                    'unknown': screened.get('reason') or 'no screened approach route'}
+                continue
             try:
                 centre = np.asarray(env.object_pose(action['object'])[0], float)
                 answers = [reachable(env, controller, candidate, pinch_point(candidate, centre, yaw), yaw)
