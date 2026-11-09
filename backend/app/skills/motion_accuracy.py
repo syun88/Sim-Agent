@@ -22,29 +22,37 @@ FLOOR_M = 0.01
 _samples: dict[str, list[float]] = {}
 
 
-def record(arm: str, position_error_m: float, *, source: str = 'move') -> None:
+#: Moves made while touching something (a grasp, a placed object) legitimately stop short; they describe
+#: contact, not the free-space landing error a home target has to absorb.
+FREE_SPACE_SOURCES = ('park_arrival', 'move_to_site')
+
+
+def record(arm: str, position_error_m: float, *, joint_error_rad: float | None = None,
+           source: str = 'move') -> None:
     """Note how far an arm landed from its commanded position."""
     if position_error_m is None:
         return
-    _samples.setdefault(arm, []).append({'m': float(position_error_m), 'source': source}['m'])
+    _samples.setdefault(arm, []).append({'position_error_m': float(position_error_m),
+                                        'joint_error_rad': None if joint_error_rad is None else float(joint_error_rad),
+                                        'source': source})
 
 
-def samples(arm: str | None = None) -> list[float]:
-    if arm is None:
-        return [value for values in _samples.values() for value in values]
-    return list(_samples.get(arm, []))
+def samples(arm: str | None = None, *, sources: tuple | None = None) -> list[dict]:
+    entries = [{'arm': name, **entry} for name, values in _samples.items() for entry in values
+               if not sources or entry['source'] in sources]
+    return [entry for entry in entries if arm is None or entry['arm'] == arm]
 
 
-def observed_error(arm: str) -> float:
-    """The worst landing error seen for this arm, or the measured default when nothing is recorded."""
-    recorded = samples(arm)
+def observed_error(arm: str, *, sources: tuple = FREE_SPACE_SOURCES) -> float:
+    """The worst free-space landing error seen for this arm, or the measured default if none is recorded."""
+    recorded = [entry['position_error_m'] for entry in samples(arm, sources=sources)]
     return max(recorded) if recorded else DEFAULT_OBSERVED_ERROR_M
 
 
 def required_clearance(arm: str, *, gain: float = GAIN, floor: float = FLOOR_M,
-                       ceiling: float = 0.12) -> float:
+                       ceiling: float = 0.12, sources: tuple = FREE_SPACE_SOURCES) -> float:
     """How much room a target pose must have before it is worth commanding, for this body."""
-    return float(min(ceiling, max(floor, observed_error(arm) * gain + floor)))
+    return float(min(ceiling, max(floor, observed_error(arm, sources=sources) * gain + floor)))
 
 
 def reset() -> None:

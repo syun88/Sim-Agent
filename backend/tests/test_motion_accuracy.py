@@ -8,7 +8,7 @@ from backend.app.skills.homing import plan_empty_arm_home
 def test_the_required_clearance_comes_from_the_measured_error():
     motion_accuracy.reset()
     before = motion_accuracy.required_clearance('left')
-    motion_accuracy.record('left', 0.05)
+    motion_accuracy.record('left', 0.05, source='move_to_site')
     after = motion_accuracy.required_clearance('left')
     assert after > before
     assert after >= 0.05, 'a target must be clearer than the error it has to absorb'
@@ -85,9 +85,36 @@ def test_a_recorded_larger_error_raises_the_bar_for_the_next_attempt():
     motion_accuracy.reset()
     env, controller = _plan(_Kin(actual_gap=0.0308))
     first, _ = plan_empty_arm_home(env, controller, 'left')
-    motion_accuracy.record('left', 0.09)
+    motion_accuracy.record('left', 0.09, source='move_to_site')
     second_kin = _Kin(actual_gap=0.055)
     env, controller = _plan(second_kin)
     route, evidence = plan_empty_arm_home(env, controller, 'left')
     assert evidence['home_clearance_required_m'] >= 0.09
     assert evidence['home_mode'] == 'scene_clearance_home'
+
+
+def test_a_move_that_stopped_in_contact_does_not_raise_the_home_bar():
+    """A grasp legitimately stops short. That is contact, not the free-space error a home target absorbs."""
+    motion_accuracy.reset()
+    baseline = motion_accuracy.required_clearance('left')
+    motion_accuracy.record('left', 0.10, source='move_blocked')
+    assert motion_accuracy.required_clearance('left') == baseline
+
+
+def test_the_controller_records_every_landing_with_its_source():
+    from types import SimpleNamespace
+    from backend.app.control.motion import OpenArmV2Controller
+
+    motion_accuracy.reset()
+    env = SimpleNamespace(
+        arm_qpos=lambda side: np.zeros(7), ee_pose=lambda side: (np.array([0.5, 0.0, 1.2]), np.eye(3)),
+        arm_kinematics=lambda side: SimpleNamespace(evaluate=lambda q: (np.array([0.5, 0.0, 1.2]), np.eye(3),
+                                                                        None, None)),
+        arm_limits=lambda side: np.array([[-3., 3.]] * 7),
+        configure_motion_response=lambda *a, **k: None, timestep=.002, set_arm=lambda *a, **k: None,
+        step=lambda *a, **k: None, arm_velocity_limits=lambda side: None,
+        motion_position_tolerance=.012, motion_rotation_tolerance=.15)
+    controller = OpenArmV2Controller(env, configure_motors=False)
+    controller.move_to_site('left', np.array([0.5, 0.0, 1.2]), np.eye(3))
+    recorded = motion_accuracy.samples('left')
+    assert recorded and recorded[-1]['source'] in {'move_to_site', 'move_blocked'}

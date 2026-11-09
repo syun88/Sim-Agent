@@ -345,6 +345,10 @@ class OpenArmV2Controller:
             if require_stable and stable_steps * self.timestep >= .03:
                 break
         # Solving IK is not evidence that the motors reached it: a collision can block them.
+        # Whichever way it ended, this is a measurement of how far this body lands from its command.
+        from backend.app.skills import motion_accuracy
+        motion_accuracy.record(side, float(np.linalg.norm(actual - position)),
+                               source='move_to_site' if result.success else 'move_blocked')
         return MotionResult(residual <= position_tolerance and rotation_residual <= rotation_tolerance,
                             None if residual <= position_tolerance and rotation_residual <= rotation_tolerance else "MOTION_BLOCKED",
                             actual.tolist(), residual, rotation_residual,
