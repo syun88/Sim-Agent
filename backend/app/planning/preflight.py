@@ -38,8 +38,10 @@ def _placement_questions(actions):
             if action.get('op') == 'place' and action.get('relation') and action.get('target')]
 
 
-#: Operations that need one arm to reach one object.
-_GRASP_OPS = ('pick', 'approach')
+#: Operations that need one arm to reach one object. `place` is in here because the arm still has to approach
+#: and grasp what it is going to place - measured 2026-11-09: with only pick/approach listed, the zone
+#: placements (the dominant failure) produced no arm rows at all, so the check never ran.
+_GRASP_OPS = ('pick', 'approach', 'place', 'handover')
 
 
 def arm_feasibility(env, controller, actions, *, arms=('left', 'right')) -> list[dict]:

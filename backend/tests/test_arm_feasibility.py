@@ -90,3 +90,11 @@ def test_a_body_that_cannot_answer_the_route_question_is_unknown_not_unreachable
             return np.array([0.45, 0., 1.03]), np.eye(3)
     answer = approach_feasible(Bare(), SimpleNamespace(), 'left', 'red_cube')
     assert answer['feasible'] is None and 'unknown' in answer
+
+
+def test_a_place_also_asks_whether_the_arm_can_reach_what_it_will_pick_up():
+    """Zone placements compile to a single `place` action; the reach question still applies."""
+    env, controller = _env([0.54, 0.264, 1.031], right_error=.06, left_error=.002)
+    rows = arm_feasibility(env, controller, [{'op': 'place', 'object': 'red_cube', 'arm': 'right',
+                                              'target': 'blue_zone'}])
+    assert rows and rows[0]['verdict'] == 'REQUESTED_ARM_UNREACHABLE'
