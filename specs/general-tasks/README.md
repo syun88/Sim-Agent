@@ -25,11 +25,34 @@
 - プロンプトは**文面を変えない**（語彙の一般化とプロンプト変更を同時にやると、生きたモデルの答えが
   変わって検証が落ちる。実測: `test_plan_ledger`）。
 
-## S2 タスクをデータにする（未着手）
+## S2 タスクをデータにする（実装済み・2026-11-09）
 
-- `assets/tasks/*.json`: 目標の並び（`holding` / `placed` / `stacked` / `in_zone` / `poured`）と
-  必要な capability を宣言。文法は据え置き、**複合タスクのテンプレート**をデータで足せるようにする。
-- 受け入れ: 新しい複合タスク（拾う→渡す→棚に置く）を JSON 追加だけで計画できる。
+`assets/tasks/*.json` が**複合手順**を持つ。1ファイル = 1手順:
+
+```json
+{"id": "handover_then_place",
+ "description": "pick with one hand, pass it to the other, then place it in a zone",
+ "phrases": ["渡してから", "hand it over then"],
+ "slots": {"object": "object", "zone": "zone", "giver": "arm", "receiver": "arm"},
+ "requires": ["grasp", "handover", "place"],
+ "goal": {"type": "place_in_zone", "object": "{object}", "target": "{zone}"},
+ "actions": [{"op": "pick", "object": "{object}", "arm": "{giver}"},
+             {"op": "handover", "object": "{object}", "arm": "{giver}", "receiver": "{receiver}"},
+             {"op": "place", "object": "{object}", "target": "{zone}"}]}
+```
+
+`planning/task_templates.py` が読み、**スロットを実シーンで接地**してから提案エンベロープに展開する。
+展開結果は通常の計画と同じく grounding・コンパイラ・契約を通る（**テンプレートは身体の能力を広げない**）。
+
+- 拒否する場合: 未宣言スロット（`UNKNOWN_SLOT`）／未接地の物体・ゾーン・腕（`SLOT_NOT_OBSERVED`）／
+  身体が持たない capability（`CAPABILITY_UNAVAILABLE`）／壊れた定義（`INVALID_TEMPLATE`）。
+- モデルへは**指示が `phrases` に触れたときだけ**手順を提示する。それ以外のプロンプトは1バイトも
+  変えない（実測: 無条件に1行足したら、生きたモデルの答えが変わって `test_plan_ledger` が落ちた）。
+- 収録: `handover_then_place` / `pick_then_place` / `two_on_one`。
+- 受け入れ: 新しい複合タスクは JSON 追加だけで展開・コンパイルできる（`test_task_templates.py` 11件）。
+  未接地・能力不足・未知テンプレート名は拒否される。
+
+残り: 決定論パス（モデル無し）からもテンプレートを引けるようにするか、は未着手。
 
 ## S3 実機バックエンド（未着手）
 
