@@ -898,8 +898,7 @@ class SkillRunner:
         pad_bias = float((cube_rotation.T @ (ee + rotation @ FINGERTIP_MIDPOINT[arm] - cube))[0])
         bias = float(np.clip(.03 + pad_bias, .015, .025))
         try:
-            geometry = plan_handover_geometry(self.env, arm, obj, receiver_bias=bias,
-                                              controller=self.controller)
+            geometry = plan_handover_geometry(self.env, arm, obj, receiver_bias=bias)
         except ValueError as exc:
             raise SkillError("HANDOVER_UNREACHABLE", str(exc)) from None
         offset = rotation.T @ (cube - ee)
@@ -984,8 +983,7 @@ class SkillRunner:
         if rose < VERIFICATION_LIFT * VERIFICATION_FOLLOW_RATIO:
             raise SkillError("HANDOVER_LOST", "Cube did not follow the receiver after donor released")
         return {"object": obj, "giver": arm, "receiver": receiver,
-                "meeting_point": (geometry.meeting or {}).get('point'),
-                "meeting_measured": bool((geometry.meeting or {}).get('measured')),
+                "meeting": geometry.meeting,
                 "giver_contacts_before_release": donor_contacts, "receiver_pinch_contacts": receiving_contacts,
                 "giver_released": True, "receiver_contacts_after_lift": sorted(self._contact_fingers(obj, receiver)),
                 "object_rose": rose, "approach_displacement": displacement,

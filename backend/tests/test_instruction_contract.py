@@ -626,7 +626,11 @@ def test_handover_geometry_adapts_to_measured_cube_location():
     geom = plan_handover_geometry(env, 'left', 'red_cube')
     assert geom.residual < .003
     assert 0.40 <= geom.position[0] <= 0.52
-    assert abs(geom.position[1]) < .02
+    # y = 0 used to be hard-coded; the meeting point is now the best of several candidates around the cube,
+    # so the assertion is that it stayed near the measured cube - and that the choice was measured.
+    assert abs(geom.position[1] - cube_pos[1]) <= .06
+    assert geom.meeting['measured'] is True
+    assert geom.meeting['chosen'] in {item['name'] for item in geom.meeting['evaluations']}
 
 
 def test_handover_skill_accepts_minimal_arguments_and_infers_arms():

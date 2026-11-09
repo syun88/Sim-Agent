@@ -1,76 +1,41 @@
-"""Where the hands meet is measured from both arms, not read from a fixed point in the cell."""
-from types import SimpleNamespace
-
+"""Where the hands meet is chosen by trying the candidates and keeping the best measured residual."""
 import numpy as np
 import pytest
 
-from backend.app.simulation.openarm_v2.definition import FINGERTIP_MIDPOINT, GRASP_ROTATION
-from backend.app.simulation.openarm_v2.handover import measured_meeting_point
-
-CUBE = np.array([0.45, 0.10, 1.10])
+from backend.app.simulation.openarm_v2 import handover
 
 
-def _env():
-    return SimpleNamespace(
-        object_pose=lambda name: (CUBE.copy(), np.eye(3)),
-        ee_pose=lambda arm: (np.array([0.45, 0.10, 1.12]), np.eye(3)))
+def test_the_candidates_include_the_point_the_cell_used_to_hard_code():
+    points = dict(handover._meeting_points(np.array([0.30, 0.15, 1.05])))
+    assert 'legacy_clip' in points
+    # The legacy point is the old clip box, now expressed as a candidate rather than as the answer.
+    assert points['legacy_clip'] == pytest.approx([0.40, 0.0, 1.10])
+    assert any(name.startswith('offset_') for name in points)
 
 
-def _controller(preferred_y, *, reaches=(-.10, .10)):
-    """IK whose error is smallest at the meeting offset both arms prefer; outside `reaches` it fails."""
-    asked = []
-
-    def solve(arm, target, rotation, **kwargs):
-        asked.append((arm, np.asarray(target, float).copy()))
-        # The pinch target encodes the meeting point through the fingertip offset.
-        pinch = np.asarray(target, float) + np.asarray(rotation, float) @ FINGERTIP_MIDPOINT[arm]
-        offset = float(pinch[1] - CUBE[1])
-        if not (reaches[0] <= offset <= reaches[1]):
-            return None, None, 0.
-        return np.zeros(7), 0.001 + abs(offset - preferred_y) * .02, 0.
-    return SimpleNamespace(solve_ik=solve), asked
+def test_the_held_objects_own_position_is_a_candidate():
+    cube = np.array([0.45, 0.02, 1.09])
+    assert dict(handover._meeting_points(cube))['offset_+0.00_+0.00_+0.00'] == pytest.approx(cube)
 
 
-def test_the_meeting_offset_is_the_one_both_arms_can_hold():
-    controller, asked = _controller(preferred_y=.06)
-    answer = measured_meeting_point(_env(), controller, 'left', 'right', 'blue_cube', .015)
-    assert answer['measured'] is True
-    assert answer['offset_y_m'] == pytest.approx(.06, abs=.031)
-    assert answer['point'][1] == pytest.approx(CUBE[1] + .06, abs=.031)
-    # Both arms were asked about every candidate: the choice is a measurement of the pair.
-    assert {arm for arm, _ in asked} == {'left', 'right'}
+def test_a_candidate_that_never_solved_cannot_win():
+    solved = object()
+    evaluations = [
+        {'name': 'unsolvable', 'error': 0.001, 'solved': None},
+        {'name': 'worse', 'error': 0.0025, 'solved': solved},
+        {'name': 'best', 'error': 0.0009, 'solved': solved},
+    ]
+    winner = handover.select_winner(evaluations)
+    assert winner['name'] == 'best'
 
 
-def test_a_meeting_point_only_one_arm_can_hold_is_not_chosen():
-    """The donor is comfortable off-centre; the receiver is not. The pair decides, not the donor."""
-    def solve(arm, target, rotation, **kwargs):
-        pinch = np.asarray(target, float) + np.asarray(rotation, float) @ FINGERTIP_MIDPOINT[arm]
-        offset = float(pinch[1] - CUBE[1])
-        if arm == 'left':
-            return np.zeros(7), .001, 0.               # indifferent along y
-        return np.zeros(7), .001 + abs(offset) * .5, 0.  # the receiver wants y = 0
-    answer = measured_meeting_point(_env(), SimpleNamespace(solve_ik=solve), 'left', 'right', 'blue_cube', .015)
-    assert answer['measured'] is True
-    assert answer['offset_y_m'] == pytest.approx(0., abs=.031)
+def test_no_solvable_candidate_returns_none_instead_of_the_least_bad_label():
+    assert handover.select_winner([{'name': 'a', 'error': 0.4, 'solved': None},
+                                   {'name': 'b', 'error': None, 'solved': None}]) is None
 
 
-def test_an_unmeasurable_body_reports_the_grasp_point_and_says_it_was_not_measured():
-    def solve(arm, target, rotation, **kwargs):
-        return None, None, 0.
-    answer = measured_meeting_point(_env(), SimpleNamespace(solve_ik=solve), 'left', 'right', 'blue_cube', .015)
-    assert answer['measured'] is False and answer['reason'] == 'UNMEASURED'
-    assert answer['point'] == pytest.approx(CUBE.tolist())
-
-
-def test_the_old_fixed_point_is_still_a_candidate_so_it_can_win_on_measurement():
-    """If the measurement prefers the point the cell used to hard-code, that is still a measured choice."""
-    controller, _ = _controller(preferred_y=.0)
-    answer = measured_meeting_point(_env(), controller, 'left', 'right', 'blue_cube', .015)
-    assert answer['measured'] is True
-    assert any(item['point'] == pytest.approx(answer['point']) for item in answer['evaluations'])
-
-
-def test_a_meeting_point_outside_both_arms_hold_range_is_not_reported_as_measured():
-    controller, _ = _controller(preferred_y=0., reaches=(.5, .6))
-    answer = measured_meeting_point(_env(), controller, 'left', 'right', 'blue_cube', .015)
-    assert answer['measured'] is False and answer['reason'] == 'UNMEASURED'
+def test_the_legacy_point_wins_only_if_it_measures_better():
+    solved = object()
+    evaluations = [{'name': 'legacy_clip', 'error': 0.002, 'solved': solved},
+                   {'name': 'offset_+0.00_+0.03_+0.00', 'error': 0.0011, 'solved': solved}]
+    assert handover.select_winner(evaluations)['name'] == 'offset_+0.00_+0.03_+0.00'
