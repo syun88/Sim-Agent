@@ -118,3 +118,13 @@ def test_the_controller_records_every_landing_with_its_source():
     controller.move_to_site('left', np.array([0.5, 0.0, 1.2]), np.eye(3))
     recorded = motion_accuracy.samples('left')
     assert recorded and recorded[-1]['source'] in {'move_to_site', 'move_blocked'}
+
+
+def test_ordinary_moves_never_lower_the_bar_below_the_measured_baseline():
+    """Free-space moves land within ~12 mm; that must not make the near-object 35 mm case 'clear' again."""
+    motion_accuracy.reset()
+    baseline = motion_accuracy.required_clearance('left')
+    motion_accuracy.record('left', 0.012, source='move_to_site')
+    assert motion_accuracy.required_clearance('left') == baseline
+    motion_accuracy.record('left', 0.05, source='move_to_site')
+    assert motion_accuracy.required_clearance('left') > baseline

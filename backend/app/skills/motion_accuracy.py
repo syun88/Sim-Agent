@@ -44,9 +44,14 @@ def samples(arm: str | None = None, *, sources: tuple | None = None) -> list[dic
 
 
 def observed_error(arm: str, *, sources: tuple = FREE_SPACE_SOURCES) -> float:
-    """The worst free-space landing error seen for this arm, or the measured default if none is recorded."""
+    """The error a home target has to absorb: the worst recorded free-space landing, floored by the default.
+
+    Records may only raise the bar, never lower it. Measured 2026-11-09: ordinary free-space moves land
+    within ~12 mm, but the *near-object* posture that caused the collision was ~35 mm off - so a per-move
+    maximum that could fall below the measured baseline would call the 30.8 mm margin clear again.
+    """
     recorded = [entry['position_error_m'] for entry in samples(arm, sources=sources)]
-    return max(recorded) if recorded else DEFAULT_OBSERVED_ERROR_M
+    return max([DEFAULT_OBSERVED_ERROR_M] + recorded)
 
 
 def required_clearance(arm: str, *, gain: float = GAIN, floor: float = FLOOR_M,
