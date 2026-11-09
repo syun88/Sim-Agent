@@ -24,9 +24,76 @@ class HandoverGeometry:
     receiver_relative_rotation: np.ndarray
     receiver_bias: float
     residual: float
+    meeting: dict | None = None
 
 
-def plan_handover_geometry(env, giver: str, obj: str, receiver_bias: float = .015) -> HandoverGeometry:
+DEFAULT_MEETING_SPAN_M = .09
+DEFAULT_MEETING_STEP_M = .03
+
+
+def measured_meeting_point(env, controller, giver: str, receiver: str, obj: str, receiver_bias: float,
+                           *, span: float = DEFAULT_MEETING_SPAN_M,
+                           step: float = DEFAULT_MEETING_STEP_M) -> dict:
+    """Where the two hands should meet, chosen because both arms can hold it - not a fixed table point.
+
+    It was `x = clip(cube_x, .40, .52)`, **`y = 0.0`**, `z = clip(cube_z, 1.10, 1.18)`: a box someone once
+    measured to work. The score here is the worse of the two arms' IK margins at that meeting point, so a
+    point nearer to whichever arm is struggling wins, and the offsets are searched rather than assumed.
+    """
+    cube, _ = env.object_pose(obj)
+    solve = getattr(controller, 'solve_ik', None)
+    if not callable(solve):
+        return {'point': [float(value) for value in cube], 'measured': False,
+                'reason': 'NO_IK_SOLVER', 'evaluations': []}
+
+    def margin(arm, target, rotation):
+        """How close this arm gets to the pose, as a number; None when it cannot be measured."""
+        try:
+            solution, error, _ = solve(arm, target, rotation)
+        except Exception:
+            return None
+        if solution is None or error is None:
+            return None
+        return -float(error)
+
+    cube, cube_rotation = env.object_pose(obj)
+    ee, rotation = env.ee_pose(giver)
+    grasp_offset = rotation.T @ (np.asarray(cube, float) - ee)
+    grasp_rotation = rotation.T @ cube_rotation
+    opposite = np.diag([-1., -1., 1.])
+    relative = opposite @ GRASP_ROTATION
+    if obj.endswith('_cube'):
+        # Same equivalent-face rule as the coupled solve: opposed approach directions, not the same side.
+        relative = min((relative, opposite @ relative),
+                       key=lambda candidate: float((grasp_rotation @ candidate)[2, 2]))
+    evaluations = []
+    best = None
+    for offset_y in np.arange(-span, span + 1e-9, step):
+        point = np.array([float(cube[0]), float(cube[1]) + float(offset_y), float(cube[2])])
+        donor_target = point - rotation @ grasp_offset
+        receiving_rotation = rotation @ grasp_rotation @ relative
+        receiver_target = (point + receiving_rotation @ np.array([0., 0., receiver_bias])
+                           - receiving_rotation @ FINGERTIP_MIDPOINT[receiver])
+        donor_margin = margin(giver, donor_target, rotation)
+        receiver_margin = margin(receiver, receiver_target, receiving_rotation)
+        score = None
+        if donor_margin is not None and receiver_margin is not None:
+            # The worse of the two: a meeting point only one arm can hold is not a meeting point.
+            score = min(donor_margin, receiver_margin)
+        evaluations.append({'offset_y_m': float(offset_y), 'score': score,
+                            'donor_margin_m': donor_margin, 'receiver_margin_m': receiver_margin})
+        if score is not None and (best is None or score > best['score']):
+            best = {'point': point.tolist(), 'score': score, 'offset_y_m': float(offset_y)}
+    if best is None:
+        # Nothing measurable: keep the point the grasp is already at, and say the choice was not measured.
+        return {'point': [float(cube[0]), float(cube[1]), float(cube[2])], 'measured': False,
+                'evaluations': evaluations, 'reason': 'UNMEASURED'}
+    return {'point': best['point'], 'measured': True, 'score': best['score'],
+            'offset_y_m': best['offset_y_m'], 'evaluations': evaluations}
+
+
+def plan_handover_geometry(env, giver: str, obj: str, receiver_bias: float = .015, *,
+                           controller=None, meeting: dict | None = None) -> HandoverGeometry:
     import mujoco
     from scipy.optimize import least_squares
     from scipy.spatial.transform import Rotation
@@ -62,12 +129,18 @@ def plan_handover_geometry(env, giver: str, obj: str, receiver_bias: float = .01
         # this only changes the candidate grasp, never the object's pose.
         relative = min((relative,opposite@relative),
                        key=lambda candidate:float((grasp_rotation@candidate)[2,2]))
-    # Adapt the target handover position to the measured object location within the
-    # shared dual-arm workspace, rather than rigidly forcing a single center point.
-    desired_x = float(np.clip(cube[0], 0.40, 0.52))
-    desired_y = 0.0
-    desired_z = float(np.clip(cube[2], 1.10, 1.18))
-    desired_cube = np.array([desired_x, desired_y, desired_z])
+    # Where the hands meet is decided by measuring both arms, not by a fixed point in the cell.
+    if meeting is None:
+        if controller is not None:
+            meeting = measured_meeting_point(env, controller, giver, receiver, obj, receiver_bias)
+        else:
+            meeting = {'point': [float(cube[0]), float(cube[1]), float(cube[2])], 'measured': False,
+                       'reason': 'NO_CONTROLLER'}
+    desired_cube = np.array(meeting['point'], float)
+    if meeting.get('measured') is not True:
+        # Fall back to the previously validated working volume rather than an unmeasured point.
+        desired_cube = np.array([float(np.clip(cube[0], 0.40, 0.52)), 0.0,
+                                 float(np.clip(cube[2], 1.10, 1.18))])
 
     def poses(q):
         data.qpos[indices] = q
@@ -111,5 +184,8 @@ def plan_handover_geometry(env, giver: str, obj: str, receiver_bias: float = .01
             collision_rejections += 1
             continue
         slices = {"left": slice(0, 7), "right": slice(7, 14)}
-        return HandoverGeometry(obj_p, donor_r, solved.x[slices[giver]], solved.x[slices[receiver]], relative, receiver_bias, error)
+        geometry = HandoverGeometry(obj_p, donor_r, solved.x[slices[giver]], solved.x[slices[receiver]],
+                                    relative, receiver_bias, error)
+        geometry.meeting = meeting
+        return geometry
     raise ValueError(f"No collision-free coupled handover pose fits the measured grasp (kinematic residual {best_error:.4f}, collision rejections {collision_rejections})")
