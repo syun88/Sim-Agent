@@ -60,8 +60,9 @@ def test_the_roomiest_screened_route_is_the_one_used():
     route, evidence = plan_empty_arm_home(env, controller, 'left')
     assert route is not None, evidence
     chosen = next(item for item in evidence['considered'] if item['route'] == evidence['route'])
-    assert chosen['clearance_m'] == evidence['measured_clearance_m']
-    assert chosen['clearance_m'] == max(item['clearance_m'] for item in evidence['considered'])
+    assert chosen['clearance_first_segment_m'] == evidence['measured_clearance_m']
+    assert chosen['clearance_first_segment_m'] == max(
+        item['clearance_first_segment_m'] for item in evidence['considered'])
 
 
 def test_every_rejected_candidate_says_why():

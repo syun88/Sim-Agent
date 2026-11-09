@@ -83,8 +83,11 @@ def test_home_route_screens_the_current_stack_instead_of_the_original_layout():
     # from the object before climbing, and the choice is the roomiest of the ones that passed.
     assert evidence['route'] in {item['route'] for item in evidence['considered']}
     chosen = next(item for item in evidence['considered'] if item['route'] == evidence['route'])
-    assert chosen['clearance_m'] == evidence['measured_clearance_m']
-    assert chosen['clearance_m'] == max(item['clearance_m'] for item in evidence['considered'])
+    # The first segment is what brushes the object; it is ranked before the whole-path minimum.
+    assert chosen['clearance_first_segment_m'] == evidence['measured_clearance_m']
+    assert chosen['clearance_first_segment_m'] == max(
+        (item['clearance_first_segment_m'] for item in evidence['considered']
+         if item['clearance_first_segment_m'] is not None))
     assert evidence['home_mode']=='scene_clearance_home'
 
 

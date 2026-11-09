@@ -99,6 +99,10 @@ def plan_empty_arm_home(env, controller, arm):
     if nominal_clear:
         candidates.append(('direct_home', [], float(target[2])))
 
+    def clip_first(value):
+        # An unmeasured clearance must not outrank a measured one, and must not be read as zero either.
+        return float('-inf') if value is None else float(value)
+
     rejected, considered = [], []
     best = None
     for name, poses, height in candidates:
@@ -111,14 +115,20 @@ def plan_empty_arm_home(env, controller, arm):
         if check is not None and not check(route, objects, minimum_object_clearance=.03,allow_clearance_exit=True):
             rejected.append({'route':name, 'height_m':height, 'error':'COLLISION_PATH'})
             continue
-        clearance_measured = (measure(route, objects, ceiling=.05) if measure is not None else None)
-        considered.append({'route':name, 'height_m':height, 'clearance_m':clearance_measured})
-        if best is None or (clearance_measured is not None and
-                            (best[3] is None or clearance_measured > best[3])):
-            best = (name, height, route, clearance_measured)
+        # The whole-path minimum is dominated by the final home posture, which every candidate shares, so it
+        # cannot tell a retreat from a straight lift. The segment that actually brushes the object just
+        # released is the first one, so that is measured separately - and it is what gets ranked first.
+        clearance_all = (measure(route, objects, ceiling=.05) if measure is not None else None)
+        clearance_first = (measure(route[:2], objects, ceiling=.05)
+                           if measure is not None and len(route) >= 2 else None)
+        considered.append({'route':name, 'height_m':height, 'clearance_m':clearance_all,
+                           'clearance_first_segment_m':clearance_first})
+        score = (clip_first(clearance_first), clip_first(clearance_all))
+        if best is None or score > best[3]:
+            best = (name, height, route, score, clearance_all, clearance_first)
     if best is None:
         return None, {'error':'HOME_PATH_UNAVAILABLE','rejected_routes':rejected,'considered':considered}
-    name, height, route, clearance_measured = best
+    name, height, route, _, clearance_all, clearance_first = best
     planner = getattr(env, 'plan_joint_waypoints', None)
     if planner is not None:
         planned = planner(arm, route, controller.stop_requested)
@@ -126,7 +136,8 @@ def plan_empty_arm_home(env, controller, arm):
             rejected.append({'route':name, 'height_m':height, 'error':'COLLISION_PATH'})
             return None, {'error':'HOME_PATH_UNAVAILABLE','rejected_routes':rejected,'considered':considered}
         route = planned
-    return route, {'route':name,'clearance_height_m':height,'measured_clearance_m':clearance_measured,
+    return route, {'route':name,'clearance_height_m':height,'measured_clearance_m':clearance_first,
+                   'measured_clearance_whole_path_m':clearance_all,
                    'rejected_routes':rejected,'considered':considered,
                    'target_joint_positions':np.asarray(route[-1]).tolist(),
                    'home_mode':'model_home' if nominal_clear else 'scene_clearance_home',
