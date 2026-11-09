@@ -63,3 +63,34 @@ def test_a_region_no_wider_than_the_object_offers_no_alternative():
     desired, search = skills._reachable_destination('red_cube', 'blue_cube', 'on', 'left')
     assert search['chosen'] == 'unreachable'
     assert len(search['considered']) == 1
+
+
+def test_the_carry_error_is_recorded_with_the_choice_so_the_risk_is_visible():
+    """The probe and the landing error answer different questions; both are kept with the decision."""
+    from backend.app.skills import motion_accuracy
+
+    motion_accuracy.reset()
+    motion_accuracy.record('left', 0.020, source='carry')
+    skills = _runner(lambda distance: True)
+    skills.controller.solve_ik = staticmethod(
+        lambda arm, target, rotation, **kwargs: (np.zeros(7), 0.008, 0.0))
+    _desired, search = skills._reachable_destination('red_cube', 'blue_zone', 'on', 'left')
+    assert search['expected_carry_error_m'] == pytest.approx(0.020)
+    assert search['feasible_within_tolerance'] is False, '8 mm probe + 20 mm landing exceeds the 12 mm tolerance'
+    assert search['chosen'] == 'requested', 'the carry is still the authority; the risk is recorded, not guessed'
+
+
+def test_the_default_carry_floor_already_costs_the_whole_motion_tolerance():
+    """12 mm expected carry error + any probe residual exceeds the 12 mm tolerance.
+
+    That is exactly why this stays a recorded flag and not a gate: a hard gate would call every practical
+    placement infeasible. A gate needs a per-task placement accuracy, which is not measured yet.
+    """
+    from backend.app.skills import motion_accuracy
+
+    motion_accuracy.reset()
+    skills = _runner(lambda distance: True)
+    _desired, search = skills._reachable_destination('red_cube', 'blue_zone', 'on', 'left')
+    assert search['expected_carry_error_m'] == pytest.approx(motion_accuracy.PHASE_DEFAULTS['carry'])
+    assert search['feasible_within_tolerance'] is False
+    assert search['chosen'] == 'requested', 'the placement still runs; the risk is on the record'

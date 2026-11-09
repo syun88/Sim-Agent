@@ -810,6 +810,10 @@ class SkillRunner:
             self._require_hold(arm, obj)
             actual = self.env.object_pose(obj)[0]
             error = float(np.linalg.norm(actual - desired))
+            # How far a carry lands from its target is a property of this body and this phase; the next
+            # placement feasibility question is judged against it.
+            from backend.app.skills import motion_accuracy
+            motion_accuracy.record(arm, error, source='carry')
             if error <= .008:
                 return {"object": obj, "target": np.asarray(desired).tolist(), "position": actual.tolist(), "position_error": error}
             target += np.asarray(desired) - actual
@@ -915,6 +919,21 @@ class SkillRunner:
         if not callable(solve):
             return requested, search
 
+        from backend.app.skills import motion_accuracy
+        # The probe answers "can the IK put the end effector there". What the placement needs is "can the arm
+        # put it there and still land within tolerance" - so the probe has to leave room for how far this
+        # body actually lands when carrying. Measured 2026-11-09: an IK residual of 12 mm and an executed
+        # residual of 26 mm on the same carry, which is why the probe alone called an impossible point fine.
+        # The probe answers "can the IK put the end effector there". It does not answer "will the carry land
+        # within tolerance": measured 2026-11-09, an IK residual of 12 mm and an executed residual of 26 mm on
+        # the same carry. Gating on both would make almost every practical point infeasible while the motion
+        # tolerance itself is 12 mm, so the risk is *recorded* here and the carry remains the authority. A
+        # hard gate needs a per-task placement accuracy, which is not measured yet.
+        expected_carry_error = motion_accuracy.expected_error(arm, 'carry')
+        search['expected_carry_error_m'] = expected_carry_error
+        search['feasible_within_tolerance'] = None
+        headroom = PLACEMENT_REACH_TOLERANCE_M
+
         def margin(point):
             aim, rotation, _offset = self._carry_aim(arm, obj, np.asarray(point, float))
             try:
@@ -927,12 +946,14 @@ class SkillRunner:
 
         best_point, best_margin = np.asarray(requested, float), margin(requested)
         search['considered'].append({'offset': [0., 0.], 'margin_m': best_margin})
+        if best_margin is not None:
+            search['feasible_within_tolerance'] = bool(
+                -best_margin + expected_carry_error <= PLACEMENT_REACH_TOLERANCE_M)
         if best_margin is None:
             # Reachability could not be measured here; the carry itself is the authority, as before.
             search['chosen'] = 'unmeasured'
             return requested, search
-        # The same acceptance the capability query uses for "this arm can hold a pinch here" (12 mm).
-        if best_margin >= -PLACEMENT_REACH_TOLERANCE_M:
+        if best_margin >= -headroom:
             return requested, search
         # How much room the region itself has: a zone's own extent, or the support face minus the object.
         try:
@@ -963,10 +984,10 @@ class SkillRunner:
                 search['considered'].append({'offset': offset.tolist(), 'margin_m': value})
                 if value is not None and (best_margin is None or value > best_margin):
                     best_point, best_margin = point, value
-            if best_margin is not None and best_margin >= -PLACEMENT_REACH_TOLERANCE_M:
+            if best_margin is not None and best_margin >= -headroom:
                 break
         requested_margin = margin(requested)
-        if (best_margin is not None and best_margin >= -PLACEMENT_REACH_TOLERANCE_M
+        if (best_margin is not None and best_margin >= -headroom
                 and (requested_margin is None or best_margin > requested_margin)):
             search['chosen'] = 'offset_inside_region'
             search['chosen_point'] = best_point.tolist()

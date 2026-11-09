@@ -54,6 +54,18 @@ def observed_error(arm: str, *, sources: tuple = FREE_SPACE_SOURCES) -> float:
     return max([DEFAULT_OBSERVED_ERROR_M] + recorded)
 
 
+#: What a phase is expected to land within when nothing has been recorded for it yet. A carry lands worse
+#: than a free-space move: it ends against a support, at a pose the arm reached while holding something.
+PHASE_DEFAULTS = {'carry': 0.012, 'move_to_site': 0.010, 'park_arrival': DEFAULT_OBSERVED_ERROR_M}
+
+
+def expected_error(arm: str, phase: str, *, default: float | None = None) -> float:
+    """How far this arm lands from its command in this phase - recorded if possible, else that phase's floor."""
+    recorded = [entry['position_error_m'] for entry in samples(arm, sources=(phase,))]
+    floor = PHASE_DEFAULTS.get(phase, default if default is not None else 0.012)
+    return max([floor] + recorded)
+
+
 def required_clearance(arm: str, *, gain: float = GAIN, floor: float = FLOOR_M,
                        ceiling: float = 0.12, sources: tuple = FREE_SPACE_SOURCES) -> float:
     """How much room a target pose must have before it is worth commanding, for this body."""
