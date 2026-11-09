@@ -1044,6 +1044,7 @@ class SkillRunner:
                 error.evidence = planning
                 raise error
             executed = []
+            sampled = []
 
             def guard():
                 for other, obj in others.items():
@@ -1052,8 +1053,22 @@ class SkillRunner:
                 # Where the arm actually is at this instant: a model that says the route has 30 mm has to be
                 # checked against what the pads did, not against itself.
                 ee, _ = self.env.ee_pose(arm)
-                executed.append({'ee': [float(value) for value in ee],
-                                 'joints': [float(value) for value in self.env.arm_qpos(arm)]})
+                joints_now = [float(value) for value in self.env.arm_qpos(arm)]
+                executed.append({'ee': [float(value) for value in ee], 'joints': joints_now})
+                # Ask the same model about the segment just travelled, at every sample: that is what turns
+                # "the model said 30 mm and it touched" into a curve showing where the two disagree.
+                if sampled:
+                    query = getattr(self.env.arm_kinematics(arm), 'path_clearance_detail', None)
+                    if query is not None:
+                        report = query([sampled[-1]['joints'], joints_now],
+                                       {name: self.env.object_pose(name)
+                                        for name in self.env.frame().objects}, ceiling=.02)
+                        sampled.append({'joints': joints_now, 'ee': [float(v) for v in ee],
+                                        'gap_m': None if report is None else report.get('gap_m')})
+                    else:
+                        sampled.append({'joints': joints_now, 'ee': [float(v) for v in ee], 'gap_m': None})
+                else:
+                    sampled.append({'joints': joints_now, 'ee': [float(v) for v in ee], 'gap_m': None})
                 for obj, position in stationary.items():
                     if (self.env.object_contacts(obj, arm)
                             or np.linalg.norm(self.env.object_pose(obj)[0]-position) > .002):
@@ -1071,6 +1086,8 @@ class SkillRunner:
                                           'displacement_m':float(np.linalg.norm(self.env.object_pose(obj)[0]-position)),
                                           'executed_ee_path':[item['ee'] for item in executed[-200:]],
                                           'executed_path_clearance':detail,
+                                          'clearance_trace':[{k: item[k] for k in ('ee', 'gap_m')}
+                                                             for item in sampled[::max(1, len(sampled)//40)]],
                                           'object_position':[float(v) for v in self.env.object_pose(obj)[0]]}
                         raise error
             # Execute only an admitted route. Exact final joint targets preserve
