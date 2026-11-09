@@ -67,3 +67,36 @@ def test_the_contract_can_be_read_without_a_body():
     operations = {row['operation'] for row in rows}
     assert {'frame', 'object_pose', 'arm_kinematics', 'step'} <= operations
     assert all(row.get('kind') in {'read_only', 'command'} for row in rows)
+
+
+def test_the_approach_screen_carries_the_measured_approach_error(monkeypatch):
+    """20 mm nominal + how far an approach lands off its plan, measured rather than assumed."""
+    from backend.app.skills import approach, motion_accuracy
+
+    motion_accuracy.reset()
+    seen = {}
+
+    def fake_check(route, objects, **kwargs):
+        seen['minimum_object_clearance'] = kwargs.get('minimum_object_clearance')
+        return True
+
+    # Paired with solve_ik so a route actually gets built and therefore screened.
+    from backend.app.simulation.openarm_v2.definition import GRASP_ROTATION
+    pose = {'point': np.array([0.45, 0.0, 1.05])}
+    # The attitude has to be the one the planner asks for, or every IK candidate is rejected on orientation.
+    kin = SimpleNamespace(evaluate=lambda q: (pose['point'].copy(), GRASP_ROTATION.copy(), None, None),
+                          empty_arm_path_is_clear=fake_check)
+    env = SimpleNamespace(
+        arm_qpos=lambda arm: np.zeros(7), home_arm_qpos=lambda arm: np.zeros(7),
+        ee_pose=lambda arm: (np.array([0.40, 0.0, 1.20]), np.eye(3)),
+        arm_kinematics=lambda arm: kin, arm_velocity_limits=lambda arm: None,
+        object_pose=lambda name: (np.array([0.45, 0.0, 1.05]), np.eye(3)),
+        frame=lambda: SimpleNamespace(objects={'blue_cube': np.array([0.45, 0.0, 1.05])}))
+    def solve_ik(arm, target, rotation, **kwargs):
+        pose['point'] = np.asarray(target, float).copy()
+        return np.zeros(7), 0.001, 0.0
+    controller = SimpleNamespace(solve_ik=solve_ik)
+    approach.plan_cube_approach(env, controller, 'left', 'blue_cube',
+                                np.array([0.45, 0.0, 1.05]), np.array([0.45, 0.0, 1.11]), .10, 1.24)
+    expected = approach.NONCONTACT_CLEARANCE_M + motion_accuracy.PHASE_DEFAULTS['approach']
+    assert seen['minimum_object_clearance'] == expected

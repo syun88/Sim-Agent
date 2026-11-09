@@ -73,6 +73,12 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
     kin = env.arm_kinematics(arm)
     objects = {name:env.object_pose(name) for name in env.frame().objects}
     check = getattr(kin,'empty_arm_path_is_clear',None)
+    # The screen's clearance is not only the nominal 20 mm: an approach lands a few millimetres off its planned
+    # path (measured 2026-11-09: 6.7-9.1 mm of displacement on the object it was reaching for), so the route
+    # has to be screened with that much extra room. Refusing more routes is the intended trade - a route that
+    # brushes the user's object is not a route.
+    from backend.app.skills import motion_accuracy
+    screen_clearance = NONCONTACT_CLEARANCE_M + motion_accuracy.expected_error(arm, 'approach')
     # The clearance query ranks candidates; the route screen still decides. Where the two disagree the
     # trace says so (rejected_by), because a measured win the screen refuses is not an improvement.
     measure = getattr(kin,'path_minimum_clearance',None)
@@ -124,7 +130,7 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
                     continue
                 route, curve = built
                 if check is None or check(route,objects,allowed_contacts=allowed,curve=curve,
-                                          minimum_object_clearance=NONCONTACT_CLEARANCE_M,
+                                          minimum_object_clearance=screen_clearance,
                                           object_clearances={obj:TARGET_BODY_CLEARANCE_M}):
                     found = (frame, float(rise), staged, route, curve)
                     break
@@ -183,7 +189,7 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
             candidate_route, candidate_curve = built
             if check is not None and not check(candidate_route, objects, allowed_contacts=allowed,
                                                curve=candidate_curve,
-                                               minimum_object_clearance=NONCONTACT_CLEARANCE_M,
+                                               minimum_object_clearance=screen_clearance,
                                                object_clearances={obj:TARGET_BODY_CLEARANCE_M}):
                 entry['rejected_by'] = 'COLLISION_PATH'
                 continue
@@ -196,6 +202,8 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
     attitude = frame['rotation']
     return route, {'approach_overfly_m':float(rise),'staging':staged,
                    'noncontact_clearance_m':NONCONTACT_CLEARANCE_M,
+                   'screen_clearance_m':screen_clearance,
+                   'expected_approach_error_m':motion_accuracy.expected_error(arm, 'approach'),
                    'target_body_clearance_m':TARGET_BODY_CLEARANCE_M,
                    'grasp_yaw_deg':frame['yaw_deg'],
                    'grasp_tilt_deg':frame.get('tilt_deg', 0.),

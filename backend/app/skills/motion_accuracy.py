@@ -56,9 +56,11 @@ def observed_error(arm: str, *, sources: tuple = FREE_SPACE_SOURCES) -> float:
 
 #: How many recordings a phase needs before its median is trusted over the default.
 MIN_SAMPLES_FOR_ESTIMATE = 3
-#: What a phase is expected to land within when nothing has been recorded for it yet. A carry lands worse
-#: than a free-space move: it ends against a support, at a pose the arm reached while holding something.
-PHASE_DEFAULTS = {'carry': 0.012, 'move_to_site': 0.010, 'park_arrival': DEFAULT_OBSERVED_ERROR_M}
+#: What a phase is expected to land within when nothing has been recorded for it yet. `approach` is the
+#: 6.7-9.1 mm by which approaches displaced the object they were reaching for (measured 2026-11-09), which is
+#: the margin the approach screen has to absorb on top of its nominal clearance.
+PHASE_DEFAULTS = {'carry': 0.012, 'move_to_site': 0.010, 'approach': 0.008,
+                  'park_arrival': DEFAULT_OBSERVED_ERROR_M}
 
 
 def expected_error(arm: str, phase: str, *, default: float | None = None) -> float:
