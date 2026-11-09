@@ -214,6 +214,22 @@ required_clearance = max(記録された最大誤差, 実測デフォルト 0.03
 証拠は `post_task_homing.arms[].evidence` の `tightest`（計画経路）と `executed_path_clearance`
 （実行関節列）に残る。
 
+## 収集ラウンド（2026-11-09、`b885c08`）
+
+`traces-20261109/`（6 指示 × 3、ランダム配置）: **SUCCEEDED 6 / FAILED 12**。主因は
+`move_to_target`/`approach_object` の IK_FAILURE（延べ 17 回）で、帰属は `PLANNING 10 / TRACKING 9 /
+APPROACH_CONTACT 4`。
+
+**分かったこと**: ランダム配置の受け入れは**把持の到達性しか見ていない**。開始時 `admitted_grasp_arm` は
+全物体に付いているのに、配置目標（ゾーン・積み上げ先）は到達不能なことがある。→ reset の受け入れに
+「その指示の目標」の到達性も含めるべき（未実装）。
+
+**連続探索はライブで効いている**: approach 計画 14 件中、yaw 11 件・tilt 3 件が候補リスト外の値
+（例 yaw -14.0625°, tilt -0.9375°）。14 件すべてに `refinements` が記録される。
+
+**メカニズム予測器: NOT_ADOPTED**（18 例、40 例未満／PLANNING 0/4・TRACKING 0/3／確信度逆転 0.53 vs 0.66）。
+学習部品を入れる根拠は今のところ無い。詳細は `~/dojo/lime-verify-20261025/collection-20261109/REPORT.md`。
+
 ## やらないこと
 
 - 安全しきい値（20 mm / 3 mm / パッド上の余白）を「測ったから」と言って緩めない。これは方針。
