@@ -36,6 +36,74 @@ class OfficialArmKinematics:
                 self._data.site_xmat[self._site].reshape(3, 3).copy(),
                 self._linear[:, self._dofs].copy(), self._angular[:, self._dofs].copy())
 
+    def path_minimum_clearance(self, waypoints, objects, resolution=.025, *, allowed_contacts=None,
+                               curve=None, ceiling=.05):
+        """The smallest gap between this arm and the scene objects anywhere along a path.
+
+        A boolean screen can only say pass or fail, so a search over candidate angles had nothing to rank
+        them by. This returns the number: the minimum `mj_geomDistance` over sampled configurations, capped
+        at `ceiling` - a path with nothing within the ceiling radius reports the ceiling, because "far from
+        everything" and "0.05 m of room" are the same answer for a search that is ranking candidates.
+        Negative means the arm is inside something. `None` means the scene held no object this arm could be
+        measured against, which a caller must treat as unknown rather than clear.
+        """
+        from backend.app.simulation.transform import mat_to_quat
+        mj, model = self._mj, self._model
+        data = mj.MjData(model)
+        data.qpos[:] = self._data.qpos
+        placed = 0
+        for name, (position, rotation) in objects.items():
+            body = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, name)
+            if body < 0 or not model.body_jntnum[body]:
+                continue
+            joint = model.body_jntadr[body]
+            if model.jnt_type[joint] != mj.mjtJoint.mjJNT_FREE:
+                continue
+            address = model.jnt_qposadr[joint]
+            data.qpos[address:address+3] = position
+            data.qpos[address+3:address+7] = mat_to_quat(rotation)
+            placed += 1
+        if not placed:
+            return None
+        root = model.jnt_bodyid[model.dof_jntid[self._dofs[0]]]
+        descendants = set()
+        for body in range(model.nbody):
+            ancestor = body
+            while ancestor and ancestor != root:
+                ancestor = model.body_parentid[ancestor]
+            if ancestor == root:
+                descendants.add(body)
+        moving = np.array([int(b) in descendants for b in model.geom_bodyid])
+        samples = []
+        for start, end in zip(waypoints, waypoints[1:]):
+            count = max(2, int(np.ceil(np.max(abs(end-start))/resolution))+1)
+            samples.extend(np.linspace(start, end, count))
+        if curve is not None:
+            samples = curve(np.unique(np.r_[np.linspace(0., 1., max(30, 2*len(samples))), curve.x]))
+        names = [mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, int(b)) or '' for b in model.geom_bodyid]
+        allowed_contacts = allowed_contacts or {}
+        prop_geoms = [i for i, name in enumerate(names) if name in objects]
+        moving_geoms = np.flatnonzero(moving)
+        if not len(moving_geoms):
+            return None
+        smallest = None
+        for joints in samples:
+            data.qpos[self._positions] = joints
+            mj.mj_kinematics(model, data)
+            for prop in prop_geoms:
+                nearby = moving_geoms[np.linalg.norm(
+                    data.geom_xpos[moving_geoms] - data.geom_xpos[prop], axis=1)
+                    < model.geom_rbound[moving_geoms] + model.geom_rbound[prop] + ceiling]
+                for geom in nearby:
+                    a, b = names[int(geom)], names[prop]
+                    if b in allowed_contacts.get(a, set()) or a in allowed_contacts.get(b, set()):
+                        continue
+                    gap = mj.mj_geomDistance(model, data, int(geom), prop, ceiling, None)
+                    if smallest is None or gap < smallest:
+                        smallest = gap
+        # Nothing within the ceiling radius is not an unknown: it is the ceiling, saturated.
+        return float(ceiling) if smallest is None else float(smallest)
+
     def empty_arm_path_is_clear(self, waypoints, objects, resolution=.025, *, allowed_contacts=None, curve=None,
                                 minimum_object_clearance=0., allow_clearance_exit=False,
                                 object_clearances=None):

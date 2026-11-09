@@ -122,7 +122,11 @@ def test_approach_searches_grasp_yaw_when_the_nominal_collision_route_is_blocked
     route,planning=plan_cube_approach(env,controller,'right','blue_cube',pinch,standoff,.10,1.24,
         frames=cube_approach_frames('right',center,.06))
     assert route is not None,planning
-    assert planning['grasp_yaw_deg'] == -60
+    # The listed yaws seed the search; the angle used is the one the clearance measurement preferred, so it
+    # is not required to be a listed value - only to be away from the blocked nominal frame and to be clear.
+    assert abs(planning['grasp_yaw_deg']) >= 45
+    assert env.arm_kinematics('right').empty_arm_path_is_clear(route, objects)
+    assert planning['measured_clearance_m'] is not None
     assert planning['noncontact_clearance_m'] >= .020
     assert len(route)>=4
     assert planning['pinch_target'] != pinch.tolist()

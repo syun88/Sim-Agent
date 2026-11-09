@@ -3,6 +3,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from backend.app.control.motion import joint_spline
+from backend.app.planning.angle_search import refine
 from backend.app.simulation.openarm_v2.definition import FINGERTIP_MIDPOINT, GRASP_ROTATION
 from backend.app.simulation.transform import orientation_error
 
@@ -17,6 +18,8 @@ NONCONTACT_CLEARANCE_M = .020
 # The target is approached intentionally; its non-fingertip geometry still needs
 # space, but a 20 mm exclusion there would forbid a normal close-in pinch.
 TARGET_BODY_CLEARANCE_M = .003
+# Above this the path is obviously not tight; the search does not need an exact distance.
+CLEARANCE_CEILING_M = .05
 
 
 def two_axis_frames(arm, center, standoff_m, *, world_x_offset=None):
@@ -44,17 +47,21 @@ def two_axis_frames(arm, center, standoff_m, *, world_x_offset=None):
     return frames
 
 
+def frame_at(arm, center, standoff_m, yaw_deg, *, world_x_offset=None, tilt_deg=0.):
+    """The grasp frame at one yaw. Any angle is a real frame, not an interpolation of listed ones."""
+    rotation = Rotation.from_euler('z', yaw_deg, degrees=True).as_matrix() @ GRASP_ROTATION
+    offset = rotation @ FINGERTIP_MIDPOINT[arm]
+    if world_x_offset is not None:
+        offset[0] = world_x_offset
+    pinch = np.asarray(center, float) - offset
+    finger_direction = rotation @ np.array([0., 0., -1.])
+    return {'yaw_deg':float(yaw_deg), 'tilt_deg':float(tilt_deg), 'rotation':rotation, 'pinch':pinch,
+            'standoff':pinch - standoff_m * finger_direction}
+
+
 def cube_approach_frames(arm, center, standoff_m, *, world_x_offset=None):
-    frames = []
-    for yaw in CUBE_GRASP_YAWS_DEG:
-        rotation = Rotation.from_euler('z', yaw, degrees=True).as_matrix() @ GRASP_ROTATION
-        offset = rotation @ FINGERTIP_MIDPOINT[arm]
-        if world_x_offset is not None:
-            offset[0] = world_x_offset
-        pinch = np.asarray(center, float) - offset
-        finger_direction = rotation @ np.array([0., 0., -1.])
-        frames.append({'yaw_deg':yaw, 'rotation':rotation, 'pinch':pinch,
-                       'standoff':pinch - standoff_m * finger_direction})
+    frames = [frame_at(arm, center, standoff_m, yaw, world_x_offset=world_x_offset)
+              for yaw in CUBE_GRASP_YAWS_DEG]
     return frames
 
 
@@ -64,49 +71,114 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
     kin = env.arm_kinematics(arm)
     objects = {name:env.object_pose(name) for name in env.frame().objects}
     check = getattr(kin,'empty_arm_path_is_clear',None)
+    measure = getattr(kin,'path_minimum_clearance',None)
     allowed = {obj:{f'openarm_{arm}_ee_inner_finger',f'openarm_{arm}_ee_outer_finger'}}
     rejected = []
     # Older callers screen only the calibrated nominal frame. The runtime
     # explicitly supplies candidate frames, each with its own fingertip offset.
     candidates = frames if frames is not None else [
         {'yaw_deg':0, 'rotation':GRASP_ROTATION, 'pinch':pinch, 'standoff':standoff}]
-    for frame in candidates:
+    def route_for(frame, rise, staged):
+        """Solve the joint route for one attitude and rise, reusing the accepted frame's offsets."""
         attitude = frame['rotation']
-        pinch_target = frame['pinch']
-        standoff_target = frame['standoff']
+        high = frame['standoff']+np.array([0., 0., rise])
+        poses = ([np.r_[point[:2],staging_altitude]] if staged else [])+[
+            high, frame['standoff'], frame['pinch']]
+        route = [start]
+        for target in poses:
+            solved = None
+            for seed in (route[-1],env.home_arm_qpos(arm)):
+                q,_,_=controller.solve_ik(arm,target,attitude,q_init=seed)
+                if q is None:continue
+                actual,rotation,_,_=kin.evaluate(q)
+                if (np.linalg.norm(actual-target)<.004
+                        and np.linalg.norm(orientation_error(rotation,attitude))<.04):
+                    solved=q;break
+            if solved is None:
+                return None
+            route.append(solved)
+        return route, joint_spline(route,env.arm_velocity_limits(arm))
+
+    def clearance_of(frame, rise, staged):
+        """How much room this route leaves, in metres. None when it cannot be built or measured."""
+        if measure is None:
+            return None
+        built = route_for(frame, rise, staged)
+        if built is None:
+            return None
+        route, curve = built
+        return measure(route,objects,allowed_contacts=allowed,curve=curve,ceiling=CLEARANCE_CEILING_M)
+
+    found = None
+    for frame in candidates:
         for rise in np.linspace(overfly,0.,5):
-            high = standoff_target+np.array([0.,0.,rise])
             for staged in (True,False) if staging_altitude-point[2]>.02 else (False,):
-                poses = ([np.r_[point[:2],staging_altitude]] if staged else [])+[high,standoff_target,pinch_target]
-                route = [start]
-                for target in poses:
-                    solved = None
-                    for seed in (route[-1],env.home_arm_qpos(arm)):
-                        q,_,_=controller.solve_ik(arm,target,attitude,q_init=seed)
-                        if q is None:continue
-                        actual,rotation,_,_=kin.evaluate(q)
-                        if (np.linalg.norm(actual-target)<.004
-                                and np.linalg.norm(orientation_error(rotation,attitude))<.04):
-                            solved=q;break
-                    if solved is None:break
-                    route.append(solved)
-                else:
-                    curve=joint_spline(route,env.arm_velocity_limits(arm))
-                    if check is None or check(route,objects,allowed_contacts=allowed,curve=curve,
-                                              minimum_object_clearance=NONCONTACT_CLEARANCE_M,
-                                              object_clearances={obj:TARGET_BODY_CLEARANCE_M}):
-                        return route,{'approach_overfly_m':float(rise),'staging':staged,
-                                      'noncontact_clearance_m':NONCONTACT_CLEARANCE_M,
-                                      'target_body_clearance_m':TARGET_BODY_CLEARANCE_M,
-                                      'grasp_yaw_deg':frame['yaw_deg'],
-                                      'grasp_tilt_deg':frame.get('tilt_deg', 0.),
-                                      'grasp_rotation':attitude.tolist(),
-                                      'pinch_target':pinch_target.tolist(),
-                                      'rejected_routes':rejected}
+                built = route_for(frame, rise, staged)
+                if built is None:
                     rejected.append({'yaw_deg':frame['yaw_deg'],'overfly_m':float(rise),
-                                     'staging':staged,'error':'COLLISION_PATH'})
+                                     'staging':staged,'error':'IK_FAILURE'})
                     continue
+                route, curve = built
+                if check is None or check(route,objects,allowed_contacts=allowed,curve=curve,
+                                          minimum_object_clearance=NONCONTACT_CLEARANCE_M,
+                                          object_clearances={obj:TARGET_BODY_CLEARANCE_M}):
+                    found = (frame, float(rise), staged, route, curve)
+                    break
                 rejected.append({'yaw_deg':frame['yaw_deg'],'overfly_m':float(rise),
-                                 'staging':staged,'error':'IK_FAILURE'})
-    return None,{'error':'APPROACH_PATH_UNAVAILABLE','rejected_routes':rejected,
-                 'attempted_grasp_yaws_deg':[frame['yaw_deg'] for frame in candidates]}
+                                 'staging':staged,'error':'COLLISION_PATH'})
+            if found: break
+        if found: break
+    if not found:
+        return None, {'error':'APPROACH_PATH_UNAVAILABLE','rejected_routes':rejected,
+                      'attempted_grasp_yaws_deg':[frame['yaw_deg'] for frame in candidates]}
+
+    # The listed yaws and the five rise values only got us a route that passes. Now the angle and the height
+    # are derived from the measurement: the same clearance query, maximised. A yaw or rise that cannot be
+    # reached scores None and loses, so the search cannot drift somewhere unattainable.
+    frame, rise, staged, route, curve = found
+    accepted_clearance = clearance_of(frame, rise, staged)
+    refinements = []
+    if measure is not None:
+        centre = frame['pinch'] + frame['rotation'] @ FINGERTIP_MIDPOINT[arm]
+        offset_vector = frame['standoff'] - frame['pinch']
+
+        def frame_with(yaw_deg):
+            candidate = frame_at(arm, centre, 0., yaw_deg)
+            return {**candidate, 'standoff': candidate['pinch'] + offset_vector}
+
+        for name, from_value, span, step, rebuild in (
+                ('refine_overfly', rise, max(rise/2., .01), max(rise/4., .005),
+                 lambda value: (frame, value)),
+                ('refine_grasp_yaw', float(frame['yaw_deg']), 15., 5.,
+                 lambda value: (frame_with(value), rise))):
+            trace = refine(lambda value: clearance_of(*rebuild(value), staged),
+                           from_value, span, step=step)
+            refinements.append({'query': name, **trace})
+            if trace['best_value'] is None or trace['best_score'] is None:
+                continue
+            if accepted_clearance is not None and trace['best_score'] <= accepted_clearance:
+                continue
+            candidate_frame, candidate_rise = rebuild(trace['best_value'])
+            built = route_for(candidate_frame, candidate_rise, staged)
+            if built is None:
+                continue
+            candidate_route, candidate_curve = built
+            if check is not None and not check(candidate_route, objects, allowed_contacts=allowed,
+                                               curve=candidate_curve,
+                                               minimum_object_clearance=NONCONTACT_CLEARANCE_M,
+                                               object_clearances={obj:TARGET_BODY_CLEARANCE_M}):
+                continue
+            frame, rise, route, curve = candidate_frame, candidate_rise, candidate_route, candidate_curve
+            accepted_clearance = trace['best_score']
+
+    attitude = frame['rotation']
+    return route, {'approach_overfly_m':float(rise),'staging':staged,
+                   'noncontact_clearance_m':NONCONTACT_CLEARANCE_M,
+                   'target_body_clearance_m':TARGET_BODY_CLEARANCE_M,
+                   'grasp_yaw_deg':frame['yaw_deg'],
+                   'grasp_tilt_deg':frame.get('tilt_deg', 0.),
+                   'grasp_rotation':attitude.tolist(),
+                   'pinch_target':frame['pinch'].tolist(),
+                   'measured_clearance_m':accepted_clearance,
+                   'refinements':refinements,
+                   'rejected_routes':rejected}
