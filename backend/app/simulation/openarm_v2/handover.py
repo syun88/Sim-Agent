@@ -29,6 +29,9 @@ class HandoverGeometry:
 
 DEFAULT_MEETING_SPAN_M = .09
 DEFAULT_MEETING_STEP_M = .03
+#: The point the cell used to hard-code. It stays in the candidate set so that if the measurement says it is
+#: the best available, it is chosen *because it was measured*, not because nobody looked anywhere else.
+LEGACY_MEETING_BOX = ((0.40, 0.52), 0.0, (1.10, 1.18))
 
 
 def measured_meeting_point(env, controller, giver: str, receiver: str, obj: str, receiver_bias: float,
@@ -66,10 +69,18 @@ def measured_meeting_point(env, controller, giver: str, receiver: str, obj: str,
         # Same equivalent-face rule as the coupled solve: opposed approach directions, not the same side.
         relative = min((relative, opposite @ relative),
                        key=lambda candidate: float((grasp_rotation @ candidate)[2, 2]))
+    (low_x, high_x), legacy_y, (low_z, high_z) = LEGACY_MEETING_BOX
+    candidates = [np.array([float(np.clip(cube[0], low_x, high_x)), float(legacy_y),
+                            float(np.clip(cube[2], low_z, high_z))])]
+    for offset_x in (-.02, 0., .02):
+        for offset_y in np.arange(-span, span + 1e-9, step):
+            for offset_z in (-.04, 0., .04):
+                candidates.append(np.array([float(cube[0]) + offset_x, float(cube[1]) + float(offset_y),
+                                            float(cube[2]) + offset_z]))
     evaluations = []
     best = None
-    for offset_y in np.arange(-span, span + 1e-9, step):
-        point = np.array([float(cube[0]), float(cube[1]) + float(offset_y), float(cube[2])])
+    for point in candidates:
+        offset_y = float(point[1] - cube[1])
         donor_target = point - rotation @ grasp_offset
         receiving_rotation = rotation @ grasp_rotation @ relative
         receiver_target = (point + receiving_rotation @ np.array([0., 0., receiver_bias])
@@ -80,7 +91,7 @@ def measured_meeting_point(env, controller, giver: str, receiver: str, obj: str,
         if donor_margin is not None and receiver_margin is not None:
             # The worse of the two: a meeting point only one arm can hold is not a meeting point.
             score = min(donor_margin, receiver_margin)
-        evaluations.append({'offset_y_m': float(offset_y), 'score': score,
+        evaluations.append({'point': point.tolist(), 'offset_y_m': offset_y, 'score': score,
                             'donor_margin_m': donor_margin, 'receiver_margin_m': receiver_margin})
         if score is not None and (best is None or score > best['score']):
             best = {'point': point.tolist(), 'score': score, 'offset_y_m': float(offset_y)}
@@ -89,7 +100,9 @@ def measured_meeting_point(env, controller, giver: str, receiver: str, obj: str,
         return {'point': [float(cube[0]), float(cube[1]), float(cube[2])], 'measured': False,
                 'evaluations': evaluations, 'reason': 'UNMEASURED'}
     return {'point': best['point'], 'measured': True, 'score': best['score'],
-            'offset_y_m': best['offset_y_m'], 'evaluations': evaluations}
+            'offset_y_m': best['offset_y_m'],
+            'legacy_point_chosen': best['point'] == [float(value) for value in candidates[0]],
+            'evaluations': evaluations}
 
 
 def plan_handover_geometry(env, giver: str, obj: str, receiver_bias: float = .015, *,

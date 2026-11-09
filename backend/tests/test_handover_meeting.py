@@ -60,3 +60,17 @@ def test_an_unmeasurable_body_reports_the_grasp_point_and_says_it_was_not_measur
     answer = measured_meeting_point(_env(), SimpleNamespace(solve_ik=solve), 'left', 'right', 'blue_cube', .015)
     assert answer['measured'] is False and answer['reason'] == 'UNMEASURED'
     assert answer['point'] == pytest.approx(CUBE.tolist())
+
+
+def test_the_old_fixed_point_is_still_a_candidate_so_it_can_win_on_measurement():
+    """If the measurement prefers the point the cell used to hard-code, that is still a measured choice."""
+    controller, _ = _controller(preferred_y=.0)
+    answer = measured_meeting_point(_env(), controller, 'left', 'right', 'blue_cube', .015)
+    assert answer['measured'] is True
+    assert any(item['point'] == pytest.approx(answer['point']) for item in answer['evaluations'])
+
+
+def test_a_meeting_point_outside_both_arms_hold_range_is_not_reported_as_measured():
+    controller, _ = _controller(preferred_y=0., reaches=(.5, .6))
+    answer = measured_meeting_point(_env(), controller, 'left', 'right', 'blue_cube', .015)
+    assert answer['measured'] is False and answer['reason'] == 'UNMEASURED'
