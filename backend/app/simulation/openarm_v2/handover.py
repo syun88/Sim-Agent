@@ -167,8 +167,12 @@ def plan_handover_geometry(env, giver: str, obj: str, receiver_bias: float = .01
     geometry = HandoverGeometry(winner['obj_p'], winner['donor_r'],
                                 winner['solved'].x[slices[giver]], winner['solved'].x[slices[receiver]],
                                 relative, receiver_bias, winner['error'])
-    geometry.meeting = {'point': winner['point'], 'measured': True, 'chosen': winner['name'],
-                        'residual': winner['error'],
-                        'evaluations': [{key: value for key, value in item.items() if key != 'solved'}
+    geometry.meeting = {'point': [float(value) for value in winner['point']], 'measured': True,
+                        'chosen': winner['name'], 'residual': float(winner['error']),
+                        # Only plain data: this evidence travels back through the API.
+                        'evaluations': [{'name': item['name'],
+                                         'point': [float(value) for value in item['point']],
+                                         'error': None if item.get('error') is None else float(item['error']),
+                                         'collision_rejections': int(item.get('collision_rejections') or 0)}
                                         for item in evaluations]}
     return geometry

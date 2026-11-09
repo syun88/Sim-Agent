@@ -39,3 +39,17 @@ def test_the_legacy_point_wins_only_if_it_measures_better():
     evaluations = [{'name': 'legacy_clip', 'error': 0.002, 'solved': solved},
                    {'name': 'offset_+0.00_+0.03_+0.00', 'error': 0.0011, 'solved': solved}]
     assert handover.select_winner(evaluations)['name'] == 'offset_+0.00_+0.03_+0.00'
+
+
+def test_the_meeting_evidence_can_be_returned_by_the_api():
+    """A task failed once because this evidence held arrays: it has to serialise as it stands."""
+    import json
+    import numpy as np
+    from backend.app.simulation.openarm_v2.handover import HandoverGeometry
+
+    geometry = HandoverGeometry(np.zeros(3), np.eye(3), np.zeros(7), np.zeros(7), np.eye(3), .015, .001,
+                                meeting={'point': [0.4, 0.0, 1.1], 'measured': True, 'chosen': 'legacy_clip',
+                                         'residual': 0.001,
+                                         'evaluations': [{'name': 'legacy_clip', 'point': [0.4, 0.0, 1.1],
+                                                          'error': 0.001, 'collision_rejections': 0}]})
+    assert json.loads(json.dumps(geometry.meeting))['chosen'] == 'legacy_clip'
