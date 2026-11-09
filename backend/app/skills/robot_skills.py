@@ -1049,14 +1049,25 @@ class SkillRunner:
                 # Where the arm actually is at this instant: a model that says the route has 30 mm has to be
                 # checked against what the pads did, not against itself.
                 ee, _ = self.env.ee_pose(arm)
-                executed.append([float(value) for value in ee])
+                executed.append({'ee': [float(value) for value in ee],
+                                 'joints': [float(value) for value in self.env.arm_qpos(arm)]})
                 for obj, position in stationary.items():
                     if (self.env.object_contacts(obj, arm)
                             or np.linalg.norm(self.env.object_pose(obj)[0]-position) > .002):
                         error = SkillError('PARK_COLLISION', f'Empty-arm parking disturbed {obj}')
+                        # Re-ask the model about the configurations the arm actually passed through, so
+                        # "the model says 30 mm" can be compared with the same model on the real path.
+                        joints = [item['joints'] for item in executed[-200:]]
+                        detail = None
+                        kin = self.env.arm_kinematics(arm)
+                        query = getattr(kin, 'path_clearance_detail', None)
+                        if query is not None and len(joints) >= 2:
+                            detail = query(joints, {name: self.env.object_pose(name)
+                                                    for name in self.env.frame().objects}, ceiling=.05)
                         error.evidence = {**planning,'object':obj,'contacts':self.env.object_contacts(obj,arm),
                                           'displacement_m':float(np.linalg.norm(self.env.object_pose(obj)[0]-position)),
-                                          'executed_ee_path':executed[-200:],
+                                          'executed_ee_path':[item['ee'] for item in executed[-200:]],
+                                          'executed_path_clearance':detail,
                                           'object_position':[float(v) for v in self.env.object_pose(obj)[0]]}
                         raise error
             # Execute only an admitted route. Exact final joint targets preserve
