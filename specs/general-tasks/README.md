@@ -315,6 +315,15 @@ probe 残差 + その身体の運搬着地誤差  ≤  どれだけ中心から�
 **IK だけの判定では不十分**だった（実測: IK は「届く」と言い、接近探索が全滅 6 回）。また `place` を
 対象に含めないと、ゾーン配置で検査が一度も走らない（arm 行 0 件）ことも実測で分かった。
 
+## 接近スクリーンも実測で（実装済み・`ae99e9d`）
+
+`NONCONTACT_CLEARANCE_M`（20 mm）に `motion_accuracy.expected_error(arm, 'approach')` を足した値で
+接近経路をスクリーニングする。8 mm は `APPROACH_COLLISION` の実測変位（6.7–9.1 mm）から。
+証拠に `screen_clearance_m` / `expected_approach_error_m` を残す。
+
+ライブ（`traces-20261109i`, 6 件）: **SUCCEEDED 4**、スクリーンは 0.028 m、
+**`APPROACH_COLLISION` は 0 件**（直前ラウンドは 12 件中 6 件）。残る失敗は配置側。
+
 ## やらないこと
 
 - 安全しきい値（20 mm / 3 mm / パッド上の余白）を「測ったから」と言って緩めない。これは方針。
