@@ -120,7 +120,8 @@ def test_a_zone_placement_searches_inside_the_zone_instead_of_carrying_to_the_ce
 
     env = type('E', (), {})()
     env.object_pose = lambda name: (SUPPORT.copy(), np.eye(3))
-    env.object_bounds = lambda name: (HELD if name == 'red_cube' else REGION).copy()
+    zone_region = np.stack([zone - [0.05, 0.05, 0.], zone + [0.05, 0.05, 0.]])
+    env.object_bounds = lambda name: (HELD if name == 'red_cube' else zone_region).copy()
     env.ee_pose = lambda arm: (np.array([0.40, 0.0, 1.15]), np.eye(3))
     env.zone_position = lambda name: zone.copy()
     env.frame = lambda: type('F', (), {'objects': {'red_cube': SUPPORT.copy()}, 'zones': {'blue_zone': zone}})()
@@ -139,4 +140,5 @@ def test_a_zone_placement_searches_inside_the_zone_instead_of_carrying_to_the_ce
     chosen = np.asarray(search['chosen_point'], float)
     assert np.linalg.norm(chosen - np.asarray(search['requested'], float)) > 1e-6, \
         'the zone centre was not reachable; a point inside it was'
-    assert REGION[0][0] <= chosen[0] <= REGION[1][0] and REGION[0][1] <= chosen[1] <= REGION[1][1]
+    assert zone_region[0][0] <= chosen[0] <= zone_region[1][0]
+    assert zone_region[0][1] <= chosen[1] <= zone_region[1][1]
