@@ -25,7 +25,7 @@ from typing import Callable
 
 import numpy as np
 
-from backend.app.control.motion import OpenArmV2Controller
+from backend.app.control.motion import OpenArmV2Controller, orientation_error
 from backend.app.control.navigation import BasePose, WaypointController, clearance_to_aabbs
 from backend.app.simulation.base import SimulationBackend
 from backend.app.planning.capability_queries import attitude as attitude_for_yaw
@@ -89,6 +89,9 @@ SUPPORT_REGRASP_SHIFT_TOLERANCE = 0.010
 #: 0.5 with the servo response unchanged cleared both with 10.18 and 15.01 mm of room (measured 2026-10-28).
 #: Softening the servo instead deepens the penetration, because a softer servo lags further behind.
 APPROACH_TRAJECTORY_SPEED = 0.5
+#: A parked arm must land on the planned waypoint: the same tolerance the route was admitted with.
+PARK_ARRIVAL_TOLERANCE_M = 0.005
+PARK_ARRIVAL_TOLERANCE_RAD = 0.04
 #: The approach may not displace the object by more than this (m); the object is only pinched
 #: after this check, so a shove here would fake nothing anyway, but the plan still fails loudly.
 APPROACH_DISTURBANCE_TOLERANCE = 0.005
@@ -1072,6 +1075,7 @@ class SkillRunner:
                         raise error
             # Execute only an admitted route. Exact final joint targets preserve
             # the canonical home branch of a redundant arm; normal motors move it.
+            previous = self.env.arm_qpos(arm)
             for joints in route[1:]:
                 kin = self.env.arm_kinematics(arm)
                 position, attitude, _, _ = kin.evaluate(joints)
@@ -1082,6 +1086,37 @@ class SkillRunner:
                 moved = self.controller.move_to_site(arm, position, attitude, planned_joints=edge, on_sample=guard)
                 if not moved.success:
                     raise SkillError(moved.error or 'MOTION_BLOCKED', 'Empty arm could not clear the handover workspace')
+                # A successful move_to_site means the *site* reached its target; it does not mean the arm
+                # followed the planned joint path. Measured 2026-11-09: the planned route cleared the object
+                # by 30.8 mm, the arm stopped short, and the posture it stopped in was 4.7 mm inside the cube
+                # while the site read as arrived. So the traversed segment is screened and the arrival checked
+                # against the plan, and the two failures are labelled apart.
+                arrived = self.env.arm_qpos(arm)
+                objects_now = {o: self.env.object_pose(o) for o in self.env.frame().objects}
+                detail = getattr(kin, 'path_clearance_detail', None)
+                travelled = detail([previous, arrived], objects_now, ceiling=.05) if detail else None
+                if travelled is not None and travelled.get('gap_m') is not None and travelled['gap_m'] < 0:
+                    error = SkillError('PARK_PATH_UNCLEAR',
+                                       'The arm passed through geometry that the planned route did not')
+                    error.evidence = {'traversed': travelled, 'planned_joints': np.asarray(joints).tolist(),
+                                      'arrived_joints': np.asarray(arrived).tolist(), **planning}
+                    raise error
+                actual_position, actual_attitude, _, _ = kin.evaluate(arrived)
+                deviation = float(np.linalg.norm(actual_position - position))
+                rotation_error = float(np.linalg.norm(orientation_error(actual_attitude, attitude)))
+                joint_error = float(np.max(np.abs(np.asarray(arrived) - np.asarray(joints))))
+                if deviation > PARK_ARRIVAL_TOLERANCE_M or rotation_error > PARK_ARRIVAL_TOLERANCE_RAD:
+                    error = SkillError('HOME_SHORT_STOP',
+                                       f'Parking stopped {deviation*1000:.1f} mm short of the planned waypoint')
+                    error.evidence = {'planned_position': np.asarray(position).tolist(),
+                                      'actual_position': np.asarray(actual_position).tolist(),
+                                      'deviation_m': deviation, 'rotation_error_rad': rotation_error,
+                                      'joint_error_rad': joint_error,
+                                      'planned_joints': np.asarray(joints).tolist(),
+                                      'arrived_joints': np.asarray(arrived).tolist(),
+                                      'traversed': travelled, **planning}
+                    raise error
+                previous = arrived
                 guard()
             joint_error = float(np.max(abs(self.env.arm_qpos(arm)-route[-1])))
             if joint_error > .025:
