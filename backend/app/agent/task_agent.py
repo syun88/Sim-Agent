@@ -148,6 +148,17 @@ class TaskAgent:
         except Exception as error:
             preflight = {'available': False, 'reason': f'{type(error).__name__}: {error}'}
             plan.planning_evidence = {**(plan.planning_evidence or {}), 'preflight': preflight}
+        # An arm that cannot reach the object is refused before any motion, with the alternative named.
+        # Measured 2026-11-09: a right-hand instruction for a cube at y=+0.264 failed twelve attempts in the
+        # approach search; both arms answer this reachability question in milliseconds.
+        unreachable = [row for row in (preflight or {}).get('arms', [])
+                       if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE']
+        if unreachable:
+            row = unreachable[0]
+            alternative = ', '.join(row.get('reachable_arms') or [])
+            raise GroundingError(
+                f"ARM_CANNOT_REACH: the {row['arm']} hand cannot reach {row['object']} here "
+                f"(reachable: {alternative or 'neither hand'})")
         for decision in binding['decisions']:
             if decision['explanation']:
                 plan.assumptions.append(decision['explanation'])
