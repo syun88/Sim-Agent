@@ -528,12 +528,15 @@ class SkillRunner:
                                f'No reachable point inside {target} for this arm')
             error.evidence = {'destination_search': search, 'reference_object': target, 'relation': 'in'}
             raise error
+        from backend.app.skills import placement_accuracy
+        requirement = placement_accuracy.required_accuracy(self.env, obj, target, 'in')
+        allow = requirement.get('required_m')
         self._align_for_placement(arm, obj)
         travel = desired_object.copy()
         travel[2] = 1.14
         self._carry_to(arm, obj, travel)
-        placed = self._carry_to(arm, obj, desired_object)
-        return {**placed, 'destination_search': search}
+        placed = self._carry_to(arm, obj, desired_object, allow_error_m=allow)
+        return {**placed, 'destination_search': search, 'placement_requirement': requirement}
 
     def _align_for_placement(self, arm: str, obj: str, rotation=None) -> None:
         """Rotate the held object's grasp to the placement attitude while it is still clear.
@@ -688,8 +691,10 @@ class SkillRunner:
                 # attempt, so the preparation's measurement must survive it as well.
                 if prepared_attitude is not None:
                     self._align_for_placement(arm, obj, rotation=prepared_attitude)
+                from backend.app.skills import placement_accuracy as _accuracy
+                _allow = _accuracy.required_accuracy(self.env, obj, target, relation).get('required_m')
                 self._carry_to(arm, obj, travel, exclude_target=target)
-                placed = self._carry_to(arm, obj, desired, exclude_target=target)
+                placed = self._carry_to(arm, obj, desired, exclude_target=target, allow_error_m=_allow)
             except SkillError as error:
                 # Keep what the preparation step measured. A placement that fails later must not hide
                 # whether the support regrasp happened (measured 2026-11-07: it did, and the report lost it).
@@ -751,8 +756,12 @@ class SkillRunner:
         return path, np.asarray(env.arm_kinematics(arm).evaluate(seed)[1], float)
 
     def _carry_to(self, arm: str, obj: str, desired: np.ndarray, *, attitude: str = "pinned",
-                  exclude_target: str | None = None) -> dict:
+                  exclude_target: str | None = None, allow_error_m: float | None = None) -> dict:
         """Carry the held object to a pose. ``attitude="free"`` lets the arm choose its orientation.
+
+        `allow_error_m` is how far off the target this *task* tolerates, from the region the object is landing
+        in (`placement_accuracy`). Without it the carry's own 8 mm and the controller's 12 mm decide, which
+        measured 2026-11-09 refused placements whose 27 mm shortfall still landed inside a 35 mm zone.
 
         A six-joint arm carries the attitude its pinch was validated in, and that is the default. An arm
         whose pinch frame is only achievable near the object cannot carry it any higher while keeping
@@ -810,6 +819,13 @@ class SkillRunner:
                     via=via if attempt == 0 else None, on_sample=guard_carry)
             guard_carry()
             if not result.success:
+                # A controller refusal is measured against the *task's* requirement before it fails the task:
+                # the arm landing 27 mm short inside a 35 mm zone is a placement, not a failure.
+                achieved = float(np.linalg.norm(self.env.object_pose(obj)[0] - np.asarray(desired, float)))
+                if allow_error_m is not None and achieved <= allow_error_m:
+                    return {"object": obj, "target": np.asarray(desired).tolist(),
+                            "position": self.env.object_pose(obj)[0].tolist(), "position_error": achieved,
+                            "accepted_within_task_tolerance_m": float(allow_error_m)}
                 # The controller's own solve failing is what the planner-solved path is for: without this
                 # the fallback sits behind a raise that never lets it run (measured: the residuals were
                 # bit-identical with and without the plan, which is how the dead path was found).
@@ -817,6 +833,8 @@ class SkillRunner:
                     continue
                 error = SkillError(result.error or "IK_FAILURE", f"Cannot carry {obj} to {np.round(desired, 4).tolist()} (EE {np.round(target, 4).tolist()}, position residual {result.position_error}, rotation residual {result.rotation_error})")
                 error.evidence = self._motion_evidence(result, object=obj, phase='carry')
+                error.evidence = {**error.evidence, 'achieved_offset_m': achieved,
+                                  **({'task_tolerance_m': allow_error_m} if allow_error_m is not None else {})}
                 raise error
             self._require_hold(arm, obj)
             actual = self.env.object_pose(obj)[0]
@@ -825,8 +843,11 @@ class SkillRunner:
             # placement feasibility question is judged against it.
             from backend.app.skills import motion_accuracy
             motion_accuracy.record(arm, error, source='carry')
-            if error <= .008:
-                return {"object": obj, "target": np.asarray(desired).tolist(), "position": actual.tolist(), "position_error": error}
+            if error <= max(.008, allow_error_m or 0.):
+                return {"object": obj, "target": np.asarray(desired).tolist(), "position": actual.tolist(),
+                        "position_error": error,
+                        **({'accepted_within_task_tolerance_m': float(allow_error_m)}
+                           if allow_error_m is not None and error > .008 else {})}
             target += np.asarray(desired) - actual
         raise SkillError("GRASP_SLIP", f"{obj} deviated from carry target by {error * 1000:.1f} mm")
 
