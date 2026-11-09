@@ -596,6 +596,7 @@ class SkillRunner:
             regrasp = None
             strategy = None
             planner_yaw = None
+            prepared_attitude = None
             is_held_stationary = (self._pinch_established(target, other_arm)
                                   and self.env.object_linear_speed(target) < .02)
             if not is_held_stationary:
@@ -652,11 +653,15 @@ class SkillRunner:
                 staged_support = self.env.object_pose(target)[0]
                 attitude = (attitude_for_yaw(planner_yaw) if planner_yaw is not None
                             else self._stacking_attitude(arm, obj, other_arm, staged_support))
-                self._align_for_placement(arm, obj, rotation=attitude)
+                prepared_attitude = attitude
             desired = relative_destination(self.env, obj, target, relation, arm, distance_cm)
             travel = desired.copy()
             travel[2] = min(1.15, desired[2] + .02 if is_held_stationary else max(1.14, desired[2] + .035))
             try:
+                # Reorienting the grasp belongs to the same placement: a failure there is part of this
+                # attempt, so the preparation's measurement must survive it as well.
+                if prepared_attitude is not None:
+                    self._align_for_placement(arm, obj, rotation=prepared_attitude)
                 self._carry_to(arm, obj, travel, exclude_target=target)
                 placed = self._carry_to(arm, obj, desired, exclude_target=target)
             except SkillError as error:

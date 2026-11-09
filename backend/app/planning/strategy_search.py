@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from backend.app.planning.angle_search import refine
 from backend.app.planning.capability_queries import (ATTITUDE_YAWS_DEG, pad_blocks_support_face,
                                                     pinch_point, reachable)
 from backend.app.simulation.openarm_v2.definition import FINGERTIP_MIDPOINT
@@ -23,6 +24,30 @@ from backend.app.simulation.openarm_v2.definition import FINGERTIP_MIDPOINT
 STAGING_POSITIONS = ((0.45, 0.04, 1.06), (0.45, 0.0, 1.06), (0.45, -0.04, 1.06))
 #: Support heights worth testing: the holder's arm must reach the staging point without the table.
 STAGING_HEIGHTS = (1.06, 1.10)
+
+
+def _reach_margin(env, controller, arm, staging, yaw):
+    """How much margin this arm has at a staging pose, and the pose asked about (or None if unmeasured)."""
+    target = pinch_point(arm, np.asarray(staging, float), yaw)
+    answer = reachable(env, controller, arm, target, yaw)
+    if answer.get('ok') is None or answer.get('position_error_m') is None:
+        return None, target
+    return -float(answer['position_error_m']), target
+
+
+def _pair_margin(env, controller, holder_arm, placer_arm, staging, yaw, half_height):
+    """The worse of the two arms' margins at one candidate staging point: the one that has to hold."""
+    holder, _ = _reach_margin(env, controller, holder_arm, staging, 0.)
+    placer, _ = _reach_margin(env, controller, placer_arm,
+                              np.asarray(staging, float) + np.array([0., 0., half_height]), yaw)
+    if holder is None or placer is None:
+        return None
+    return min(holder, placer)
+
+
+def _placer_margin_at(env, controller, placer_arm, top, yaw):
+    margin, _ = _reach_margin(env, controller, placer_arm, top, yaw)
+    return margin
 
 
 def plan_stack_on_held_support(env, controller, placer_arm: str, support: str) -> dict:
@@ -66,6 +91,30 @@ def plan_stack_on_held_support(env, controller, placer_arm: str, support: str) -
             evaluations.append({'query': 'reachable_pose', 'arm': placer_arm,
                                 'staging': staging.tolist(), **placer_reach})
             if placer_reach.get('ok') is True:
+                # The listed staging points and quarter turns only decide *where to look*. The final
+                # staging offset and yaw are then derived by measuring: the score is the margin the two
+                # arms have at that pose (the worse of the two IK residuals, negated), so a nearby angle
+                # or offset that both arms reach better is found instead of refused.
+                held_margin, holder_at = _reach_margin(env, controller, holder_arm, staging, 0.)
+                placer_margin, placer_at = _reach_margin(
+                    env, controller, placer_arm, staging + np.array([0., 0., half_height]), yaw)
+                if held_margin is not None and placer_margin is not None:
+                    refined_y = refine(
+                        lambda dy: _pair_margin(env, controller, holder_arm, placer_arm,
+                                                np.array([staging[0], staging[1] + dy, staging[2]]),
+                                                yaw, half_height),
+                        float(staging[1]), 0.02, step=0.01)
+                    if refined_y['best_value'] is not None and refined_y['best_score'] is not None:
+                        staging = np.array([staging[0], refined_y['best_value'], staging[2]])
+                        evaluations.append({'query': 'refine_staging_y', **refined_y})
+                    refined_yaw = refine(
+                        lambda dyaw: _placer_margin_at(
+                            env, controller, placer_arm, staging + np.array([0., 0., half_height]),
+                            yaw + dyaw),
+                        float(yaw), 20., step=5.)
+                    if refined_yaw['best_value'] is not None and refined_yaw['best_score'] is not None:
+                        yaw = refined_yaw['best_value']
+                        evaluations.append({'query': 'refine_placer_yaw', **refined_yaw})
                 return {'ok': True, 'staging': staging.tolist(), 'placer_yaw_deg': yaw,
                         'holder_arm': holder_arm, 'evaluations': evaluations}
 

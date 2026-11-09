@@ -48,8 +48,11 @@ def test_the_search_prefers_a_staging_point_on_the_placing_arms_side(monkeypatch
     monkeypatch.setattr(strategy_search, 'pad_blocks_support_face', lambda *a, **k: {'blocks': False})
     result = plan_stack_on_held_support(_env(), _controller(), 'left', 'support')
     assert result['ok'] is True
-    assert result['staging'][1] > 0, 'a left-hand placement stages on the left side of the table'
-    assert result['placer_yaw_deg'] in strategy_search.ATTITUDE_YAWS_DEG
+    assert result['staging'][1] > 0.005, 'a left-hand placement stages on the left side of the table'
+    # The listed quarter turns only seed the search; the angle actually used is the one the measurement
+    # preferred, and that derivation is recorded.
+    assert any(item['query'] == 'refine_placer_yaw' for item in result['evaluations'])
+    assert isinstance(result['placer_yaw_deg'], float)
 
 
 def test_a_scene_where_the_placing_arm_cannot_reach_refuses_with_the_measurements(monkeypatch):
