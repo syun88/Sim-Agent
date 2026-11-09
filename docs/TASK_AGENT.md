@@ -238,6 +238,28 @@ yaw は測定した側でしか成立しなかった。定数を規則の代わ�
 準備の理由と対象は `planning_evidence.preparations`、元の要求は `requested_program` に残る。
 一時置きの候補は物体寸法と既知の位置から選ぶ。連続軌道の可否や実把持は実行時に別途検査する。
 
+## ヘッドレス運用（2026-11-09）
+
+`GENESIS_SHOW_VIEWER=0` で起動すると、ネイティブの Genesis ウィンドウを開かずに同じ所有者として動く。
+API と Web UI（`/simple`）はそのまま使え、`/api/scene` の状態・計画・実行トレース・検証結果は
+ウィンドウ無しでも取得できる（3D 表示だけが無い）。
+
+実測（このホスト）:
+
+- ヘッドレス起動は **約35秒**で `viewer_online: true`（`Ready: local_ollama; arm motion 6x`）
+- 指示「赤いキューブを左手で左において」→ **SUCCEEDED**、`placement red_cube` / `undisturbed blue_cube` とも真、
+  赤は `[0.46, 0.299, 1.031]`
+- `GET /simple` は 200 で配信される（ブラウザからは従来どおり操作可能）
+
+一方、**ネイティブウィンドウ付き起動は同じ位置で停止する**（プロセス生存・RSS 2.4GB・VRAM 1.04GB 確保後、
+全スレッド futex 待ち・CPU 0・`viewer_starting: true` のまま）。切り分け:
+
+- `import genesis` 3.3 s、`gs.init` 1.1 s、`create_backend()` 31.7 s、`env.step(10)` 成功 → **エンジンは健全**
+- したがって停止は**表示（EGL/Xwayland）経路**にある。発生は 4時間の実行上限で GUI が SIGTERM された直後から
+- 復旧には Xwayland / デスクトップセッションの再起動が必要（ユーザー操作の領域）
+
+ウィンドウ無しでも計画・実行・検証・記録はすべて動くので、表示が要らない作業はこの形で続けられる。
+
 ## モデル比較と学習の判定（2026-11-07 実測）
 
 `scripts/compare_planners.py` で、同じ12ケースの指示バッテリー（今日失敗した種類を含む）を
