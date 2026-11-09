@@ -83,6 +83,12 @@ def clearances_blocks(clearance_m: float) -> bool:
 
 #: A regrasp must not walk the object sideways; this is the tolerated lateral shift (m).
 SUPPORT_REGRASP_SHIFT_TOLERANCE = 0.010
+#: How fast the approach transit is driven, as a fraction of the nominal trajectory speed. The trajectory's
+#: speed and the servo's response are separate levers and only this one helps: at the default speed 6 a pad
+#: entered the cube by 0.74-1.54 mm during the transit on the two measured layouts, while the same route at
+#: 0.5 with the servo response unchanged cleared both with 10.18 and 15.01 mm of room (measured 2026-10-28).
+#: Softening the servo instead deepens the penetration, because a softer servo lags further behind.
+APPROACH_TRAJECTORY_SPEED = 0.5
 #: The approach may not displace the object by more than this (m); the object is only pinched
 #: after this check, so a shove here would fake nothing anyway, but the plan still fails loudly.
 APPROACH_DISTURBANCE_TOLERANCE = 0.005
@@ -273,6 +279,9 @@ class SkillRunner:
                                                   progress=progress, via=via,
                                                   planned_joints=route if approach_evidence else None,
                                                   scale_speed=not approach_evidence or approach_evidence['grasp_yaw_deg']==0,
+                                                  # The transit is where a trailing pad reaches the cube; drive it
+                                                  # slowly while the servo keeps the response it was configured with.
+                                                  trajectory_speed=APPROACH_TRAJECTORY_SPEED if approach_evidence else None,
                                                   on_sample=guard_undisturbed)
             guard_undisturbed()
             if not result.success:

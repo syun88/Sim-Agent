@@ -178,6 +178,7 @@ class OpenArmV2Controller:
         via_rotations: list[np.ndarray] | None = None,
         on_sample: Callable[[], None] | None = None,
         planned_joints: list[np.ndarray] | None = None,
+        trajectory_speed: float | None = None,
     ) -> MotionResult:
         if rotation is None:
             # The official cell's grasp frame. An imported robot's own attitude is passed in explicitly by
@@ -185,6 +186,17 @@ class OpenArmV2Controller:
             # here: measured 2026-10-25, changing this default broke the official handover, whose right
             # arm is mirrored and depends on exactly this constant.
             rotation = GRASP_ROTATION.copy()
+        # The trajectory's speed and the servo's response are different questions. Coupling them was
+        # measured to be the wrong knob: capping the response deepens the penetration the approach allows
+        # (1.54 mm to 3.76 mm), while driving the same route at half speed with the response left as
+        # configured cleared both measured layouts with 10.18 and 15.01 mm of room (2026-10-28).
+        # `trajectory_speed` therefore replaces only the duration's divisor.
+        call_speed = self.motion_speed if scale_speed else 1.
+        if trajectory_speed is not None:
+            speed = float(trajectory_speed)
+            if not np.isfinite(speed) or speed <= 0:
+                raise ValueError('trajectory_speed must be a positive number')
+            call_speed = speed
         self.env.configure_motion_response(self.motion_speed if scale_speed else 1.)
         joint_waypoints = [self.env.arm_qpos(side)]
         q, pos_err = None, float("inf")
@@ -243,7 +255,7 @@ class OpenArmV2Controller:
                 else:
                     nominal_duration = sum(.56 + max(14, int(np.linalg.norm(b - a) / .005)) * self.timestep
                                            for a, b in zip(joint_waypoints, joint_waypoints[1:]))
-            trajectory_duration = nominal_duration / (self.motion_speed if scale_speed else 1.)
+            trajectory_duration = nominal_duration / call_speed
             curve = derivative = None
             if curved_path:
                 curve = joint_spline(joint_waypoints,velocity_limits)
@@ -264,7 +276,7 @@ class OpenArmV2Controller:
                 # The locally timed profile enforces motor limits too. Retain
                 # the caller's nominal pacing; remove the global worst-corner
                 # bound which would slow every other part of the motion.
-                trajectory_duration=max(nominal_duration/(self.motion_speed if scale_speed else 1.),timing.duration)
+                trajectory_duration=max(nominal_duration/call_speed,timing.duration)
             result = MotionResult(True)
             steps = max(2, int(np.ceil(trajectory_duration / self.timestep)))
             trajectory_duration = steps * self.timestep
