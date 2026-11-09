@@ -46,19 +46,26 @@
   測定値（クリアランス、残差、regrasp 緩め量、会議点）を1レコードに。身体の別を `body` で持つ。
 - 受け入れ: 同じスキーマで Genesis と実機のエピソードを混ぜて学習側に渡せる。
 
-## 見つけた不具合（未修正・2026-11-09 ライブ実測）
+## 直した不具合: 目標がすでに成立しているとき（2026-11-09）
 
-指示「青いキューブを右手で緑のゾーンに置いて」→ **FAILED: CONTRACT_VIOLATION: plan manipulates an
-unrequested object**。
+指示「青いキューブを右手で緑のゾーンに置いて」→ **FAILED: CONTRACT_VIOLATION**。原因は
+`green_zone [0.48,-0.20]` と `blue_cube [0.5,-0.22]` が 2.8 cm（ゾーン半径 5.5 cm）で**すでに達成**で、
+プランナが目標種別を `already_at_target` に書き換え、`return_home` だけの計画にしていたこと。
+その結果 `allowed_object_motion` が空で凍結され、次に同じ物体へ触る計画が「要求されていない物体を
+操作」として拒否された。加えて、`return_home` 自体が失敗すると**何もする必要がないタスクが失敗**した。
 
-原因は計画側で、`green_zone` が `[0.48, -0.20]`、`blue_cube` が `[0.5, -0.22]` にあり
-（距離 2.8 cm、ゾーン半径 5.5 cm）、**すでに目標を満たしている**。プランナは `already_at_target` を返し
-`return_home` だけの計画を作るが、契約チェックはそれを「要求された最終条件の欠落／対象外の操作」として
-拒否する。つまり「もう終わっている」を成功として扱う経路が無い。
+修正:
 
-直し方（案）: 目標が既に成立している場合は、計画を no-op として成功にし、証拠に
-`already_satisfied` と判定根拠（位置・ゾーン半径）を残す。**契約チェックは緩めない**（他の経路の
-取りこぼしを防いでいるため）。再現条件は上記の座標と指示だけで決まる。
+1. 目標種別は `place_in_zone` のまま（目標は*条件*であって状態ではない）、`already_satisfied: true` と
+   判定根拠（距離・高さ差・許容値・座標・保持者）を残す。
+2. 計画は**空**（`steps: []`）。ホーム復帰は要求に含まれないので、失敗してよい筋の動作を足さない。
+3. `validate_plan` は「空の計画」を `already_satisfied` の placement に限って許可。
+4. `TaskContract.freeze` の `allowed_object_motion` に**目標そのものの物体**を含める（要求は
+   その物体についての要求なので、今回の試行に手順が無くても要求されている）。
+
+検証: `test_command_planner.py`（空計画・種別・根拠・契約の許可集合）と、ライブ実測
+（SUCCEEDED、`steps: []`、`already_satisfied: true`、`placement blue_cube: true` / `undisturbed
+red_cube: true`）。契約チェックは緩めていない。
 
 ## やらないこと
 
