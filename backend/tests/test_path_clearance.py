@@ -48,3 +48,12 @@ def test_a_scene_without_movable_objects_is_unknown_not_clear():
     env, controller, objects = _case()
     kin = env.arm_kinematics('left')
     assert kin.path_minimum_clearance([env.arm_qpos('left'), env.home_arm_qpos('left')], {}) is None
+
+
+def test_the_refinement_trace_can_be_returned_by_the_api():
+    """A task failed once because this trace held dataclasses: the evidence has to serialise."""
+    import json
+    from backend.app.planning.angle_search import refine
+
+    trace = refine(lambda value: -abs(value - 3.), 0., 6., step=2.)
+    assert json.loads(json.dumps(trace))['best_value'] == trace['best_value']

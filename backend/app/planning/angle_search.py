@@ -14,17 +14,13 @@ good was it" is evidence a reader can check.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 #: How many measurements one refinement pass may spend, on top of the coarse scan.
 DEFAULT_REFINEMENT_STEPS = 5
 
 
-@dataclass(frozen=True)
-class Sample:
-    value: float
-    score: float | None
-    note: str | None = None
+def _sample(value: float, score: float | None) -> dict:
+    """Plain data: these traces are returned from the API, so they must serialise as they are."""
+    return {'value': float(value), 'score': None if score is None else float(score)}
 
 
 def refine(objective, start: float, span: float, *, step: float,
@@ -36,15 +32,15 @@ def refine(objective, start: float, span: float, *, step: float,
     """
     if step <= 0 or span <= 0:
         raise ValueError('span and step must be positive')
-    evaluations: list[Sample] = []
-    best: Sample | None = None
+    evaluations: list[dict] = []
+    best: dict | None = None
 
     def measure(value: float) -> None:
         nonlocal best
         score = objective(float(value))
-        sample = Sample(float(value), None if score is None else float(score))
+        sample = _sample(value, score)
         evaluations.append(sample)
-        if sample.score is not None and (best is None or sample.score > best.score):
+        if sample['score'] is not None and (best is None or sample['score'] > best['score']):
             best = sample
 
     steps = max(1, int(round(span / step)))
@@ -58,11 +54,11 @@ def refine(objective, start: float, span: float, *, step: float,
         if local_span < minimum_step:
             break
         for offset in (-local_span, local_span):
-            measure(best.value + offset)
-    return {'best_value': None if best is None else best.value,
-            'best_score': None if best is None else best.score,
+            measure(best['value'] + offset)
+    return {'best_value': None if best is None else best['value'],
+            'best_score': None if best is None else best['score'],
             'started_at': float(start), 'evaluations': evaluations,
-            'measured': sum(1 for sample in evaluations if sample.score is not None)}
+            'measured': sum(1 for sample in evaluations if sample['score'] is not None)}
 
 
 def best_of(objective, values):
