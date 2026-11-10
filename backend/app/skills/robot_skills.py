@@ -539,7 +539,8 @@ class SkillRunner:
         travel = desired_object.copy()
         travel[2] = 1.14
         self._carry_to(arm, obj, travel)
-        placed = self._carry_to(arm, obj, desired_object, allow_error_m=allow)
+        placed = self._carry_to(arm, obj, desired_object, allow_error_m=allow,
+                                q_init=search.get('chosen_joints'))
         return {**placed, 'destination_search': search, 'placement_requirement': requirement}
 
     def _align_for_placement(self, arm: str, obj: str, rotation=None) -> None:
@@ -698,7 +699,8 @@ class SkillRunner:
                 from backend.app.skills import placement_accuracy as _accuracy
                 _allow = _accuracy.required_accuracy(self.env, obj, target, relation).get('required_m')
                 self._carry_to(arm, obj, travel, exclude_target=target)
-                placed = self._carry_to(arm, obj, desired, exclude_target=target, allow_error_m=_allow)
+                placed = self._carry_to(arm, obj, desired, exclude_target=target, allow_error_m=_allow,
+                                        q_init=destination_search.get('chosen_joints'))
             except SkillError as error:
                 # Keep what the preparation step measured. A placement that fails later must not hide
                 # whether the support regrasp happened (measured 2026-11-07: it did, and the report lost it).
@@ -776,7 +778,8 @@ class SkillRunner:
         return path, np.asarray(env.arm_kinematics(arm).evaluate(seed)[1], float)
 
     def _carry_to(self, arm: str, obj: str, desired: np.ndarray, *, attitude: str = "pinned",
-                  exclude_target: str | None = None, allow_error_m: float | None = None) -> dict:
+                  exclude_target: str | None = None, allow_error_m: float | None = None,
+                  q_init=None) -> dict:
         """Carry the held object to a pose. ``attitude="free"`` lets the arm choose its orientation.
 
         `allow_error_m` is how far off the target this *task* tolerates, from the region the object is landing
@@ -846,8 +849,12 @@ class SkillRunner:
                 result = self.controller.move_to_site(arm, target, planned[1], planned_joints=planned[0],
                                                       on_sample=guard_carry)
             else:
+                # The configuration the destination search already accepted is the seed for the motion's own
+                # IK. Measured 2026-11-09: without it the motion re-solved from the current pose and landed on
+                # a different local solution 27 mm short of the same aim the probe had solved to 2 mm.
                 result = self.controller.move_to_site(arm, target, commanded_rotation,
-                    via=via if attempt == 0 else None, on_sample=guard_carry)
+                    via=via if attempt == 0 else None,
+                    on_sample=guard_carry, **({'q_init': q_init} if q_init is not None else {}))
             guard_carry()
             if not result.success:
                 # A controller refusal is measured against the *task's* requirement before it fails the task:
@@ -1021,6 +1028,8 @@ class SkillRunner:
                 return None
             return float(np.min(np.minimum(q - limits[:, 0], limits[:, 1] - q)))
 
+        solutions = {}
+
         def probe(point):
             """Both halves of "can the arm hold this pose": IK residual and room left in the joints."""
             aim, rotation, _offset = self._carry_aim(arm, obj, np.asarray(point, float))
@@ -1030,6 +1039,7 @@ class SkillRunner:
                 return None, None
             if solution is None or error is None:
                 return None, None
+            solutions[tuple(np.round(np.asarray(point, float), 6))] = np.asarray(solution, float)
             return -float(error), limit_margin_rad(solution)
 
         def usable(point):
@@ -1049,6 +1059,8 @@ class SkillRunner:
         _requested_value, _requested_limit = probe(requested)
         search['considered'].append({'offset': [0., 0.], 'margin_m': best_margin,
                                      'joint_limit_margin_rad': _requested_limit})
+        chosen_joints = solutions.get(tuple(np.round(best_point, 6)))
+        search['chosen_joints'] = None if chosen_joints is None else chosen_joints.tolist()
         if best_margin is not None:
             from backend.app.skills import placement_accuracy
             # How precisely this placement has to land, measured from the region it lands on: a zone has

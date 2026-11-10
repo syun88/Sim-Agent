@@ -1,4 +1,6 @@
 """A placement the arm cannot reach inside the requested region: find a reachable point, or refuse."""
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -167,3 +169,32 @@ def test_a_destination_with_room_left_in_the_joints_is_commandable():
     _desired, search = skills._reachable_destination('red_cube', 'blue_zone', 'on', 'left')
     assert search['considered'][0]['joint_limit_margin_rad'] == pytest.approx(2.5)
     assert search['chosen'] == 'requested'
+
+
+def test_the_configuration_the_search_accepted_is_what_the_carry_starts_from():
+    """Measured 2026-11-09: without seeding, the motion re-solved to a local solution 27 mm short."""
+    skills = _runner(lambda distance: True)
+    accepted = np.array([0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
+    skills.controller.solve_ik = staticmethod(
+        lambda arm, target, rotation, **kwargs: (accepted.copy(), 0.001, 0.0))
+    _desired, search = skills._reachable_destination('red_cube', 'blue_zone', 'on', 'left')
+    assert search['chosen_joints'] == pytest.approx(accepted.tolist())
+
+    seen = {}
+    carried = {'object': SUPPORT.copy()}
+
+    def move(arm, target, rotation, **kwargs):
+        seen['q_init'] = kwargs.get('q_init')
+        # The carried object ends up where the carry aimed, so the placement itself can be judged.
+        offset = OFFSET.copy()
+        carried['object'] = np.asarray(target, float) + offset
+        return SimpleNamespace(success=True, error=None, position_error=0.0, rotation_error=0.)
+
+    skills.controller.move_to_site = move
+    skills.controller.motion_speed = 6.
+    skills.env.object_pose = lambda name: (carried['object'].copy(), np.eye(3))
+    skills.env.frame = lambda: type('F', (), {'objects': {'red_cube': carried['object'].copy()}, 'zones': {}})()
+    skills._require_hold = lambda *a, **k: None
+    target_point = np.asarray(search.get('chosen_point') or search['requested'], float)
+    skills._carry_to('left', 'red_cube', target_point, q_init=search['chosen_joints'])
+    assert seen['q_init'] == pytest.approx(accepted.tolist())
