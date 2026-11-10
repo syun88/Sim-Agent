@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 BATTERY = ('青いキューブを右手で青いゾーンに置いて',
            '赤いキューブを拾って青いゾーンに置いて',
            '青いキューブを赤いキューブの上に置いて',
@@ -33,8 +35,9 @@ def main(argv=None):
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    flags = {name: os.environ.get(f'OPENARM_MEASURE_{name.upper()}', '1')
-             for name in ('approach_margin', 'destination_search', 'arm_preflight', 'home_margin')}
+    # The effective state, read from the same module the cell uses, so the label cannot disagree with the run.
+    from backend.app.planning.measurement_flags import describe
+    flags = describe()
     print(f'[{args.label}] flags={flags}', flush=True)
     for seed in [value.strip() for value in args.seeds.split(',') if value.strip()]:
         for instruction in BATTERY:
