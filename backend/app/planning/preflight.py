@@ -115,8 +115,13 @@ def run_preflight(env, controller, plan) -> dict:
         return {'available': False, 'reason': 'no environment or controller to query',
                 'questions': len(questions), 'arms': []}
     arms = arm_feasibility(env, controller, actions)
+    try:
+        from backend.app.planning.capability_queries import zone_reachability
+        zones = zone_reachability(env, controller)
+    except Exception as error:
+        zones = {'error': f'{type(error).__name__}: {error}'}
     if not questions:
-        return {'available': True, 'questions': [], 'arms': arms,
+        return {'available': True, 'questions': [], 'arms': arms, 'zones': zones,
                 'note': 'no relative placement to query'}
 
     answers = []
@@ -147,4 +152,4 @@ def run_preflight(env, controller, plan) -> dict:
             row['reachable_yaws'] = None
             row['reach_error'] = f'{type(error).__name__}: {error}'
         answers.append({key: _finite(value) for key, value in row.items()})
-    return {'available': True, 'questions': answers, 'arms': arms}
+    return {'available': True, 'questions': answers, 'arms': arms, 'zones': zones}

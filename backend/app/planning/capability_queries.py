@@ -178,3 +178,41 @@ def approach_feasible(env, controller, arm: str, obj: str) -> dict:
         return {'feasible': None, 'unknown': f'{type(error).__name__}: {error}'}
     except Exception as error:
         return {'feasible': None, 'unknown': f'{type(error).__name__}: {error}'}
+
+
+def zone_reachability(env, controller, *, arms=('left', 'right')) -> dict:
+    """Whether each zone is within an arm's reach at all - the question a layout has to answer before it is used.
+
+    Measured 2026-11-09: of 8 tasks on two fixed layouts, 4 failed and 2 of those were `DESTINATION_UNREACHABLE`
+    - the zone could not be reached by the arm holding the cube from any posture. Nothing in the reset checked
+    that, so the layout was handed to a task it could not satisfy.
+    """
+    found = {}
+    try:
+        zones = list((getattr(env.frame(), 'zones', {}) or {}))
+    except Exception:
+        return found
+    for zone in zones:
+        try:
+            centre = np.asarray(env.zone_position(zone), float)
+        except Exception:
+            continue
+        for arm in arms:
+            postures = canonical_postures(env, arm)
+            best, asked = None, 0
+            for posture in postures:
+                for yaw in ATTITUDE_YAWS_DEG:
+                    target = pinch_point(arm, centre, yaw)
+                    try:
+                        solution, error, _ = controller.solve_ik(arm, target, attitude(yaw), q_init=posture)
+                    except Exception:
+                        continue
+                    if error is None:
+                        continue
+                    asked += 1
+                    if solution is not None and (best is None or error < best):
+                        best = float(error)
+            found.setdefault(zone, {})[arm] = {
+                'reachable': None if not asked else bool(best is not None and best <= .012),
+                'best_residual_m': best, 'asked': asked}
+    return found
