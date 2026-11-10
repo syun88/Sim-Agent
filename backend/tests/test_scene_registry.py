@@ -30,10 +30,13 @@ def test_only_scenes_that_have_actually_been_built_are_offered():
     and did not finish in fifteen minutes, so it stays unselectable until it is built once."""
     listed = {entry['id']: entry for entry in scenes.describe()}
     assert listed['cubes']['selectable'] is True
-    assert listed['mixed']['selectable'] is True and scenes.sdf('mixed') == {'cell_mm': 1.0, 'min_res': 64, 'max_res': 160}
-    assert listed['wine']['selectable'] is False
-    assert 'SDF' in listed['wine']['note']
-    assert scenes.is_selectable('wine') is False
+    coarse = {'cell_mm': 1.0, 'min_res': 64, 'max_res': 160}
+    assert listed['mixed']['selectable'] is True and scenes.sdf('mixed') == coarse
+    assert listed['wine']['selectable'] is True and scenes.sdf('wine') == coarse
+    assert listed['wine']['warnings'] and 'POUR_SPILL' in listed['wine']['warnings'][0], \
+        'a scene whose task measurably fails says so on the label'
+    assert 'slower' in listed['mixed']['warnings'][0]
+    # A scene still has to be built once before it is offered; forcing is for measuring that build.
     assert scenes.is_selectable('wine', force=True) is True
 
 

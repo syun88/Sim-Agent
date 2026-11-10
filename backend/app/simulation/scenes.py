@@ -28,11 +28,18 @@ SCENES: dict[str, dict] = {
         'zones': [],
         'needs': ['wine'],
         'fluid': True,
-        # Measured 2026-11-10: building this scene stops in Genesis' mesh-to-SDF conversion
-        # (`rigid_geom._compute_sd` -> `T_mesh_to_sdf`) and had not finished after ten minutes at ~350% CPU.
-        # The wine world was never built in this session, so the earlier "verified" was an assumption.
-        'verified': False,
-        'note': 'build stalls in Genesis mesh-to-SDF conversion; not yet built on this host',
+        # The same coupling-SDF decision as `mixed`: at the official 0.4 mm / 512^3 the build had not finished
+        # in fifteen minutes; at 1.0 mm / 160 it builds in 22.8 s with 3600 particles and 45 mL in the bottle
+        # (measured 2026-11-10). Coarser coupling is the price, and whether it costs pour accuracy is the next
+        # measurement - this note says what has been established, not what is hoped.
+        'sdf': {'cell_mm': 1.0, 'min_res': 64, 'max_res': 160},
+        'verified': True,
+        # Measured 2026-11-10 on this scene: the approach and grasp succeed, then pouring fails with
+        # POUR_SPILL - bottle 45 -> 40.4 mL, glass 3.1 mL, about 1.5 mL spilled. The official 0.4 mm coupling
+        # cannot be built here (it stalls), so this is not yet comparable: the coarse SDF is usable for the
+        # scene, and not yet shown to be usable for the pour.
+        'note': 'builds in ~23 s at 1.0 mm coupling SDF (official 0.4 mm stalls)',
+        'warnings': ['pour measured POUR_SPILL at 1.0 mm coupling: glass 3.1 mL, ~1.5 mL spilled of 45 mL'],
     },
     'mixed': {
         'description': 'Cubes, a bottle and a glass together: pour and stack in one scene.',
@@ -49,7 +56,8 @@ SCENES: dict[str, dict] = {
         # single cube placement had not finished after ten minutes here and takes about twelve seconds in
         # `cubes`. The scene is offered with that warning rather than hidden, because pour-while-stacking is
         # exactly what it is for - and a person should decide whether that cost is worth it.
-        'note': 'builds in ~222 s at 1.0 mm coupling SDF; manipulation is ~50x slower than cubes (WINE_DT)',
+        'note': 'builds in ~222 s at 1.0 mm coupling SDF',
+        'warnings': ['manipulation is ~50x slower than cubes (WINE_DT): a cube placement took over ten minutes'],
     },
 }
 
@@ -94,6 +102,7 @@ def describe(active: str | None = None) -> list[dict]:
     return [{'id': profile, 'description': entry['description'], 'objects': list(entry['objects']),
              'zones': list(entry['zones']), 'fluid': bool(entry['fluid']),
              'verified': bool(entry.get('verified')), 'note': entry.get('note'),
+             'warnings': list(entry.get('warnings') or []),
              'selectable': bool(entry.get('verified')),
              'active': profile == active}
             for profile, entry in SCENES.items()]

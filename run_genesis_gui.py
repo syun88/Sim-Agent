@@ -38,7 +38,8 @@ def main() -> None:
     parser.add_argument('--headless', action='store_true', help='Same real physics/executor without a native window')
     parser.add_argument('--once', action='store_true', help='Exit after executing one command (integration verification)')
     parser.add_argument('--backend-url', default=BACKEND_URL)
-    parser.add_argument('--scene', choices=['cubes', 'wine'], default='cubes', help='Initial Genesis scene')
+    parser.add_argument('--scene', choices=['cubes', 'wine', 'mixed'], default=None,
+                        help='Initial Genesis scene (defaults to OPENARM_SCENE, then cubes)')
     parser.add_argument('--robot', help='Imported robot ID; default is the saved selection or OpenArm')
     args = parser.parse_args()
     acquire_genesis_owner()
@@ -63,7 +64,8 @@ def main() -> None:
         os.environ.setdefault('GENESIS_SHOW_VIEWER', '1')
     robot_id = get_profile(args.robot or selected_robot())['id']
     print(f'Building {robot_id} on Genesis...', flush=True)
-    env = create_backend(args.scene if robot_id == 'openarm_v2' else 'cubes', robot_id=robot_id)
+    initial_scene = args.scene or os.environ.get('OPENARM_SCENE') or 'cubes'
+    env = create_backend(initial_scene if robot_id == 'openarm_v2' else 'cubes', robot_id=robot_id)
     env.step(200)
     # Ask the body itself whether it answers everything the skills will drive it with, and leave the answer
     # where a person or a port can read it. A real arm's backend is validated the same way.
@@ -82,7 +84,7 @@ def main() -> None:
     try:
         from backend.app.simulation import conformance
         problems = conformance.check(env)
-        report = {'robot_id': robot_id, 'scene': args.scene, 'problems': problems,
+        report = {'robot_id': robot_id, 'scene': env.scene_profile, 'problems': problems,
                   'contract_operations': len(conformance.describe())}
         path = os.environ.get('SIM_AGENT_CONFORMANCE_OUT', '/tmp/sim-agent-conformance.json')
         with open(path, 'w') as handle:
