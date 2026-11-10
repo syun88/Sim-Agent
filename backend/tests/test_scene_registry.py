@@ -25,6 +25,16 @@ def test_the_active_scene_is_marked_in_the_listing():
     assert [entry['id'] for entry in listed if entry['active']] == ['mixed']
 
 
+def test_a_scene_that_has_not_been_built_is_not_offered():
+    """Measured 2026-11-10: the mixed scene ran over ten minutes without finishing, so it is not a button."""
+    listed = {entry['id']: entry for entry in scenes.describe()}
+    assert listed['mixed']['verified'] is False and listed['mixed']['selectable'] is False
+    assert listed['mixed']['note']
+    assert listed['cubes']['selectable'] is True
+    assert scenes.is_selectable('mixed') is False
+    assert scenes.is_selectable('mixed', force=True) is True
+
+
 def test_an_unknown_scene_is_refused_by_name():
     with pytest.raises(ValueError, match='Unknown scene profile'):
         scenes.check('kitchen')

@@ -143,13 +143,22 @@ def scene_list():
 
 
 @app.post('/api/scenes/select')
-def scene_select(scene: str):
-    """Ask the simulation owner to rebuild the scene. It refuses while an arm holds something."""
+def scene_select(scene: str, force: bool = False):
+    """Ask the simulation owner to rebuild the scene.
+
+    A scene that has never been built is refused: measured 2026-11-10, the `mixed` scene ran for over ten
+    minutes without finishing, and offering that as a button is a trap. `force=true` overrides it for someone
+    who wants to measure exactly that.
+    """
     from backend.app.simulation import scenes as scene_registry
     try:
         scene_registry.check(scene)
     except ValueError as error:
         raise HTTPException(400, str(error)) from None
+    if not scene_registry.is_selectable(scene, force=force):
+        entry = scene_registry.SCENES[scene]
+        raise HTTPException(409, f'scene {scene!r} is registered but has not been built yet: '
+                                 f'{entry.get("note") or "no build recorded"}')
     record = _enqueue({'action': 'select_scene', 'scene': scene})
     return {'status': 'queued', 'scene': scene, 'task_id': record['task_id']}
 

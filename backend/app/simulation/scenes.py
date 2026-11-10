@@ -20,6 +20,7 @@ SCENES: dict[str, dict] = {
         'zones': ['blue_zone', 'green_zone'],
         'needs': ['cubes'],
         'fluid': False,
+        'verified': True,
     },
     'wine': {
         'description': 'Bottle and glass with a fluid surface: pouring.',
@@ -27,6 +28,7 @@ SCENES: dict[str, dict] = {
         'zones': [],
         'needs': ['wine'],
         'fluid': True,
+        'verified': True,
     },
     'mixed': {
         'description': 'Cubes, a bottle and a glass together: pour and stack in one scene.',
@@ -34,6 +36,10 @@ SCENES: dict[str, dict] = {
         'zones': ['blue_zone', 'green_zone'],
         'needs': ['cubes', 'wine'],
         'fluid': True,
+        # Measured 2026-11-10: building this scene ran for over ten minutes at ~350% CPU without finishing, so
+        # it is not offered. A scene a person can select and then wait forever for is worse than an honest no.
+        'verified': False,
+        'note': 'not buildable yet: the build did not finish in ten minutes on this host',
     },
 }
 
@@ -57,11 +63,20 @@ def has_fluid(profile: str) -> bool:
 
 
 def describe(active: str | None = None) -> list[dict]:
-    """The list a client renders, with the running scene marked."""
+    """The list a client renders: what each scene holds, which is running, and which can actually be built."""
     return [{'id': profile, 'description': entry['description'], 'objects': list(entry['objects']),
              'zones': list(entry['zones']), 'fluid': bool(entry['fluid']),
+             'verified': bool(entry.get('verified')), 'note': entry.get('note'),
+             'selectable': bool(entry.get('verified')),
              'active': profile == active}
             for profile, entry in SCENES.items()]
+
+
+def is_selectable(profile: str, *, force: bool = False) -> bool:
+    """A scene can be selected when it has been built at least once (or when the caller insists)."""
+    if not is_valid(profile):
+        return False
+    return force or bool((SCENES.get(profile) or {}).get('verified'))
 
 
 def check(profile: str) -> str:
