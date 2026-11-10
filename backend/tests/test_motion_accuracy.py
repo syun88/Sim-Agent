@@ -27,12 +27,13 @@ class _Kin:
     def __init__(self, actual_gap):
         self.actual_gap = actual_gap
         self.thresholds = []
-        # Paired with solve_ik: the IK that just "solved" is the pose this arm reports, so a candidate
-        # route is accepted on its own terms and the test is about the clearance threshold, not IK.
+        # A linear joint-to-pose map, so a route can actually be solved through a high waypoint: the test is
+        # about which clearance decides the home target, not about IK.
         self.pose = np.array([0.5, 0.0, 1.2])
 
     def evaluate(self, q):
-        return self.pose.copy(), np.eye(3), None, None
+        q = np.asarray(q, float)
+        return np.array([0.40 + q[0] * 0.1, q[1] * 0.1, 1.00 + q[2] * 0.1]), np.eye(3), None, None
 
     def empty_arm_path_is_clear(self, route, objects, *, minimum_object_clearance=0., **kwargs):
         self.thresholds.append(minimum_object_clearance)
@@ -53,8 +54,9 @@ def _plan(kin):
         frame=lambda: SimpleNamespace(objects={'red_cube': np.array([0.5, 0.0, 1.05])}),
         arm_limits=lambda arm: np.array([[-3., 3.]] * 7))
     def solve_ik(arm, target, rotation, **kwargs):
-        kin.pose = np.asarray(target, float).copy()
-        return np.zeros(7), 0.001, 0.0
+        target = np.asarray(target, float)
+        return np.array([(target[0] - 0.40) / 0.1, target[1] / 0.1, (target[2] - 1.00) / 0.1,
+                         0., 0., 0., 0.]), 0.001, 0.0
     controller = SimpleNamespace(solve_ik=solve_ik, stop_requested=lambda: False)
     return env, controller
 
@@ -68,8 +70,10 @@ def test_a_cube_at_the_old_30mm_margin_no_longer_counts_as_clear_home():
     assert route is not None, evidence
     assert evidence['home_mode'] == 'scene_clearance_home'
     assert evidence['home_clearance_required_m'] > 0.0308
-    # The arm parks above the home frame instead of descending into the cube's neighbourhood.
-    assert 'lift_then_home' in {item['route'] for item in evidence['considered']}
+    # The arm parks above a frame instead of descending into the cube's neighbourhood; which frame is a
+    # measured choice now, so the requirement is that the route ends above rather than in a posture.
+    assert any('park_above' in item['route'] for item in evidence['considered'])
+    assert evidence.get('park_target') is None, 'a park-above route does not claim a posture'
 
 
 def test_a_home_that_is_genuinely_clear_is_still_used():

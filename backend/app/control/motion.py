@@ -76,7 +76,9 @@ class OpenArmV2Controller:
 
     def __init__(self, env: SimulationBackend, *, motion_speed: float | None = None, configure_motors: bool = True):
         self.env = env
-        self.motion_speed = float(os.getenv("OPENARM_MOTION_SPEED", "6")) if motion_speed is None else float(motion_speed)
+        # 1x is real time: the motors move at the speed the model says they can. The old default of 6x made
+        # the arm look like it teleported (measured 2026-11-10, reported from watching the cell).
+        self.motion_speed = float(os.getenv("OPENARM_MOTION_SPEED", "1")) if motion_speed is None else float(motion_speed)
         if not np.isfinite(self.motion_speed) or self.motion_speed <= 0:
             raise ValueError("OPENARM_MOTION_SPEED must be a finite positive number")
         if configure_motors:

@@ -268,17 +268,24 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         self._meta = _OfficialModelMetadata(self._xml)
         self._scene_xml = genesis_scene_xml(self._xml, self._meta)
         fluid_options = {}
+        fluid_settings = scene_registry.fluid(scene_profile) or {}
+        particle_size = fluid_dt = fluid_substeps = None
         if wants_wine:
             from backend.app.simulation.genesis_backend.wine import (
                 PARTICLE_SIZE, LIQUID_MU, WINE_DT, WINE_SUBSTEPS, PRESSURE_SOLVER, HASH_GRID_SIZE, validate_fluid_timestep,
             )
-            validate_fluid_timestep(PARTICLE_SIZE, LIQUID_MU, WINE_DT / WINE_SUBSTEPS)
+            # The scene declares what its fluid costs; measured 2026-11-10, the engine defaults advanced 7.9 ms
+            # of simulated time per wall second, which made the scene unusable in practice.
+            particle_size = float(fluid_settings.get('particle_mm', PARTICLE_SIZE * 1000.)) / 1000.
+            fluid_dt = float(fluid_settings.get('dt_ms', WINE_DT * 1000.)) / 1000.
+            fluid_substeps = int(fluid_settings.get('substeps', WINE_SUBSTEPS))
+            validate_fluid_timestep(particle_size, LIQUID_MU, fluid_dt / max(1, fluid_substeps))
             fluid_options["sph_options"] = self._gs.options.SPHOptions(
-                particle_size=PARTICLE_SIZE, pressure_solver=PRESSURE_SOLVER, hash_grid_res=HASH_GRID_SIZE,
+                particle_size=particle_size, pressure_solver=PRESSURE_SOLVER, hash_grid_res=HASH_GRID_SIZE,
                 lower_bound=(.05, -.55, .80), upper_bound=(.9, .55, 1.75))
         self._scene = self._gs.Scene(
-            sim_options=self._gs.options.SimOptions(dt=WINE_DT if wants_wine else .001,
-                                                  substeps=WINE_SUBSTEPS if wants_wine else 1),
+            sim_options=self._gs.options.SimOptions(dt=fluid_dt if wants_wine else .001,
+                                                  substeps=fluid_substeps if wants_wine else 1),
             # The default viewer looks at the opaque front of the official cell.
             # Place the camera inside the cell so both hands and cubes stay visible.
             viewer_options=self._gs.options.ViewerOptions(
@@ -313,7 +320,9 @@ class GenesisOpenArmV2Environment(SimulationBackend):
                 <geom type="plane" size="1 1 .01" pos="0 0 1.006" contype="1073741824" conaffinity="0"/>
                 </worldbody></mujoco>''', visualization=False))
             self._wine = WineWorld(self._scene, self._gs, async_surface=show_viewer,
-                                   sdf=scene_registry.sdf(scene_profile))
+                                   sdf=scene_registry.sdf(scene_profile),
+                                   fluid={**fluid_settings, 'particle_mm': particle_size * 1000.,
+                                          'dt_ms': fluid_dt * 1000., 'substeps': fluid_substeps})
         self._camera = self._scene.add_camera(
             res=camera_resolution,
             pos=free_camera_position(),

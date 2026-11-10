@@ -33,6 +33,11 @@ SCENES: dict[str, dict] = {
         # (measured 2026-11-10). Coarser coupling is the price, and whether it costs pour accuracy is the next
         # measurement - this note says what has been established, not what is hoped.
         'sdf': {'cell_mm': 1.0, 'min_res': 64, 'max_res': 160},
+        # Measured 2026-11-10: at 2.5 mm particles, dt 2 ms and 32 substeps the scene advanced 7.9 ms of
+        # simulated time per wall second (about 1/127 of real time), which is why a wine task felt broken. At
+        # 3.5 mm / dt 3 ms / 20 substeps it advances 49.3 ms per wall second (6.2x faster) and stays inside
+        # the viscosity stability bound (150 us substep vs 163 us limit).
+        'fluid': {'particle_mm': 3.5, 'dt_ms': 3, 'substeps': 20},
         'verified': True,
         # Measured 2026-11-10 on this scene: the approach and grasp succeed, then pouring fails with
         # POUR_SPILL - bottle 45 -> 40.4 mL, glass 3.1 mL, about 1.5 mL spilled. The official 0.4 mm coupling
@@ -86,6 +91,11 @@ def is_valid(profile: str) -> bool:
 
 def needs(profile: str) -> tuple[str, ...]:
     return tuple((SCENES.get(profile) or {}).get('needs') or ())
+
+
+def fluid(profile: str) -> dict | None:
+    """The particle size and timestep this scene should run with, if it differs from the engine's defaults."""
+    return (SCENES.get(profile) or {}).get('fluid')
 
 
 def sdf(profile: str) -> dict | None:
