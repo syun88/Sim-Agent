@@ -26,6 +26,7 @@ def _runner(accept):
     env.ee_pose = lambda arm: (np.array([0.40, 0.0, 1.15]), np.eye(3))
     env.frame = lambda: type('F', (), {'objects': {'red_cube': SUPPORT.copy()},
                                        'zones': {'blue_zone': np.array([0.45, 0.0, 1.0])}})()
+    env.arm_limits = lambda arm: np.array([[-3., 3.]] * 7)
     skills = SkillRunner.__new__(SkillRunner)
     skills.env = env
     skills.controller = type('C', (), {'solve_ik': staticmethod(solve), 'target_rotations': {}})()
@@ -142,3 +143,27 @@ def test_a_zone_placement_searches_inside_the_zone_instead_of_carrying_to_the_ce
         'the zone centre was not reachable; a point inside it was'
     assert zone_region[0][0] <= chosen[0] <= zone_region[1][0]
     assert zone_region[0][1] <= chosen[1] <= zone_region[1][1]
+
+
+def test_a_destination_that_needs_a_joint_limit_is_not_commandable():
+    """Measured 2026-11-09: the carries that stopped 27 mm short were at the edge of the workspace."""
+    from backend.app.skills import robot_skills
+
+    skills = _runner(lambda distance: True)
+    # Solve "successfully" but into the last 1 degree of a joint: IK says yes, the servo cannot hold it.
+    skills.controller.solve_ik = staticmethod(
+        lambda arm, target, rotation, **kwargs: (np.array([3.0 - 0.017, 0., 0., 0., 0., 0., 0.]), 0.001, 0.0))
+    skills.env.arm_limits = lambda arm: np.array([[-3., 3.]] + [[-3., 3.]] * 6)
+    _desired, search = skills._reachable_destination('red_cube', 'blue_zone', 'on', 'left')
+    assert search['considered'][0]['joint_limit_margin_rad'] == pytest.approx(0.017, abs=1e-3)
+    assert search['chosen'] != 'requested', 'a pose on a joint limit is not a placement this arm can hold'
+
+
+def test_a_destination_with_room_left_in_the_joints_is_commandable():
+    skills = _runner(lambda distance: True)
+    skills.controller.solve_ik = staticmethod(
+        lambda arm, target, rotation, **kwargs: (np.array([0.5, 0., 0., 0., 0., 0., 0.]), 0.001, 0.0))
+    skills.env.arm_limits = lambda arm: np.array([[-3., 3.]] + [[-3., 3.]] * 6)
+    _desired, search = skills._reachable_destination('red_cube', 'blue_zone', 'on', 'left')
+    assert search['considered'][0]['joint_limit_margin_rad'] == pytest.approx(2.5)
+    assert search['chosen'] == 'requested'

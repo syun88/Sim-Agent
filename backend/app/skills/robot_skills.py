@@ -93,6 +93,10 @@ APPROACH_TRAJECTORY_SPEED = 0.5
 #: How close a placement point has to be for the arm to be considered able to hold it: the same acceptance
 #: the capability queries use, so "reachable" means one thing in this codebase.
 PLACEMENT_REACH_TOLERANCE_M = 0.012
+#: A destination whose configuration sits this close to a joint limit is not commanded. Measured 2026-11-09:
+#: carries that stopped 27 mm short were at the edge of the workspace, where IK solves but the servo cannot
+#: hold the pose. 0.05 rad is about 3 degrees.
+JOINT_LIMIT_MARGIN_RAD = 0.05
 PARK_ARRIVAL_TOLERANCE_M = 0.005
 PARK_ARRIVAL_TOLERANCE_RAD = 0.04
 #: The approach may not displace the object by more than this (m); the object is only pinched
@@ -978,18 +982,45 @@ class SkillRunner:
             verdict = answer.get('feasible')
             return True if verdict is None else bool(verdict)
 
-        def margin(point):
+        def limit_margin_rad(configuration):
+            """How far the solved configuration sits from any joint limit, or None if unmeasurable."""
+            try:
+                limits = np.asarray(self.env.arm_limits(arm), float)
+            except Exception:
+                return None
+            q = np.asarray(configuration, float)
+            if q.shape != (limits.shape[0],):
+                return None
+            return float(np.min(np.minimum(q - limits[:, 0], limits[:, 1] - q)))
+
+        def probe(point):
+            """Both halves of "can the arm hold this pose": IK residual and room left in the joints."""
             aim, rotation, _offset = self._carry_aim(arm, obj, np.asarray(point, float))
             try:
                 solution, error, _ = solve(arm, aim, rotation)
             except Exception:
-                return None
+                return None, None
             if solution is None or error is None:
+                return None, None
+            return -float(error), limit_margin_rad(solution)
+
+        def usable(point):
+            value, limit = probe(point)
+            if value is None:
                 return None
-            return -float(error)
+            if limit is not None and limit < JOINT_LIMIT_MARGIN_RAD:
+                # The IK solves, but the arm would have to sit on a joint limit to hold it. Measured
+                # 2026-11-09: the carries that stopped 27 mm short were at the edge of the workspace.
+                return None
+            return value
+
+        def margin(point):
+            return usable(point)
 
         best_point, best_margin = np.asarray(requested, float), margin(requested)
-        search['considered'].append({'offset': [0., 0.], 'margin_m': best_margin})
+        _requested_value, _requested_limit = probe(requested)
+        search['considered'].append({'offset': [0., 0.], 'margin_m': best_margin,
+                                     'joint_limit_margin_rad': _requested_limit})
         if best_margin is not None:
             from backend.app.skills import placement_accuracy
             # How precisely this placement has to land, measured from the region it lands on: a zone has
