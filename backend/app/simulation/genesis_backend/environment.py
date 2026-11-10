@@ -329,13 +329,23 @@ class GenesisOpenArmV2Environment(SimulationBackend):
                                    sdf=scene_registry.sdf(scene_profile),
                                    fluid={**fluid_settings, 'particle_mm': particle_size * 1000.,
                                           'dt_ms': fluid_dt * 1000., 'substeps': fluid_substeps})
-        self._camera = self._scene.add_camera(
-            res=camera_resolution,
-            pos=free_camera_position(),
-            lookat=list(CAMERA_LOOKAT),
-            fov=CAMERA_FOV,
-            GUI=False,
-        )
+        # The camera needs a renderer, and a renderer needs EGL. Measured 2026-11-10 on the ROCm path: EGL
+        # initialises (`eglInitialize` 1.5) but pyrender cannot create a context for the AMD device, which killed
+        # the whole environment including the physics that had nothing to do with rendering. A scene that cannot
+        # be drawn can still be simulated, so the camera is optional and its absence is reported.
+        try:
+            self._camera = self._scene.add_camera(
+                res=camera_resolution,
+                pos=free_camera_position(),
+                lookat=list(CAMERA_LOOKAT),
+                fov=CAMERA_FOV,
+                GUI=False,
+            )
+            self.render_error = None
+        except Exception as error:
+            self._camera = None
+            self.render_error = f'{type(error).__name__}: {str(error)[:200]}'
+            print(f'No camera for this scene (rendering disabled): {self.render_error}', flush=True)
         self._scene.build()
         self._index()
         if self._wine:

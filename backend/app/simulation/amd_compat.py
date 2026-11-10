@@ -74,3 +74,19 @@ def apply() -> dict:
                 rebound.append(f'{name}.{attribute}')
     _applied = {'applied': True, 'guarded': touched, 'hip': torch.version.hip, 'rebound': rebound}
     return _applied
+
+
+#: What stops the ROCm path today, measured 2026-11-10 (do not re-derive it by hand):
+#:
+#: * `torch 2.10.0+rocm7.0` runs the GPU (`hip 7.0.51831`, `cuda.is_available() True`, RX 7800 XT).
+#: * `apply()` above is required and sufficient for `genesis 1.4.6` to get past its CUDA-only device query.
+#: * `scene.build()` then fails in `genesis/vis/rasterizer.py` -> `pyrender.OffscreenRenderer` ->
+#:   `EGLPlatform.init_context()` with "No EGL context could be initialized", **even with no camera and
+#:   show_viewer=False**, because Genesis always builds a rasterizer.
+#: * The same EGL steps succeed when called directly (`eglInitialize` 1.5, `eglChooseConfig`, `eglBindAPI`,
+#:   `eglCreateContext` for 4.1 core, `eglMakeCurrent`), so this is a pyrender/PyOpenGL binding problem: after
+#:   Genesis' import, `eglGetDisplay.argtypes` is `(EGLNativeDisplayType_pointer,)` and the later calls pass
+#:   integers where opaque pointers are declared ("expected EGLNativeDisplayType instead of int").
+#:
+#: So the AMD backend is blocked in the rendering layer, not in this project and not in torch. Continuing there
+#: means patching pyrender's EGL platform as a whole (not one call), or an upstream fix.
