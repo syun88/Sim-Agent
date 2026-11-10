@@ -15,9 +15,20 @@ import numpy as np
 from backend.app.simulation.base import SimulationBackend
 
 
+def _truth(env):
+    """Verification judges the truth, not the estimate the planner was given.
+
+    When a perception bias is installed for a measurement run (see `simulation/perception.py`) this wrapper
+    makes the difference explicit: the skills plan on the biased pose, the checks read the real one.
+    """
+    from backend.app.simulation.perception import truth_view
+    return truth_view(env)
+
+
 def verify_place_goal(
     env: SimulationBackend, object_id: str, target_id: str, tolerance: float = 0.04
 ) -> dict:
+    env = _truth(env)
     before = env.object_pose(object_id)[0].copy()
     env.step(100)
     position, _ = env.object_pose(object_id)
@@ -49,6 +60,7 @@ def verify_place_goal(
 
 
 def verify_task_goal(env: SimulationBackend, plan, results: list[dict], initial_state: dict | None = None) -> dict:
+    env = _truth(env)
     """Read every final predicate, including the objects placed earlier in a sequence."""
     complete = len(results) == len(plan.steps) and all(r.get("success") for r in results)
     checks = plan.goal.get("checks", [])

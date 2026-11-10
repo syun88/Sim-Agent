@@ -67,6 +67,18 @@ def main() -> None:
     env.step(200)
     # Ask the body itself whether it answers everything the skills will drive it with, and leave the answer
     # where a person or a port can read it. A real arm's backend is validated the same way.
+    # A measurement harness, not a feature: bias what the planner reads so "would this survive a real camera?"
+    # becomes a number. Loud on purpose - a harness that quietly lies to its own controller is worse than none.
+    _perception_mm = os.environ.get('OPENARM_PERCEPTION_ERROR_MM')
+    if _perception_mm:
+        try:
+            from backend.app.simulation import perception
+            installed = perception.install(env, float(_perception_mm) / 1000.,
+                                           seed=int(os.environ.get('OPENARM_PERCEPTION_SEED', '0')))
+            print(f'PERCEPTION BIAS INSTALLED: {installed["error_m"]*1000:.1f} mm '
+                  f'(seed {installed["seed"]}); verification still reads the truth', flush=True)
+        except Exception as error:
+            print(f'Perception bias could not be installed: {type(error).__name__}: {error}', flush=True)
     try:
         from backend.app.simulation import conformance
         problems = conformance.check(env)
