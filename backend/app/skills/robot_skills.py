@@ -522,6 +522,11 @@ class SkillRunner:
                 raise SkillError("TARGET_OCCUPIED", f"{other} occupies {target}; refusing to stack cubes accidentally")
         requested = zone.copy()
         requested[2] = RELEASE_HEIGHT
+        # The grasp is reoriented *before* the destination is probed. Measured 2026-11-09: probing first meant
+        # the search judged the aim in one grasp attitude while the carry commanded another (the alignment
+        # changes the grasp offset), so the search called a point reachable that the carry then missed by
+        # 27 mm without moving at all. One question, one attitude.
+        self._align_for_placement(arm, obj)
         # The zone centre is a request, not a target the arm is assumed to reach: the same region search the
         # relational placements use decides where inside the zone this body can actually put the object.
         # Measured 2026-11-09: zone placements were the dominant failure (10 of 12) because this path carried
@@ -535,7 +540,6 @@ class SkillRunner:
         from backend.app.skills import placement_accuracy
         requirement = placement_accuracy.required_accuracy(self.env, obj, target, 'in')
         allow = requirement.get('required_m')
-        self._align_for_placement(arm, obj)
         travel = desired_object.copy()
         travel[2] = 1.14
         self._carry_to(arm, obj, travel)
