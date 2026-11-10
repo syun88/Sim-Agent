@@ -9,7 +9,7 @@ from typing import Any
 from dotenv import load_dotenv
 import os
 
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -132,6 +132,35 @@ def catalog_vocabulary():
                          'label': entry.label, 'aliases': entry.aliases} for entry in loaded.objects],
             'zones': [{'id': entry.id, 'label': entry.label, 'aliases': entry.aliases}
                       for entry in loaded.zones]}
+
+
+#: The most recent rendered frame, if the owner streams one. A live view is an observation, not a command.
+app.state.view_frame = None
+
+
+@app.get('/api/view.jpg')
+def live_view():
+    """The latest frame the owner rendered, or 204 until it has one.
+
+    The native viewer window needs a GPU backend, and this host's Genesis resolves `gs.gpu` to `gs.cpu`
+    (measured 2026-11-10), so the interactive window never appears. The scene can still be rendered offscreen
+    in 0.19 s, so the browser is the view.
+    """
+    frame = app.state.view_frame
+    if not frame:
+        return Response(status_code=204)
+    return Response(content=frame['jpeg'], media_type='image/jpeg',
+                    headers={'Cache-Control': 'no-store', 'X-Frame-Time': f"{frame['time']:.3f}"})
+
+
+@app.post('/api/genesis/frame')
+async def genesis_frame(request: Request):
+    """Accept one rendered frame from the simulation owner."""
+    payload = await request.body()
+    if not payload:
+        raise HTTPException(400, 'empty frame')
+    app.state.view_frame = {'jpeg': bytes(payload), 'time': time.time()}
+    return {'status': 'ok', 'bytes': len(payload)}
 
 
 @app.get('/api/scenes')

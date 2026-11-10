@@ -12,6 +12,7 @@ import uuid
 
 from dotenv import load_dotenv
 import httpx
+import numpy as np
 
 from backend.app.agent.world_state import build_world_state
 from backend.app.agent.task_agent import TaskAgent
@@ -136,6 +137,29 @@ def main() -> None:
                 pass
         return stop_cache
 
+    # A live view for the browser: the native window needs a GPU backend this host does not provide, and an
+    # offscreen frame costs 0.19 s (measured 2026-11-10), so one frame a second is cheap and enough to see what
+    # the cell is doing.
+    stream_view = os.environ.get('OPENARM_STREAM_VIEW', '1') != '0'
+
+    last_frame = 0.0
+
+    def stream_frame():
+        if not stream_view:
+            return
+        try:
+            image = env.render(720, 480)
+            if image is None:
+                return
+            import io as _io
+            from PIL import Image
+            buffer = _io.BytesIO()
+            Image.fromarray(np.asarray(image).astype('uint8')).save(buffer, format='JPEG', quality=80)
+            httpx.post(f'{args.backend_url}/api/genesis/frame', content=buffer.getvalue(), timeout=2.)
+        except Exception:
+            # A view that cannot be rendered must never disturb the run.
+            pass
+
     def emit(event, **payload):
         status = payload.pop('status', 'VERIFYING' if event == 'verifying' else 'EXECUTING')
         publish(event, force=True, status=status, **payload)
@@ -246,6 +270,9 @@ def main() -> None:
             if not command.get('action'):
                 env.step(5)
                 time.sleep(.04)
+                if time.monotonic() - last_frame > 1.0:
+                    last_frame = time.monotonic()
+                    stream_frame()
                 continue
             active_id = command['task_id']
             stop_cache, last_control = False, 0.0

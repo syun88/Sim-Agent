@@ -40,6 +40,20 @@ const $=id=>document.getElementById(id);
 let currentTaskId=null, polling=false, shownPlan='', robotCatalog=[], activeRobot='openarm_v2', isBusy=false,lastRandomization=null;
 const arm={left:'左手',right:'右手'}, object={red_cube:'赤いキューブ',blue_cube:'青いキューブ',wine_bottle:'ワインボトル',wine_glass:'グラス'}, target={blue_zone:'青いゾーン',green_zone:'緑のゾーン',left_side:'左側',right_side:'右側',center:'中央',wine_glass:'グラス'};
 // Labels come from the scene catalog, so an object added there shows up here without editing this file.
+// Live view: the owner posts rendered frames, so the page shows the cell without a native window.
+const liveView = document.createElement('div');
+liveView.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:9999;background:#111;padding:6px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,.5)';
+liveView.innerHTML = '<img id="liveView" width="360" height="240" alt="live view" style="display:block;border-radius:4px;background:#000">' +
+  '<div id="liveViewState" style="color:#aaa;font:11px/1.6 monospace;margin-top:4px">view: —</div>';
+document.body.appendChild(liveView);
+setInterval(()=>{
+  const img = document.getElementById('liveView');
+  const loader = new Image();
+  loader.onload = ()=>{ img.src = loader.src; document.getElementById('liveViewState').textContent =
+    'view: ' + new Date().toLocaleTimeString(); };
+  loader.onerror = ()=>{ document.getElementById('liveViewState').textContent = 'view: 未配信'; };
+  loader.src = '/api/view.jpg?t=' + Date.now();
+}, 1000);
 // Scene selector: the list comes from /api/scenes, so a new scene is data, not a UI edit.
 fetch('/api/scenes').then(r=>r.json()).then(d=>{
   const bar=document.createElement('div');
