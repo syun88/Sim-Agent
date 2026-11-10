@@ -141,3 +141,21 @@ def test_the_approach_falls_back_to_a_shorter_standoff_when_the_nominal_one_has_
     # The staged helper asks from canonical postures; what matters here is that the variant path is reachable code
     # and that a shorter standoff is one of the questions it can ask.
     assert result is None or isinstance(result, tuple)
+
+
+def test_a_complete_reference_body_passes_the_contract():
+    """The checker's positive path, exercised without Genesis: a body that answers every operation."""
+    from backend.app.simulation.conformance_reference import ReferenceBody
+
+    body = ReferenceBody()
+    assert conformance.check(body) == []
+
+
+def test_the_reference_body_is_a_template_a_bridge_can_copy():
+    """Every operation the contract names is implemented, so a hardware port has a starting file."""
+    from backend.app.simulation.conformance import COMMANDS, READ_ONLY
+    from backend.app.simulation.conformance_reference import ReferenceBody
+
+    body = ReferenceBody()
+    missing = [name for name in list(READ_ONLY) + list(COMMANDS) if not callable(getattr(body, name, None))]
+    assert missing == []
