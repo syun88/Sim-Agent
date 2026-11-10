@@ -417,6 +417,24 @@ uv run python scripts/export_lerobot_annotations.py \
 この層は「どの層で壊れたか」を言えるようにするためのものであり、任意の自然言語の理解を保証しない。
 学習モデルを後段に置く場合も、この決定集合が提案と検証の境界になる。
 
+## GUI の出し方（2026-11-10 実測で確定）
+
+**ネイティブウィンドウはこのホストでは出せない。** 原因は表示経路ではなく GPU で、
+`genesis 1.4.4` に `gs.init(backend=gs.gpu)` を渡しても **CPU で起動する**（ログに
+`Running on [AMD Ryzen 7 9800X3D] with backend gs.cpu`）。Genesis の interactive viewer は GPU 前提なので
+`show_viewer=True` でも窓が作られない（プロセスに X11/Wayland の fd が 1 つも無いことで確認した）。
+※以前「表示（EGL/Xwayland）経路が詰まっている」と結論したのは**誤り**で、この測定で置き換える。
+
+代わりに**ブラウザを GUI にした**:
+
+- 所有者が offscreen で描画（`env.render(720, 480)`、**0.19 秒/枚**）し、1 秒に 1 枚
+  `POST /api/genesis/frame` で送る
+- `GET /api/view.jpg` が最新フレームを返す（未配信なら 204）
+- `/simple` の右下に**ライブビュー**（1 秒更新）を追加。操作 UI はそのまま
+
+実測: 開始フレーム→「赤を拾って左に置く」実行→終了フレームで**9.2% のピクセルが変化**し、
+キューブが左手前から机の左へ移動しているのが見える（差分 8.21）。タスクは SUCCEEDED。
+
 ## シーンを選べるようにした（2026-11-10）
 
 `simulation/scenes.py` が**シーンの一覧をデータで持つ**（`cubes` / `wine` / `mixed`）。追加は「id・含む物体・
