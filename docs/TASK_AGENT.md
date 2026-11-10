@@ -426,9 +426,25 @@ uv run python scripts/export_lerobot_annotations.py \
 - `POST /api/scenes/select?scene=<id>` → 所有者に再構築を依頼（把持中は拒否）
 - 指示文からも選ばれる（`scene_for_instruction`: ワイン語と キューブ語が両方出れば `mixed`）
 
-**「登録されているが構築できない」を選べなくした**。実測: `mixed`（キューブ＋ワイン器物）は
-**10 分以上 CPU 350% で構築が終わらなかった**ため `verified: false` とし、API は 409 で理由を返し、
-UI も選択不可にする。主張（この scene は作れる）は `scripts/check_scenes.py` で**実際に構築して確かめる**。
+**「登録されているが構築できない」を選べなくする**。主張（この scene は作れる）は
+`scripts/check_scenes.py` で**実際に構築して確かめる**。API は未検証の scene を 409 で断り、UI も選択不可。
+
+### `mixed` が構築できなかった原因と解決（2026-11-10 実測）
+
+スタックダンプで特定: **流体と剛体の結合用 SDF 生成**（`genesis/.../rigid_geom._compute_sd` →
+`T_mesh_to_sdf`）で止まっていた。原因は `wine.py` の `sdf_cell_size=.0004`（0.4 mm）／`sdf_max_res=512`。
+キャッシュが **1 形状あたり 696 MB**、構築は 15 分でも終わらない。
+
+- 解像度を**測定可能な設定**にした（`OPENARM_WINE_SDF_CELL_MM` / `_MIN_RES` / `_MAX_RES`、
+  scene ごとに `sdf` を宣言できる）
+- `mixed` は **1.0 mm / 160** で **221.6 秒**（全4物体入り）→ `verified: true`、API で切替成功
+- `wine` は公式の 0.4 mm のまま**未検証**（15分で終わらない）。粗くするなら計測してから
+
+**代償も実測**: `mixed` は流体の時間刻み（`WINE_DT`）のため**操作が約50倍遅い** — 単純な配置が10分で
+終わらず停止した（`cubes` では約12秒）。だから `mixed` は「警告付きで選択可」としてある。
+
+**明示選択は指示より優先**: 人が `mixed` を選んだ後にキューブ指示を出しても、その scene が要求物体を
+含むなら再構築しない（`scenes.hosts`）。実測で一度これが起き、選択した場が黙って壊されたため。
 
 なお `~/Downloads/assets.zip` は**リポジトリの現行アセットと完全一致**（シーンXML・wine メッシュ同一）だった
 ので、重複登録はせず、その素材で組める `mixed` を登録した。ライブ確認: 一覧・拒否（409）・
