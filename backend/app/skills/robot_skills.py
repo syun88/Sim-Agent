@@ -749,6 +749,59 @@ class SkillRunner:
                     "stack_strategy": strategy if is_held_stationary else None}
         return self._skill("move_to_object", run, time.perf_counter())
 
+    def _receiver_frames(self, receiver: str, cube, cube_rotation, geometry, bias):
+        """The receiving hand's attitude, chosen by screening the routes it would need.
+
+        The coupled solve gives one relative attitude; a cube is four-fold symmetric, so the same grasp exists
+        at quarter turns. Each candidate is screened from the receiver's current posture through its pre-grasp
+        to the pinch, with the same clearance the pick uses; the first that clears wins, and the others are
+        recorded with the reason they lost.
+        """
+        nominal = np.asarray(cube_rotation, float) @ np.asarray(geometry.receiver_relative_rotation, float)
+        if not callable(getattr(self.env, 'arm_kinematics', None)):
+            # A body without kinematics cannot answer this question; keep the coupled solve's attitude rather
+            # than failing the handover for want of a query.
+            return nominal, {'searched': False, 'unknown': 'no kinematics on this body'}
+        kin = self.env.arm_kinematics(receiver)
+        check = getattr(kin, 'empty_arm_path_is_clear', None)
+        measure = getattr(kin, 'path_minimum_clearance', None)
+        from backend.app.planning.capability_queries import attitude as _attitude
+        from backend.app.skills.motion_accuracy import required_clearance
+        from backend.app.skills.approach import NONCONTACT_CLEARANCE_M
+        needed = NONCONTACT_CLEARANCE_M + required_clearance(receiver)
+        objects = {name: self.env.object_pose(name) for name in self.env.frame().objects}
+        allowed = {receiver: {f'openarm_{receiver}_ee_inner_finger', f'openarm_{receiver}_ee_outer_finger'}}
+        considered = []
+        best = None
+        for turn in (0., 90., -90., 180.):
+            rotation = nominal if turn == 0. else _attitude(turn) @ nominal
+            site = (np.asarray(cube, float) + rotation @ np.array([0., 0., bias])
+                    - rotation @ FINGERTIP_MIDPOINT[receiver])
+            pregrasp = site + rotation[:, 2] * .12
+            route = [self.env.arm_qpos(receiver)]
+            solved = True
+            for target in (pregrasp, site):
+                q, _, _ = self.controller.solve_ik(receiver, target, rotation)
+                if q is None:
+                    solved = False
+                    break
+                route.append(q)
+            if not solved:
+                considered.append({'turn_deg': turn, 'error': 'IK_FAILURE'})
+                continue
+            gap = measure(route, objects, ceiling=.05) if measure is not None else None
+            screened = check is None or check(route, objects, allowed_contacts=allowed,
+                                              minimum_object_clearance=needed)
+            considered.append({'turn_deg': turn, 'clearance_m': gap, 'screened': bool(screened),
+                               'needed_m': needed})
+            if screened and (best is None or (gap is not None and gap > (best[1] or -9))):
+                best = (rotation, gap, turn)
+        if best is None:
+            return nominal, {'chosen_turn_deg': 0., 'searched': True, 'considered': considered,
+                             'fallback': 'nominal attitude (no candidate screened)'}
+        return best[0], {'chosen_turn_deg': best[2], 'clearance_m': best[1], 'searched': True,
+                         'considered': considered}
+
     def _stage_for_approach(self, arm: str, obj: str, centre, frames, evidence):
         """Find a posture from which the approach has a route, move there, and plan again.
 
@@ -1305,7 +1358,12 @@ class SkillRunner:
         self._require_hold(arm, obj)
         self.controller.wait_gripper(receiver, False, .5)
         cube, cube_rotation = self.env.object_pose(obj)
-        receiving_rotation = cube_rotation @ geometry.receiver_relative_rotation
+        # Which way the receiving hand comes in is a measured choice, the same way the pick attitude is: the
+        # mirrored attitude from the coupled solve is the nominal one, and the other three quarter turns are
+        # equivalent for a cube. Measured 2026-11-10: a fixed receiving attitude is what made handover fail
+        # with HANDOVER_UNREACHABLE in layouts where another approach was clear.
+        receiving_rotation, receiver_search = self._receiver_frames(
+            receiver, cube, cube_rotation, geometry, bias)
         site = cube + receiving_rotation @ np.array([0., 0., bias]) - receiving_rotation @ FINGERTIP_MIDPOINT[receiver]
         pregrasp = site + receiving_rotation[:, 2] * .12
         # A joint interpolation straight to the cube sweeps an open finger through it.
