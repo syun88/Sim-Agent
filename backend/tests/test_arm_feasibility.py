@@ -118,3 +118,35 @@ def test_the_refusal_is_reserved_for_a_hand_the_instruction_named():
 
     assert arm_mentions('青いキューブを右手で青いゾーンに置いて') == ['right']
     assert arm_mentions('青いキューブを赤いキューブの上に置いて') == []
+
+
+def test_the_layout_answer_does_not_depend_on_where_the_arm_is_standing():
+    """Root cause, measured 2026-11-09: from-here answered False/True/True for one layout depending on posture."""
+    from backend.app.planning.capability_queries import approach_feasible, clear_feasibility_cache
+    from backend.app.control.motion import OpenArmV2Controller
+    from backend.tests.test_task_homing import _stack_environment
+
+    env, q, _objects = _stack_environment()
+    env.arm_velocity_limits = lambda side: None
+    controller = OpenArmV2Controller(env, configure_motors=False)
+    answers = []
+    for posture in (np.zeros(7),
+                    np.array([1.17, -.37, .19, 2.39, -.04, .21, .40]),
+                    np.array([.01, -.67, .09, 1.72, -.18, .78, -1.09])):
+        clear_feasibility_cache()
+        q['left'] = posture
+        answers.append(approach_feasible(env, controller, 'left', 'blue_cube').get('feasible'))
+    assert answers[0] is not None
+    assert len(set(answers)) == 1, f'the same layout gave different answers: {answers}'
+
+
+def test_the_canonical_postures_are_a_fixed_set():
+    from backend.app.planning.capability_queries import canonical_postures
+
+    env = type('E', (), {'home_arm_qpos': lambda self, arm: np.zeros(7),
+                         'arm_limits': lambda self, arm: np.array([[-3., 3.]] * 7)})()
+    first = canonical_postures(env, 'left')
+    second = canonical_postures(env, 'left')
+    assert len(first) >= 2
+    assert all(np.allclose(a, b) for a, b in zip(first, second))
+    assert np.allclose(first[0], np.zeros(7)), 'home is always part of the set'

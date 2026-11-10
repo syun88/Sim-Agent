@@ -79,26 +79,99 @@ def pad_blocks_support_face(env, holder_arm: str, support: str) -> dict:
     return {'blocks': clearance < 0., 'clearance_m': float(clearance), 'measured': measured}
 
 
-def approach_feasible(env, controller, arm: str, obj: str) -> dict:
-    """Whether this arm has a *screened route* to the object, not merely an IK solution for its pinch pose.
+#: Postures a *layout* question is asked from. Fixed set: the same layout must get the same answer whenever
+#: it is asked, which is what makes the answer a property of the layout rather than of the moment.
+def canonical_postures(env, arm: str) -> list[np.ndarray]:
+    """Where to stand when asking "can this arm grasp that object here at all".
 
-    Measured 2026-11-09: an IK probe called the requested hand reachable while the approach search found no
-    collision-free route six times in one round, so the arm question has to be asked with the same planner
-    that will execute it.
+    A fixed, deterministic set: home, plus two configurations taken from the joint ranges. One posture is not
+    enough (measured 2026-11-09: home answers False for a layout the same arm can approach from a folded
+    posture) and the current posture is not allowed (the answer would depend on the moment).
+    """
+    postures = []
+    try:
+        postures.append(np.asarray(env.home_arm_qpos(arm), float))
+    except Exception:
+        pass
+    try:
+        limits = np.asarray(env.arm_limits(arm), float)
+        low, high = limits[:, 0], limits[:, 1]
+        for fraction in (0.25, 0.75):
+            # Alternate the direction per joint so the two derived postures are not mirror images of each other
+            # and the set covers both halves of each joint's range.
+            weights = np.array([fraction if index % 2 == 0 else 1. - fraction
+                                for index in range(low.size)])
+            postures.append(low + (high - low) * weights)
+    except Exception:
+        pass
+    unique = []
+    for posture in postures:
+        if posture.size and np.all(np.isfinite(posture)):
+            if not any(np.allclose(posture, seen) for seen in unique):
+                unique.append(posture)
+    return unique
+
+
+#: Answers already computed, keyed by layout. A layout question is expensive (a few approach plans) and its
+#: answer cannot change while the layout is the same, so it is remembered. Posture is *not* in the key: that
+#: is the point of asking it this way.
+_FEASIBLE_CACHE: dict[tuple, dict] = {}
+
+
+def clear_feasibility_cache() -> None:
+    _FEASIBLE_CACHE.clear()
+
+
+def approach_feasible(env, controller, arm: str, obj: str) -> dict:
+    """Whether this arm has a *screened route* to the object from any canonical posture.
+
+    Two questions live here, and conflating them was a root cause: "is there a route from where the arm is
+    standing right now" is momentary (the motion answers it), while "can this arm grasp that object in this
+    layout" is a property of the layout. Measured 2026-11-09 on one fixed layout: asking from the current
+    posture answered False from home, True from a folded posture and True from a spread one - the same
+    question flipping with the arm's whereabouts, which is why refusals and hand switches appeared
+    inconsistent. The answer below is a property of the layout because the postures it is asked from are a
+    fixed set.
     """
     try:
         from backend.app.skills.approach import cube_approach_frames, plan_cube_approach
         from backend.app.skills.robot_skills import APPROACH_OVERFLY, APPROACH_STANDOFF, STAGING_ALTITUDE
 
+        try:
+            key = (arm, obj, tuple(np.round(np.asarray(env.object_pose(obj)[0], float), 3)))
+        except Exception:
+            key = None
+        if key is not None and key in _FEASIBLE_CACHE:
+            return {**_FEASIBLE_CACHE[key], 'cached': True}
+        postures = canonical_postures(env, arm)
+        if not postures:
+            return {'feasible': None, 'unknown': 'no canonical posture for this body'}
         centre = np.asarray(env.object_pose(obj)[0], float)
         frames = cube_approach_frames(arm, centre, APPROACH_STANDOFF)
-        route, planning = plan_cube_approach(env, controller, arm, obj, frames[0]['pinch'],
-                                            frames[0]['standoff'], APPROACH_OVERFLY, STAGING_ALTITUDE,
-                                            frames=frames)
-        return {'feasible': route is not None,
-                'reason': planning.get('error'),
-                'route_found': None if route is None else planning.get('grasp_yaw_deg'),
-                'rejected_routes': len(planning.get('rejected_routes') or [])}
+        attempts = []
+        for index, posture in enumerate(postures):
+            route, planning = plan_cube_approach(env, controller, arm, obj, frames[0]['pinch'],
+                                                frames[0]['standoff'], APPROACH_OVERFLY, STAGING_ALTITUDE,
+                                                frames=frames, start_override=posture)
+            attempts.append({'posture': index,
+                             'feasible': route is not None,
+                             'reason': planning.get('error'),
+                             'grasp_yaw_deg': None if route is None else planning.get('grasp_yaw_deg')})
+            if route is not None:
+                answer = {'feasible': True, 'posture': index, 'grasp_yaw_deg': planning.get('grasp_yaw_deg'),
+                          'attempts': attempts, 'asked_from': 'canonical_postures'}
+                if key is not None:
+                    if len(_FEASIBLE_CACHE) > 128:
+                        _FEASIBLE_CACHE.clear()
+                    _FEASIBLE_CACHE[key] = answer
+                return answer
+        answer = {'feasible': False, 'reason': attempts[-1].get('reason'), 'attempts': attempts,
+                  'asked_from': 'canonical_postures'}
+        if key is not None:
+            if len(_FEASIBLE_CACHE) > 128:
+                _FEASIBLE_CACHE.clear()
+            _FEASIBLE_CACHE[key] = answer
+        return answer
     except AttributeError as error:
         # A body that cannot answer the planner's own questions is not thereby unable to approach: report the
         # question as unknown rather than turning a missing method into a refusal.

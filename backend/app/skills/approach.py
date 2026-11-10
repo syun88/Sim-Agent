@@ -67,9 +67,22 @@ def cube_approach_frames(arm, center, standoff_m, *, world_x_offset=None):
     return frames
 
 
-def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, staging_altitude, *, frames=None):
-    start = env.arm_qpos(arm)
-    point = env.ee_pose(arm)[0]
+def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, staging_altitude, *, frames=None,
+                       start_override=None):
+    """Plan a screened approach route.
+
+    `start_override` asks the question from a *given* configuration instead of the arm's current one. That
+    distinction is fundamental: "can this arm grasp this object in this layout" is a property of the layout and
+    must not change depending on where the arm happens to be standing, while "is there a route from here right
+    now" is a momentary question the motion itself answers. Measured 2026-11-09: a feasibility answer used as a
+    layout property flipped between attempts because it was computed from the current posture.
+    """
+    if start_override is not None:
+        start = np.asarray(start_override, float)
+        point, rotation_at_start, _, _ = env.arm_kinematics(arm).evaluate(start)
+    else:
+        start = env.arm_qpos(arm)
+        point = env.ee_pose(arm)[0]
     kin = env.arm_kinematics(arm)
     objects = {name:env.object_pose(name) for name in env.frame().objects}
     check = getattr(kin,'empty_arm_path_is_clear',None)
