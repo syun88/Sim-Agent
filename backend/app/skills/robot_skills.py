@@ -292,6 +292,18 @@ class SkillRunner:
                 if staged is not None:
                     route, approach_evidence = staged
             if route is None:
+                # A shorter standoff is a different question about the same grasp: the pads stop further from
+                # whatever is beside the object. Only tried after the nominal distance has failed.
+                from backend.app.skills.approach import STANDOFF_VARIANTS_M, frame_at
+                for variant in STANDOFF_VARIANTS_M:
+                    near = frame_at(arm, centre, variant, frames[0]['yaw_deg'], world_x_offset=fault_offset)
+                    trial_route, trial_evidence = plan_cube_approach(
+                        self.env, self.controller, arm, obj, near['pinch'], near['standoff'],
+                        APPROACH_OVERFLY, STAGING_ALTITUDE, frames=[near])
+                    if trial_route is not None:
+                        route, approach_evidence = trial_route, {**trial_evidence, 'standoff_variant_m': variant}
+                        break
+            if route is None:
                 rejected=approach_evidence.get('rejected_routes',[])
                 category='COLLISION_PATH' if rejected and all(r['error']=='COLLISION_PATH' for r in rejected) else 'IK_FAILURE'
                 error=SkillError(category,'No reachable collision-screened cube approach in the bounded grasp-frame search')
