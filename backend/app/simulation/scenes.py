@@ -45,7 +45,11 @@ SCENES: dict[str, dict] = {
         # builds in 222 s with all four objects present (measured 2026-11-10). Coarser coupling is the price.
         'sdf': {'cell_mm': 1.0, 'min_res': 64, 'max_res': 160},
         'verified': True,
-        'note': 'builds in ~222 s at 1.0 mm fluid-coupling SDF (official 0.4 mm does not finish in 15 min)',
+        # Buildable, but the fluid timestep makes ordinary manipulation far slower: measured 2026-11-10, a
+        # single cube placement had not finished after ten minutes here and takes about twelve seconds in
+        # `cubes`. The scene is offered with that warning rather than hidden, because pour-while-stacking is
+        # exactly what it is for - and a person should decide whether that cost is worth it.
+        'note': 'builds in ~222 s at 1.0 mm coupling SDF; manipulation is ~50x slower than cubes (WINE_DT)',
     },
 }
 
