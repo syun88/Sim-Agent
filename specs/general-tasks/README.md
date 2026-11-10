@@ -390,6 +390,16 @@ probe 残差 + その身体の運搬着地誤差  ≤  どれだけ中心から�
 
 機能フラグ: `OPENARM_MEASURE_{APPROACH_MARGIN,DESTINATION_SEARCH,ARM_PREFLIGHT,HOME_MARGIN}`。
 
+## 実機へ渡すもの（2026-11-09 完了時点）
+
+- **契約**: `simulation/conformance.py`（16 操作）＋ `scripts/check_body_conformance.py --describe`
+- **参照実装**: `simulation/conformance_reference.py` — 契約を完全に実装した最小の身体（物理なし）。
+  実機ブリッジはこれをコピーして始められる。テストで**肯定経路**（0 問題）も固定した
+- **受け入れ手順**: (1) 契約適合 0 問題 (2) `margin_sensitivity.py` で余裕の実測
+  (3) `OPENARM_PERCEPTION_ERROR_MM` で知覚誤差曲線を測り、実機の認識精度と比較
+- **実測済みの前提**: 知覚誤差 0 mm で 4/8、10 mm で 2/8（積み上げは真値検証で落ちる）、20 mm で 0/8。
+  実機の誤差が 10 mm を超えるなら、この構成のままでは積み上げ系は成立しない
+
 ## やらないこと
 
 - 安全しきい値（20 mm / 3 mm / パッド上の余白）を「測ったから」と言って緩めない。これは方針。
