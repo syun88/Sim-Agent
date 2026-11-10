@@ -417,6 +417,23 @@ uv run python scripts/export_lerobot_annotations.py \
 この層は「どの層で壊れたか」を言えるようにするためのものであり、任意の自然言語の理解を保証しない。
 学習モデルを後段に置く場合も、この決定集合が提案と検証の境界になる。
 
+## シーンを選べるようにした（2026-11-10）
+
+`simulation/scenes.py` が**シーンの一覧をデータで持つ**（`cubes` / `wine` / `mixed`）。追加は「id・含む物体・
+必要な部品・流体の有無」を書くだけで、環境の検証・API・UI が同じ一覧を見る。
+
+- `GET /api/scenes` → 一覧（`objects` / `zones` / `fluid` / **`selectable`** / `active`）
+- `POST /api/scenes/select?scene=<id>` → 所有者に再構築を依頼（把持中は拒否）
+- 指示文からも選ばれる（`scene_for_instruction`: ワイン語と キューブ語が両方出れば `mixed`）
+
+**「登録されているが構築できない」を選べなくした**。実測: `mixed`（キューブ＋ワイン器物）は
+**10 分以上 CPU 350% で構築が終わらなかった**ため `verified: false` とし、API は 409 で理由を返し、
+UI も選択不可にする。主張（この scene は作れる）は `scripts/check_scenes.py` で**実際に構築して確かめる**。
+
+なお `~/Downloads/assets.zip` は**リポジトリの現行アセットと完全一致**（シーンXML・wine メッシュ同一）だった
+ので、重複登録はせず、その素材で組める `mixed` を登録した。ライブ確認: 一覧・拒否（409）・
+`cubes` への切り替え（SUCCEEDED）・通常タスク（SUCCEEDED、`placement`/`undisturbed` とも真）。
+
 ## 身体の契約（2026-11-09）
 
 `simulation/conformance.py` が「skills が駆動する前に身体が答えるべき操作」を宣言し、検査する。実機に
