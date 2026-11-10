@@ -417,6 +417,50 @@ uv run python scripts/export_lerobot_annotations.py \
 この層は「どの層で壊れたか」を言えるようにするためのものであり、任意の自然言語の理解を保証しない。
 学習モデルを後段に置く場合も、この決定集合が提案と検証の境界になる。
 
+## 遅さ・速さ・戻れなさの原因と修正（2026-11-10 実測）
+
+### GPU は使えない（測定で確定）
+
+`genesis 1.4.4` のバックエンドを直接叩いた結果:
+
+| 指定 | 結果 |
+|---|---|
+| `gs.gpu`（CUDA） | **CPU で起動**（`Running on [AMD Ryzen 7 9800X3D] with backend gs.cpu`） |
+| `gs.amdgpu` | `GenesisException: Backend <gs.amdgpu> not available on this machine` |
+
+つまりこのホストでは CUDA も AMD も使えず、**CPU 固定**。GPU 化は Genesis の再ビルドか CUDA 機が要る。
+
+### wine が遅い（測定と対策）
+
+`WINE_DT=2ms` × `WINE_SUBSTEPS=32` × 粒子 2.5mm で、**壁時計1秒にシミュレーション 7.9ms**（実時間の 1/127）。
+タスクが「壊れている」ように見える速さ。シーンごとに流体設定を宣言できるようにし、実測で選んだ:
+
+| 設定 | 進む sim 時間 / 壁秒 |
+|---|---|
+| 2.5mm / dt 2ms / 32 substeps（旧既定） | 7.9 ms |
+| **3.5mm / dt 3ms / 20 substeps（新既定）** | **50.2 ms（6.4倍）** |
+
+粘性安定限界（`validate_fluid_timestep`）内であることも確認（substep 150 µs ≤ 上限 163 µs）。
+
+### 腕がテレポートする（原因は既定値）
+
+`OpenArmV2Controller` の既定が **`OPENARM_MOTION_SPEED=6`（6倍速）** だった。実時間の 1倍に変更。
+起動ログが `arm motion 1x` になることを確認。速くしたいときは環境変数で戻せる。
+
+### 「初期位置に腕を戻せませんでした」（固定目標をやめた）
+
+これまでは**モデルhome だけ**が戻り先で、そこが塞がっている/届かないと失敗していた。戻り先も
+**測定で選ぶ**: モデルhome → 固定姿勢集合（canonical postures）→ 常に可能な「上空待避」の順に候補を作り、
+スクリーニングと実測クリアランスで順位付け。`park_target` / `park_targets_considered` を証拠に残す。
+ライブ: 配置タスクで両腕とも park 成功。
+
+### 受け渡し（受信側の姿勢も測定で選ぶ）
+
+結合解が出す相対姿勢を nominal とし、立方体の4回対称を使って**90度ごとの候補**を作り、受信腕の
+現在姿勢から pre-grasp → pinch の経路を**同じクリアランスでスクリーニング**して選ぶ。
+証拠に `receiver_search`（各候補の clearance / screened / needed）を残す。
+ライブ: 受け渡し成功（続く配置は `TARGET_OCCUPIED` = ゾーンが埋まっていたため失敗、受け渡し自体は成功）。
+
 ## GUI の出し方（2026-11-10 実測で確定）
 
 **ネイティブウィンドウはこのホストでは出せない。** 原因は表示経路ではなく GPU で、
