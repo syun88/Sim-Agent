@@ -875,8 +875,27 @@ class SkillRunner:
                     continue
                 error = SkillError(result.error or "IK_FAILURE", f"Cannot carry {obj} to {np.round(desired, 4).tolist()} (EE {np.round(target, 4).tolist()}, position residual {result.position_error}, rotation residual {result.rotation_error})")
                 error.evidence = self._motion_evidence(result, object=obj, phase='carry')
+                # Ask the same question twice - once the way the destination search asked it, once the way the
+                # motion asked it - so a disagreement between them is a number in the record instead of an
+                # argument. Measured 2026-11-09: the search called a point reachable, the carry then reported
+                # 28 mm without moving, and there was no way to see which solve produced which number.
+                probes = {}
+                for label, kwargs in (('unseeded', {}),
+                                      ('seeded', {'q_init': q_init} if q_init is not None else None)):
+                    if kwargs is None:
+                        continue
+                    try:
+                        solution, residual, _ = self.controller.solve_ik(arm, target, commanded_rotation, **kwargs)
+                        probes[label] = {'solved': solution is not None,
+                                         'residual_m': None if residual is None else float(residual)}
+                    except Exception as probe_error:
+                        probes[label] = {'error': f'{type(probe_error).__name__}: {probe_error}'}
                 error.evidence = {**error.evidence, 'achieved_offset_m': achieved,
                                   'carry_trace': self._carry_trace(trace, np.asarray(desired, float)),
+                                  'carry_aim': np.asarray(target, float).tolist(),
+                                  'carry_desired_object': np.asarray(desired, float).tolist(),
+                                  'ik_probes': probes,
+                                  'seeded': q_init is not None,
                                   **({'task_tolerance_m': allow_error_m} if allow_error_m is not None else {})}
                 raise error
             self._require_hold(arm, obj)
