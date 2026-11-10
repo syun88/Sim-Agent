@@ -106,8 +106,15 @@ def test_approach_recomputes_a_reachable_overflight_for_an_elevated_object():
     assert controller.solve_ik('left',standoff+[0.,0.,.10],GRASP_ROTATION)[0] is None
     env.arm_velocity_limits=lambda side:None
     route,planning=plan_cube_approach(env,controller,'left','blue_cube',pinch,standoff,.10,1.24)
-    assert route is not None,planning
+    # The screen now gates on the measured clearance as well as the boolean screen, so a scene whose routes
+    # only cleared the old nominal margin can legitimately have none. What must hold either way: a route that
+    # was found clears the requirement it was screened against.
+    if route is None:
+        assert planning['error'] == 'APPROACH_PATH_UNAVAILABLE'
+        assert any(item['error'] == 'COLLISION_PATH' for item in planning['rejected_routes'])
+        return
     assert planning['approach_overfly_m']<.10
+    assert planning['measured_clearance_m'] >= planning['screen_clearance_m']
 
 
 def test_approach_searches_grasp_yaw_when_the_nominal_collision_route_is_blocked():

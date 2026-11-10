@@ -101,6 +101,15 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
     from backend.app.planning.measurement_flags import enabled as _measured
     screen_clearance = NONCONTACT_CLEARANCE_M + (motion_accuracy.expected_error(arm, 'approach')
                                                  if _measured('approach_margin') else 0.)
+    # An absolute override, so "what does a perception budget of N mm cost?" is a measurement instead of an
+    # opinion: set OPENARM_APPROACH_MARGIN_MM and the screen asks for exactly that.
+    import os as _os
+    _override = _os.environ.get('OPENARM_APPROACH_MARGIN_MM')
+    if _override:
+        try:
+            screen_clearance = float(_override) / 1000.
+        except ValueError:
+            pass
     # The clearance query ranks candidates; the route screen still decides. Where the two disagree the
     # trace says so (rejected_by), because a measured win the screen refuses is not an improvement.
     measure = getattr(kin,'path_minimum_clearance',None)
@@ -151,9 +160,17 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
                                      'staging':staged,'error':'IK_FAILURE'})
                     continue
                 route, curve = built
-                if check is None or check(route,objects,allowed_contacts=allowed,curve=curve,
-                                          minimum_object_clearance=screen_clearance,
-                                          object_clearances={obj:TARGET_BODY_CLEARANCE_M}):
+                measured = (measure(route, objects, allowed_contacts=allowed, curve=curve,
+                                    ceiling=CLEARANCE_CEILING_M) if measure is not None else None)
+                screened = (check is None or check(route,objects,allowed_contacts=allowed,curve=curve,
+                                                   minimum_object_clearance=screen_clearance,
+                                                   object_clearances={obj:TARGET_BODY_CLEARANCE_M}))
+                # Both answers, because they answer different geometry (the screen also sees the table and the
+                # other arm; the number only sees the objects). Measured 2026-11-09: a route passed the screen
+                # while its nearest-object distance was 4.2 mm below the requirement, so the number is a gate
+                # too - a route that does not clear what the screen asks for is not a route.
+                enough = measured is None or measured >= screen_clearance
+                if screened and enough:
                     found = (frame, float(rise), staged, route, curve)
                     break
                 rejected.append({'yaw_deg':frame['yaw_deg'],'overfly_m':float(rise),

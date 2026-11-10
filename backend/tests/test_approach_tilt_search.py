@@ -23,7 +23,7 @@ def _scene():
     kin = SimpleNamespace(
         evaluate=lambda q: (asked['target'].copy(), asked['rotation'].copy(), None, None),
         empty_arm_path_is_clear=lambda *a, **k: True,
-        path_minimum_clearance=lambda waypoints, objects, **k: .03 - abs(_tilt_of(asked['rotation']) - BEST_TILT_DEG) * .0002)
+        path_minimum_clearance=lambda waypoints, objects, **k: .045 - abs(_tilt_of(asked['rotation']) - BEST_TILT_DEG) * .0002)
 
     def solve_ik(arm, target, rotation, **kwargs):
         asked['target'] = np.asarray(target, float).copy()
@@ -81,7 +81,7 @@ def test_a_measured_win_the_screen_refuses_is_recorded_as_refused():
     env.arm_kinematics = lambda arm: SimpleNamespace(
         evaluate=lambda q: (asked['target'].copy(), asked['rotation'].copy(), None, None),
         empty_arm_path_is_clear=screen,
-        path_minimum_clearance=lambda waypoints, objects, **k: .03 - abs(_tilt_of(asked['rotation']) - BEST_TILT_DEG) * .0002)
+        path_minimum_clearance=lambda waypoints, objects, **k: .045 - abs(_tilt_of(asked['rotation']) - BEST_TILT_DEG) * .0002)
     frames = [frame_at('right', CUBE, .06, 0., tilt_deg=0.)]
     route, planning = plan_cube_approach(env, controller, 'right', 'blue_cube',
                                          frames[0]['pinch'], frames[0]['standoff'], .10, 1.24, frames=frames)
