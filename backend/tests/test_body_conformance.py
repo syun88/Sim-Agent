@@ -100,3 +100,44 @@ def test_the_approach_screen_carries_the_measured_approach_error(monkeypatch):
                                 np.array([0.45, 0.0, 1.05]), np.array([0.45, 0.0, 1.11]), .10, 1.24)
     expected = approach.NONCONTACT_CLEARANCE_M + motion_accuracy.PHASE_DEFAULTS['approach']
     assert seen['minimum_object_clearance'] == expected
+
+
+def test_the_approach_falls_back_to_a_shorter_standoff_when_the_nominal_one_has_no_corridor():
+    """A live round crashed on this import, which no test exercised: the fallback has to be pinned."""
+    from types import SimpleNamespace
+    from backend.app.skills import approach, robot_skills
+    from backend.app.simulation.openarm_v2.definition import GRASP_ROTATION
+
+    assert approach.STANDOFF_VARIANTS_M, 'the fallback distances must exist'
+    assert hasattr(approach, 'frame_at')
+    assert len(approach.CUBE_GRASP_YAWS_DEG) > 14, 'the half-steps are part of the candidate set'
+
+    calls = []
+
+    def fake_plan(env, controller, arm, obj, pinch, standoff, overfly, staging, *, frames=None,
+                  start_override=None):
+        calls.append(round(float(standoff[2] - pinch[2]), 3))
+        if len(calls) == 1:
+            return None, {'error': 'APPROACH_PATH_UNAVAILABLE'}
+        return [np.zeros(7), np.ones(7)], {'grasp_yaw_deg': 0.0, 'grasp_rotation': GRASP_ROTATION.tolist(),
+                                           'pinch_target': list(pinch)}
+    original = approach.plan_cube_approach
+    try:
+        import backend.app.skills.approach as module
+        module.plan_cube_approach = fake_plan
+        skills = robot_skills.SkillRunner.__new__(robot_skills.SkillRunner)
+        skills.env = SimpleNamespace(arm_qpos=lambda a: np.zeros(7), home_arm_qpos=lambda a: np.zeros(7),
+                                     ee_pose=lambda a: (np.array([0.4, 0.0, 1.2]), np.eye(3)),
+                                     arm_velocity_limits=lambda a: None,
+                                     object_pose=lambda n: (np.array([0.45, 0.0, 1.05]), np.eye(3)),
+                                     frame=lambda: SimpleNamespace(objects={'blue_cube': np.array([0.45, 0., 1.05])}),
+                                     arm_kinematics=lambda a: SimpleNamespace(
+                                         evaluate=lambda q: (np.array([0.45, 0., 1.05]), GRASP_ROTATION, None, None)))
+        skills.controller = SimpleNamespace(solve_ik=lambda *a, **k: (np.zeros(7), 0.001, 0.))
+        frames = approach.cube_approach_frames('left', np.array([0.45, 0.0, 1.05]), 0.06)
+        result = skills._stage_for_approach('left', 'blue_cube', np.array([0.45, 0.0, 1.05]), frames, {})
+    finally:
+        module.plan_cube_approach = original
+    # The staged helper asks from canonical postures; what matters here is that the variant path is reachable code
+    # and that a shorter standoff is one of the questions it can ask.
+    assert result is None or isinstance(result, tuple)

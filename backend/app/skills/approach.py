@@ -10,7 +10,14 @@ from backend.app.simulation.transform import orientation_error
 
 # Bounded exploration, not proof that every cube face can be pinched. The physical
 # finger-contact and follow checks after approach remain the success authority.
-CUBE_GRASP_YAWS_DEG = (0, -15, 15, -30, 30, -45, 45, -60, 60, -75, 75, -90, 90, 180)
+#: Every 15 degrees, plus the half-steps between them. Measured 2026-11-09: in tight layouts the 15-degree
+#: grid was exhausted and no route was reported; a half-step can find a corridor between two blocked
+#: neighbours. The coarse values stay first so the cheap answer is found early.
+CUBE_GRASP_YAWS_DEG = (0, -15, 15, -30, 30, -45, 45, -60, 60, -75, 75, -90, 90, 180,
+                       -7.5, 7.5, -22.5, 22.5, -37.5, 37.5, -52.5, 52.5, -67.5, 67.5, -82.5, 82.5)
+#: Standoffs tried when the nominal distance yields no corridor: a shorter reach keeps the pads further from
+#: a neighbouring object.
+STANDOFF_VARIANTS_M = (0.05, 0.04)
 # Task 57efa442 moved a cube 248 mm after a no-margin path passed; with 8 mm
 # clearance task 22d8e6c7 still moved red 15.8 mm between motion samples.
 # Keep 20 mm around NON-contact geometry; target fingertip contact is exempt.
