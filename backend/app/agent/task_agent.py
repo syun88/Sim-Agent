@@ -175,7 +175,41 @@ class TaskAgent:
         # met and the task stops with the alternative named. If the hand was only inferred, refusing would be
         # wrong - measured 2026-11-09: "青いキューブを赤いキューブの上に置いて" was refused for the inferred
         # left hand while the right hand could reach it, so the inferred choice is changed and recorded.
+        from backend.app.planning.language_fallback import arm_mentions
         from backend.app.planning.measurement_flags import enabled as _measured
+        # The *destination* decides the hand when the instruction does not name one. Measured 2026-11-09: each
+        # zone in these layouts is reachable by exactly one arm (blue by the left, green by the right), so an
+        # inferred hand that cannot reach the target makes the task impossible for a reason that is known
+        # before any motion - and already measured in preflight['zones'].
+        explicit_arms = set(arm_mentions(instruction))
+        zone_switch = []
+        for step in (getattr(plan, 'steps', None) or []):
+            target, arm = getattr(step, 'target', None), getattr(step, 'arm', None)
+            zones = (preflight or {}).get('zones') or {}
+            if not target or arm not in ('left', 'right') or arm in explicit_arms:
+                continue
+            if not isinstance(zones.get(target), dict):
+                continue
+            if (zones[target].get(arm) or {}).get('reachable') is False:
+                alternatives = [name for name in ('left', 'right') if name != arm
+                                and (zones[target].get(name) or {}).get('reachable') is True]
+                if not alternatives:
+                    continue
+                for other_step in (getattr(plan, 'steps', None) or []):
+                    if getattr(other_step, 'arm', None) == arm:
+                        other_step.arm = alternatives[0]
+                for action in (getattr(getattr(plan, 'program', None), 'actions', None) or []):
+                    if getattr(action, 'arm', None) == arm:
+                        action.arm = alternatives[0]
+                zone_switch.append({'target': target, 'from': arm, 'to': alternatives[0],
+                                    'basis': 'the other arm is the one that can reach that destination',
+                                    'residual_m': (zones[target].get(alternatives[0]) or {}).get('best_residual_m')})
+        if zone_switch:
+            plan.planning_evidence = {**(plan.planning_evidence or {}),
+                                      'arm_choice': (plan.planning_evidence or {}).get('arm_choice', []) + zone_switch}
+            announce({'kind': 'arm_choice',
+                      'explanation': '指示に手の指定が無いため、目的地に届く手を選びました。',
+                      'arm_choice': zone_switch})
         unreachable = ([row for row in (preflight or {}).get('arms', [])
                         if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE']
                        if _measured('arm_preflight') else [])
