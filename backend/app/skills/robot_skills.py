@@ -284,6 +284,14 @@ class SkillRunner:
                     STAGING_ALTITUDE, frames=leaning)
                 approach_evidence = {**approach_evidence, 'search': 'two_axis'}
             if route is None:
+                # Before giving up: is there a posture from which this object *is* approachable? Measured
+                # 2026-11-09: 4 of 8 approach failures came from searching only from where the arm happened to
+                # be. The fixed posture set makes the question independent of the current stance, and when one
+                # answers yes the arm can simply go there first.
+                staged = self._stage_for_approach(arm, obj, centre, frames, approach_evidence)
+                if staged is not None:
+                    route, approach_evidence = staged
+            if route is None:
                 rejected=approach_evidence.get('rejected_routes',[])
                 category='COLLISION_PATH' if rejected and all(r['error']=='COLLISION_PATH' for r in rejected) else 'IK_FAILURE'
                 error=SkillError(category,'No reachable collision-screened cube approach in the bounded grasp-frame search')
@@ -728,6 +736,40 @@ class SkillRunner:
                     "support_regrasp": regrasp if is_held_stationary else None,
                     "stack_strategy": strategy if is_held_stationary else None}
         return self._skill("move_to_object", run, time.perf_counter())
+
+    def _stage_for_approach(self, arm: str, obj: str, centre, frames, evidence):
+        """Find a posture from which the approach has a route, move there, and plan again.
+
+        The question "is this object approachable at all" is answered from a fixed posture set, so the answer
+        does not depend on where the arm is standing; "can I get there from here" is what the planning itself
+        answers. When the second fails but the first says yes, the arm goes to the posture that works.
+        """
+        from backend.app.planning.capability_queries import canonical_postures
+        from backend.app.skills.approach import plan_cube_approach
+        for index, posture in enumerate(canonical_postures(self.env, arm)):
+            try:
+                trial, planning = plan_cube_approach(
+                    self.env, self.controller, arm, obj, frames[0]['pinch'], frames[0]['standoff'],
+                    APPROACH_OVERFLY, STAGING_ALTITUDE, frames=frames,
+                    start_override=np.asarray(posture, float))
+            except Exception:
+                continue
+            if trial is None:
+                continue
+            try:
+                staged = self._stage_to_posture(arm, posture)
+            except SkillError as error:
+                error.evidence = {**(error.evidence or {}), 'stage_posture': index, 'phase': 'approach_staging'}
+                raise
+            # Plan again from the posture the arm is now in: the route has to start where the arm is.
+            route, approach_evidence = plan_cube_approach(
+                self.env, self.controller, arm, obj, frames[0]['pinch'], frames[0]['standoff'],
+                APPROACH_OVERFLY, STAGING_ALTITUDE, frames=frames)
+            approach_evidence = {**approach_evidence, 'recovered_by_staging': True,
+                                 'stage_posture_index': index, 'staged_to': staged['position'],
+                                 'layout_question_asked_from': index}
+            return (route, approach_evidence) if route is not None else None
+        return None
 
     def _stage_to_posture(self, arm: str, posture) -> dict:
         """Move the arm, holding its grasp, to a configuration from which the placement is reachable."""
