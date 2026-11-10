@@ -58,6 +58,25 @@ def _repeats_measured_contact(mechanism, receipt):
     return before == after
 
 
+def _switch_plan_arm(plan, old_arm: str, new_arm: str) -> None:
+    """Rewrite an inferred hand in both the program and the compiled steps.
+
+    Only used when the instruction did not name a hand: then the hand is a resolution of the request, and
+    resolving it to the arm that measurably has an approach route is what the request actually asked for.
+    """
+    program = getattr(plan, 'program', None)
+    for action in (getattr(program, 'actions', None) or []):
+        if getattr(action, 'arm', None) == old_arm:
+            action.arm = new_arm
+        if getattr(action, 'receiver', None) == old_arm:
+            action.receiver = new_arm
+    for step in (getattr(plan, 'steps', None) or []):
+        if getattr(step, 'arm', None) == old_arm:
+            step.arm = new_arm
+        if getattr(step, 'receiver', None) == old_arm:
+            step.receiver = new_arm
+
+
 class TaskAgent:
     def __init__(self, executor, planner, *, plan_call=None, recovery_call=None, max_attempts=4, max_resets=1,
                  mechanism_reviewer=None):
@@ -148,11 +167,39 @@ class TaskAgent:
         except Exception as error:
             preflight = {'available': False, 'reason': f'{type(error).__name__}: {error}'}
             plan.planning_evidence = {**(plan.planning_evidence or {}), 'preflight': preflight}
-        # An arm that cannot reach the object is refused before any motion, with the alternative named.
-        # Measured 2026-11-09: a right-hand instruction for a cube at y=+0.264 failed twelve attempts in the
-        # approach search; both arms answer this reachability question in milliseconds.
+        # An arm that cannot reach the object is measured before any motion. Measured 2026-11-09: a right-hand
+        # instruction for a cube at y=+0.264 failed twelve attempts in the approach search; both arms answer
+        # this question in milliseconds.
+        #
+        # What happens next depends on who chose the hand. If the *instruction* named it, the request cannot be
+        # met and the task stops with the alternative named. If the hand was only inferred, refusing would be
+        # wrong - measured 2026-11-09: "青いキューブを赤いキューブの上に置いて" was refused for the inferred
+        # left hand while the right hand could reach it, so the inferred choice is changed and recorded.
         unreachable = [row for row in (preflight or {}).get('arms', [])
                        if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE']
+        if unreachable:
+            from backend.app.planning.language_fallback import arm_mentions
+            explicit = set(arm_mentions(instruction))
+            switchable = [row for row in unreachable
+                          if row['arm'] not in explicit and row.get('reachable_arms')]
+            if switchable:
+                changes = []
+                for row in switchable:
+                    alternative = row['reachable_arms'][0]
+                    _switch_plan_arm(plan, row['arm'], alternative)
+                    changes.append({'object': row['object'], 'from': row['arm'], 'to': alternative,
+                                    'basis': 'the hand was not requested; the other one has a screened approach',
+                                    'screen': (row.get('screen') or {}).get(alternative)})
+                plan.planning_evidence = {**(plan.planning_evidence or {}),
+                                          'arm_choice': changes}
+                announce({'kind': 'arm_choice', 'explanation':
+                          '指示に手の指定が無いため、接近経路が確認できた手を選びました。',
+                          'arm_choice': changes})
+                preflight = run_preflight(getattr(self.executor, 'env', None),
+                                          getattr(self.executor, 'controller', None), plan.program)
+                plan.planning_evidence = {**(plan.planning_evidence or {}), 'preflight': preflight}
+                unreachable = [row for row in (preflight or {}).get('arms', [])
+                               if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE']
         if unreachable:
             row = unreachable[0]
             alternative = ', '.join(row.get('reachable_arms') or [])

@@ -98,3 +98,23 @@ def test_a_place_also_asks_whether_the_arm_can_reach_what_it_will_pick_up():
     rows = arm_feasibility(env, controller, [{'op': 'place', 'object': 'red_cube', 'arm': 'right',
                                               'target': 'blue_zone'}])
     assert rows and rows[0]['verdict'] == 'REQUESTED_ARM_UNREACHABLE'
+
+
+def test_an_inferred_hand_is_switched_not_refused():
+    """Measured 2026-11-09: '青いキューブを赤いキューブの上に置いて' was refused for the inferred left hand
+    while the right hand had a route."""
+    from types import SimpleNamespace
+    from backend.app.agent.task_agent import _switch_plan_arm
+
+    action = SimpleNamespace(arm='left', receiver=None)
+    step = SimpleNamespace(arm='left', receiver=None)
+    plan = SimpleNamespace(program=SimpleNamespace(actions=[action]), steps=[step])
+    _switch_plan_arm(plan, 'left', 'right')
+    assert action.arm == 'right' and step.arm == 'right'
+
+
+def test_the_refusal_is_reserved_for_a_hand_the_instruction_named():
+    from backend.app.planning.language_fallback import arm_mentions
+
+    assert arm_mentions('青いキューブを右手で青いゾーンに置いて') == ['right']
+    assert arm_mentions('青いキューブを赤いキューブの上に置いて') == []
