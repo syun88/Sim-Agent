@@ -21,10 +21,18 @@ FLAGS = {
 }
 
 
+#: Flags that a measurement showed to be harmful as a default. Measured 2026-11-09 on identical layouts and
+#: instructions (seeds 11,12 x 4 tasks): with the arm preflight refusing, 2/8 succeeded and 4 tasks were
+#: refused that the robot could actually do; with it off, 3/8 succeeded and nothing was refused. The
+#: measurement is still recorded (the preflight rows are computed either way) - it just does not decide.
+DEFAULT_OFF = {'arm_preflight'}
+
+
 def enabled(name: str) -> bool:
     if name not in FLAGS:
         raise KeyError(f'unknown measurement flag {name!r}; known: {sorted(FLAGS)}')
-    return os.environ.get(f'OPENARM_MEASURE_{name.upper()}', '1') not in ('0', 'false', 'False', '')
+    default = '0' if name in DEFAULT_OFF else '1'
+    return os.environ.get(f'OPENARM_MEASURE_{name.upper()}', default) not in ('0', 'false', 'False', '')
 
 
 def describe() -> dict[str, bool]:

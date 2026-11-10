@@ -4,13 +4,17 @@ import numpy as np
 from backend.app.planning import measurement_flags as flags
 
 
-def test_every_safeguard_is_on_by_default(monkeypatch):
+def test_defaults_follow_the_measurement(monkeypatch):
+    """A safeguard measured as harmful is off by default; the rest are on."""
     for name in flags.FLAGS:
         monkeypatch.delenv(f'OPENARM_MEASURE_{name.upper()}', raising=False)
-    assert all(flags.describe().values())
+    state = flags.describe()
+    assert state['arm_preflight'] is False, 'measured harmful: it refused tasks the robot could do'
+    assert all(value for name, value in state.items() if name != 'arm_preflight')
 
 
 def test_a_flag_can_be_switched_off(monkeypatch):
+    monkeypatch.delenv('OPENARM_MEASURE_APPROACH_MARGIN', raising=False)
     monkeypatch.setenv('OPENARM_MEASURE_DESTINATION_SEARCH', '0')
     assert flags.enabled('destination_search') is False
     assert flags.enabled('approach_margin') is True, 'flags are independent'
