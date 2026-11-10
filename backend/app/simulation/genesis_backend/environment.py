@@ -245,15 +245,19 @@ class GenesisOpenArmV2Environment(SimulationBackend):
             )
         self._gs = _ensure_genesis_init(prefer_gpu)
         self.compute_backend = self._gs.backend.name
-        if scene_profile not in {"cubes", "wine"}:
-            raise ValueError("Unknown scene profile")
+        from backend.app.simulation import scenes as scene_registry
+        scene_registry.check(scene_profile)
         self.scene_profile = scene_profile
         self._wine = None
         self._xml = resolved_scene_xml()
-        self._cube_names = tuple(OBJECTS) if scene_profile == "cubes" else ()
-        if scene_profile == "wine":
-            # Keep the official robot/cell attachment intact. Each task profile
-            # carries only its workpieces, rather than unused free cube joints.
+        # A scene says what it needs; the builder follows that instead of a hard-coded pair of names, so
+        # `mixed` (cubes and vessels together) needs no new branch here.
+        wants_cubes = 'cubes' in scene_registry.needs(scene_profile)
+        wants_wine = 'wine' in scene_registry.needs(scene_profile)
+        self._cube_names = tuple(OBJECTS) if wants_cubes else ()
+        if not wants_cubes:
+            # Keep the official robot/cell attachment intact. A scene without cubes carries only its
+            # workpieces, rather than unused free cube joints.
             import xml.etree.ElementTree as ET
             root = ET.fromstring(self._xml)
             world = root.find("worldbody")
@@ -264,7 +268,7 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         self._meta = _OfficialModelMetadata(self._xml)
         self._scene_xml = genesis_scene_xml(self._xml, self._meta)
         fluid_options = {}
-        if scene_profile == "wine":
+        if wants_wine:
             from backend.app.simulation.genesis_backend.wine import (
                 PARTICLE_SIZE, LIQUID_MU, WINE_DT, WINE_SUBSTEPS, PRESSURE_SOLVER, HASH_GRID_SIZE, validate_fluid_timestep,
             )
@@ -273,21 +277,21 @@ class GenesisOpenArmV2Environment(SimulationBackend):
                 particle_size=PARTICLE_SIZE, pressure_solver=PRESSURE_SOLVER, hash_grid_res=HASH_GRID_SIZE,
                 lower_bound=(.05, -.55, .80), upper_bound=(.9, .55, 1.75))
         self._scene = self._gs.Scene(
-            sim_options=self._gs.options.SimOptions(dt=WINE_DT if scene_profile == "wine" else .001,
-                                                  substeps=WINE_SUBSTEPS if scene_profile == "wine" else 1),
+            sim_options=self._gs.options.SimOptions(dt=WINE_DT if wants_wine else .001,
+                                                  substeps=WINE_SUBSTEPS if wants_wine else 1),
             # The default viewer looks at the opaque front of the official cell.
             # Place the camera inside the cell so both hands and cubes stay visible.
             viewer_options=self._gs.options.ViewerOptions(
                 res=(1100, 760),
                 realtime_factor=self.simulation_speed,
-                camera_pos=(.78, 0., 1.75) if scene_profile == "wine" else NATIVE_CAMERA_POSITION,
-                camera_lookat=(.40, .07, 1.13) if scene_profile == "wine" else NATIVE_CAMERA_LOOKAT,
-                camera_fov=72. if scene_profile == "wine" else 65.,
+                camera_pos=(.78, 0., 1.75) if wants_wine else NATIVE_CAMERA_POSITION,
+                camera_lookat=(.40, .07, 1.13) if wants_wine else NATIVE_CAMERA_LOOKAT,
+                camera_fov=72. if wants_wine else 65.,
             ),
             rigid_options=self._gs.options.RigidOptions(
                 constraint_solver=self._gs.constraint_solver.Newton,
-                contact_resolution=self._gs.contact_resolution.convex if scene_profile == "wine" else None,
-                impratio=10. if scene_profile == "wine" else None,
+                contact_resolution=self._gs.contact_resolution.convex if wants_wine else None,
+                impratio=10. if wants_wine else None,
                 friction_cone=self._gs.friction_cone.elliptic,
                 enable_torsional_friction=True,
                 enable_rolling_friction=True,
@@ -300,9 +304,9 @@ class GenesisOpenArmV2Environment(SimulationBackend):
             show_viewer=show_viewer,
             **fluid_options,
         )
-        material = self._gs.materials.Rigid(needs_coup=False) if scene_profile == "wine" else None
+        material = self._gs.materials.Rigid(needs_coup=False) if wants_wine else None
         self._entity = self._scene.add_entity(self._gs.morphs.MJCF(file=self._scene_xml), material=material)
-        if scene_profile == "wine":
+        if wants_wine:
             from backend.app.simulation.genesis_backend.wine import WineWorld
             # Same tabletop height, also a collision boundary for spilled particles.
             self._scene.add_entity(self._gs.morphs.MJCF(file='''<mujoco><worldbody>

@@ -40,6 +40,23 @@ const $=id=>document.getElementById(id);
 let currentTaskId=null, polling=false, shownPlan='', robotCatalog=[], activeRobot='openarm_v2', isBusy=false,lastRandomization=null;
 const arm={left:'左手',right:'右手'}, object={red_cube:'赤いキューブ',blue_cube:'青いキューブ',wine_bottle:'ワインボトル',wine_glass:'グラス'}, target={blue_zone:'青いゾーン',green_zone:'緑のゾーン',left_side:'左側',right_side:'右側',center:'中央',wine_glass:'グラス'};
 // Labels come from the scene catalog, so an object added there shows up here without editing this file.
+// Scene selector: the list comes from /api/scenes, so a new scene is data, not a UI edit.
+fetch('/api/scenes').then(r=>r.json()).then(d=>{
+  const bar=document.createElement('div');
+  bar.innerHTML='<label>シーン: <select id="sceneSelect"></select></label> <span id="sceneState"></span>';
+  document.body.insertBefore(bar, document.body.firstChild);
+  const select=bar.querySelector('#sceneSelect');
+  for(const scene of d.scenes||[]){
+    const option=document.createElement('option');
+    option.value=scene.id; option.textContent=scene.id+' — '+scene.description;
+    option.selected=scene.id===d.active; select.appendChild(option);
+  }
+  select.onchange=async()=>{
+    const state=bar.querySelector('#sceneState'); state.textContent='切替中…';
+    const response=await fetch('/api/scenes/select?scene='+encodeURIComponent(select.value),{method:'POST'});
+    state.textContent=response.ok?'要求を送信しました':'失敗: '+response.status;
+  };
+}).catch(()=>{});
 fetch('/api/catalog').then(r=>r.json()).then(c=>{
   for(const e of c.objects||[]) if(e.label&&e.label.ja){object[e.id]=e.label.ja;}
   for(const e of c.zones||[]) if(e.label&&e.label.ja){target[e.id]=e.label.ja;}

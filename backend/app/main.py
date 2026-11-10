@@ -134,6 +134,26 @@ def catalog_vocabulary():
                       for entry in loaded.zones]}
 
 
+@app.get('/api/scenes')
+def scene_list():
+    """Which scenes exist, and which one is running (from the owner's last published state)."""
+    from backend.app.simulation import scenes as scene_registry
+    active = (app.state.world_state or {}).get('scene_profile')
+    return {'scenes': scene_registry.describe(active), 'active': active}
+
+
+@app.post('/api/scenes/select')
+def scene_select(scene: str):
+    """Ask the simulation owner to rebuild the scene. It refuses while an arm holds something."""
+    from backend.app.simulation import scenes as scene_registry
+    try:
+        scene_registry.check(scene)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from None
+    record = _enqueue({'action': 'select_scene', 'scene': scene})
+    return {'status': 'queued', 'scene': scene, 'task_id': record['task_id']}
+
+
 @app.post('/api/scene/reset')
 def reset_scene(randomize: bool = False,seed:int|None=Query(default=None,ge=0,le=2**32-1),shuffle_sides:bool=True):
     seed=resolve_seed(seed) if randomize else None

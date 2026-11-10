@@ -281,6 +281,11 @@ def main() -> None:
                     body.update(success=all(row['success'] for row in rows), verification={'success': True,
                         'goal_type': 'pinch_diagnostic', 'observer': command.get('observer') is not False,
                         'rows': rows}, final_world_state=build_world_state(env))
+                elif command['action'] == 'select_scene':
+                    prepare_scene(command['scene'])
+                    body.update(success=True, verification={'success': True, 'goal_type': 'scene_selection',
+                                                            'scene': env.scene_profile},
+                                final_world_state=build_world_state(env))
                 elif command['action'] == 'select_robot':
                     prepare_robot(command['robot_id'])
                     body.update(success=True, verification={'success': True, 'goal_type': 'robot_selection', 'robot_id': command['robot_id']},
