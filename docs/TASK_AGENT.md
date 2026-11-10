@@ -419,6 +419,23 @@ uv run python scripts/export_lerobot_annotations.py \
 
 ## 遅さ・速さ・戻れなさの原因と修正（2026-11-10 実測）
 
+### ROCm 対応: 途中まで（2026-11-10 実測）
+
+`genesis/utils/misc.py:192` が `gs.amdgpu` を `torch.version.hip` の有無で判定していたため、
+**ROCm ビルドの PyTorch** を別 venv に入れた（`scripts/setup_rocm_venv.sh`）:
+
+| 項目 | 結果 |
+|---|---|
+| torch | **2.10.0+rocm7.0**、`hip 7.0.51831`、`cuda.is_available() True`（RX 7800 XT が見える） |
+| venv | `/home/yuu/Documents/Sim-Agent-nav/.venv-rocm`（CUDA 版のメイン venv は無傷） |
+| 落とし穴 | 4.6GB ホイールは **/tmp が 6GB tmpfs で溢れる** → 実ディスクへ。`triton-rocm` は PyTorch の ROCm index のみ |
+| Genesis の次の壁 | `shared_memory_per_multiprocessor` が ROCm の torch に無い → 互換シムで回避（`simulation/amd_compat.py`、5モジュールを再バインド） |
+| **その先** | シーン構築が **10分以上進まない**（HIP カーネルの JIT、子プロセス無し・`/dev/kfd` を保持したまま） |
+
+つまり **ROCm で torch と GPU 認識までは到達**したが、**Genesis 1.4.4 の AMD バックエンドはこの環境で
+実用にならない**（測定）。GPU 化するなら Genesis の AMD 対応版（新しいリリース）か CUDA 機が要る。
+`scripts/setup_rocm_venv.sh` で再現でき、`amd_compat.py` は ROCm 以外では何もしない（メイン venv に影響なし）。
+
 ### GPU は使えない（測定で確定）
 
 `genesis 1.4.4` のバックエンドを直接叩いた結果:
