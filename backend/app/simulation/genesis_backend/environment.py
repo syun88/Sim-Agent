@@ -96,6 +96,12 @@ def _ensure_genesis_init(prefer_gpu: bool):
             gs.destroy()
             _INITIALISED = False
         if not _INITIALISED:
+            if prefer_gpu:
+                # A ROCm build of torch needs one guarded lookup before Genesis can build a scene at all.
+                from backend.app.simulation import amd_compat
+                compat = amd_compat.apply()
+                if compat.get('applied'):
+                    print(f'AMD compatibility applied: {compat}', flush=True)
             gs.init(backend=gs.gpu if prefer_gpu else gs.cpu, precision="32", logging_level="error")
             _INITIALISED = True
     return gs
