@@ -31,6 +31,8 @@ def test_a_scene_that_has_not_been_built_is_not_offered():
     assert listed['mixed']['verified'] is False and listed['mixed']['selectable'] is False
     assert listed['mixed']['note']
     assert listed['cubes']['selectable'] is True
+    assert listed['wine']['selectable'] is False, 'the wine build stalls in mesh-to-SDF conversion'
+    assert 'SDF' in listed['wine']['note'] or 'SDF' in listed['mixed']['note']
     assert scenes.is_selectable('mixed') is False
     assert scenes.is_selectable('mixed', force=True) is True
 

@@ -28,7 +28,11 @@ SCENES: dict[str, dict] = {
         'zones': [],
         'needs': ['wine'],
         'fluid': True,
-        'verified': True,
+        # Measured 2026-11-10: building this scene stops in Genesis' mesh-to-SDF conversion
+        # (`rigid_geom._compute_sd` -> `T_mesh_to_sdf`) and had not finished after ten minutes at ~350% CPU.
+        # The wine world was never built in this session, so the earlier "verified" was an assumption.
+        'verified': False,
+        'note': 'build stalls in Genesis mesh-to-SDF conversion; not yet built on this host',
     },
     'mixed': {
         'description': 'Cubes, a bottle and a glass together: pour and stack in one scene.',
