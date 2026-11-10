@@ -91,7 +91,9 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
     # has to be screened with that much extra room. Refusing more routes is the intended trade - a route that
     # brushes the user's object is not a route.
     from backend.app.skills import motion_accuracy
-    screen_clearance = NONCONTACT_CLEARANCE_M + motion_accuracy.expected_error(arm, 'approach')
+    from backend.app.planning.measurement_flags import enabled as _measured
+    screen_clearance = NONCONTACT_CLEARANCE_M + (motion_accuracy.expected_error(arm, 'approach')
+                                                 if _measured('approach_margin') else 0.)
     # The clearance query ranks candidates; the route screen still decides. Where the two disagree the
     # trace says so (rejected_by), because a measured win the screen refuses is not an improvement.
     measure = getattr(kin,'path_minimum_clearance',None)

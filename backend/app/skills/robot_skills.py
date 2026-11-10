@@ -989,7 +989,11 @@ class SkillRunner:
 
     def _search_destination(self, arm: str, obj: str, target: str, requested, relation: str):
         """The same measurement for any requested placement point: a zone centre, a support offset, ..."""
+        from backend.app.planning.measurement_flags import enabled as _measured
         search = {'requested': np.asarray(requested, float).tolist(), 'chosen': 'requested', 'considered': []}
+        if not _measured('destination_search'):
+            search['search'] = 'disabled_by_flag'
+            return requested, search
         solve = getattr(self.controller, 'solve_ik', None)
         if not callable(solve):
             return requested, search

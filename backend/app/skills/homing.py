@@ -33,7 +33,8 @@ def plan_empty_arm_home(env, controller, arm):
     # derived from how far the arm actually lands from where it was told to go (measured), not from a
     # constant. Measured 2026-11-09: a 30 mm margin lost to a ~35 mm positioning difference.
     from backend.app.skills import motion_accuracy
-    home_clearance_required = motion_accuracy.required_clearance(arm)
+    from backend.app.planning.measurement_flags import enabled as _measured
+    home_clearance_required = (motion_accuracy.required_clearance(arm) if _measured('home_margin') else .03)
     nominal_clear = (check is None
                      or check([home, home], objects, minimum_object_clearance=home_clearance_required))
 

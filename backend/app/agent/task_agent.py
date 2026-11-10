@@ -175,8 +175,10 @@ class TaskAgent:
         # met and the task stops with the alternative named. If the hand was only inferred, refusing would be
         # wrong - measured 2026-11-09: "青いキューブを赤いキューブの上に置いて" was refused for the inferred
         # left hand while the right hand could reach it, so the inferred choice is changed and recorded.
-        unreachable = [row for row in (preflight or {}).get('arms', [])
-                       if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE']
+        from backend.app.planning.measurement_flags import enabled as _measured
+        unreachable = ([row for row in (preflight or {}).get('arms', [])
+                        if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE']
+                       if _measured('arm_preflight') else [])
         if unreachable:
             from backend.app.planning.language_fallback import arm_mentions
             explicit = set(arm_mentions(instruction))
