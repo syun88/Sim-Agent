@@ -203,6 +203,14 @@ class TaskAgent:
         if unreachable:
             row = unreachable[0]
             alternative = ', '.join(row.get('reachable_arms') or [])
+            # Keep the whole measurement with the plan before refusing: measured 2026-11-09, refusals raised
+            # here left no preflight rows behind, so a refused round could not be diagnosed afterwards.
+            plan.planning_evidence = {**(plan.planning_evidence or {}),
+                                      'preflight': preflight,
+                                      'arm_refusal': {'object': row.get('object'), 'arm': row.get('arm'),
+                                                      'reachable_arms': row.get('reachable_arms'),
+                                                      'alternatives': row.get('alternatives'),
+                                                      'screen': row.get('screen')}}
             raise GroundingError(
                 f"ARM_CANNOT_REACH: the {row['arm']} hand cannot reach {row['object']} here "
                 f"(reachable: {alternative or 'neither hand'})")
