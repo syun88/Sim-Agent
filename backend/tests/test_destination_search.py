@@ -211,3 +211,35 @@ def test_a_pose_that_would_need_a_joint_limit_is_treated_as_unusable_not_unknown
     assert search['considered'][0]['blocked_by_joint_limit'] is True
     assert search['chosen'] in {'unreachable', 'offset_inside_region'}
     assert search['chosen'] != 'unmeasured', 'a measured-but-unusable pose is not an unknown'
+
+
+def test_no_ik_solution_is_unreachable_not_unknown():
+    """Measured 2026-11-09: 'no solution' was read as unknown, so a point 254 mm out of reach was commanded."""
+    skills = _runner(lambda distance: True)
+    skills.controller.solve_ik = staticmethod(lambda arm, target, rotation, **kwargs: (None, None, 0.))
+    _desired, search = skills._reachable_destination('red_cube', 'blue_zone', 'on', 'left')
+    assert search['chosen'] != 'unmeasured', 'a solver that says "no" has answered the question'
+    assert search['chosen'] in {'unreachable', 'offset_inside_region'}
+
+
+def test_a_posture_that_would_reach_the_zone_is_offered_as_staging():
+    """The zone may be unreachable from here and reachable from somewhere else; that is worth knowing."""
+    skills = _runner(lambda distance: True)
+    home = np.zeros(7)
+    good = np.array([0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    skills.env.home_arm_qpos = lambda arm: home.copy()
+    skills.env.arm_limits = lambda arm: np.array([[-3., 3.]] * 7)
+    skills.env.arm_qpos = lambda arm: np.full(7, 3.0 - 0.01)   # arm parked on a limit: cannot reach
+
+    def solve(arm, target, rotation, **kwargs):
+        seed = kwargs.get('q_init')
+        if seed is not None and np.allclose(seed, home):
+            return home.copy(), 0.002, 0.0
+        if seed is not None and np.allclose(seed, good):
+            return good.copy(), 0.002, 0.0
+        return None, None, 0.0
+
+    skills.controller.solve_ik = staticmethod(solve)
+    _desired, search = skills._reachable_destination('red_cube', 'blue_zone', 'on', 'left')
+    assert search['chosen'] == 'unreachable'
+    assert search['stage_posture'] is not None, 'a reachable posture exists and must be reported'

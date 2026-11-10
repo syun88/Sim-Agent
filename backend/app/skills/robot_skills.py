@@ -532,6 +532,11 @@ class SkillRunner:
         # Measured 2026-11-09: zone placements were the dominant failure (10 of 12) because this path carried
         # to the centre with no reachability search at all.
         desired_object, search = self._search_destination(arm, obj, target, requested, 'in')
+        if search.get('chosen') == 'unreachable' and search.get('stage_posture'):
+            # The zone is out of reach from where the arm is; it is not out of reach from everywhere.
+            self._stage_to_posture(arm, search['stage_posture'])
+            desired_object, search = self._search_destination(arm, obj, target, requested, 'in')
+            search['recovered_by_staging'] = True
         if search.get('chosen') == 'unreachable':
             error = SkillError('DESTINATION_UNREACHABLE',
                                f'No reachable point inside {target} for this arm')
@@ -684,6 +689,11 @@ class SkillRunner:
                             else self._stacking_attitude(arm, obj, other_arm, staged_support))
                 prepared_attitude = attitude
             desired, destination_search = self._reachable_destination(obj, target, relation, arm, distance_cm)
+            if (destination_search.get('chosen') == 'unreachable'
+                    and destination_search.get('stage_posture')):
+                self._stage_to_posture(arm, destination_search['stage_posture'])
+                desired, destination_search = self._reachable_destination(obj, target, relation, arm, distance_cm)
+                destination_search['recovered_by_staging'] = True
             if destination_search.get('chosen') == 'unreachable':
                 # Nothing inside the region could be reached: refuse with the measurements, do not place
                 # somewhere else and call it the same task.
@@ -718,6 +728,18 @@ class SkillRunner:
                     "support_regrasp": regrasp if is_held_stationary else None,
                     "stack_strategy": strategy if is_held_stationary else None}
         return self._skill("move_to_object", run, time.perf_counter())
+
+    def _stage_to_posture(self, arm: str, posture) -> dict:
+        """Move the arm, holding its grasp, to a configuration from which the placement is reachable."""
+        kin = self.env.arm_kinematics(arm)
+        point, attitude, _, _ = kin.evaluate(np.asarray(posture, float))
+        result = self.controller.move_to_site(arm, point, attitude,
+                                              planned_joints=[self.env.arm_qpos(arm), np.asarray(posture, float)])
+        if not result.success:
+            error = SkillError(result.error or 'MOTION_BLOCKED', 'Could not stage the arm for this placement')
+            error.evidence = self._motion_evidence(result, phase='staging')
+            raise error
+        return {'position': np.asarray(point, float).tolist(), 'posture': np.asarray(posture, float).tolist()}
 
     @staticmethod
     def _carry_trace(samples: list, desired: np.ndarray, *, keep: int = 40) -> dict:
@@ -1058,13 +1080,20 @@ class SkillRunner:
         solutions = {}
 
         def probe(point):
-            """Both halves of "can the arm hold this pose": IK residual and room left in the joints."""
+            """Both halves of "can the arm hold this pose": IK residual and room left in the joints.
+
+            `solve_ik` returning no solution is a *measurement* - this arm cannot put its hand there - and must
+            not be read as "unknown". Measured 2026-11-09: it was read as unknown, the search gave up, and the
+            carry was then commanded to a point 254 mm out of reach, moving nothing.
+            """
             aim, rotation, _offset = self._carry_aim(arm, obj, np.asarray(point, float))
             try:
                 solution, error, _ = solve(arm, aim, rotation)
             except Exception:
                 return None, None
-            if solution is None or error is None:
+            if solution is None:
+                return BLOCKED, None
+            if error is None:
                 return None, None
             solutions[tuple(np.round(np.asarray(point, float), 6))] = np.asarray(solution, float)
             return -float(error), limit_margin_rad(solution)
@@ -1131,6 +1160,25 @@ class SkillRunner:
                 half = np.maximum(0., (support[1, :2] - support[0, :2] - (held[1, :2] - held[0, :2])) / 2. - .003)
             except Exception:
                 half = np.zeros(2)
+        # Before giving up: would standing somewhere else reach it? A fixed set of postures, so the answer does
+        # not depend on the current stance (see capability_queries.canonical_postures).
+        stage_posture = None
+        try:
+            from backend.app.planning.capability_queries import canonical_postures
+            aim_now, rotation_now, _ = self._carry_aim(arm, obj, np.asarray(requested, float))
+            for posture in canonical_postures(self.env, arm):
+                try:
+                    candidate, residual, _ = solve(arm, aim_now, rotation_now, q_init=posture)
+                except Exception:
+                    continue
+                if candidate is not None and residual is not None and residual <= PLACEMENT_REACH_TOLERANCE_M:
+                    stage_posture = np.asarray(posture, float).tolist()
+                    search['stage_residual_m'] = float(residual)
+                    break
+        except Exception:
+            stage_posture = None
+        search['stage_posture'] = stage_posture
+
         reach = float(min(.02, np.max(half))) if np.any(half > 0) else 0.
         if reach <= 0:
             # The region has no room beyond the object, so there is no alternative to measure: the requested
