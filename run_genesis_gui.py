@@ -148,6 +148,10 @@ def main() -> None:
     env.step_observer = observe_step
     env.planning_pulse=should_stop
 
+    #: Set when a person picked the scene; from then on an instruction may only rebuild the world if the
+    #: current scene cannot host it (the objects it needs are missing).
+    explicit_scene = None
+
     def prepare_scene(profile):
         nonlocal env, executor, last_publish
         if profile == env.scene_profile:
@@ -283,6 +287,7 @@ def main() -> None:
                         'rows': rows}, final_world_state=build_world_state(env))
                 elif command['action'] == 'select_scene':
                     prepare_scene(command['scene'])
+                    explicit_scene = command['scene']
                     body.update(success=True, verification={'success': True, 'goal_type': 'scene_selection',
                                                             'scene': env.scene_profile},
                                 final_world_state=build_world_state(env))
@@ -292,7 +297,16 @@ def main() -> None:
                                 final_world_state=build_world_state(env))
                 else:
                     if getattr(env, 'robot_id', 'openarm_v2') == 'openarm_v2':
-                        prepare_scene(scene_for_instruction(command['instruction'], env.scene_profile))
+                        from backend.app.simulation import scenes as scene_registry
+                        wanted = scene_for_instruction(command['instruction'], env.scene_profile)
+                        if wanted == env.scene_profile:
+                            pass
+                        elif explicit_scene and scene_registry.hosts(env.scene_profile, wanted):
+                            # The chosen scene already has what this instruction needs: keep it.
+                            publish('scene_kept', force=True,
+                                    detail=f'{env.scene_profile} already hosts this instruction')
+                        else:
+                            prepare_scene(wanted)
                     if command.get('randomize'):
                         publish('scene_preparing',force=True,status='PREPARING_SCENE',detail='Sampling reachable desk positions')
                         env.reset(randomize=True,seed=command.get('seed'),shuffle_sides=command.get('shuffle_sides',True))

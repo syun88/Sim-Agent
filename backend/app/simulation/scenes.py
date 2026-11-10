@@ -56,6 +56,18 @@ def ids() -> list[str]:
     return list(SCENES)
 
 
+def hosts(profile: str, instruction_scene: str) -> bool:
+    """Whether `profile` already contains everything `instruction_scene` needs.
+
+    This is what decides whether an instruction may rebuild the world. Measured 2026-11-10: a person selected
+    `mixed` and asked to place a cube, and the instruction-driven switch rebuilt `cubes`, silently discarding
+    the scene they had chosen. A scene that already hosts the objects must not be replaced.
+    """
+    wanted = set((SCENES.get(instruction_scene) or {}).get('objects') or ())
+    have = set((SCENES.get(profile) or {}).get('objects') or ())
+    return bool(wanted) and wanted <= have
+
+
 def is_valid(profile: str) -> bool:
     return profile in SCENES
 

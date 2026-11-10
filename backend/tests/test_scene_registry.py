@@ -48,3 +48,11 @@ def test_an_instruction_that_needs_both_kinds_of_object_asks_for_the_mixed_scene
     assert scene_for_instruction('ワインを注いで') == 'wine'
     assert scene_for_instruction('赤いキューブを左において') == 'cubes'
     assert scene_for_instruction('こんにちは', current='wine') == 'wine'
+
+
+def test_a_selected_scene_is_not_replaced_by_an_instruction_it_can_already_host():
+    """Measured 2026-11-10: a cube instruction rebuilt `cubes` over a person's chosen `mixed` scene."""
+    assert scenes.hosts('mixed', 'cubes') is True
+    assert scenes.hosts('mixed', 'wine') is True
+    assert scenes.hosts('cubes', 'wine') is False
+    assert scenes.hosts('cubes', 'cubes') is True
