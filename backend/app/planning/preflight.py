@@ -75,7 +75,8 @@ def arm_feasibility(env, controller, actions, *, arms=('left', 'right')) -> list
                 continue
             try:
                 centre = np.asarray(env.object_pose(action['object'])[0], float)
-                answers = [reachable(env, controller, candidate, pinch_point(candidate, centre, yaw), yaw)
+                answers = [reachable(env, controller, candidate, pinch_point(candidate, centre, yaw), yaw,
+                                     posture='canonical')
                            for yaw in ATTITUDE_YAWS_DEG]
                 decisive = [item for item in answers if item.get('ok') is not None]
                 best = min((item.get('position_error_m') for item in answers

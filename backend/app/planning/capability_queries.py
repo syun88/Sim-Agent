@@ -46,22 +46,20 @@ def pinch_point(arm: str, object_center, yaw_deg: float = 0.0) -> np.ndarray:
     return np.asarray(object_center, float) - attitude(yaw_deg) @ FINGERTIP_MIDPOINT[arm]
 
 
-def reachable(env, controller, arm: str, pinch_target, yaw_deg: float = 0.0) -> dict:
-    """Whether this arm can hold its pinch at `pinch_target` with that attitude, and how far off it is."""
-    solve = getattr(controller, 'solve_ik', None)
-    if not callable(solve):
-        return {'ok': None, 'unknown': 'no IK solver on this controller'}
-    target = np.asarray(pinch_target, float)
-    rotation = attitude(yaw_deg)
-    try:
-        solution, position_error, _ = solve(arm, target, rotation)
-    except Exception as error:
-        return {'ok': None, 'unknown': f'{type(error).__name__}: {error}'}
-    if solution is None:
-        return {'ok': False, 'position_error_m': None, 'yaw_deg': yaw_deg}
-    return {'ok': bool(position_error is not None and position_error <= .012),
-            'position_error_m': None if position_error is None else float(position_error),
-            'yaw_deg': yaw_deg}
+def reachable(env, controller, arm: str, pinch_target, yaw_deg: float = 0.0, *,
+              posture: str = 'current') -> dict:
+    """Whether this arm can hold its pinch at `pinch_target` with that attitude, and how far off it is.
+
+    Answered by the one solver (`planning.body_solver`), so this and every other caller cannot disagree about
+    the same pose.
+    """
+    from backend.app.planning.body_solver import pose_feasible as _solve
+    answer = _solve(env, controller, arm, pinch_target, attitude(yaw_deg), posture=posture)
+    if answer.get('feasible') is None:
+        return {'ok': None, 'unknown': answer.get('unknown', 'unmeasured'), 'yaw_deg': yaw_deg}
+    return {'ok': bool(answer['feasible']), 'position_error_m': answer.get('residual_m'),
+            'yaw_deg': yaw_deg, 'posture': answer.get('posture'),
+            'joint_limit_margin_rad': answer.get('joint_limit_margin_rad')}
 
 
 def pad_blocks_support_face(env, holder_arm: str, support: str) -> dict:

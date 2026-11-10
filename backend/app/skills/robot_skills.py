@@ -1129,16 +1129,18 @@ class SkillRunner:
             carry was then commanded to a point 254 mm out of reach, moving nothing.
             """
             aim, rotation, _offset = self._carry_aim(arm, obj, np.asarray(point, float))
-            try:
-                solution, error, _ = solve(arm, aim, rotation)
-            except Exception:
+            from backend.app.planning.body_solver import pose_feasible
+            # The same owner the capability queries use, from the same posture policy, so "reachable here" and
+            # "reachable for this placement" cannot disagree about the same pose.
+            # Asked from where the arm is, because this answer decides a motion it is about to make; the
+            # layout question ("would any posture do?") is asked separately when staging.
+            answer = pose_feasible(self.env, self.controller, arm, aim, rotation, posture='current')
+            if answer.get('feasible') is None:
                 return None, None
-            if solution is None:
+            if answer.get('solution') is None:
                 return BLOCKED, None
-            if error is None:
-                return None, None
-            solutions[tuple(np.round(np.asarray(point, float), 6))] = np.asarray(solution, float)
-            return -float(error), limit_margin_rad(solution)
+            solutions[tuple(np.round(np.asarray(point, float), 6))] = np.asarray(answer['solution'], float)
+            return -float(answer['residual_m']), answer.get('joint_limit_margin_rad')
 
         #: Returned when the pose *was* solved but cannot be held: measured, and unusable - not unknown.
         BLOCKED = object()

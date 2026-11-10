@@ -77,7 +77,10 @@ def _clean_body_measurements():
     Without this, one test's blocked carry raises the expected error for the next test and gates its
     placements off - a real hazard in the live process too, which is why the estimate needs several samples.
     """
+    from backend.app.planning import body_solver
     from backend.app.skills import motion_accuracy
     motion_accuracy.reset()
+    body_solver.clear_cache()
     yield
     motion_accuracy.reset()
+    body_solver.clear_cache()
