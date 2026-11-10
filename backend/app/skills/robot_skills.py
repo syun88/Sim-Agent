@@ -1050,26 +1050,39 @@ class SkillRunner:
             solutions[tuple(np.round(np.asarray(point, float), 6))] = np.asarray(solution, float)
             return -float(error), limit_margin_rad(solution)
 
+        #: Returned when the pose *was* solved but cannot be held: measured, and unusable - not unknown.
+        BLOCKED = object()
+
         def usable(point):
             value, limit = probe(point)
             if value is None:
                 return None
             if limit is not None and limit < JOINT_LIMIT_MARGIN_RAD:
                 # The IK solves, but the arm would have to sit on a joint limit to hold it. Measured
-                # 2026-11-09: the carries that stopped 27 mm short were at the edge of the workspace.
-                return None
+                # 2026-11-09: a pose like this was declared unmeasurable, the search gave up, and the carry
+                # then failed 28 mm short of the point it should never have been sent to.
+                return BLOCKED
             return value
 
         def margin(point):
             return usable(point)
 
-        best_point, best_margin = np.asarray(requested, float), margin(requested)
+        def numeric(value):
+            """A JSON-safe number for the evidence, and whether the sample was usable."""
+            if value is BLOCKED:
+                return None, False
+            return value, True
+
+        requested_value = margin(requested)
+        best_point = np.asarray(requested, float)
+        best_margin, usable_requested = numeric(requested_value)
         _requested_value, _requested_limit = probe(requested)
         search['considered'].append({'offset': [0., 0.], 'margin_m': best_margin,
+                                     'blocked_by_joint_limit': requested_value is BLOCKED,
                                      'joint_limit_margin_rad': _requested_limit})
         chosen_joints = solutions.get(tuple(np.round(best_point, 6)))
         search['chosen_joints'] = None if chosen_joints is None else chosen_joints.tolist()
-        if best_margin is not None:
+        if usable_requested and best_margin is not None:
             from backend.app.skills import placement_accuracy
             # How precisely this placement has to land, measured from the region it lands on: a zone has
             # tens of millimetres of freedom, a cube stacked on a cube needs its centre over the support.
@@ -1077,12 +1090,15 @@ class SkillRunner:
                 self.env, obj, target, relation, probe_residual_m=-best_margin,
                 expected_error_m=expected_carry_error)
             search['feasible_within_tolerance'] = search['feasibility']['feasible']
-        if best_margin is None:
+        if requested_value is None:
             # Reachability could not be measured here; the carry itself is the authority, as before.
             search['chosen'] = 'unmeasured'
             return requested, search
-        if best_margin >= -headroom and _feasible(best_margin):
+        if usable_requested and best_margin >= -headroom and _feasible(best_margin):
             return requested, search
+        if requested_value is BLOCKED:
+            # Known to be unusable (it would need a joint limit): search the region instead of commanding it.
+            search['chosen'] = 'requested_blocked'
         # How much room the region itself has: a zone's own extent, or the support face minus the object.
         try:
             region = np.asarray(self.env.object_bounds(target), float)
@@ -1108,13 +1124,14 @@ class SkillRunner:
                 offset = np.zeros(3)
                 offset[axis] = sign * step
                 point = np.asarray(requested, float) + offset
-                value = margin(point)
-                search['considered'].append({'offset': offset.tolist(), 'margin_m': value})
-                if value is not None and (best_margin is None or value > best_margin):
+                value, value_usable = numeric(margin(point))
+                search['considered'].append({'offset': offset.tolist(), 'margin_m': value,
+                                             'blocked_by_joint_limit': margin(point) is BLOCKED})
+                if value is not None and value_usable and (best_margin is None or value > best_margin):
                     best_point, best_margin = point, value
             if best_margin is not None and best_margin >= -headroom and _feasible(best_margin):
                 break
-        requested_margin = margin(requested)
+        requested_margin, _ = numeric(margin(requested))
         if (best_margin is not None and best_margin >= -headroom and _feasible(best_margin)
                 and (requested_margin is None or best_margin > requested_margin)):
             search['chosen'] = 'offset_inside_region'

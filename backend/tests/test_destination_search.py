@@ -198,3 +198,16 @@ def test_the_configuration_the_search_accepted_is_what_the_carry_starts_from():
     target_point = np.asarray(search.get('chosen_point') or search['requested'], float)
     skills._carry_to('left', 'red_cube', target_point, q_init=search['chosen_joints'])
     assert seen['q_init'] == pytest.approx(accepted.tolist())
+
+
+def test_a_pose_that_would_need_a_joint_limit_is_treated_as_unusable_not_unknown():
+    """Measured 2026-11-09: it was called unmeasurable, the search gave up, and the carry failed 28 mm short."""
+    skills = _runner(lambda distance: True)
+    # Solves, but into the last degree of a joint: known to be unusable rather than unknown.
+    skills.controller.solve_ik = staticmethod(
+        lambda arm, target, rotation, **kwargs: (np.array([3.0 - 0.01, 0., 0., 0., 0., 0., 0.]), 0.001, 0.0))
+    skills.env.arm_limits = lambda arm: np.array([[-3., 3.]] + [[-3., 3.]] * 6)
+    _desired, search = skills._reachable_destination('red_cube', 'blue_zone', 'on', 'left')
+    assert search['considered'][0]['blocked_by_joint_limit'] is True
+    assert search['chosen'] in {'unreachable', 'offset_inside_region'}
+    assert search['chosen'] != 'unmeasured', 'a measured-but-unusable pose is not an unknown'
