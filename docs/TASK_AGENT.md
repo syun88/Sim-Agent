@@ -432,9 +432,26 @@ uv run python scripts/export_lerobot_annotations.py \
 | Genesis の次の壁 | `shared_memory_per_multiprocessor` が ROCm の torch に無い → 互換シムで回避（`simulation/amd_compat.py`、5モジュールを再バインド） |
 | **その先** | シーン構築が **10分以上進まない**（HIP カーネルの JIT、子プロセス無し・`/dev/kfd` を保持したまま） |
 
-つまり **ROCm で torch と GPU 認識までは到達**したが、**Genesis 1.4.4 の AMD バックエンドはこの環境で
-実用にならない**（測定）。GPU 化するなら Genesis の AMD 対応版（新しいリリース）か CUDA 機が要る。
-`scripts/setup_rocm_venv.sh` で再現でき、`amd_compat.py` は ROCm 以外では何もしない（メイン venv に影響なし）。
+#### 1.4.6（最新リリース）でも同じ壁の先へは進めなかった（2026-11-10 追試）
+
+PyPI の最新は `genesis-world 1.4.6`（1.5 系は未リリース、タグも v1.4.6 まで）。1.4.6 + ROCm で:
+
+| 段階 | 結果 |
+|---|---|
+| `gs.amdgpu` 選択 | **成功**（`torch.version.hip` があるため） |
+| デバイス特性の読み取り | 同じ CUDA 専用属性で落ちる → `amd_compat.apply()`（5モジュール再バインド）で通過 |
+| `scene.build()` | **失敗**: `genesis/vis/rasterizer.py` → `pyrender.OffscreenRenderer` → `EGLPlatform.init_context()` が「No EGL context could be initialized」 |
+| カメラ無し・`show_viewer=False` でも | **同じ失敗**（Genesis は常に rasterizer を作る） |
+| 直接叩いた EGL | `eglInitialize` 1.5、`eglChooseConfig`、`eglBindAPI`、4.1 core の `eglCreateContext`、`eglMakeCurrent` **すべて成功** |
+
+つまり **EGL そのものは動く**が、Genesis 取り込み後の PyOpenGL バインディングで
+`eglGetDisplay.argtypes = (EGLNativeDisplayType_pointer,)` となり、以降の呼び出しが
+`expected EGLNativeDisplayType instead of int` で落ちる。**障壁は描画層（pyrender/PyOpenGL）**で、
+torch でもこのプロジェクトでもない。
+
+したがって ROCm で進めるには pyrender の EGL プラットフォーム全体を差し替えるか、上流修正が要る。
+`scripts/setup_rocm_venv.sh` でこの環境を再現でき、`amd_compat.py` は ROCm 以外では何もしない
+（メイン venv・CPU 運用に影響なし）。venv は `/home/yuu/Documents/Sim-Agent-nav/.venv-rocm`（16 GB）。
 
 ### GPU は使えない（測定で確定）
 
