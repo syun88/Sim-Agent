@@ -312,7 +312,8 @@ class GenesisOpenArmV2Environment(SimulationBackend):
             self._scene.add_entity(self._gs.morphs.MJCF(file='''<mujoco><worldbody>
                 <geom type="plane" size="1 1 .01" pos="0 0 1.006" contype="1073741824" conaffinity="0"/>
                 </worldbody></mujoco>''', visualization=False))
-            self._wine = WineWorld(self._scene, self._gs, async_surface=show_viewer)
+            self._wine = WineWorld(self._scene, self._gs, async_surface=show_viewer,
+                                   sdf=scene_registry.sdf(scene_profile))
         self._camera = self._scene.add_camera(
             res=camera_resolution,
             pos=free_camera_position(),

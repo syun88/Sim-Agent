@@ -5,6 +5,8 @@ through finger contacts and liquid moves through Genesis's rigid/SPH coupling.
 """
 from pathlib import Path
 from functools import lru_cache
+import os
+
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -113,6 +115,13 @@ def vessel_xml(name: str, fixed: bool) -> str:
       </body></worldbody></mujoco>'''
 
 
+#: Fluid-coupling SDF resolution for the vessel shells. Defaults are the official cell's; the environment
+#: variables exist so the build cost can be traded against pour accuracy on purpose rather than by surprise.
+SDF_CELL_M = float(os.environ.get("OPENARM_WINE_SDF_CELL_MM", "0.4")) / 1000.
+SDF_MIN_RES = int(os.environ.get("OPENARM_WINE_SDF_MIN_RES", "128"))
+SDF_MAX_RES = int(os.environ.get("OPENARM_WINE_SDF_MAX_RES", "512"))
+
+
 class WineWorld:
     #: Defaults are the official cell's constants, as class attributes so an instance built without __init__ (tests do
     #: this to exercise the volume arithmetic) still has them.
@@ -120,7 +129,7 @@ class WineWorld:
     glass_start = GLASS_START
 
     def __init__(self, scene, gs, *, fixed_bottle=False, async_surface=True,
-                 bottle_position=None, glass_position=None):
+                 bottle_position=None, glass_position=None, sdf=None):
         # The vessel positions are the official cell's constants by default. An imported arm has its own table height
         # and its own reach, so the caller may place them: measured 2026-10-27, the official bottle sits 0.69 m from a
         # 0.3 m arm and every approach posture is rejected for want of reach, not for want of a fluid model.
@@ -128,8 +137,17 @@ class WineWorld:
         self.glass_start = np.asarray(GLASS_START if glass_position is None else glass_position, float)
         self.scene = scene
         self.solver = "SPH"
-        material = gs.materials.Rigid(needs_coup=True, coup_friction=.2, coup_softness=.0003,
-                                     sdf_cell_size=.0004, sdf_min_res=128, sdf_max_res=512)
+        # The fluid-solid coupling SDF is the single most expensive thing this project builds: measured
+        # 2026-11-10, the defaults below produced a 696 MB cache file per shell and a build that had not
+        # finished after fifteen minutes at ~350% CPU, which is why the `wine` and `mixed` scenes were not
+        # selectable. The resolution is therefore a measurement knob, not a constant: coarser is faster and
+        # less accurate for the liquid, and which of those matters is a question to be answered by pouring.
+        settings = dict(sdf or {})
+        material = gs.materials.Rigid(
+            needs_coup=True, coup_friction=.2, coup_softness=.0003,
+            sdf_cell_size=float(settings.get('cell_mm', SDF_CELL_M * 1000.)) / 1000.,
+            sdf_min_res=int(settings.get('min_res', SDF_MIN_RES)),
+            sdf_max_res=int(settings.get('max_res', SDF_MAX_RES)))
         self.bottle = scene.add_entity(gs.morphs.MJCF(file=vessel_xml("wine_bottle", fixed_bottle), pos=tuple(self.bottle_start),
                                                     convexify=False, watertighten=None), material=material,
                                       surface=gs.surfaces.Default(vis_mode="visual", roughness=.15, double_sided=False))

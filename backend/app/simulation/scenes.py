@@ -40,10 +40,12 @@ SCENES: dict[str, dict] = {
         'zones': ['blue_zone', 'green_zone'],
         'needs': ['cubes', 'wine'],
         'fluid': True,
-        # Measured 2026-11-10: building this scene ran for over ten minutes at ~350% CPU without finishing, so
-        # it is not offered. A scene a person can select and then wait forever for is worse than an honest no.
-        'verified': False,
-        'note': 'not buildable yet: the build did not finish in ten minutes on this host',
+        # The fluid-coupling SDF is what decided whether this scene exists at all: at the official 0.4 mm /
+        # 512^3 it had not finished after fifteen minutes (696 MB of cache per shell); at 1.0 mm / 160 it
+        # builds in 222 s with all four objects present (measured 2026-11-10). Coarser coupling is the price.
+        'sdf': {'cell_mm': 1.0, 'min_res': 64, 'max_res': 160},
+        'verified': True,
+        'note': 'builds in ~222 s at 1.0 mm fluid-coupling SDF (official 0.4 mm does not finish in 15 min)',
     },
 }
 
@@ -60,6 +62,11 @@ def is_valid(profile: str) -> bool:
 
 def needs(profile: str) -> tuple[str, ...]:
     return tuple((SCENES.get(profile) or {}).get('needs') or ())
+
+
+def sdf(profile: str) -> dict | None:
+    """The fluid-coupling SDF resolution this scene should be built with, if it differs from the default."""
+    return (SCENES.get(profile) or {}).get('sdf')
 
 
 def has_fluid(profile: str) -> bool:
