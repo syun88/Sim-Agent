@@ -18,6 +18,7 @@ FLAGS = {
     'destination_search': 'place at the requested point only, with no search inside the region',
     'arm_preflight': 'do not measure the requested hand before moving',
     'home_margin': 'home clearance is the old fixed 30 mm, not the measured landing error',
+    'destination_hand': 'do not refuse a hand that cannot reach the destination it was told to use',
 }
 
 

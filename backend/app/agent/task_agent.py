@@ -204,6 +204,28 @@ class TaskAgent:
                 zone_switch.append({'target': target, 'from': arm, 'to': alternatives[0],
                                     'basis': 'the other arm is the one that can reach that destination',
                                     'residual_m': (zones[target].get(alternatives[0]) or {}).get('best_residual_m')})
+        # A hand the instruction names, aimed at a destination that hand cannot reach, is impossible as stated.
+        # This is a *layout* fact (asked from the fixed posture set), so saying it is not the momentary judgement
+        # that measurably refused work the robot could do - it is the same answer every time, for every stance.
+        if _measured('destination_hand'):
+            impossible = []
+            zones = (preflight or {}).get('zones') or {}
+            for step in (getattr(plan, 'steps', None) or []):
+                target, arm = getattr(step, 'target', None), getattr(step, 'arm', None)
+                if not target or arm not in explicit_arms or not isinstance(zones.get(target), dict):
+                    continue
+                if (zones[target].get(arm) or {}).get('reachable') is False:
+                    possible = [name for name in ('left', 'right') if name != arm
+                                and (zones[target].get(name) or {}).get('reachable') is True]
+                    impossible.append({'target': target, 'arm': arm, 'reachable_arms': possible,
+                                       'basis': (zones[target].get(arm) or {}).get('best_residual_m')})
+            if impossible:
+                first = impossible[0]
+                plan.planning_evidence = {**(plan.planning_evidence or {}),
+                                          'destination_refusal': impossible}
+                raise GroundingError(
+                    f"ARM_CANNOT_REACH: the {first['arm']} hand cannot reach {first['target']} in this layout "
+                    f"(reachable: {', '.join(first['reachable_arms']) or 'neither hand'})")
         if zone_switch:
             plan.planning_evidence = {**(plan.planning_evidence or {}),
                                       'arm_choice': (plan.planning_evidence or {}).get('arm_choice', []) + zone_switch}
