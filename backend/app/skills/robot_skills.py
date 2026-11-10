@@ -713,6 +713,22 @@ class SkillRunner:
                     "stack_strategy": strategy if is_held_stationary else None}
         return self._skill("move_to_object", run, time.perf_counter())
 
+    @staticmethod
+    def _carry_trace(samples: list, desired: np.ndarray, *, keep: int = 40) -> dict:
+        """Summarise where the carried object went, so "stopped short" can be told from "never tracked"."""
+        if not samples:
+            return {'samples': 0}
+        distances = [float(np.linalg.norm(np.asarray(item['object'], float) - desired)) for item in samples]
+        step = max(1, len(samples) // keep)
+        tail = [{'object': [round(v, 4) for v in item['object']],
+                 'distance_to_target_m': round(distance, 4)}
+                for item, distance in list(zip(samples, distances))[::step]]
+        moved_at_end = (float(np.linalg.norm(np.asarray(samples[-1]['object'], float)
+                                             - np.asarray(samples[-2]['object'], float)))
+                        if len(samples) > 1 else None)
+        return {'samples': len(samples), 'closest_m': min(distances), 'final_m': distances[-1],
+                'movement_at_end_m': moved_at_end, 'path': tail}
+
     def _carry_aim(self, arm: str, obj: str, desired, *, attitude: str = "pinned"):
         """The end-effector pose a carry to ``desired`` (the object's pose) commands, and its rotation.
 
@@ -783,8 +799,19 @@ class SkillRunner:
             ignored.add(exclude_target)
         stationary = {name: self.env.object_pose(name)[0].copy()
                       for name in self.env.frame().objects if name not in ignored}
+        trace = []
+
         def guard_carry():
             self._require_hold(arm, obj)
+            # Where the arm and the carried object actually are at this instant: a command that is not being
+            # tracked shows up here as a gap that stops shrinking, which a final residual alone cannot tell
+            # apart from a pose that could never be reached.
+            try:
+                ee_now, _rotation_now = self.env.ee_pose(arm)
+                trace.append({'ee': [float(value) for value in ee_now],
+                              'object': [float(value) for value in self.env.object_pose(obj)[0]]})
+            except Exception:
+                pass
             for name, position in stationary.items():
                 displacement = float(np.linalg.norm(self.env.object_pose(name)[0] - position))
                 if displacement > APPROACH_DISTURBANCE_TOLERANCE:
@@ -838,6 +865,7 @@ class SkillRunner:
                 error = SkillError(result.error or "IK_FAILURE", f"Cannot carry {obj} to {np.round(desired, 4).tolist()} (EE {np.round(target, 4).tolist()}, position residual {result.position_error}, rotation residual {result.rotation_error})")
                 error.evidence = self._motion_evidence(result, object=obj, phase='carry')
                 error.evidence = {**error.evidence, 'achieved_offset_m': achieved,
+                                  'carry_trace': self._carry_trace(trace, np.asarray(desired, float)),
                                   **({'task_tolerance_m': allow_error_m} if allow_error_m is not None else {})}
                 raise error
             self._require_hold(arm, obj)

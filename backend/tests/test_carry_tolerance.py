@@ -59,3 +59,32 @@ def test_a_shortfall_beyond_the_task_tolerance_is_still_a_failure():
         assert error.evidence['achieved_offset_m'] == pytest.approx(0.040)
     else:
         raise AssertionError('40 mm does not fit a 35 mm region')
+
+
+def test_the_carry_records_where_the_object_went_not_only_where_it_stopped():
+    """A final residual cannot tell "stopped 27 mm short" from "never tracked the command"."""
+    skills = _runner(achieved_offset=0.027, controller_success=False)
+    # Two guard samples: the object approaches, then stops moving while still short.
+    positions = [[0.40, 0.18, 1.14], [0.453, 0.18, 1.14]]
+    state = {'i': 0}
+
+    def object_pose(name):
+        return np.asarray(positions[min(state['i'], len(positions) - 1)], float), np.eye(3)
+
+    def move(arm, target, rotation, **kwargs):
+        state['i'] += 1
+        if 'on_sample' in kwargs:
+            kwargs['on_sample']()
+        return SimpleNamespace(success=False, error=None, position_error=0.027, rotation_error=0.)
+    skills.env.object_pose = object_pose
+    skills.env.frame = lambda: SimpleNamespace(objects={'red_cube': np.asarray(positions[-1], float)})
+    skills.controller.move_to_site = move
+    try:
+        skills._carry_to('left', 'red_cube', DESIRED)
+    except Exception as error:
+        trace = error.evidence['carry_trace']
+        assert trace['samples'] >= 1
+        assert trace['final_m'] == pytest.approx(0.027, abs=.002)
+        assert trace['movement_at_end_m'] is not None
+    else:
+        raise AssertionError('the carry must fail without a task tolerance')
