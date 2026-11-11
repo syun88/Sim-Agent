@@ -513,6 +513,22 @@ unshare -rm --map-root-user bash -c 'mount --bind /dev/null /dev/dri/renderD129;
 - 副作用: その名前空間では **HIP が使えない**（`amdgpu_get_auth failed`、torch devices 0）。
   したがって「描画=GPU / 物理=CPU」の組み合わせになる（物理は GPU でも速くならないので実害なし）
 
+##### 停止点は pyglet の X11 ウィンドウ map（スレッドダンプ/プロファイルで確定）
+
+`py-spy record --idle --threads` で GPU+viewer の150秒を採ると、**viewer スレッドが丸ごと
+`pyglet.window.xlib.XlibWindow._map` で停止**し、メインスレッドは Condition 待ちだった。つまり
+「ビルドが遅い」のではなく、**ウィンドウが map されない**。
+
+- Genesis は Linux で viewer を背景スレッドで動かす（`run_in_thread` 既定 True）→
+  `OPENARM_VIEWER_MAIN_THREAD=1` でメインスレッドに切り替えられるようにした（実装済み）
+- それでも同じ場所で止まる（4分待って `Ready` に来ない）
+- 画面のスクリーンショットが **1.2 KB（ほぼ空）** で返る＝こちらの観測時点でデスクトップが
+  描画されていない（DPMS/ロック等）。**X が窓を map できない状態では、原因がアプリ側か環境側かを
+  画面で切り分けられない**
+
+したがって次の確認は「**デスクトップが起きている状態で**、`GENESIS_SHOW_VIEWER=1` のセルを起動し、
+窓が出るか」を人が見る必要がある。出ない場合は Xwayland ではなく素の Xorg セッションで試すのが次の候補。
+
 ##### それでもネイティブ窓は起動しない（＝障壁は viewer 側）
 
 dGPU 描画（renderD128 のみ開く）で窓付き起動を試すと、窓は作られ CPU は 15% → 6% に減衰し、

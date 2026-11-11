@@ -64,6 +64,12 @@ NATIVE_CAMERA_LOOKAT = (0.30, 0.0, 1.13)
 GRAVITY_TORQUE_REFRESH_STEPS = 5
 
 
+def _viewer_run_in_thread():
+    """Whether Genesis should serve the interactive viewer from a background thread."""
+    override = os.getenv("OPENARM_VIEWER_MAIN_THREAD", "0")
+    return False if override not in ("0", "", "false") else None
+
+
 def simulation_speed_from_environment() -> float:
     """Wall-clock pacing only; physics dt and motor/skill timing stay in SI seconds."""
     speed = float(os.getenv("OPENARM_SIM_SPEED", "1"))
@@ -297,6 +303,10 @@ class GenesisOpenArmV2Environment(SimulationBackend):
             viewer_options=self._gs.options.ViewerOptions(
                 res=(1100, 760),
                 realtime_factor=self.simulation_speed,
+                # Genesis runs the viewer in a background thread on Linux by default. Measured 2026-11-10: under
+                # Xwayland that thread blocks forever in pyglet's `XlibWindow._map`, so the window never appears
+                # and the build never finishes. `OPENARM_VIEWER_MAIN_THREAD=1` builds it on the main thread instead.
+                run_in_thread=_viewer_run_in_thread(),
                 camera_pos=(.78, 0., 1.75) if wants_wine else NATIVE_CAMERA_POSITION,
                 camera_lookat=(.40, .07, 1.13) if wants_wine else NATIVE_CAMERA_LOOKAT,
                 camera_fov=72. if wants_wine else 65.,
