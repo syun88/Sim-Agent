@@ -298,11 +298,42 @@ def main() -> None:
                     body.update(success=False, status='STOPPED')
                 elif command['action'] == 'reset':
                     publish('scene_preparing',force=True,status='PREPARING_SCENE',detail='Sampling reachable desk positions')
-                    env.reset(randomize=bool(command.get('randomize')),seed=command.get('seed'),
-                              shuffle_sides=command.get('shuffle_sides',True))
-                    executor.reset_context()
-                    scene_has_tasks = False
+                    # A layout every arm must be able to reach at least one object in. Measured 2026-11-10: 6,971 of
+                    # 7,312 rejected approach routes were IK failures, i.e. the object was out of reach for the arm
+                    # that had to grasp it - so the layout is checked here, before a task is ever planned on it.
+                    from backend.app.planning.capability_queries import layout_grasp_admission
+                    seed = command.get('seed')
+                    admission = None
+                    attempts = 0
+                    _admission_started = time.monotonic()
+                    for attempts in range(1, 6):
+                        env.reset(randomize=bool(command.get('randomize')), seed=seed if seed is None else seed + attempts - 1,
+                                  shuffle_sides=command.get('shuffle_sides', True))
+                        executor.reset_context()
+                        scene_has_tasks = False
+                        if not command.get('randomize'):
+                            break
+                        # Default off: the deep check costs ~90 s per reset (measured), which is right for building a
+                        # corpus and wrong for interactive use. `OPENARM_ADMISSION=deep|ik|off`.
+                        mode = os.environ.get('OPENARM_ADMISSION', 'off')
+                        if mode == 'off':
+                            break
+                        admission = layout_grasp_admission(env, getattr(executor, 'controller', None),
+                                                           deep=(mode != 'ik'))
+                        body['admission_seconds'] = round(time.monotonic() - _admission_started, 1)
+                        if admission.get('admitted') is not False:
+                            break
+                        publish('scene_preparing', force=True, status='PREPARING_SCENE',
+                                detail=f'Resampling: an object was out of reach (attempt {attempts})')
                     env.step(200)
+                    # `verification` is what the API record keeps, so the layout decision travels there.
+                    body['verification'] = {**(body.get('verification') or {}), 'goal_type': 'scene_reset',
+                                            'randomization': env.spawn_validation.get('randomization'),
+                                            'admission': admission,
+                                            'admission_attempts': attempts,
+                                            'admission_seconds': round(time.monotonic() - _admission_started, 1)}
+                    if seed is not None:
+                        body['seed'] = seed + attempts - 1
                     body.update(success=True, verification={'success': True, 'goal_type': 'scene_reset',
                         'randomization':env.spawn_validation.get('randomization')}, final_world_state=build_world_state(env))
                 elif command['action'] == 'diagnose_pinch':
