@@ -6,6 +6,7 @@ from typing import Callable
 
 import numpy as np
 
+from backend.app.control import reflex
 from backend.app.simulation.base import SimulationBackend
 from backend.app.simulation.openarm_v2.pose_planning import ik_seeds, plan_pose, solve_from_seed
 from backend.app.simulation.openarm_v2.definition import (
@@ -64,6 +65,8 @@ class MotionResult:
     nominal_duration: float | None = None
     trajectory_duration: float | None = None
     settling_duration: float | None = None
+    #: What the deviation reflex observed on this leg (whether or not it acted).
+    reflex: dict | None = None
 
 
 class OpenArmV2Controller:
@@ -181,6 +184,7 @@ class OpenArmV2Controller:
         on_sample: Callable[[], None] | None = None,
         planned_joints: list[np.ndarray] | None = None,
         trajectory_speed: float | None = None,
+        phase: str = 'move_to_site',
     ) -> MotionResult:
         if rotation is None:
             # The official cell's grasp frame. An imported robot's own attitude is passed in explicitly by
@@ -237,6 +241,7 @@ class OpenArmV2Controller:
             if joint_waypoints is None:
                 return MotionResult(False, "COLLISION_PATH", position.tolist(), pos_err)
         curved_path = bool(via) or len(joint_waypoints)>2
+        watcher = None
         self.target_rotations[side] = rotation.copy()
         start = self.env.arm_qpos(side)
         nominal_duration = duration
@@ -285,6 +290,10 @@ class OpenArmV2Controller:
             command_steps = max(1, int(round(MOTOR_COMMAND_PERIOD / self.timestep))) if scale_speed else 1
             indices = range(0, steps, command_steps) if scale_speed else range(1, steps + 1)
             completed = False
+            # Watch the leg while it happens. This is the one place every motion goes through, so a new skill
+            # inherits the reflex instead of writing its own tolerance (see control/reflex.py).
+            watcher = (reflex.DeviationReflex(side, phase) if reflex.enabled() else None)
+            watch_every = max(1, round(reflex.CHECK_PERIOD_S / self.timestep))
             try:
                 for index in indices:
                     if self.stop_requested():
@@ -302,6 +311,13 @@ class OpenArmV2Controller:
                     self.env.step(min(command_steps, steps - index) if scale_speed else 1)
                     if on_sample is not None and index % max(command_steps, round(.02 / self.timestep)) == 0:
                         on_sample()
+                    if watcher is not None and index % watch_every == 0:
+                        departure = watcher.observe(reference, self.env.arm_qpos(side), fraction,
+                                                    self.env.arm_kinematics(side))
+                        if departure is not None:
+                            self.env.set_arm(side, self.env.arm_qpos(side))
+                            return MotionResult(False, 'MOTION_DEVIATION', position.tolist(),
+                                                departure['deviation_m'], reflex=departure)
                 completed = True
             finally:
                 # A stop/error must also clear the velocity reference; otherwise
@@ -311,6 +327,8 @@ class OpenArmV2Controller:
             return result
         actual, actual_rotation = self.env.ee_pose(side)
         residual = float(np.linalg.norm(actual - position))
+        if watcher is not None:
+            result.reflex = watcher.evidence()
         rotation_residual = float(np.linalg.norm(orientation_error(actual_rotation, rotation)))
         # Read a settled endpoint. The official wrist's damping can leave a short
         # orientation transient after a large handover rotation or lateral carry.

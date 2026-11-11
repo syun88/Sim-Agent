@@ -322,6 +322,7 @@ class SkillRunner:
                                                   # The transit is where a trailing pad reaches the cube; drive it
                                                   # slowly while the servo keeps the response it was configured with.
                                                   trajectory_speed=APPROACH_TRAJECTORY_SPEED if approach_evidence else None,
+                                                  phase='approach',
                                                   on_sample=guard_undisturbed)
             guard_undisturbed()
             if not result.success:
@@ -963,7 +964,8 @@ class SkillRunner:
                for alpha in np.linspace(0., 1., count + 1)[1:-1]]
         if self.controller.motion_speed == 1.:
             for waypoint in via:
-                result = self.controller.move_to_site(arm, waypoint, commanded_rotation, on_sample=guard_carry)
+                result = self.controller.move_to_site(arm, waypoint, commanded_rotation, phase='carry',
+                                                     on_sample=guard_carry)
                 if not result.success:
                     raise SkillError(result.error or "IK_FAILURE", "Cartesian carry was blocked")
                 guard_carry()
@@ -980,6 +982,7 @@ class SkillRunner:
         for attempt in range(3):
             if attempt == 1 and planned is not None:
                 result = self.controller.move_to_site(arm, target, planned[1], planned_joints=planned[0],
+                                                      phase='carry',
                                                       on_sample=guard_carry)
             else:
                 # The configuration the destination search already accepted is the seed for the motion's own
@@ -1535,7 +1538,8 @@ class SkillRunner:
                 edge = [self.env.arm_qpos(arm), joints]
                 if check and not check(edge, {o:self.env.object_pose(o) for o in self.env.frame().objects}):
                     raise SkillError('PARK_COLLISION', 'Home route is no longer clear in the observed scene')
-                moved = self.controller.move_to_site(arm, position, attitude, planned_joints=edge, on_sample=guard)
+                moved = self.controller.move_to_site(arm, position, attitude, planned_joints=edge,
+                                                     phase='park_arrival', on_sample=guard)
                 if not moved.success:
                     raise SkillError(moved.error or 'MOTION_BLOCKED', 'Empty arm could not clear the handover workspace')
                 # A successful move_to_site means the *site* reached its target; it does not mean the arm
