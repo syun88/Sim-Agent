@@ -197,6 +197,13 @@ class SkillRunner:
                     'rotation_error': getattr(result, 'rotation_error', None),
                     'position_tolerance_m': getattr(self.env, 'motion_position_tolerance', .012),
                     'rotation_tolerance_m': getattr(self.env, 'motion_rotation_tolerance', .15)}
+        # The deviation reflex's own summary: without it a record cannot show whether the leg was watched at
+        # all, and "the reflex did not fire" is then indistinguishable from "the reflex never ran" (measured
+        # 2026-11-10: the first version left no trace, so the new path had to be proven before its silence
+        # could mean anything).
+        watched = getattr(result, 'reflex', None)
+        if watched:
+            evidence['reflex'] = watched
         return {**{k: v for k, v in evidence.items() if v is not None}, **extra}
 
     # -- skills ------------------------------------------------------------------

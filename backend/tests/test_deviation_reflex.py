@@ -63,3 +63,14 @@ def test_the_reflex_can_be_switched_off(monkeypatch):
     assert reflex.enabled() is False
     monkeypatch.setenv('OPENARM_DEVIATION_REFLEX', '1')
     assert reflex.enabled() is True
+
+
+def test_the_threshold_can_be_forced_so_the_guard_can_be_observed_failing(monkeypatch):
+    monkeypatch.setenv('OPENARM_DEVIATION_REFLEX_MM', '3')
+    assert reflex.threshold_m('left', 'park_arrival') == pytest.approx(0.003)
+
+
+def test_the_applied_threshold_is_the_forced_one(monkeypatch):
+    monkeypatch.setenv('OPENARM_DEVIATION_REFLEX_MM', '2')
+    watcher = reflex.DeviationReflex('left', 'approach')
+    assert watcher.threshold_m == pytest.approx(0.002)

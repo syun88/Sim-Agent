@@ -49,7 +49,17 @@ def enabled() -> bool:
 
 
 def threshold_m(arm: str, phase: str) -> float:
-    """The deviation that counts as having left the plan for this arm and phase."""
+    """The deviation that counts as having left the plan for this arm and phase.
+
+    `OPENARM_DEVIATION_REFLEX_MM` forces a value. It exists so the guard can be observed failing: a reflex that
+    has never been seen to fire is indistinguishable from one that is not wired in at all.
+    """
+    forced = os.getenv('OPENARM_DEVIATION_REFLEX_MM', '').strip()
+    if forced:
+        try:
+            return float(forced) / 1000.
+        except ValueError:
+            pass
     observed = motion_accuracy.expected_error(arm, phase)
     return min(MAX_THRESHOLD_M, max(0.01, observed * 1.5 + 0.01))
 
