@@ -259,8 +259,12 @@ class TaskAgent:
             preflight = run_preflight(getattr(self.executor, 'env', None),
                                       getattr(self.executor, 'controller', None), plan.program)
             plan.planning_evidence = {**(plan.planning_evidence or {}), 'preflight': preflight}
-            unreachable = [row for row in (preflight or {}).get('arms', [])
-                           if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE']
+            # Re-derive with the same gate: recomputing unconditionally is how a refusal crept back in while the
+            # flag that governs it was off (measured 2026-11-10: an ARM_CANNOT_REACH with OPENARM_MEASURE_ARM_PREFLIGHT
+            # unset, i.e. default off).
+            unreachable = ([row for row in (preflight or {}).get('arms', [])
+                            if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE']
+                           if _measured('arm_preflight') else [])
         if unreachable:
             row = unreachable[0]
             alternative = ', '.join(row.get('reachable_arms') or [])

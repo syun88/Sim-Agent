@@ -173,3 +173,13 @@ def test_the_bounded_route_question_is_cheaper_but_same_shape():
 
     params = inspect.signature(approach_feasible).parameters
     assert 'max_postures' in params and 'max_frames' in params
+
+
+def test_switching_a_hand_never_turns_into_a_refusal_when_refusal_is_off():
+    """The switch re-runs the preflight; re-deriving the refusal list there must respect the flag."""
+    import inspect
+    from backend.app.agent import task_agent
+
+    source = inspect.getsource(task_agent)
+    assert source.count("if _measured('arm_preflight') else []") >= 2, \
+        'both the first and the post-switch derivation must be gated'
