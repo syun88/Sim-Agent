@@ -33,6 +33,13 @@ def create_backend(scene_profile: str | None = None, *, robot_id: str = "openarm
     """Create the simulation backend."""
     profile = scene_profile or os.getenv("OPENARM_SCENE", "cubes")
     gpu = prefer_gpu_from_environment()
+    if gpu:
+        # Before anything imports Genesis: a ROCm torch shadows the system libdrm_amdgpu and takes Mesa's EGL
+        # down with it (measured 2026-11-10). Doing this here means no launcher wrapper is needed.
+        from backend.app.simulation import amd_compat
+        preloaded = amd_compat.preload_system_libdrm()
+        if preloaded.get('preloaded'):
+            print(f"AMD GPU: preloaded {preloaded['library']}", flush=True)
     if robot_id != "openarm_v2":
         if profile == "wine":
             # Pouring used to be refused outright for imported robots. The wine world is engine-generic; what it needs

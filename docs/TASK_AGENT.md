@@ -449,6 +449,46 @@ PyPI の最新は `genesis-world 1.4.6`（1.5 系は未リリース、タグも 
 `expected EGLNativeDisplayType instead of int` で落ちる。**障壁は描画層（pyrender/PyOpenGL）**で、
 torch でもこのプロジェクトでもない。
 
+#### 解決（2026-11-10）: 原因は torch 同梱の libdrm_amdgpu
+
+切り分けの結果、EGL 自体ではなく **`import quadrants` の時点で壊れていた**:
+
+| 手順 | 結果 |
+|---|---|
+| `import quadrants` 後に `libEGL.eglGetDisplay(NULL)` | **NULL** |
+| その状態で `libEGL_mesa` を読むと | `libgallium: undefined symbol: amdgpu_va_manager_query_sw_info` |
+| `ctypes.CDLL('/usr/lib/libdrm_amdgpu.so.1', RTLD_GLOBAL)` を**先に**実行 | **OK**（`eglInitialize` 1.5） |
+
+原因は torch（と triton）が同梱する `libdrm_amdgpu.so` がシステム版を影で覆い、Mesa の AMD ドライバが
+シンボルを解決できなくなっていたこと。**システム版を RTLD_GLOBAL で先に読み込む**だけで直る。
+
+これで **Genesis が AMD GPU で動く**（実測）:
+
+```
+backend: amdgpu | built in 19.8 s | stepped ok
+```
+
+`GENESIS_USE_GPU=1` を付ければ `create_backend` が自動で preload する（ランチャー不要）。必要なのは2つ:
+
+1. `amd_compat.apply()` — CUDA 専用のデバイス特性読み取りを守る
+2. `amd_compat.preload_system_libdrm()` — torch 同梱の libdrm が Mesa を壊さないようにする
+
+#### ただし GPU は CPU より遅い（実測）
+
+| シーン | CPU（メイン venv） | AMD GPU（rocm venv） |
+|---|---|---|
+| cubes | **4400 steps/s**（0.23 ms/step） | 448 steps/s（2.23 ms/step） |
+| wine（新プリセット） | **50.2 ms sim / 壁秒** | 56.8 ms sim / 壁秒 |
+
+小規模シーンではカーネル起動と同期のオーバーヘッドが支配的で、Ryzen 9800X3D の CPU の方が速い。
+**既定は CPU のまま**にし、GPU は大きなシーン用の選択肢として残す。
+
+#### ネイティブ窓: 生成はされるが起動が完了しない
+
+GPU + `GENESIS_SHOW_VIEWER=1` で **X のクライアントリストに窓が1枚現れる**（`run_genesis_gui.py`、
+以前は fd すら作られなかった）。ただし **4分以上たっても `Ready` に到達せず**、49 スレッドすべて S 状態
+（12% CPU）。Xwayland/Plasma 上での interactive viewer が最後の障壁。
+
 したがって ROCm で進めるには pyrender の EGL プラットフォーム全体を差し替えるか、上流修正が要る。
 `scripts/setup_rocm_venv.sh` でこの環境を再現でき、`amd_compat.py` は ROCm 以外では何もしない
 （メイン venv・CPU 運用に影響なし）。venv は `/home/yuu/Documents/Sim-Agent-nav/.venv-rocm`（16 GB）。
