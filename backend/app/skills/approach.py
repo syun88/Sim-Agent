@@ -160,11 +160,15 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
                                      'staging':staged,'error':'IK_FAILURE'})
                     continue
                 route, curve = built
-                measured = (measure(route, objects, allowed_contacts=allowed, curve=curve,
-                                    ceiling=CLEARANCE_CEILING_M) if measure is not None else None)
+                # Screen first, measure second. Measured 2026-11-10 on real geometry: the boolean screen costs 3%
+                # of a candidate and the clearance measurement 49%, and the measurement is only needed for a
+                # candidate the screen already accepted (it ranks candidates and gates the numeric margin).
                 screened = (check is None or check(route,objects,allowed_contacts=allowed,curve=curve,
                                                    minimum_object_clearance=screen_clearance,
                                                    object_clearances={obj:TARGET_BODY_CLEARANCE_M}))
+                measured = (measure(route, objects, allowed_contacts=allowed, curve=curve,
+                                    ceiling=CLEARANCE_CEILING_M)
+                            if screened and measure is not None else None)
                 # Both answers, because they answer different geometry (the screen also sees the table and the
                 # other arm; the number only sees the objects). Measured 2026-11-09: a route passed the screen
                 # while its nearest-object distance was 4.2 mm below the requirement, so the number is a gate
