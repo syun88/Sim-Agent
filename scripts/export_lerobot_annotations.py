@@ -181,8 +181,8 @@ def records_from_execution(record: dict) -> list[dict]:
             executed = [step for step in executed_all if step.get('action_index') == index]
             before = next((s.get('before_world_state') for s in steps_here if s.get('before_world_state')), None)
             after = next((s.get('world_state') for s in reversed(steps_here) if s.get('world_state')), None)
-            failures = [s for s in steps_here if s.get('success') is False]
             evidence_steps = executed or steps_here
+            failures = [s for s in evidence_steps if s.get('success') is False]
             capability = CAPABILITIES.get(action.get('op'))
             out.append({
                 'schema': SCHEMA,
@@ -205,7 +205,8 @@ def records_from_execution(record: dict) -> list[dict]:
                 'objects_after': _objects(after) or _objects(result.get('final_world_state')),
                 'box_space': 'world_aabb',
                 'image_boxes': None,
-                'outcome': {'success': all(s.get('success') for s in steps_here) if steps_here else None,
+                'outcome': {'success': (all(s.get('success') for s in evidence_steps)
+                                        if evidence_steps else None),
                             'failed_skill': (failures[0].get('skill') if failures else None),
                             'error': (failures[0].get('error') if failures else None)},
                 'episode': _episode(record),
@@ -237,7 +238,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     source = Path(args.input)
-    files = sorted(source.glob('*.json')) if source.is_dir() else [source]
+    # Recursive: a corpus is usually one directory per collection round or per configuration.
+    files = sorted(source.rglob('*.json')) if source.is_dir() else [source]
     lines, skipped = [], []
     for path in files:
         try:

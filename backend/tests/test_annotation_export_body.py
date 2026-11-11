@@ -89,3 +89,34 @@ def test_the_tidy_up_after_the_subtasks_is_recorded_once_per_episode(tmp_path):
     arm = item['episode']['post_task_homing']['arms'][0]
     assert arm['home_mode'] == 'scene_clearance_home'
     assert arm['home_clearance_required_m'] == 0.0625
+
+
+def test_an_outcome_comes_from_what_ran_not_from_the_plan(tmp_path):
+    """Measured 2026-11-10: every subtask exported as success=False because the *plan* steps carry no result."""
+    record = _record(actions=[{'op': 'pick', 'object': 'red_cube'}],
+                     skills=[{'skill': 'approach_object', 'action_index': 0, 'arm': 'left',
+                              'object': 'red_cube', 'success': True}])
+    item = _export(tmp_path, record)[0]
+    assert item['outcome']['success'] is True
+    assert item['outcome']['failed_skill'] is None
+
+
+def test_a_failing_executed_skill_names_itself_in_the_outcome(tmp_path):
+    record = _record(actions=[{'op': 'pick', 'object': 'red_cube'}],
+                     skills=[{'skill': 'approach_object', 'action_index': 0, 'arm': 'left',
+                              'object': 'red_cube', 'success': False, 'error': 'IK_FAILURE'}])
+    item = _export(tmp_path, record)[0]
+    assert item['outcome'] == {'success': False, 'failed_skill': 'approach_object', 'error': 'IK_FAILURE'}
+
+
+def test_a_corpus_of_rounds_is_read_recursively(tmp_path):
+    nested = tmp_path / 'round-1'
+    nested.mkdir()
+    record = _record(actions=[{'op': 'pick', 'object': 'red_cube'}],
+                     skills=[{'skill': 'grasp_object', 'action_index': 0, 'success': True}])
+    (nested / 'task-a.json').write_text(json.dumps(record))
+    out = tmp_path / 'out.jsonl'
+    result = subprocess.run([sys.executable, str(SCRIPT), '--input', str(tmp_path), '--out', str(out)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert len([line for line in out.read_text().splitlines() if line.strip()]) == 1

@@ -38,7 +38,8 @@ def main(argv=None):
     paths = []
     for entry in args.input:
         path = Path(entry)
-        paths.extend(sorted(path.glob('*.json')) if path.is_dir() else [path])
+        # Recursive: a corpus is usually one directory per round or per configuration.
+        paths.extend(sorted(path.rglob('*.json')) if path.is_dir() else [path])
     examples, skipped = load_examples(paths)
 
     report = {'records': len(paths), 'examples': len(examples), 'skipped': skipped}
