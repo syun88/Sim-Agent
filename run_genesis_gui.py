@@ -33,6 +33,21 @@ def make_executor(env):
     return ImportedRobotExecutor(env)
 
 
+def _install_thread_dump() -> bool:
+    """Let SIGUSR1 dump every thread's stack.
+
+    A hung viewer gives no Python-level clue, and attaching a profiler needs elevated ptrace permissions here.
+    Registering faulthandler means `kill -USR1 <pid>` writes all stacks to stderr, which lands in the journal.
+    """
+    if os.environ.get('OPENARM_THREAD_DUMP', '0') == '0':
+        return False
+    import faulthandler
+    import signal
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    print('Thread dump enabled: kill -USR1 <pid>', flush=True)
+    return True
+
+
 def main() -> None:
     from backend.app.simulation.runtime_owner import acquire_genesis_owner
     parser = argparse.ArgumentParser(description=__doc__)
@@ -64,6 +79,7 @@ def main() -> None:
     else:
         os.environ.setdefault('GENESIS_SHOW_VIEWER', '1')
     robot_id = get_profile(args.robot or selected_robot())['id']
+    _install_thread_dump()
     print(f'Building {robot_id} on Genesis...', flush=True)
     initial_scene = args.scene or os.environ.get('OPENARM_SCENE') or 'cubes'
     env = create_backend(initial_scene if robot_id == 'openarm_v2' else 'cubes', robot_id=robot_id)

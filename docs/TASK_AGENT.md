@@ -499,6 +499,16 @@ backend: amdgpu | built in 19.8 s | stepped ok
 小規模シーンではカーネル起動と同期のオーバーヘッドが支配的で、Ryzen 9800X3D の CPU の方が速い。
 **既定は CPU のまま**にし、GPU は大きなシーン用の選択肢として残す。
 
+#### ネイティブ窓: 生成はされるが起動が完了しない（py-spy で中身を確認済み）
+
+`OPENARM_THREAD_DUMP=1` を付けると `kill -USR1 <pid>` で全スレッドのスタックを出せるようにした。
+`py-spy record`（親プロセスとして起動すれば ptrace 制限を回避できる）で GPU+viewer の60秒を採ると、
+最深フレームの大半は **`quadrants.lang.kernel.Kernel.launch_kernel`** と `_try_load_fastcache`
+＝**HIP カーネルの初回JITコンパイル**だった。つまり最初の数十秒〜数分は「ハング」ではなく**コンパイル**。
+ただし待っても起動は完了せず、CPU は 53% → 5% まで低下して停止（49スレッド）。窓は作られる
+（X のクライアントリストに `run_genesis_gui.py` が現れる）が、描画が iGPU + Xwayland 経由のため
+提示（present）で止まっていると見られる。
+
 #### ネイティブ窓: 生成はされるが起動が完了しない
 
 GPU + `GENESIS_SHOW_VIEWER=1` で **X のクライアントリストに窓が1枚現れる**（`run_genesis_gui.py`、
