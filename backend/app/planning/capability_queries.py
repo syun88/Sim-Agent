@@ -232,6 +232,7 @@ def layout_grasp_admission(env, controller, arms=('left', 'right'), *, yaws=ATTI
     could not even solve the pregrasp for the object. 341 were clearance. So the dominant reason a task failed was
     a layout the body could not work in, which is answerable before the task starts.
     """
+    from backend.app.skills.approach import CUBE_GRASP_YAWS_DEG
     answer = {'objects': {}, 'admitted': True}
     try:
         names = list((getattr(env.frame(), 'objects', {}) or {}))
@@ -250,7 +251,11 @@ def layout_grasp_admission(env, controller, arms=('left', 'right'), *, yaws=ATTI
                 # layout the planner then failed on (0 resamples), because a screened 4-waypoint approach needs more
                 # than an IK solution at the pinch point.
                 if deep == 'waypoints':
-                    per_arm[arm] = grasp_waypoints_reachable(env, controller, arm, name).get('reachable')
+                    # The fast attribution form: four sides, no overfly variants. Measured 2026-11-10, a positive
+                    # answer costs 3 IK probes (0.01 s); asking for all 26 frames and 5 rises costs 170 probes
+                    # (3.5 s) on a negative, which is the common case and not worth it inside a reset.
+                    per_arm[arm] = grasp_waypoints_reachable(
+                        env, controller, arm, name, yaws=CUBE_GRASP_YAWS_DEG[:4], rises=1).get('reachable')
                     continue
                 budget = {} if deep == 'deep' else {'max_postures': 1, 'max_frames': 4}
                 probe = approach_feasible(env, controller, arm, name, **budget)
@@ -293,33 +298,41 @@ def grasp_waypoints_reachable(env, controller, arm: str, obj: str, *, yaws=None,
         centre = np.asarray(env.object_pose(obj)[0], float)
     except Exception as error:
         return {'reachable': None, 'unknown': f'{type(error).__name__}: {error}'}
-    candidates = list(yaws if yaws is not None else CUBE_GRASP_YAWS_DEG[:4])
+    if yaws is not None:
+        passes = [list(yaws)]
+    else:
+        # Coarse side first, then everything. Measured 2026-11-10: a deep check spends 780 candidate routes, most
+        # of them on angles where nothing can be solved; 8 coarse frames find the working side in the normal case,
+        # and the full 26 stay as the fallback so a corridor at a fine angle is not lost.
+        from backend.app.skills.approach import CUBE_GRASP_YAWS_COARSE_DEG
+        passes = [list(CUBE_GRASP_YAWS_COARSE_DEG), list(CUBE_GRASP_YAWS_DEG)]
     attempted = 0
     best = None
-    for posture in postures:
-        for yaw in candidates:
-            frame = frame_at(arm, centre, APPROACH_STANDOFF, float(yaw))
-            for rise in np.linspace(APPROACH_OVERFLY, 0., max(1, rises)):
-                high = frame['standoff'] + np.array([0., 0., float(rise)])
-                solved_all = True
-                worst = 0.
-                # The pinch is checked first: if the final pose is unreachable no route exists, and that is the
-                # common case here (6,971 of 7,312 rejections were IK). Measured 2026-11-10: this skips the two
-                # earlier waypoints' solves for every hopeless candidate.
-                for target in (frame['pinch'], frame['standoff'], high):
-                    try:
-                        solution, error, _ = solve(arm, target, frame['rotation'], q_init=posture)
-                    except Exception:
-                        solved_all = False
-                        break
-                    attempted += 1
-                    if solution is None or error is None or error > .012:
-                        solved_all = False
-                        break
-                    worst = max(worst, float(error))
-                if solved_all:
-                    return {'reachable': True, 'yaw_deg': float(yaw), 'rise_m': float(rise),
-                            'residual_m': worst, 'attempted': attempted}
-                if best is None or worst < best:
-                    best = worst
+    for candidates in passes:
+      for posture in postures:
+          for yaw in candidates:
+              frame = frame_at(arm, centre, APPROACH_STANDOFF, float(yaw))
+              for rise in np.linspace(APPROACH_OVERFLY, 0., max(1, rises)):
+                  high = frame['standoff'] + np.array([0., 0., float(rise)])
+                  solved_all = True
+                  worst = 0.
+                  # The pinch is checked first: if the final pose is unreachable no route exists, and that is the
+                  # common case here (6,971 of 7,312 rejections were IK). Measured 2026-11-10: this skips the two
+                  # earlier waypoints' solves for every hopeless candidate.
+                  for target in (frame['pinch'], frame['standoff'], high):
+                      try:
+                          solution, error, _ = solve(arm, target, frame['rotation'], q_init=posture)
+                      except Exception:
+                          solved_all = False
+                          break
+                      attempted += 1
+                      if solution is None or error is None or error > .012:
+                          solved_all = False
+                          break
+                      worst = max(worst, float(error))
+                  if solved_all:
+                      return {'reachable': True, 'yaw_deg': float(yaw), 'rise_m': float(rise),
+                              'residual_m': worst, 'attempted': attempted}
+                  if best is None or worst < best:
+                      best = worst
     return {'reachable': False, 'attempted': attempted, 'best_residual_m': best}

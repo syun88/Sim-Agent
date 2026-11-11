@@ -15,6 +15,10 @@ from backend.app.simulation.transform import orientation_error
 #: neighbours. The coarse values stay first so the cheap answer is found early.
 CUBE_GRASP_YAWS_DEG = (0, -15, 15, -30, 30, -45, 45, -60, 60, -75, 75, -90, 90, 180,
                        -7.5, 7.5, -22.5, 22.5, -37.5, 37.5, -52.5, 52.5, -67.5, 67.5, -82.5, 82.5)
+#: The coarse pass: every 30 degrees. Tried first so a workable side is found without paying for all 26 frames;
+#: the full list follows when the coarse pass finds nothing, so a corridor that only exists at a fine angle is
+#: still found (measured 2026-11-10: a deep check spends 780 candidate routes, most of them on hopeless angles).
+CUBE_GRASP_YAWS_COARSE_DEG = (0, -30, 30, -60, 60, -90, 90, 180)
 #: Standoffs tried when the nominal distance yields no corridor: a shorter reach keeps the pads further from
 #: a neighbouring object.
 STANDOFF_VARIANTS_M = (0.05, 0.04)
