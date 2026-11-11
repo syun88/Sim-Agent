@@ -526,8 +526,15 @@ unshare -rm --map-root-user bash -c 'mount --bind /dev/null /dev/dri/renderD129;
   描画されていない（DPMS/ロック等）。**X が窓を map できない状態では、原因がアプリ側か環境側かを
   画面で切り分けられない**
 
-したがって次の確認は「**デスクトップが起きている状態で**、`GENESIS_SHOW_VIEWER=1` のセルを起動し、
-窓が出るか」を人が見る必要がある。出ない場合は Xwayland ではなく素の Xorg セッションで試すのが次の候補。
+**その後の確認（2026-11-10 13:45、こちらで実行）**: 窓は `_NET_WM_STATE_HIDDEN`（最小化）で、
+`XlibWindow.map_state = 0`。`scripts/raise_window.py` で外から map/raise しても変わらず。
+その間の画面キャプチャは **1920x1080 で全画素 0（真っ黒）**、`kscreen-doctor` は
+「HDMI-A-1 enabled/connected」、KWin は `compositingType = gl2` / `compositingPossible = true`、
+`ddcutil` は「DDC/CI 対応ディスプレイなし」、`pkgs` の `xset` は未インストール、`SimulateUserActivity` も無効。
+
+→ **ディスプレイが提示していない**（パネルが落ちている/セッションが描画していない）状態で、
+アプリ側の問題ではない。ここから先は現地での操作（キー入力で復帰、あるいはセッション再起動）が必要。
+なお、この状態でも `GENESIS_SHOW_VIEWER=0` のヘッドレス運用と、`/api/view.jpg` のライブビューは正常。
 
 ##### それでもネイティブ窓は起動しない（＝障壁は viewer 側）
 
