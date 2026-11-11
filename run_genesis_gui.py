@@ -315,11 +315,17 @@ def main() -> None:
                             break
                         # Default off: the deep check costs ~90 s per reset (measured), which is right for building a
                         # corpus and wrong for interactive use. `OPENARM_ADMISSION=deep|ik|off`.
+                        # `off` (default) | `ik` | `cheap` | `waypoints` (IK over the route waypoints, no
+                        # clearance sweep) | `deep` (full screened routes, ~89 s per reset).
                         mode = os.environ.get('OPENARM_ADMISSION', 'off')
                         if mode == 'off':
                             break
-                        admission = layout_grasp_admission(env, getattr(executor, 'controller', None),
-                                                           deep=(mode != 'ik'))
+                        try:
+                            admission = layout_grasp_admission(env, getattr(executor, 'controller', None),
+                                                               deep=(mode != 'ik'))
+                        except Exception as error:  # an admission is advice, not a step: never fail the reset
+                            admission = {'admitted': None, 'error': f'{type(error).__name__}: {error}'}
+                            print(f'Layout admission unavailable: {admission["error"]}', flush=True)
                         body['admission_seconds'] = round(time.monotonic() - _admission_started, 1)
                         if admission.get('admitted') is not False:
                             break

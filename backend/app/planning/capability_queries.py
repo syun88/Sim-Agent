@@ -249,6 +249,9 @@ def layout_grasp_admission(env, controller, arms=('left', 'right'), *, yaws=ATTI
                 # The route question, not the pinch question. Measured 2026-11-10: pinch reachability admitted every
                 # layout the planner then failed on (0 resamples), because a screened 4-waypoint approach needs more
                 # than an IK solution at the pinch point.
+                if deep == 'waypoints':
+                    per_arm[arm] = grasp_waypoints_reachable(env, controller, arm, name).get('reachable')
+                    continue
                 budget = {} if deep == 'deep' else {'max_postures': 1, 'max_frames': 4}
                 probe = approach_feasible(env, controller, arm, name, **budget)
                 per_arm[arm] = probe.get('feasible')
@@ -266,3 +269,54 @@ def layout_grasp_admission(env, controller, arms=('left', 'right'), *, yaws=ATTI
         if per_arm and not reachable_arms and all(ok is not None for ok in per_arm.values()):
             answer['admitted'] = False
     return answer
+
+
+def grasp_waypoints_reachable(env, controller, arm: str, obj: str, *, yaws=None, rises=5,
+                              posture_count: int = 1) -> dict:
+    """Whether any approach *route* can be solved for this object, without screening it for clearance.
+
+    Measured 2026-11-10 on 7,312 rejected approach routes: 6,971 failed with `IK_FAILURE`, i.e. the waypoints could
+    not even be solved - and the clearance screen was not what refused them. Screening (a MuJoCo distance sweep
+    over every joint sample) is the expensive part of `approach_feasible` (89 s per reset); the IK half is cheap.
+    This asks only the IK half, over the same families of frames and rises, so a reset can use it.
+    """
+    from backend.app.skills.approach import CUBE_GRASP_YAWS_DEG, frame_at
+    from backend.app.skills.robot_skills import APPROACH_OVERFLY, APPROACH_STANDOFF
+
+    solve = getattr(controller, 'solve_ik', None)
+    if not callable(solve):
+        return {'reachable': None, 'unknown': 'no IK solver'}
+    postures = canonical_postures(env, arm)[:max(1, posture_count)]
+    if not postures:
+        return {'reachable': None, 'unknown': 'no canonical posture'}
+    try:
+        centre = np.asarray(env.object_pose(obj)[0], float)
+    except Exception as error:
+        return {'reachable': None, 'unknown': f'{type(error).__name__}: {error}'}
+    candidates = list(yaws if yaws is not None else CUBE_GRASP_YAWS_DEG[:4])
+    attempted = 0
+    best = None
+    for posture in postures:
+        for yaw in candidates:
+            frame = frame_at(arm, centre, APPROACH_STANDOFF, float(yaw))
+            for rise in np.linspace(APPROACH_OVERFLY, 0., max(1, rises)):
+                high = frame['standoff'] + np.array([0., 0., float(rise)])
+                solved_all = True
+                worst = 0.
+                for target in (high, frame['standoff'], frame['pinch']):
+                    try:
+                        solution, error, _ = solve(arm, target, frame['rotation'], q_init=posture)
+                    except Exception:
+                        solved_all = False
+                        break
+                    attempted += 1
+                    if solution is None or error is None or error > .012:
+                        solved_all = False
+                        break
+                    worst = max(worst, float(error))
+                if solved_all:
+                    return {'reachable': True, 'yaw_deg': float(yaw), 'rise_m': float(rise),
+                            'residual_m': worst, 'attempted': attempted}
+                if best is None or worst < best:
+                    best = worst
+    return {'reachable': False, 'attempted': attempted, 'best_residual_m': best}
