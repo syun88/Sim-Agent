@@ -473,6 +473,22 @@ backend: amdgpu | built in 19.8 s | stepped ok
 1. `amd_compat.apply()` — CUDA 専用のデバイス特性読み取りを守る
 2. `amd_compat.preload_system_libdrm()` — torch 同梱の libdrm が Mesa を壊さないようにする
 
+#### どの GPU を使っているか（実測・重要）
+
+| 用途 | 実体 | 根拠 |
+|---|---|---|
+| **計算（HIP/torch）** | **Radeon RX 7800 XT**（gfx1101, 15.98 GB, PCI 03:00.0, 30 CU） | `torch.cuda.get_device_properties(0)` |
+| **描画（Mesa/EGL）** | **Ryzen 9800X3D の内蔵GPU**（`raphael_mendocino`, 512 MB 側 = renderD129） | `GL_RENDERER` 実測 |
+
+描画が iGPU になるのは、この Mesa が `EGL_EXT_device_base` を持たず、headless EGL が
+**最初に見つけた render node** を選ぶため。`DRI_PRIME=1` / `DRI_PRIME=pci-0000_03_00_0` /
+`EGL_PLATFORM=surfaceless` のいずれでも **iGPU のまま**（実測）。`EGL_DEVICE_ID` で選ぶには
+`EGL_EXT_device_base` が必要で、この Mesa には無い。
+
+また `HSA_OVERRIDE_GFX_VERSION=11.0.1` は**不要かつ有害**: gfx1101 は ROCm 7 が正式対応しており、
+この上書きがあると **iGPU（本来 gfx1036）まで gfx1101 として見え**、torch の device 1 に
+「Ryzen 7 9800X3D / 15.2 GB / 1 CU」という偽の GPU が現れる。無しでも Genesis は amdgpu で動く（実測 19.6 s）。
+
 #### ただし GPU は CPU より遅い（実測）
 
 | シーン | CPU（メイン venv） | AMD GPU（rocm venv） |

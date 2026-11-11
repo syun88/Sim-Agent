@@ -20,7 +20,9 @@ VIRTUAL_ENV="$VENV" "$UV" pip install --python "$VENV/bin/python" \
 "$UV" export --frozen --no-hashes --no-dev -o /tmp/req.txt
 grep -viE '^(torch|triton|pytorch-triton|nvidia-)' /tmp/req.txt > /tmp/req-no-torch.txt
 VIRTUAL_ENV="$VENV" "$UV" pip install --python "$VENV/bin/python" -r /tmp/req-no-torch.txt
-HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-11.0.1} "$VENV/bin/python" - <<'PY'
+# No HSA_OVERRIDE_GFX_VERSION: gfx1101 (RX 7800 XT) is supported natively by ROCm 7, and the override makes the
+# Ryzen iGPU (really gfx1036) masquerade as gfx1101 - a second, useless torch device.
+"$VENV/bin/python" - <<'PY'
 import torch
 print('torch', torch.__version__, '| hip', torch.version.hip, '| avail', torch.cuda.is_available(),
       '| device', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a')
