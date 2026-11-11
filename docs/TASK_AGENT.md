@@ -499,6 +499,26 @@ backend: amdgpu | built in 19.8 s | stepped ok
 小規模シーンではカーネル起動と同期のオーバーヘッドが支配的で、Ryzen 9800X3D の CPU の方が速い。
 **既定は CPU のまま**にし、GPU は大きなシーン用の選択肢として残す。
 
+##### 描画を dGPU にする方法は見つかった（root 不要）
+
+Mesa の headless EGL は「最初の render node」を選ぶので iGPU になる。**ユーザー名前空間で
+iGPU の render node を `/dev/null` に被せる**と、Mesa は 7800 XT を選ぶ（実測）:
+
+```bash
+unshare -rm --map-root-user bash -c 'mount --bind /dev/null /dev/dri/renderD129; exec <cmd>'
+# GL_RENDERER: AMD Radeon RX 7800 XT (radeonsi, navi32, ACO, DRM 3.64)
+```
+
+- `renderD128` = 7800 XT（PCI 03:00.0、16 GB）、`renderD129` = Ryzen 内蔵GPU（PCI 73:00.0、512 MB）
+- 副作用: その名前空間では **HIP が使えない**（`amdgpu_get_auth failed`、torch devices 0）。
+  したがって「描画=GPU / 物理=CPU」の組み合わせになる（物理は GPU でも速くならないので実害なし）
+
+##### それでもネイティブ窓は起動しない（＝障壁は viewer 側）
+
+dGPU 描画（renderD128 のみ開く）で窓付き起動を試すと、窓は作られ CPU は 15% → 6% に減衰し、
+**7分待っても `Ready` に到達しない**（49スレッド、ヘッドレスなら同じシーンが20〜45秒で構築）。
+つまり障壁は GPU 選択でも EGL でもなく、**Genesis の interactive viewer のイベントループ**。
+
 #### ネイティブ窓: 生成はされるが起動が完了しない（py-spy で中身を確認済み）
 
 `OPENARM_THREAD_DUMP=1` を付けると `kill -USR1 <pid>` で全スレッドのスタックを出せるようにした。
