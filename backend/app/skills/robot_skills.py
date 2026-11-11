@@ -156,12 +156,19 @@ class SkillRunner:
             raise SkillError("GRASP_LOST", f"{arm} no longer has both finger contacts with {obj}")
 
     def _skill(self, name: str, run: Callable[[], dict], started: float) -> dict:
+        log = getattr(self.controller, 'reflex_log', None)
+        if log is not None:
+            log.clear()
         try:
             result = run()
-            return {"skill": name, "success": True, "duration": time.perf_counter() - started, **result}
+            return {"skill": name, "success": True, "duration": time.perf_counter() - started, **result,
+                    **({'evidence': {'reflex_log': list(log)}} if log else {})}
         except SkillError as exc:
+            evidence = dict(exc.evidence or {})
+            if log:
+                evidence.setdefault('reflex_log', list(log))
             return {"skill": name, "success": False, "duration": time.perf_counter() - started, "error": exc.category,
-                    "detail": str(exc), **({"evidence": exc.evidence} if exc.evidence else {})}
+                    "detail": str(exc), **({'evidence': evidence} if evidence else {})}
 
     def _raise_support_face_blocked(self, arm: str, support: str, clearance: dict, regrasp) -> None:
         """Refuse a placement the hand's own geometry cannot allow, naming the measured reason."""

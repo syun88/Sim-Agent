@@ -78,6 +78,10 @@ class OpenArmV2Controller:
     """
 
     def __init__(self, env: SimulationBackend, *, motion_speed: float | None = None, configure_motors: bool = True):
+        #: What the deviation reflex observed on every leg of the current skill, drained into the skill's
+        #: evidence. Without this a leg that stayed under threshold leaves nothing behind, and the reflex's
+        #: numbers can never be tuned from data - only its failures would be visible.
+        self.reflex_log: list[dict] = []
         self.env = env
         # 1x is real time: the motors move at the speed the model says they can. The old default of 6x made
         # the arm look like it teleported (measured 2026-11-10, reported from watching the cell).
@@ -329,6 +333,7 @@ class OpenArmV2Controller:
         residual = float(np.linalg.norm(actual - position))
         if watcher is not None:
             result.reflex = watcher.evidence()
+            self.reflex_log.append(result.reflex)
         rotation_residual = float(np.linalg.norm(orientation_error(actual_rotation, rotation)))
         # Read a settled endpoint. The official wrist's damping can leave a short
         # orientation transient after a large handover rotation or lateral carry.
