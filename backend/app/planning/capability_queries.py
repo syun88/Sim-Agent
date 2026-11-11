@@ -120,7 +120,8 @@ def clear_feasibility_cache() -> None:
     _FEASIBLE_CACHE.clear()
 
 
-def approach_feasible(env, controller, arm: str, obj: str) -> dict:
+def approach_feasible(env, controller, arm: str, obj: str, *, max_postures: int | None = None,
+                      max_frames: int | None = None) -> dict:
     """Whether this arm has a *screened route* to the object from any canonical posture.
 
     Two questions live here, and conflating them was a root cause: "is there a route from where the arm is
@@ -142,10 +143,17 @@ def approach_feasible(env, controller, arm: str, obj: str) -> dict:
         if key is not None and key in _FEASIBLE_CACHE:
             return {**_FEASIBLE_CACHE[key], 'cached': True}
         postures = canonical_postures(env, arm)
+        if max_postures is not None:
+            # A bounded question for callers that must stay cheap (a reset admission runs on every scene). Measured
+            # 2026-11-10: the full set costs ~89 s per reset across two objects and two arms, which is right for an
+            # offline corpus and wrong interactively.
+            postures = postures[:max(1, max_postures)]
         if not postures:
             return {'feasible': None, 'unknown': 'no canonical posture for this body'}
         centre = np.asarray(env.object_pose(obj)[0], float)
         frames = cube_approach_frames(arm, centre, APPROACH_STANDOFF)
+        if max_frames is not None:
+            frames = frames[:max(1, max_frames)]
         attempts = []
         for index, posture in enumerate(postures):
             route, planning = plan_cube_approach(env, controller, arm, obj, frames[0]['pinch'],
@@ -217,7 +225,7 @@ def zone_reachability(env, controller, *, arms=('left', 'right')) -> dict:
 
 
 def layout_grasp_admission(env, controller, arms=('left', 'right'), *, yaws=ATTITUDE_YAWS_DEG,
-                           deep: bool = False) -> dict:
+                           deep: bool | str = False) -> dict:
     """Whether every object in the current layout can be pinched by *some* arm from a canonical posture.
 
     Measured 2026-11-10 on a 18-task round: of 7,312 rejected approach routes, 6,971 were `IK_FAILURE` - the arm
@@ -241,7 +249,8 @@ def layout_grasp_admission(env, controller, arms=('left', 'right'), *, yaws=ATTI
                 # The route question, not the pinch question. Measured 2026-11-10: pinch reachability admitted every
                 # layout the planner then failed on (0 resamples), because a screened 4-waypoint approach needs more
                 # than an IK solution at the pinch point.
-                probe = approach_feasible(env, controller, arm, name)
+                budget = {} if deep == 'deep' else {'max_postures': 1, 'max_frames': 4}
+                probe = approach_feasible(env, controller, arm, name, **budget)
                 per_arm[arm] = probe.get('feasible')
                 continue
             for yaw in yaws:

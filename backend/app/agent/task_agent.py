@@ -232,32 +232,35 @@ class TaskAgent:
             announce({'kind': 'arm_choice',
                       'explanation': '指示に手の指定が無いため、目的地に届く手を選びました。',
                       'arm_choice': zone_switch})
-        unreachable = ([row for row in (preflight or {}).get('arms', [])
-                        if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE']
+        # Two decisions live here and only one was measured as harmful. *Refusing* because the requested hand
+        # cannot reach (a momentary answer) threw away work the robot could do, so it stays off by default.
+        # *Switching* a hand the instruction never named costs nothing, so it always runs.
+        rows = list((preflight or {}).get('arms', []))
+        unreachable = ([row for row in rows if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE']
                        if _measured('arm_preflight') else [])
-        if unreachable:
-            from backend.app.planning.language_fallback import arm_mentions
-            explicit = set(arm_mentions(instruction))
-            switchable = [row for row in unreachable
-                          if row['arm'] not in explicit and row.get('reachable_arms')]
-            if switchable:
-                changes = []
-                for row in switchable:
-                    alternative = row['reachable_arms'][0]
-                    _switch_plan_arm(plan, row['arm'], alternative)
-                    changes.append({'object': row['object'], 'from': row['arm'], 'to': alternative,
-                                    'basis': 'the hand was not requested; the other one has a screened approach',
-                                    'screen': (row.get('screen') or {}).get(alternative)})
-                plan.planning_evidence = {**(plan.planning_evidence or {}),
-                                          'arm_choice': changes}
-                announce({'kind': 'arm_choice', 'explanation':
-                          '指示に手の指定が無いため、接近経路が確認できた手を選びました。',
-                          'arm_choice': changes})
-                preflight = run_preflight(getattr(self.executor, 'env', None),
-                                          getattr(self.executor, 'controller', None), plan.program)
-                plan.planning_evidence = {**(plan.planning_evidence or {}), 'preflight': preflight}
-                unreachable = [row for row in (preflight or {}).get('arms', [])
-                               if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE']
+        from backend.app.planning.language_fallback import arm_mentions
+        explicit = set(arm_mentions(instruction))
+        switchable = [row for row in rows
+                      if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE'
+                      and row['arm'] not in explicit and row.get('reachable_arms')]
+        if switchable:
+            changes = []
+            for row in switchable:
+                alternative = row['reachable_arms'][0]
+                _switch_plan_arm(plan, row['arm'], alternative)
+                changes.append({'object': row['object'], 'from': row['arm'], 'to': alternative,
+                                'basis': 'the hand was not requested; the other one has a screened approach',
+                                'screen': (row.get('screen') or {}).get(alternative)})
+            plan.planning_evidence = {**(plan.planning_evidence or {}),
+                                      'arm_choice': changes}
+            announce({'kind': 'arm_choice', 'explanation':
+                      '指示に手の指定が無いため、接近経路が確認できた手を選びました。',
+                      'arm_choice': changes})
+            preflight = run_preflight(getattr(self.executor, 'env', None),
+                                      getattr(self.executor, 'controller', None), plan.program)
+            plan.planning_evidence = {**(plan.planning_evidence or {}), 'preflight': preflight}
+            unreachable = [row for row in (preflight or {}).get('arms', [])
+                           if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE']
         if unreachable:
             row = unreachable[0]
             alternative = ', '.join(row.get('reachable_arms') or [])

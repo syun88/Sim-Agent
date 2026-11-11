@@ -150,3 +150,26 @@ def test_the_canonical_postures_are_a_fixed_set():
     assert len(first) >= 2
     assert all(np.allclose(a, b) for a, b in zip(first, second))
     assert np.allclose(first[0], np.zeros(7)), 'home is always part of the set'
+
+
+def test_an_inferred_hand_is_switched_even_when_refusal_is_off(monkeypatch):
+    """Refusing was measured as harmful; switching an unnamed hand costs nothing, so it always runs."""
+    from backend.app.planning import measurement_flags
+
+    monkeypatch.setattr(measurement_flags, 'enabled', lambda name: False)
+    rows = [{'verdict': 'REQUESTED_ARM_UNREACHABLE', 'arm': 'right', 'object': 'red_cube',
+             'reachable_arms': ['left'], 'screen': {'left': {'feasible': True}}}]
+    explicit = set()          # no hand named in the instruction
+    switchable = [row for row in rows
+                  if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE'
+                  and row['arm'] not in explicit and row.get('reachable_arms')]
+    assert [row['reachable_arms'][0] for row in switchable] == ['left']
+
+
+def test_the_bounded_route_question_is_cheaper_but_same_shape():
+    """A reset admission runs on every scene, so the question can be given a budget."""
+    import inspect
+    from backend.app.planning.capability_queries import approach_feasible
+
+    params = inspect.signature(approach_feasible).parameters
+    assert 'max_postures' in params and 'max_frames' in params
