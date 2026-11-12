@@ -116,6 +116,14 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
             pass
     # The clearance query ranks candidates; the route screen still decides. Where the two disagree the
     # trace says so (rejected_by), because a measured win the screen refuses is not an improvement.
+    # The route must also keep clear of the object it is reaching for *until the last sample*: an approach
+    # lands a few millimetres off its planned path (measured 2026-11-09: 6.7-9.1 mm of displacement on the
+    # object it was reaching for), so a planned 3 mm is contact in execution. Measured 2026-11-10: a stacking
+    # approach displaced the cube by 8.1 mm and was refused afterwards with APPROACH_COLLISION, then repeated
+    # the same shove on retry. The target clearance therefore carries the same measured error the noncontact
+    # clearance does; the screen still lets the final sample close in on the grasp.
+    target_clearance = TARGET_BODY_CLEARANCE_M + (motion_accuracy.expected_error(arm, 'approach')
+                                                 if _measured('approach_margin') else 0.)
     measure = getattr(kin,'path_minimum_clearance',None)
     allowed = {obj:{f'openarm_{arm}_ee_inner_finger',f'openarm_{arm}_ee_outer_finger'}}
     rejected = []
@@ -169,7 +177,7 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
                 # candidate the screen already accepted (it ranks candidates and gates the numeric margin).
                 screened = (check is None or check(route,objects,allowed_contacts=allowed,curve=curve,
                                                    minimum_object_clearance=screen_clearance,
-                                                   object_clearances={obj:TARGET_BODY_CLEARANCE_M}))
+                                                   object_clearances={obj:target_clearance}))
                 measured = (measure(route, objects, allowed_contacts=allowed, curve=curve,
                                     ceiling=CLEARANCE_CEILING_M)
                             if screened and measure is not None else None)
@@ -237,7 +245,7 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
             if check is not None and not check(candidate_route, objects, allowed_contacts=allowed,
                                                curve=candidate_curve,
                                                minimum_object_clearance=screen_clearance,
-                                               object_clearances={obj:TARGET_BODY_CLEARANCE_M}):
+                                               object_clearances={obj:target_clearance}):
                 entry['rejected_by'] = 'COLLISION_PATH'
                 continue
             entry['accepted'] = True
@@ -252,6 +260,7 @@ def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, stag
                    'screen_clearance_m':screen_clearance,
                    'expected_approach_error_m':motion_accuracy.expected_error(arm, 'approach'),
                    'target_body_clearance_m':TARGET_BODY_CLEARANCE_M,
+                   'target_clearance_used_m':target_clearance,
                    'grasp_yaw_deg':frame['yaw_deg'],
                    'grasp_tilt_deg':frame.get('tilt_deg', 0.),
                    'grasp_rotation':attitude.tolist(),
