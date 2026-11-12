@@ -114,6 +114,10 @@ PARK_ARRIVAL_TOLERANCE_RAD = 0.04
 #: The approach may not displace the object by more than this (m); the object is only pinched
 #: after this check, so a shove here would fake nothing anyway, but the plan still fails loudly.
 APPROACH_DISTURBANCE_TOLERANCE = 0.005
+#: How far the object may slide *along the approach axis* while an offset grasp engages its face. Measured
+#: 2026-11-10: the pad slides 8.06 mm axially when the grasp point is 15 mm off centre, and the grasp still
+#: forms from the observed pose afterwards, so refusing it at 5 mm was refusing a grasp that works.
+APPROACH_SLIDE_TOLERANCE = 0.020
 #: World-frame deltas for human "right/left/forward/back" commands. Positive world y is the left
 #: side of the official Cell spawn pose; positive world x is toward the table/front.
 DIRECTION_VECTORS = {
@@ -321,6 +325,13 @@ class SkillRunner:
         stationary = {name:self.env.object_pose(name)[0].copy() for name in self.env.frame().objects}
         initial_joints = ({side:self.env.arm_qpos(side).tolist() for side in ('left','right')}
                           if hasattr(self.env,'arm_qpos') else None)
+        # The approach axis, so a slide along the face can be told from a shove across it.
+        approach_axis = None
+        try:
+            direction = -(GRASP_ROTATION @ np.array([0.0, 0.0, 1.0]))
+            approach_axis = direction / max(np.linalg.norm(direction), 1e-9)
+        except Exception:
+            approach_axis = None
         leg_progress = {'leg': 'start', 'displacements': {}, 'trace': [], 'calls': 0}
         def guard_undisturbed(after_leg: bool = False):
             leg_progress['calls'] += 1
@@ -338,7 +349,16 @@ class SkillRunner:
                 # records every half millimetre of growth with the label and the call index it happened on.
                 if displacement - leg_progress['trace'][-1][2] > .0005 if leg_progress['trace'] else True:
                     leg_progress['trace'].append((label, leg_progress['calls'], round(displacement, 4)))
-                if displacement > APPROACH_DISTURBANCE_TOLERANCE:
+                # Not every displacement is a shove. An offset grasp makes one pad slide along the face it is
+                # about to close on, and the screen deliberately does not police the grasping hand's contacts
+                # with its own object (allowed_contacts), so that slide is expected physics rather than an
+                # accident. Measured 2026-11-10: the slide is axial (8.06 mm, mostly along the approach axis).
+                axial = 0.
+                vector = self.env.object_pose(name)[0] - position
+                if approach_axis is not None:
+                    axial = float(abs(np.dot(vector, approach_axis)))
+                lateral = float(np.linalg.norm(vector - (axial * approach_axis))) if approach_axis is not None else displacement
+                if lateral > APPROACH_DISTURBANCE_TOLERANCE or axial > APPROACH_SLIDE_TOLERANCE:
                     error=SkillError('APPROACH_COLLISION',
                         f'Approach displaced {name} by {displacement * 1000:.1f} mm; stopping the arm')
                     error.evidence={**approach_evidence,'object':name,'displacement_m':displacement,
@@ -402,6 +422,14 @@ class SkillRunner:
             # impact: displacement sat at 0 for 133 samples, then jumped 2.8 -> 8.0 mm in a single sample
             # (2026-11-10). The servo response is what overshoots, and the lever known to work on this cell is
             # the trajectory speed of that leg, so the final approach gets its own, slower one.
+            if name == 'pinch':
+                # Re-aim at where the object *is*: the slide above happens during this approach's own transit,
+                # so a pinch computed from the initial pose is already stale by the time it is executed.
+                observed = np.asarray(self.env.object_pose(obj)[0], float)
+                moved_to = float(np.linalg.norm(observed - (obj_pos + shift)))
+                pinch = self._pinch_site_target(arm, observed + shift, fault_offset)
+                if moved_to > .001:
+                    leg_progress.setdefault('reaimed', []).append({'object': obj, 'slide_m': moved_to})
             final_speed = APPROACH_PINCH_TRAJECTORY_SPEED if name == 'pinch' else APPROACH_TRAJECTORY_SPEED
             result = self.controller.move_to_site(arm, target,
                                                   np.asarray(approach_evidence['grasp_rotation']) if approach_evidence else None,

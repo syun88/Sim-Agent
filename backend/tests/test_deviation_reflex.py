@@ -140,3 +140,18 @@ def test_the_receiver_standoff_is_searched_from_comfortable_to_close():
     assert RECEIVER_STANDOFF_CANDIDATES_M[0] == 0.12, 'the comfortable distance is still tried first'
     assert list(RECEIVER_STANDOFF_CANDIDATES_M) == sorted(RECEIVER_STANDOFF_CANDIDATES_M, reverse=True)
     assert all(0. < distance < 0.12 for distance in RECEIVER_STANDOFF_CANDIDATES_M[1:])
+
+
+def test_an_axial_slide_is_allowed_and_a_lateral_shove_is_not():
+    """An offset grasp slides one pad along the face; a shove across the face is still a collision."""
+    from backend.app.skills import robot_skills
+
+    assert robot_skills.APPROACH_SLIDE_TOLERANCE > robot_skills.APPROACH_DISTURBANCE_TOLERANCE
+    source = inspect_source(robot_skills.SkillRunner._approach)
+    assert 'lateral > APPROACH_DISTURBANCE_TOLERANCE' in source
+    assert 'axial > APPROACH_SLIDE_TOLERANCE' in source
+
+
+def inspect_source(function):
+    import inspect
+    return inspect.getsource(function)
