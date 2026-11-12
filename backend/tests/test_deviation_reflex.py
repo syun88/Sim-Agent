@@ -102,3 +102,12 @@ def test_two_samples_over_threshold_act_on_a_two_sample_leg():
     assert watcher.observe(planned, far, 0.5, FakeKinematics()) is None
     reported = watcher.observe(planned, far, 0.7, FakeKinematics())
     assert reported is not None and reported['reason'] == 'MOTION_DEVIATION'
+
+
+def test_the_required_run_matches_the_samples_the_leg_will_produce():
+    """A park leg yields two samples; the requirement must be two, not three."""
+    watcher = reflex.DeviationReflex('left', 'park_arrival', threshold_m=0.02, expected_samples=2)
+    planned, far = np.zeros(7), np.full(7, 0.05)
+    first = watcher.observe(planned, far, 0.4, FakeKinematics())
+    second = watcher.observe(planned, far, 0.9, FakeKinematics())
+    assert first is None and second is not None
