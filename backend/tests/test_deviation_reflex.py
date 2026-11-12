@@ -126,7 +126,7 @@ def test_being_late_on_the_path_is_not_drift():
     """A fast large move that trails its setpoint is still on the path, and must not be stopped for it."""
     watcher = reflex.DeviationReflex('left', 'move_to_site', threshold_m=0.02, expected_samples=6)
     # The path runs from 0 to 1 in joint 0; the arm is at 0.4 the whole time, which is *on* the path.
-    path = [np.array([value] + [0.] * 6) for value in np.linspace(0., 1., 24)]
+    path = [np.array([value] + [0.] * 6) for value in np.arange(0., 1. + 4e-3, 4e-3)]
     actual = np.array([0.4] + [0.] * 6)
     for _ in range(6):
         assert watcher.observe(path, actual, 0.9, FakeKinematics()) is None
