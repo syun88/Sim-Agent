@@ -58,6 +58,46 @@ def _repeats_measured_contact(mechanism, receipt):
     return before == after
 
 
+def _reachability_report(executor, plan) -> dict:
+    """Which hands could reach the object the plan was working on, measured at the moment of failure.
+
+    A failure is a claim about the execution; this is the claim about the *layout*. Without it "the task
+    failed" and "the task is impossible in this layout" read the same in a record, and the second one is not
+    the robot's fault. Cheap: the question costs one IK-positive answer (~10 ms) and only a negative pays the
+    full frame sweep (~3.5 s), and it is only asked after a failure.
+    """
+    from backend.app.planning.capability_queries import grasp_waypoints_reachable
+    from backend.app.skills.approach import CUBE_GRASP_YAWS_DEG
+
+    obj = None
+    for step in (getattr(plan, 'steps', None) or []):
+        if getattr(step, 'skill', '') in {'approach_object', 'grasp_object'} and getattr(step, 'object', None):
+            obj = step.object
+            break
+    if not obj:
+        return {}
+    env = getattr(executor, 'env', None)
+    controller = getattr(executor, 'controller', None)
+    if env is None or controller is None:
+        return {'object': obj, 'unknown': 'no simulator handle'}
+    arms = {}
+    for arm in ('left', 'right'):
+        try:
+            arms[arm] = grasp_waypoints_reachable(env, controller, arm, obj,
+                                                  yaws=CUBE_GRASP_YAWS_DEG[:4], rises=1).get('reachable')
+        except Exception as error:
+            arms[arm] = None
+            arms.setdefault('errors', {})[arm] = f'{type(error).__name__}: {error}'
+    reachable = [arm for arm, value in arms.items() if value is True]
+    if reachable:
+        verdict = 'AN_ARM_CAN_REACH'
+    elif any(value is False for value in arms.values()):
+        verdict = 'NO_ARM_CAN_REACH'
+    else:
+        verdict = 'UNMEASURED'
+    return {'object': obj, 'arms': arms, 'reachable_arms': reachable, 'verdict': verdict}
+
+
 def _switch_plan_arm(plan, old_arm: str, new_arm: str) -> None:
     """Rewrite an inferred hand in both the program and the compiled steps.
 
@@ -376,6 +416,13 @@ class TaskAgent:
                 'observed_hands':{s:observed.get('robot',{}).get(s+'_arm',{}).get('held_object') for s in ('left','right')}})
             if iteration+1==self.max_attempts or category not in RECOVERABLE or not restartable:
                 result['detail'] = result.get('detail') or f'{category}: 自動復旧できる操作の範囲または試行上限に達しました。'
+                # Say whether the layout could be done at all, not only that this attempt failed.
+                reachability = _reachability_report(self.executor, plan)
+                if reachability:
+                    result['reachability'] = reachability
+                    if reachability.get('verdict') == 'NO_ARM_CAN_REACH':
+                        result['detail'] += (' 測定: この配置ではどちらの手も対象に到達できません'
+                                             f'（{reachability["object"]}）。')
                 return finish(result)
             legal, continuation, alternate = [], None, None
             prefix = 0 if plan.goal_program else completed_prefix(plan,result)
