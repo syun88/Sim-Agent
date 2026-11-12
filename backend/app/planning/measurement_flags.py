@@ -30,10 +30,13 @@ FLAGS = {
 #: measurement is still recorded (the preflight rows are computed either way) - it just does not decide.
 DEFAULT_OFF = {'arm_preflight'}
 
-#: `requested_hand_preflight` is deliberately not in DEFAULT_OFF yet and not out of it either: it is the
-#: cheap form of the refusal that `arm_preflight` got wrong (that one answered from the arm's momentary posture
-#: and refused work the robot could do). Its verdict is `REQUESTED_HAND_UNREACHABLE` from the canonical-posture
-#: question, and the A/B over both seeds decides whether it ships on.
+#: `requested_hand_preflight` ships on, by measurement rather than by preference. It is the cheap form of the
+#: refusal that `arm_preflight` got wrong: that one answered from the arm's momentary posture and refused work
+#: the robot could do. Measured 2026-11-10 on both seeds with the same six instructions - seed 21 (the layout
+#: that works): 6/6 with the refusal on, 6/6 with it off, and nothing refused. Seed 22 (two tasks name a hand
+#: the layout cannot serve): 2/6 either way, and the refusal turned two 60-90 s failures into an immediate
+#: failure carrying the measured reason ("the left hand cannot reach red_cube here; the right one can").
+#: Same success, no discarded work, two wasted attempts gone.
 
 
 def enabled(name: str) -> bool:

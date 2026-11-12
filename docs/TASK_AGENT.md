@@ -1533,3 +1533,16 @@ detail : … 測定: left手はこの配置でred_cubeに到達できません�
 - `NO_ARM_CAN_REACH`（どの手も届かない）/ `REQUESTED_HAND_UNREACHABLE`（名指しの手が届かない）/
   `AN_ARM_CAN_REACH`（届く手はある＝実行側の問題）/ `UNMEASURED`。
 - コストは当たり約10ms、外れ約3.5s、**失敗時にのみ**走る。成功経路には触れない（seed 21 の 6/6 は不変）。
+
+### 実行前の拒否は「名指しの手が届かない」場合だけ、測定に基づいて行う
+
+`OPENARM_MEASURE_REQUESTED_HAND_PREFLIGHT`（既定 on）。条件は2つ:
+経路IKの実測が `REQUESTED_HAND_UNREACHABLE` を返す **かつ** 指示がその手を名指ししている。
+
+| 配置 | 拒否 off | 拒否 on | 拒否件数 |
+|---|---|---|---|
+| seed 21 | 6/6 | **6/6** | 0 |
+| seed 22 | 2/6 | 2/6 | 2（60〜90s → **0.0s** の即時失敗） |
+
+成功率は不変で誤拒否ゼロ、無駄な試行と曖昧な記録だけが消える。以前の `arm_preflight`（瞬間的な姿勢で判定）が
+有害だったのとは別物で、こちらは canonical posture の質問で答える。
