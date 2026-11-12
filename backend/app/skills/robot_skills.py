@@ -91,6 +91,10 @@ SUPPORT_REGRASP_SHIFT_TOLERANCE = 0.010
 #: 0.5 with the servo response unchanged cleared both with 10.18 and 15.01 mm of room (measured 2026-10-28).
 #: Softening the servo instead deepens the penetration, because a softer servo lags further behind.
 APPROACH_TRAJECTORY_SPEED = 0.5
+#: The final leg, which arrives on the object. Measured 2026-11-10: the impact that pushed a cube 8 mm happened
+#: in one sample at the end of that leg, so it is driven slower than the rest of the approach. A knob, because
+#: how slow is a measurement: OPENARM_PINCH_SPEED.
+APPROACH_PINCH_TRAJECTORY_SPEED = float(os.environ.get('OPENARM_PINCH_SPEED', '0.25'))
 #: A parked arm must land on the planned waypoint: the same tolerance the route was admitted with.
 #: How close a placement point has to be for the arm to be considered able to hold it: the same acceptance
 #: the capability queries use, so "reachable" means one thing in this codebase.
@@ -357,6 +361,11 @@ class SkillRunner:
         for name, target in destinations:
             via = [point for _, point in waypoints[:-1]] if self.controller.motion_speed != 1. and not approach_evidence else None
             leg_progress['leg'] = name
+            # The last leg is the one that arrives on the object, and it is where the measurement put the
+            # impact: displacement sat at 0 for 133 samples, then jumped 2.8 -> 8.0 mm in a single sample
+            # (2026-11-10). The servo response is what overshoots, and the lever known to work on this cell is
+            # the trajectory speed of that leg, so the final approach gets its own, slower one.
+            final_speed = APPROACH_PINCH_TRAJECTORY_SPEED if name == 'pinch' else APPROACH_TRAJECTORY_SPEED
             result = self.controller.move_to_site(arm, target,
                                                   np.asarray(approach_evidence['grasp_rotation']) if approach_evidence else None,
                                                   progress=progress, via=via,
@@ -364,7 +373,7 @@ class SkillRunner:
                                                   scale_speed=not approach_evidence or approach_evidence['grasp_yaw_deg']==0,
                                                   # The transit is where a trailing pad reaches the cube; drive it
                                                   # slowly while the servo keeps the response it was configured with.
-                                                  trajectory_speed=APPROACH_TRAJECTORY_SPEED if approach_evidence else None,
+                                                  trajectory_speed=final_speed if approach_evidence else None,
                                                   phase='approach',
                                                   on_sample=guard_undisturbed)
             guard_undisturbed(after_leg=True)
