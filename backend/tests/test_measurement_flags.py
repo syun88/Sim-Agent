@@ -5,12 +5,14 @@ from backend.app.planning import measurement_flags as flags
 
 
 def test_defaults_follow_the_measurement(monkeypatch):
-    """A safeguard measured as harmful is off by default; the rest are on."""
+    """Harmful or insufficiently validated refusals are off by default."""
     for name in flags.FLAGS:
         monkeypatch.delenv(f'OPENARM_MEASURE_{name.upper()}', raising=False)
     state = flags.describe()
     assert state['arm_preflight'] is False, 'measured harmful: it refused tasks the robot could do'
-    assert all(value for name, value in state.items() if name != 'arm_preflight')
+    assert state['requested_hand_preflight'] is False
+    assert all(value for name, value in state.items()
+               if name not in {'arm_preflight', 'requested_hand_preflight'})
 
 
 def test_a_flag_can_be_switched_off(monkeypatch):

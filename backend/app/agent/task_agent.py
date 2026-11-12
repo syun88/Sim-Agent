@@ -59,12 +59,9 @@ def _repeats_measured_contact(mechanism, receipt):
 
 
 def _reachability_report(executor, plan) -> dict:
-    """Which hands could reach the object the plan was working on, measured at the moment of failure.
+    """Probe a bounded set of grasp waypoints, not physical reachability or collision-free routes.
 
-    A failure is a claim about the execution; this is the claim about the *layout*. Without it "the task
-    failed" and "the task is impossible in this layout" read the same in a record, and the second one is not
-    the robot's fault. Cheap: the question costs one IK-positive answer (~10 ms) and only a negative pays the
-    full frame sweep (~3.5 s), and it is only asked after a failure.
+    This is also used by the experimental preflight. The first object in the plan may not be the failed one.
     """
     from backend.app.planning.capability_queries import grasp_waypoints_reachable
     from backend.app.skills.approach import CUBE_GRASP_YAWS_DEG
@@ -94,11 +91,10 @@ def _reachability_report(executor, plan) -> dict:
         if getattr(step, 'skill', '') in {'approach_object', 'grasp_object'} and getattr(step, 'object', None):
             requested = getattr(step, 'arm', None)
             break
-    if not reachable and any(value is False for value in arms.values()):
+    if all(arms.get(arm) is False for arm in ('left', 'right')):
         verdict = 'NO_ARM_CAN_REACH'
     elif requested and arms.get(requested) is False and reachable:
-        # The instruction (or the planner) asked for a hand that this layout cannot support while the other one
-        # can. That is a fact about the layout and the request, not a defect in this attempt.
+        # A sampled candidate exists for the other hand, but not this one; neither result proves execution.
         verdict = 'REQUESTED_HAND_UNREACHABLE'
     elif reachable:
         verdict = 'AN_ARM_CAN_REACH'
@@ -113,10 +109,10 @@ def _reachability_sentence(report: dict) -> str:
     obj = report.get('object')
     other = [arm for arm in report.get('reachable_arms') or []]
     if report.get('verdict') == 'NO_ARM_CAN_REACH':
-        return f' 測定: この配置ではどちらの手も{obj}に到達できません。'
+        return f' 限定された把持候補の探索では、どちらの手も{obj}に到達する候補が見つかりませんでした。'
     if report.get('verdict') == 'REQUESTED_HAND_UNREACHABLE':
-        return (f' 測定: {report["requested_arm"]}手はこの配置で{obj}に到達できません'
-                f'（届くのは{"/".join(other)}手）。')
+        return (f' 限定された把持候補の探索では、{report["requested_arm"]}手で{obj}に到達する候補が見つかりませんでした'
+                f'（{"/".join(other)}手には候補あり）。')
     return ''
 
 
@@ -328,10 +324,7 @@ class TaskAgent:
                             if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE']
                            if _measured('arm_preflight') else [])
         if _measured('requested_hand_preflight'):
-            # The cheap form of the same refusal. Measured 2026-11-10: the canonical-posture question names
-            # exactly the layouts a named hand cannot serve (seed 22: left/red, right/blue), and on seed 21 it
-            # names none - so refusing here should save two attempts without discarding work. It is gated
-            # because the *old* refusal answered from the momentary posture and did discard work.
+            # Experimental only: failure of this bounded pose search does not prove impossibility.
             measured_hand = _reachability_report(self.executor, plan)
             if (measured_hand.get('verdict') == 'REQUESTED_HAND_UNREACHABLE'
                     and measured_hand.get('requested_arm') in explicit):
