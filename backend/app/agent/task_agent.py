@@ -508,6 +508,14 @@ class TaskAgent:
                                         f'reviewer={review["reviewer_mechanism"]}）。')
                 else:
                     result['detail'] = f'{category}: 同じシーン内で利用できる復旧案を試しました。配置を維持して停止します。'
+                # Every terminal path says whether the layout could be done at all, not only that this attempt
+                # failed: "impossible here" and "possible but failed" must not read the same in a record.
+                reachability = _reachability_report(self.executor, plan)
+                if reachability:
+                    result['reachability'] = reachability
+                    if reachability.get('verdict') == 'NO_ARM_CAN_REACH':
+                        result['detail'] += (' 測定: この配置ではどちらの手も対象に到達できません'
+                                             f'（{reachability["object"]}）。')
                 return finish(result)
             assessment = self.recovery_call(instruction,observed,
                 {'category':category,'detail':failed.get('detail') or result.get('detail'),
