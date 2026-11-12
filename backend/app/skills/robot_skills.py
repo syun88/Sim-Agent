@@ -23,6 +23,8 @@ from __future__ import annotations
 import time
 from typing import Callable
 
+import os
+
 import numpy as np
 
 from backend.app.control.motion import OpenArmV2Controller, orientation_error
@@ -238,6 +240,15 @@ class SkillRunner:
         shift = np.asarray(grasp_offset, float) if grasp_offset is not None else np.array([grasp_offset_x, 0., 0.])
         pinch = self._pinch_site_target(arm, obj_pos + shift, fault_offset)
         finger_direction = GRASP_ROTATION @ np.array([0.0, 0.0, -1.0])
+        # Back the grasp target off along the approach axis. Measured 2026-11-10: the *pinch* leg was the one
+        # that pushed a cube (8.1 mm, and again 5.3 mm on retry, against a 5 mm tolerance), so the hand arrives
+        # deeper than planned. The depth is a measurement question, not a preference, so it is a knob.
+        backoff_mm = os.environ.get('OPENARM_PINCH_BACKOFF_MM', '').strip()
+        if backoff_mm:
+            try:
+                pinch = pinch - (float(backoff_mm) / 1000.) * finger_direction
+            except ValueError:
+                pass
         standoff = pinch - APPROACH_STANDOFF * finger_direction
         high = standoff + np.array([0.0, 0.0, APPROACH_OVERFLY])
         before = obj_pos.copy()
