@@ -280,8 +280,10 @@ class SkillRunner:
         stationary = {name:self.env.object_pose(name)[0].copy() for name in self.env.frame().objects}
         initial_joints = ({side:self.env.arm_qpos(side).tolist() for side in ('left','right')}
                           if hasattr(self.env,'arm_qpos') else None)
-        leg_progress = {'leg': 'start', 'displacements': {}}
-        def guard_undisturbed():
+        leg_progress = {'leg': 'start', 'displacements': {}, 'trace': [], 'calls': 0}
+        def guard_undisturbed(after_leg: bool = False):
+            leg_progress['calls'] += 1
+            label = leg_progress['leg'] + ('+settle' if after_leg else '')
             for name,position in stationary.items():
                 displacement=float(np.linalg.norm(self.env.object_pose(name)[0]-position))
                 # Which leg did it, not just that it happened: the same 8.06 mm shove came back on retry with
@@ -289,12 +291,18 @@ class SkillRunner:
                 # (measured 2026-11-10). A displacement with no leg attached cannot say that.
                 if displacement > leg_progress['displacements'].get(name, 0.):
                     leg_progress['displacements'][name] = displacement
-                    leg_progress['worst_leg'] = leg_progress['leg']
+                    leg_progress['worst_leg'] = label
+                # And *when*: the leg name alone could not separate a push during the transit from one during
+                # the arrival, because the same 8.06 mm came back with the grasp target moved 10 mm. The trace
+                # records every half millimetre of growth with the label and the call index it happened on.
+                if displacement - leg_progress['trace'][-1][2] > .0005 if leg_progress['trace'] else True:
+                    leg_progress['trace'].append((label, leg_progress['calls'], round(displacement, 4)))
                 if displacement > APPROACH_DISTURBANCE_TOLERANCE:
                     error=SkillError('APPROACH_COLLISION',
                         f'Approach displaced {name} by {displacement * 1000:.1f} mm; stopping the arm')
                     error.evidence={**approach_evidence,'object':name,'displacement_m':displacement,
                                     'worst_leg':leg_progress.get('worst_leg'),
+                                    'displacement_trace':leg_progress['trace'][:40],
                                     'displacements_by_object':dict(leg_progress['displacements']),
                                     'initial_object_positions':{key:value.tolist() for key,value in stationary.items()},
                                     'observed_object_positions':{key:self.env.object_pose(key)[0].tolist()
@@ -359,7 +367,7 @@ class SkillRunner:
                                                   trajectory_speed=APPROACH_TRAJECTORY_SPEED if approach_evidence else None,
                                                   phase='approach',
                                                   on_sample=guard_undisturbed)
-            guard_undisturbed()
+            guard_undisturbed(after_leg=True)
             if not result.success:
                 error=SkillError(result.error or "IK_FAILURE", f"Unable to reach the {name} pose "
                                  f"(position error={result.position_error}, rotation error={result.rotation_error})")
