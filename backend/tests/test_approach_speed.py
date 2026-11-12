@@ -44,7 +44,12 @@ def test_the_cube_approach_transit_is_driven_below_full_speed(monkeypatch):
                                               wait_gripper=lambda *a: None))
     result = skills.approach_object('right', 'blue_cube')
     assert result['success'], result
-    assert calls and calls[0]['trajectory_speed'] == APPROACH_TRAJECTORY_SPEED
+    speeds = [call['trajectory_speed'] for call in calls]
+    assert speeds, 'the approach moved the arm'
+    assert all(0. < speed < 1. for speed in speeds), f'every approach leg is below full speed: {speeds}'
+    # The leg that arrives on the object is the one that was measured pushing it, so it is no faster than the
+    # transit (and normally slower).
+    assert speeds[-1] <= APPROACH_TRAJECTORY_SPEED, speeds
     assert APPROACH_TRAJECTORY_SPEED < 1., 'the whole point is a slower transit than the carry'
 
 

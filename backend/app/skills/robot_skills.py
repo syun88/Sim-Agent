@@ -51,6 +51,9 @@ VERIFICATION_LIFT = 0.03
 VERIFICATION_FOLLOW_RATIO = 0.6
 #: How far the gripper pulls back along the approach axis before the straight slide-in (m).
 APPROACH_STANDOFF = 0.06
+#: Half the width of one finger pad. A grasp offset may move the fingertip midpoint by the object's half face
+#: less this much, otherwise a pad is inside the object it is about to close on.
+GRASP_PAD_HALF_WIDTH_M = 0.005
 #: Height of the swing waypoint above the approach-axis start (m), keeping the open fingers
 #: clear of the object during the swing from the staging altitude.
 APPROACH_OVERFLY = 0.10
@@ -126,6 +129,23 @@ class SkillRunner:
         self.controller = controller
 
     # -- grasp geometry ----------------------------------------------------------
+
+    def _bounded_grasp_shift(self, obj: str, shift: np.ndarray) -> tuple[np.ndarray, dict]:
+        """Keep a requested grasp offset inside the object's face, minus the pad it has to sit between."""
+        try:
+            bounds = self.env.object_bounds(obj)
+            half = np.array([0.5 * float(bounds[1][0] - bounds[0][0]),
+                             0.5 * float(bounds[1][1] - bounds[0][1])], float)
+        except Exception as error:
+            return shift, {'unknown': f'{type(error).__name__}: {error}'}
+        # The pads are a few millimetres wide and must stay outside the face, so the midpoint may move by the
+        # face's half extent less one pad and a millimetre of margin.
+        allowed = np.maximum(0., half - GRASP_PAD_HALF_WIDTH_M - 0.001)
+        used = np.array([float(np.clip(shift[0], -allowed[0], allowed[0])),
+                         float(np.clip(shift[1], -allowed[1], allowed[1])),
+                         0.], float)
+        return used, {'requested': np.asarray(shift, float).tolist(), 'used': used.tolist(),
+                      'half_extent': half.tolist(), 'allowed': allowed.tolist()}
 
     def _pinch_site_target(
         self, arm: str, object_center: np.ndarray, world_x_offset: float | None = None
@@ -242,6 +262,11 @@ class SkillRunner:
         # missed pinch needs is along the jaws' closing axis, which is not world x. The scalar x form stays
         # for the plan language, which has always expressed the offset that way.
         shift = np.asarray(grasp_offset, float) if grasp_offset is not None else np.array([grasp_offset_x, 0., 0.])
+        # A grasp offset is a request about where to hold the object, and the object's own size bounds it: past
+        # half the face the fingertip midpoint leaves the object and one pad sits inside it. Measured
+        # 2026-11-10: the planner's fixed -15 mm offset for a handover-to-come pushed a cube 8.06 mm during the
+        # approach, identically on every retry, while the same approach with no offset (the zone tasks) did not.
+        shift, shift_bounds = self._bounded_grasp_shift(obj, shift)
         pinch = self._pinch_site_target(arm, obj_pos + shift, fault_offset)
         finger_direction = GRASP_ROTATION @ np.array([0.0, 0.0, -1.0])
         # Back the grasp target off along the approach axis. Measured 2026-11-10: the *pinch* leg was the one
@@ -401,6 +426,7 @@ class SkillRunner:
             "fingertip_midpoint_error": midpoint_error,
             "object_displacement": disturbance,
             "grasp_offset_x": grasp_offset_x, "grasp_offset": shift.tolist(),
+            "grasp_offset_bounds": shift_bounds,
             "planning":approach_evidence,
         }
 
