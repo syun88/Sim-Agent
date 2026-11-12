@@ -1520,3 +1520,16 @@ objects: {}          ← 何も置けない
 
 実測: seed 21 が **3/6 → 6/6**（積み上げ・ハンドオーバ含む）。seed 22 は 2/6 で、
 こちらは**配置が厳しい**（ゾーンへ届かない・IK 枯渇）ため改善ではなく配置依存として記録。
+
+### 失敗の記録は「配置の事実」も言う
+
+終端経路すべてで、対象に**どの手が届くか**を実測して `reachability` に残す。
+
+```
+verdict: REQUESTED_HAND_UNREACHABLE
+detail : … 測定: left手はこの配置でred_cubeに到達できません（届くのはright手）。
+```
+
+- `NO_ARM_CAN_REACH`（どの手も届かない）/ `REQUESTED_HAND_UNREACHABLE`（名指しの手が届かない）/
+  `AN_ARM_CAN_REACH`（届く手はある＝実行側の問題）/ `UNMEASURED`。
+- コストは当たり約10ms、外れ約3.5s、**失敗時にのみ**走る。成功経路には触れない（seed 21 の 6/6 は不変）。
