@@ -327,6 +327,17 @@ class TaskAgent:
             unreachable = ([row for row in (preflight or {}).get('arms', [])
                             if row.get('verdict') == 'REQUESTED_ARM_UNREACHABLE']
                            if _measured('arm_preflight') else [])
+        if _measured('requested_hand_preflight'):
+            # The cheap form of the same refusal. Measured 2026-11-10: the canonical-posture question names
+            # exactly the layouts a named hand cannot serve (seed 22: left/red, right/blue), and on seed 21 it
+            # names none - so refusing here should save two attempts without discarding work. It is gated
+            # because the *old* refusal answered from the momentary posture and did discard work.
+            measured_hand = _reachability_report(self.executor, plan)
+            if (measured_hand.get('verdict') == 'REQUESTED_HAND_UNREACHABLE'
+                    and measured_hand.get('requested_arm') in explicit):
+                plan.planning_evidence = {**(plan.planning_evidence or {}),
+                                          'requested_hand_refusal': measured_hand}
+                raise GroundingError("ARM_CANNOT_REACH" + _reachability_sentence(measured_hand))
         if unreachable:
             row = unreachable[0]
             alternative = ', '.join(row.get('reachable_arms') or [])

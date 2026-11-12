@@ -19,6 +19,8 @@ FLAGS = {
     'arm_preflight': 'do not measure the requested hand before moving',
     'home_margin': 'home clearance is the old fixed 30 mm, not the measured landing error',
     'destination_hand': 'do not refuse a hand that cannot reach the destination it was told to use',
+    'requested_hand_preflight': ('do not refuse before moving when the named hand measurably cannot reach '
+                                 'the object in this layout while the other hand can'),
 }
 
 
@@ -27,6 +29,11 @@ FLAGS = {
 #: refused that the robot could actually do; with it off, 3/8 succeeded and nothing was refused. The
 #: measurement is still recorded (the preflight rows are computed either way) - it just does not decide.
 DEFAULT_OFF = {'arm_preflight'}
+
+#: `requested_hand_preflight` is deliberately not in DEFAULT_OFF yet and not out of it either: it is the
+#: cheap form of the refusal that `arm_preflight` got wrong (that one answered from the arm's momentary posture
+#: and refused work the robot could do). Its verdict is `REQUESTED_HAND_UNREACHABLE` from the canonical-posture
+#: question, and the A/B over both seeds decides whether it ships on.
 
 
 def enabled(name: str) -> bool:
