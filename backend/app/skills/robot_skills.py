@@ -1552,8 +1552,12 @@ class SkillRunner:
                 edge = [self.env.arm_qpos(arm), joints]
                 if check and not check(edge, {o:self.env.object_pose(o) for o in self.env.frame().objects}):
                     raise SkillError('PARK_COLLISION', 'Home route is no longer clear in the observed scene')
+                # Park is a free-space leg with nothing to be fast for, and the reflex showed what speed 6 costs
+                # it: a single sample past 62 mm (110 mm at worst), which is 35 mm off plan on arrival - the
+                # mechanism behind PARK_COLLISION. Drive it at the nominal trajectory speed instead.
                 moved = self.controller.move_to_site(arm, position, attitude, planned_joints=edge,
-                                                     phase='park_arrival', on_sample=guard)
+                                                     phase='park_arrival', trajectory_speed=1.,
+                                                     on_sample=guard)
                 if not moved.success:
                     raise SkillError(moved.error or 'MOTION_BLOCKED', 'Empty arm could not clear the handover workspace')
                 # A successful move_to_site means the *site* reached its target; it does not mean the arm
