@@ -326,6 +326,10 @@ class OpenArmV2Controller:
                                                     self.env.arm_kinematics(side))
                         if departure is not None:
                             self.env.set_arm(side, self.env.arm_qpos(side))
+                            # Record it before returning: a stopped leg is exactly the leg whose numbers matter,
+                            # and returning early left the failing skills with empty evidence (measured
+                            # 2026-11-10: a MOTION_DEVIATION stop arrived with no phase or deviation attached).
+                            self.reflex_log.append(departure)
                             return MotionResult(False, 'MOTION_DEVIATION', position.tolist(),
                                                 departure['deviation_m'], reflex=departure)
                 completed = True

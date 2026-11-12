@@ -622,9 +622,13 @@ class SkillRunner:
                        else [len(positions) - 1])
             for index in indeces:
                 chained = sweep in ('short', 'long') and self.controller.motion_speed != 1.
+                # Turn the object at the nominal trajectory speed. It is a free-space manoeuvre with nothing to
+                # be fast for, and the same rule that fixed the park leg applies: at speed 6 the arc leg drifted
+                # far enough for the reflex to stop it (measured 2026-11-10).
                 result = self.controller.move_to_site(arm, positions[index], orientations[index],
                     via=positions[:-1] if chained else None,
                     via_rotations=orientations[:-1] if chained else None,
+                    trajectory_speed=1., phase='carry',
                     on_sample=lambda: self._require_hold(arm, obj))
                 if not result.success:
                     failures.append({'attempt': label, 'error': result.error,
