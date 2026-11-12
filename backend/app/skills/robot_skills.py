@@ -326,12 +326,12 @@ class SkillRunner:
         initial_joints = ({side:self.env.arm_qpos(side).tolist() for side in ('left','right')}
                           if hasattr(self.env,'arm_qpos') else None)
         # The approach axis, so a slide along the face can be told from a shove across it.
-        approach_axis = None
+        approach = {'axis': None}
         try:
-            direction = -(GRASP_ROTATION @ np.array([0.0, 0.0, 1.0]))
-            approach_axis = direction / max(np.linalg.norm(direction), 1e-9)
+            direction = GRASP_ROTATION @ np.array([0.0, 0.0, -1.0])
+            approach['axis'] = direction / max(np.linalg.norm(direction), 1e-9)
         except Exception:
-            approach_axis = None
+            approach['axis'] = None
         leg_progress = {'leg': 'start', 'displacements': {}, 'trace': [], 'calls': 0}
         def guard_undisturbed(after_leg: bool = False):
             leg_progress['calls'] += 1
@@ -353,15 +353,18 @@ class SkillRunner:
                 # about to close on, and the screen deliberately does not police the grasping hand's contacts
                 # with its own object (allowed_contacts), so that slide is expected physics rather than an
                 # accident. Measured 2026-11-10: the slide is axial (8.06 mm, mostly along the approach axis).
-                axial = 0.
+                axis = approach['axis']
                 vector = self.env.object_pose(name)[0] - position
-                if approach_axis is not None:
-                    axial = float(abs(np.dot(vector, approach_axis)))
-                lateral = float(np.linalg.norm(vector - (axial * approach_axis))) if approach_axis is not None else displacement
+                axial = float(abs(np.dot(vector, axis))) if axis is not None else 0.
+                lateral = (float(np.linalg.norm(vector - np.dot(vector, axis) * axis)) if axis is not None
+                           else displacement)
                 if lateral > APPROACH_DISTURBANCE_TOLERANCE or axial > APPROACH_SLIDE_TOLERANCE:
                     error=SkillError('APPROACH_COLLISION',
                         f'Approach displaced {name} by {displacement * 1000:.1f} mm; stopping the arm')
                     error.evidence={**approach_evidence,'object':name,'displacement_m':displacement,
+                                    'axial_m':axial,'lateral_m':lateral,
+                                    'axial_tolerance_m':APPROACH_SLIDE_TOLERANCE,
+                                    'lateral_tolerance_m':APPROACH_DISTURBANCE_TOLERANCE,
                                     'worst_leg':leg_progress.get('worst_leg'),
                                     'displacement_trace':leg_progress['trace'][:40],
                                     'displacements_by_object':dict(leg_progress['displacements']),
@@ -377,6 +380,10 @@ class SkillRunner:
             frames = cube_approach_frames(arm, centre, APPROACH_STANDOFF, world_x_offset=fault_offset)
             route,approach_evidence=plan_cube_approach(self.env,self.controller,arm,obj,pinch,standoff,
                                                        APPROACH_OVERFLY,STAGING_ALTITUDE,frames=frames)
+            if approach_evidence.get('grasp_rotation'):
+                planned_rotation = np.asarray(approach_evidence['grasp_rotation'], float)
+                axis = planned_rotation @ np.array([0.0, 0.0, -1.0])
+                approach['axis'] = axis / max(np.linalg.norm(axis), 1e-9)
             if route is None:
                 # The calibrated attitude with quarter turns is the cheap search. Only when it finds no
                 # corridor does the leaning search run, which costs 20 candidates instead of 14 and would
