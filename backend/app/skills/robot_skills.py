@@ -266,6 +266,15 @@ class SkillRunner:
         # half the face the fingertip midpoint leaves the object and one pad sits inside it. Measured
         # 2026-11-10: the planner's fixed -15 mm offset for a handover-to-come pushed a cube 8.06 mm during the
         # approach, identically on every retry, while the same approach with no offset (the zone tasks) did not.
+        forced_offset = os.environ.get('OPENARM_GRASP_OFFSET_MM', '').strip()
+        if forced_offset:
+            # The offset exists to leave room for a second hand. Whether it costs contact is a measurement, so
+            # it can be forced: measured 2026-11-10, the planner's -15 mm offset for a handover-to-come pushed a
+            # 52 mm cube 8.06 mm during the approach while the same approach at 0 mm did not.
+            try:
+                shift = np.array([float(forced_offset) / 1000., shift[1], 0.], float)
+            except ValueError:
+                pass
         shift, shift_bounds = self._bounded_grasp_shift(obj, shift)
         pinch = self._pinch_site_target(arm, obj_pos + shift, fault_offset)
         finger_direction = GRASP_ROTATION @ np.array([0.0, 0.0, -1.0])
