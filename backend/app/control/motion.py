@@ -296,7 +296,8 @@ class OpenArmV2Controller:
             completed = False
             # Watch the leg while it happens. This is the one place every motion goes through, so a new skill
             # inherits the reflex instead of writing its own tolerance (see control/reflex.py).
-            watcher = (reflex.DeviationReflex(side, phase) if reflex.enabled() else None)
+            watcher = (reflex.DeviationReflex(side, phase, expected_samples=len(indices))
+                       if reflex.enabled() else None)
             watch_every = max(1, round(reflex.CHECK_PERIOD_S / self.timestep))
             try:
                 for index in indices:

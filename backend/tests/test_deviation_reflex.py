@@ -86,3 +86,19 @@ def test_a_spike_is_distinguished_from_a_hold():
     assert summary['max_run'] == 1
     assert summary['worst_fraction'] == pytest.approx(0.5), 'the first sample at the worst depth'
     assert summary['acted'] is False
+
+
+def test_a_short_leg_cannot_be_required_to_hold_three_samples():
+    """The park legs produce two samples; demanding three made the reflex blind where drift was worst."""
+    short = reflex.DeviationReflex('left', 'park_arrival', threshold_m=0.02, expected_samples=2)
+    assert short.required == 2
+    long = reflex.DeviationReflex('left', 'park_arrival', threshold_m=0.02, expected_samples=40)
+    assert long.required == reflex.CONSECUTIVE_SAMPLES
+
+
+def test_two_samples_over_threshold_act_on_a_two_sample_leg():
+    watcher = reflex.DeviationReflex('left', 'park_arrival', threshold_m=0.02, expected_samples=2)
+    planned, far = np.zeros(7), np.full(7, 0.05)
+    assert watcher.observe(planned, far, 0.5, FakeKinematics()) is None
+    reported = watcher.observe(planned, far, 0.7, FakeKinematics())
+    assert reported is not None and reported['reason'] == 'MOTION_DEVIATION'

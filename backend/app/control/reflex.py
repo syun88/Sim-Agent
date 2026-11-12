@@ -71,6 +71,11 @@ class DeviationReflex:
     arm: str
     phase: str
     threshold_m: float = field(default=0.0)
+    #: How many consecutive samples must agree. Defaults to CONSECUTIVE_SAMPLES, but a leg that only *produces*
+    #: two samples can never satisfy three - measured 2026-11-10: park legs yielded 1-2 samples, so a 110 mm
+    #: departure against a 62 mm threshold could not act, and the reflex was blind exactly where drift was worst.
+    required: int = 0
+    expected_samples: int | None = None
     samples: int = 0
     worst_m: float = 0.0
     #: Where on the leg the worst sample was, and the longest run above threshold. A leg that drifts far but
@@ -84,6 +89,11 @@ class DeviationReflex:
     def __post_init__(self) -> None:
         if not self.threshold_m:
             self.threshold_m = threshold_m(self.arm, self.phase)
+        if not self.required:
+            budget = CONSECUTIVE_SAMPLES
+            if self.expected_samples is not None:
+                budget = min(budget, max(1, int(self.expected_samples)))
+            self.required = budget
 
     def observe(self, planned_joints, actual_joints, fraction: float,
                 kinematics) -> dict | None:
@@ -104,7 +114,7 @@ class DeviationReflex:
             self.max_run = max(self.max_run, self.over_threshold)
         else:
             self.over_threshold = 0
-        if self.over_threshold < CONSECUTIVE_SAMPLES:
+        if self.over_threshold < self.required:
             return None
         return {'reason': 'MOTION_DEVIATION', 'arm': self.arm, 'phase': self.phase,
                 'deviation_m': deviation, 'threshold_m': self.threshold_m, 'worst_m': self.worst_m,
@@ -114,4 +124,4 @@ class DeviationReflex:
     def evidence(self) -> dict:
         return {'arm': self.arm, 'phase': self.phase, 'threshold_m': self.threshold_m,
                 'samples': self.samples, 'worst_m': self.worst_m, 'worst_fraction': self.worst_fraction,
-                'max_run': self.max_run, 'acted': False}
+                'max_run': self.max_run, 'required': self.required, 'acted': False}
