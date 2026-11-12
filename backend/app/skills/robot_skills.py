@@ -269,13 +269,22 @@ class SkillRunner:
         stationary = {name:self.env.object_pose(name)[0].copy() for name in self.env.frame().objects}
         initial_joints = ({side:self.env.arm_qpos(side).tolist() for side in ('left','right')}
                           if hasattr(self.env,'arm_qpos') else None)
+        leg_progress = {'leg': 'start', 'displacements': {}}
         def guard_undisturbed():
             for name,position in stationary.items():
                 displacement=float(np.linalg.norm(self.env.object_pose(name)[0]-position))
+                # Which leg did it, not just that it happened: the same 8.06 mm shove came back on retry with
+                # the plan's clearance widened, which meant the contact was not the transit path at all
+                # (measured 2026-11-10). A displacement with no leg attached cannot say that.
+                if displacement > leg_progress['displacements'].get(name, 0.):
+                    leg_progress['displacements'][name] = displacement
+                    leg_progress['worst_leg'] = leg_progress['leg']
                 if displacement > APPROACH_DISTURBANCE_TOLERANCE:
                     error=SkillError('APPROACH_COLLISION',
                         f'Approach displaced {name} by {displacement * 1000:.1f} mm; stopping the arm')
                     error.evidence={**approach_evidence,'object':name,'displacement_m':displacement,
+                                    'worst_leg':leg_progress.get('worst_leg'),
+                                    'displacements_by_object':dict(leg_progress['displacements']),
                                     'initial_object_positions':{key:value.tolist() for key,value in stationary.items()},
                                     'observed_object_positions':{key:self.env.object_pose(key)[0].tolist()
                                                                  for key in stationary},
@@ -328,6 +337,7 @@ class SkillRunner:
             destinations = waypoints if self.controller.motion_speed == 1. else [waypoints[-1]]
         for name, target in destinations:
             via = [point for _, point in waypoints[:-1]] if self.controller.motion_speed != 1. and not approach_evidence else None
+            leg_progress['leg'] = name
             result = self.controller.move_to_site(arm, target,
                                                   np.asarray(approach_evidence['grasp_rotation']) if approach_evidence else None,
                                                   progress=progress, via=via,
