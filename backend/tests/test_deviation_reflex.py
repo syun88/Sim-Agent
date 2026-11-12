@@ -118,5 +118,5 @@ def test_the_reorientation_tries_both_arcs_and_the_direct_move():
     import inspect
     from backend.app.skills import robot_skills
 
-    source = inspect.getsource(robot_skills.RobotSkills._align_for_placement)
+    source = inspect.getsource(robot_skills.SkillRunner._align_for_placement)
     assert "'short_arc'" in source and "'long_arc'" in source and "'direct'" in source
