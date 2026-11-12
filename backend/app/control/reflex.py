@@ -73,6 +73,12 @@ class DeviationReflex:
     threshold_m: float = field(default=0.0)
     samples: int = 0
     worst_m: float = 0.0
+    #: Where on the leg the worst sample was, and the longest run above threshold. A leg that drifts far but
+    #: never holds it for `CONSECUTIVE_SAMPLES` is either spiky or too short to judge, and those two are
+    #: different defects - measured 2026-11-10, a park leg reached 110 mm against a 62 mm threshold and did not
+    #: act, which is indistinguishable from "the reflex is not wired in" without these two numbers.
+    worst_fraction: float = 0.0
+    max_run: int = 0
     over_threshold: int = 0
 
     def __post_init__(self) -> None:
@@ -91,18 +97,21 @@ class DeviationReflex:
             return None
         deviation = float(np.linalg.norm(planned_point - actual_point))
         self.samples += 1
-        self.worst_m = max(self.worst_m, deviation)
+        if deviation > self.worst_m:
+            self.worst_m, self.worst_fraction = deviation, float(fraction)
         if deviation > self.threshold_m:
             self.over_threshold += 1
+            self.max_run = max(self.max_run, self.over_threshold)
         else:
             self.over_threshold = 0
         if self.over_threshold < CONSECUTIVE_SAMPLES:
             return None
         return {'reason': 'MOTION_DEVIATION', 'arm': self.arm, 'phase': self.phase,
                 'deviation_m': deviation, 'threshold_m': self.threshold_m, 'worst_m': self.worst_m,
-                'fraction': float(fraction), 'samples': self.samples,
+                'worst_fraction': self.worst_fraction, 'fraction': float(fraction), 'samples': self.samples,
                 'consecutive': self.over_threshold}
 
     def evidence(self) -> dict:
         return {'arm': self.arm, 'phase': self.phase, 'threshold_m': self.threshold_m,
-                'samples': self.samples, 'worst_m': self.worst_m, 'acted': False}
+                'samples': self.samples, 'worst_m': self.worst_m, 'worst_fraction': self.worst_fraction,
+                'max_run': self.max_run, 'acted': False}

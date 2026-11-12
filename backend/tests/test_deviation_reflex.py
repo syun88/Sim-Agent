@@ -74,3 +74,15 @@ def test_the_applied_threshold_is_the_forced_one(monkeypatch):
     monkeypatch.setenv('OPENARM_DEVIATION_REFLEX_MM', '2')
     watcher = reflex.DeviationReflex('left', 'approach')
     assert watcher.threshold_m == pytest.approx(0.002)
+
+
+def test_a_spike_is_distinguished_from_a_hold():
+    """A leg that reaches far but never holds it must not look like a leg that drifted steadily."""
+    watcher = reflex.DeviationReflex('left', 'park_arrival', threshold_m=0.02)
+    watcher.observe(np.zeros(7), np.full(7, 0.05), 0.5, FakeKinematics())
+    watcher.observe(np.zeros(7), np.zeros(7), 0.6, FakeKinematics())
+    watcher.observe(np.zeros(7), np.full(7, 0.05), 0.7, FakeKinematics())
+    summary = watcher.evidence()
+    assert summary['max_run'] == 1
+    assert summary['worst_fraction'] == pytest.approx(0.5), 'the first sample at the worst depth'
+    assert summary['acted'] is False
