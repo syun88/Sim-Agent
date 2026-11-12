@@ -111,3 +111,12 @@ def test_the_required_run_matches_the_samples_the_leg_will_produce():
     first = watcher.observe(planned, far, 0.4, FakeKinematics())
     second = watcher.observe(planned, far, 0.9, FakeKinematics())
     assert first is None and second is not None
+
+
+def test_the_reorientation_tries_both_arcs_and_the_direct_move():
+    """A wrist limit on one arc must not refuse a reorientation the other way round can make."""
+    import inspect
+    from backend.app.skills import robot_skills
+
+    source = inspect.getsource(robot_skills.RobotSkills._align_for_placement)
+    assert "'short_arc'" in source and "'long_arc'" in source and "'direct'" in source

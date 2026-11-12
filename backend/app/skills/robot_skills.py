@@ -605,17 +605,43 @@ class SkillRunner:
         center = self.env.object_pose(obj)[0]
         offset = rotation.T @ (center - ee)
         from scipy.spatial.transform import Rotation, Slerp
-        arc = Slerp([0., 1.], Rotation.from_matrix(np.stack([rotation, target_rotation])))
-        orientations = [arc(alpha).as_matrix() for alpha in np.linspace(0., 1., 9)[1:]]
-        positions = [center - attitude @ offset for attitude in orientations]
-        for index in range(len(positions)) if self.controller.motion_speed == 1. else [len(positions) - 1]:
-            result = self.controller.move_to_site(arm, positions[index], orientations[index],
-                via=positions[:-1] if self.controller.motion_speed != 1. else None,
-                via_rotations=orientations[:-1] if self.controller.motion_speed != 1. else None,
-                on_sample=lambda: self._require_hold(arm, obj))
-            if not result.success:
-                raise SkillError(result.error or "IK_FAILURE", "Cannot reorient the physical grasp for placement")
-            self._require_hold(arm, obj)
+        # Two arcs end at the same attitude. Only the short one was tried, so a wrist limit anywhere along it
+        # refused the reorientation even when the *other* way round was clear (measured 2026-11-10: the live
+        # failure "Cannot reorient the physical grasp for placement" was the short arc's via points failing IK,
+        # with both endpoints reachable). The direct move is the third option: nothing is in the way while the
+        # cube is held high, and a via chain is only there to keep the arc smooth.
+        attempts = [('short_arc', 1.), ('long_arc', -1.), ('direct', 0.)]
+        failures = []
+        for label, sweep in attempts:
+            _, rotation = self.env.ee_pose(arm)
+            center = self.env.object_pose(obj)[0]
+            offset = rotation.T @ (center - self.env.ee_pose(arm)[0])
+            if sweep:
+                arc = Slerp([0., 1.], Rotation.from_matrix(np.stack([rotation, target_rotation])))
+                orientations = [arc(alpha * sweep).as_matrix() for alpha in np.linspace(0., 1., 9)[1:]]
+                positions = [center - attitude @ offset for attitude in orientations]
+            else:
+                orientations = [target_rotation]
+                positions = [center - target_rotation @ offset]
+            indeces = (range(len(positions)) if self.controller.motion_speed == 1.
+                       else [len(positions) - 1])
+            for index in indeces:
+                chained = sweep and self.controller.motion_speed != 1.
+                result = self.controller.move_to_site(arm, positions[index], orientations[index],
+                    via=positions[:-1] if chained else None,
+                    via_rotations=orientations[:-1] if chained else None,
+                    on_sample=lambda: self._require_hold(arm, obj))
+                if not result.success:
+                    failures.append({'attempt': label, 'error': result.error,
+                                     'position_error': result.position_error})
+                    break
+                self._require_hold(arm, obj)
+            else:
+                if failures:
+                    self.last_reorientation = {'attempt': label, 'failures': failures}
+                return
+        raise SkillError(failures[-1]['error'] or "IK_FAILURE",
+                         "Cannot reorient the physical grasp for placement")
 
     def _stacking_attitude(self, arm: str, obj: str, holder_arm: str, support_center):
         """A grasp attitude that reaches the top of a held support from a different side than its holder.
