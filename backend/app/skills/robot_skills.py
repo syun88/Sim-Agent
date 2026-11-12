@@ -1465,9 +1465,12 @@ class SkillRunner:
                 center = (1. - alpha) * cube + alpha * geometry.position
                 donor_positions.append(center - attitude @ offset)
                 donor_rotations.append(attitude)
+        # Nominal trajectory speed: a handover is a large, free-space swing, and at 6x the arm trailed its own
+        # planned path by 110 mm on the park leg and 78 mm here (measured 2026-11-10). Speed buys nothing on a
+        # leg that ends in a two-handed meeting, and the reflex refuses it.
         moved = self.controller.move_to_site(arm, donor_site, geometry.donor_rotation,
             q_init=geometry.donor_seed, via=donor_positions, via_rotations=donor_rotations,
-            on_sample=lambda: self._require_hold(arm, obj))
+            trajectory_speed=1., phase='carry', on_sample=lambda: self._require_hold(arm, obj))
         if not moved.success:
             error = SkillError(moved.error or "IK_FAILURE", "Donor could not reach the coupled handover pose")
             error.evidence = self._motion_evidence(moved, object=obj, phase='handover_donor')
@@ -1513,7 +1516,9 @@ class SkillRunner:
             raise error
         # A joint interpolation straight to the cube sweeps an open finger through it.
         # First stay outside the donor, then insert along a measured Cartesian line.
-        result = self.controller.move_to_site(receiver, pregrasp, receiving_rotation, q_init=geometry.receiver_seed)
+        result = self.controller.move_to_site(receiver, pregrasp, receiving_rotation,
+                                              q_init=geometry.receiver_seed, trajectory_speed=1.,
+                                              phase='carry')
         if not result.success:
             error = SkillError(result.error or "IK_FAILURE", "Receiver could not reach the handover standoff")
             error.evidence = {**self._motion_evidence(result, object=obj, phase='handover_receiver'),
@@ -1526,7 +1531,7 @@ class SkillRunner:
         for target in destinations:
             result = self.controller.move_to_site(receiver, target, receiving_rotation,
                 via=insertion[:-1] if self.controller.motion_speed != 1. else None,
-                on_sample=lambda: self._require_hold(arm, obj))
+                trajectory_speed=1., phase='carry', on_sample=lambda: self._require_hold(arm, obj))
             if not result.success:
                 raise SkillError(result.error or "IK_FAILURE", "Receiver was blocked during the straight insertion")
             self._require_hold(arm, obj)
