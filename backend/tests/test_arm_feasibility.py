@@ -183,3 +183,14 @@ def test_switching_a_hand_never_turns_into_a_refusal_when_refusal_is_off():
     source = inspect.getsource(task_agent)
     assert source.count("if _measured('arm_preflight') else []") >= 2, \
         'both the first and the post-switch derivation must be gated'
+
+
+def test_the_reachability_sentence_names_the_layout_fact():
+    from backend.app.agent.task_agent import _reachability_sentence
+
+    says = _reachability_sentence({'object': 'red_cube', 'verdict': 'REQUESTED_HAND_UNREACHABLE',
+                                   'requested_arm': 'left', 'reachable_arms': ['right'], 'arms': {}})
+    assert 'left' in says and 'red_cube' in says and 'right' in says
+    assert _reachability_sentence({'object': 'red_cube', 'verdict': 'NO_ARM_CAN_REACH', 'arms': {}}).strip()
+    assert _reachability_sentence({'object': 'red_cube', 'verdict': 'AN_ARM_CAN_REACH',
+                                   'reachable_arms': ['left'], 'arms': {}}) == ''

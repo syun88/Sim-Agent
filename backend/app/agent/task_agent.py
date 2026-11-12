@@ -89,13 +89,35 @@ def _reachability_report(executor, plan) -> dict:
             arms[arm] = None
             arms.setdefault('errors', {})[arm] = f'{type(error).__name__}: {error}'
     reachable = [arm for arm, value in arms.items() if value is True]
-    if reachable:
-        verdict = 'AN_ARM_CAN_REACH'
-    elif any(value is False for value in arms.values()):
+    requested = None
+    for step in (getattr(plan, 'steps', None) or []):
+        if getattr(step, 'skill', '') in {'approach_object', 'grasp_object'} and getattr(step, 'object', None):
+            requested = getattr(step, 'arm', None)
+            break
+    if not reachable and any(value is False for value in arms.values()):
         verdict = 'NO_ARM_CAN_REACH'
+    elif requested and arms.get(requested) is False and reachable:
+        # The instruction (or the planner) asked for a hand that this layout cannot support while the other one
+        # can. That is a fact about the layout and the request, not a defect in this attempt.
+        verdict = 'REQUESTED_HAND_UNREACHABLE'
+    elif reachable:
+        verdict = 'AN_ARM_CAN_REACH'
     else:
         verdict = 'UNMEASURED'
-    return {'object': obj, 'arms': arms, 'reachable_arms': reachable, 'verdict': verdict}
+    return {'object': obj, 'arms': arms, 'reachable_arms': reachable, 'requested_arm': requested,
+            'verdict': verdict}
+
+
+def _reachability_sentence(report: dict) -> str:
+    """What the measured reachability says about the layout, in one sentence, or nothing."""
+    obj = report.get('object')
+    other = [arm for arm in report.get('reachable_arms') or []]
+    if report.get('verdict') == 'NO_ARM_CAN_REACH':
+        return f' 測定: この配置ではどちらの手も{obj}に到達できません。'
+    if report.get('verdict') == 'REQUESTED_HAND_UNREACHABLE':
+        return (f' 測定: {report["requested_arm"]}手はこの配置で{obj}に到達できません'
+                f'（届くのは{"/".join(other)}手）。')
+    return ''
 
 
 def _switch_plan_arm(plan, old_arm: str, new_arm: str) -> None:
@@ -420,9 +442,7 @@ class TaskAgent:
                 reachability = _reachability_report(self.executor, plan)
                 if reachability:
                     result['reachability'] = reachability
-                    if reachability.get('verdict') == 'NO_ARM_CAN_REACH':
-                        result['detail'] += (' 測定: この配置ではどちらの手も対象に到達できません'
-                                             f'（{reachability["object"]}）。')
+                    result['detail'] += _reachability_sentence(reachability)
                 return finish(result)
             legal, continuation, alternate = [], None, None
             prefix = 0 if plan.goal_program else completed_prefix(plan,result)
@@ -513,9 +533,7 @@ class TaskAgent:
                 reachability = _reachability_report(self.executor, plan)
                 if reachability:
                     result['reachability'] = reachability
-                    if reachability.get('verdict') == 'NO_ARM_CAN_REACH':
-                        result['detail'] += (' 測定: この配置ではどちらの手も対象に到達できません'
-                                             f'（{reachability["object"]}）。')
+                    result['detail'] += _reachability_sentence(reachability)
                 return finish(result)
             assessment = self.recovery_call(instruction,observed,
                 {'category':category,'detail':failed.get('detail') or result.get('detail'),
