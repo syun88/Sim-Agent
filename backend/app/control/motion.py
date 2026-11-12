@@ -304,6 +304,27 @@ class OpenArmV2Controller:
                              if index / max(steps, 1) >= reflex.START_FRACTION and index % watch_every == 0)
             watcher = (reflex.DeviationReflex(side, phase, expected_samples=will_watch)
                        if reflex.enabled() else None)
+            if watcher is not None:
+                # The path, sampled once: the reflex asks "is the arm on it" rather than "is it on time". The
+                # sampling is dense enough that the samples themselves are not the accuracy limit - a fixed 24
+                # points put 8.7 mm of granularity into a one-metre leg, which is the size of the deviation the
+                # reflex is looking for (measured 2026-11-10).
+                try:
+                    kin = self.env.arm_kinematics(side)
+                    def point_at(alpha):
+                        joints = curve(alpha) if curve is not None else start + (q - start) * alpha
+                        return np.asarray(kin.evaluate(np.asarray(joints, float))[0], float)
+                    endpoints = [point_at(alpha) for alpha in np.linspace(0., 1., 9)]
+                    length = sum(float(np.linalg.norm(b - a)) for a, b in zip(endpoints, endpoints[1:]))
+                    count = int(min(reflex.MAX_PATH_SAMPLES,
+                                    max(reflex.MIN_PATH_SAMPLES, np.ceil(length / reflex.PATH_SPACING_M))))
+                    alphas = np.linspace(0., 1., count)
+                    watcher.path_points = [point_at(alpha) for alpha in alphas]
+                    if len(watcher.path_points) > 1:
+                        watcher.granularity_m = max(float(np.linalg.norm(b - a)) for a, b
+                                                    in zip(watcher.path_points, watcher.path_points[1:]))
+                except Exception:
+                    watcher = None
             try:
                 for index in indices:
                     if self.stop_requested():
@@ -322,7 +343,7 @@ class OpenArmV2Controller:
                     if on_sample is not None and index % max(command_steps, round(.02 / self.timestep)) == 0:
                         on_sample()
                     if watcher is not None and index % watch_every == 0:
-                        departure = watcher.observe(reference, self.env.arm_qpos(side), fraction,
+                        departure = watcher.observe(watcher.path_points, self.env.arm_qpos(side), fraction,
                                                     self.env.arm_kinematics(side))
                         if departure is not None:
                             self.env.set_arm(side, self.env.arm_qpos(side))

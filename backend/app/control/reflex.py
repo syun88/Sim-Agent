@@ -38,6 +38,11 @@ START_FRACTION = 0.15
 CONSECUTIVE_SAMPLES = 3
 #: Ceiling: past this the arm is not tracking the plan at all, and a larger threshold would only delay the stop.
 MAX_THRESHOLD_M = 0.12
+#: How finely the planned path is sampled for the distance question. The samples are forward kinematics, so the
+#: cost is small; the spacing is what bounds the measurement, and a fixed count made that bound path-dependent.
+PATH_SPACING_M = 0.005
+MIN_PATH_SAMPLES = 24
+MAX_PATH_SAMPLES = 256
 #: How often the comparison is made. A forward-kinematics call is cheap, and 20 Hz is well above the rate at
 #: which a 7-joint arm can drift into a neighbouring object.
 CHECK_PERIOD_S = 0.05
@@ -76,6 +81,11 @@ class DeviationReflex:
     #: departure against a 62 mm threshold could not act, and the reflex was blind exactly where drift was worst.
     required: int = 0
     expected_samples: int | None = None
+    #: Forward-kinematics positions along the planned path, filled by the motion that owns the leg.
+    path_points: list = field(default_factory=list)
+    #: The spacing of those samples. The nearest-sample distance cannot resolve finer than half of this, so it
+    #: is added to the threshold instead of being mistaken for drift.
+    granularity_m: float = 0.0
     samples: int = 0
     worst_m: float = 0.0
     #: Where on the leg the worst sample was, and the longest run above threshold. A leg that drifts far but
@@ -95,21 +105,26 @@ class DeviationReflex:
                 budget = min(budget, max(1, int(self.expected_samples)))
             self.required = budget
 
-    def observe(self, planned_joints, actual_joints, fraction: float,
+    def observe(self, path_points, actual_joints, fraction: float,
                 kinematics) -> dict | None:
-        """Compare the planned pose with the executed one; return evidence when the departure persists."""
+        """Distance from the actual pose to the planned *path*; return evidence when it persists.
+
+        Measured against the path, not against the time-indexed setpoint. The first version compared the arm with
+        where the plan said it should be at that instant, so a fast large move that was merely behind schedule
+        read as 387 mm of drift and stopped a legitimate handover (measured 2026-11-10). What matters for
+        collision is being *on* the path; being late on it is the servo's business.
+        """
         if fraction < START_FRACTION:
             return None
         try:
-            planned_point = np.asarray(kinematics.evaluate(np.asarray(planned_joints, float))[0], float)
             actual_point = np.asarray(kinematics.evaluate(np.asarray(actual_joints, float))[0], float)
+            deviation = min(float(np.linalg.norm(point - actual_point)) for point in path_points)
         except Exception:  # a measurement that cannot be made must not stop the arm
             return None
-        deviation = float(np.linalg.norm(planned_point - actual_point))
         self.samples += 1
         if deviation > self.worst_m:
             self.worst_m, self.worst_fraction = deviation, float(fraction)
-        if deviation > self.threshold_m:
+        if deviation > self.threshold_m + 0.5 * self.granularity_m:
             self.over_threshold += 1
             self.max_run = max(self.max_run, self.over_threshold)
         else:

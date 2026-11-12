@@ -24,19 +24,19 @@ def test_the_threshold_follows_the_measured_error_for_the_phase():
 
 def test_a_transient_departure_does_not_stop_the_leg():
     watcher = reflex.DeviationReflex('left', 'approach', threshold_m=0.02)
-    planned = np.zeros(7)
+    path = [np.zeros(7)]
     far = np.full(7, 0.05)
-    assert watcher.observe(planned, far, 0.5, FakeKinematics()) is None, 'one sample is a transient'
-    assert watcher.observe(planned, far, 0.5, FakeKinematics()) is None
+    assert watcher.observe(path, far, 0.5, FakeKinematics()) is None, 'one sample is a transient'
+    assert watcher.observe(path, far, 0.5, FakeKinematics()) is None
 
 
 def test_a_persistent_departure_is_reported_with_its_numbers():
     watcher = reflex.DeviationReflex('left', 'approach', threshold_m=0.02)
-    planned = np.zeros(7)
+    path = [np.zeros(7)]
     far = np.full(7, 0.05)
     reported = None
     for _ in range(reflex.CONSECUTIVE_SAMPLES):
-        reported = watcher.observe(planned, far, 0.5, FakeKinematics())
+        reported = watcher.observe(path, far, 0.5, FakeKinematics())
     assert reported is not None
     assert reported['reason'] == 'MOTION_DEVIATION'
     assert reported['deviation_m'] == pytest.approx(0.05 * np.sqrt(7))
@@ -47,13 +47,13 @@ def test_a_persistent_departure_is_reported_with_its_numbers():
 def test_the_start_of_a_leg_is_not_watched():
     watcher = reflex.DeviationReflex('left', 'approach', threshold_m=0.02)
     for _ in range(reflex.CONSECUTIVE_SAMPLES + 2):
-        assert watcher.observe(np.zeros(7), np.full(7, 0.05), 0.05, FakeKinematics()) is None
+        assert watcher.observe([np.zeros(7)], np.full(7, 0.05), 0.05, FakeKinematics()) is None
 
 
 def test_a_leg_within_threshold_reports_a_summary_rather_than_a_violation():
     watcher = reflex.DeviationReflex('right', 'carry', threshold_m=0.05)
     for _ in range(4):
-        assert watcher.observe(np.zeros(7), np.full(7, 0.001), 0.6, FakeKinematics()) is None
+        assert watcher.observe([np.zeros(7)], np.full(7, 0.001), 0.6, FakeKinematics()) is None
     summary = watcher.evidence()
     assert summary['samples'] == 4 and summary['worst_m'] < 0.05 and summary['acted'] is False
 
@@ -79,9 +79,9 @@ def test_the_applied_threshold_is_the_forced_one(monkeypatch):
 def test_a_spike_is_distinguished_from_a_hold():
     """A leg that reaches far but never holds it must not look like a leg that drifted steadily."""
     watcher = reflex.DeviationReflex('left', 'park_arrival', threshold_m=0.02)
-    watcher.observe(np.zeros(7), np.full(7, 0.05), 0.5, FakeKinematics())
-    watcher.observe(np.zeros(7), np.zeros(7), 0.6, FakeKinematics())
-    watcher.observe(np.zeros(7), np.full(7, 0.05), 0.7, FakeKinematics())
+    watcher.observe([np.zeros(7)], np.full(7, 0.05), 0.5, FakeKinematics())
+    watcher.observe([np.zeros(7)], np.zeros(7), 0.6, FakeKinematics())
+    watcher.observe([np.zeros(7)], np.full(7, 0.05), 0.7, FakeKinematics())
     summary = watcher.evidence()
     assert summary['max_run'] == 1
     assert summary['worst_fraction'] == pytest.approx(0.5), 'the first sample at the worst depth'
@@ -98,18 +98,18 @@ def test_a_short_leg_cannot_be_required_to_hold_three_samples():
 
 def test_two_samples_over_threshold_act_on_a_two_sample_leg():
     watcher = reflex.DeviationReflex('left', 'park_arrival', threshold_m=0.02, expected_samples=2)
-    planned, far = np.zeros(7), np.full(7, 0.05)
-    assert watcher.observe(planned, far, 0.5, FakeKinematics()) is None
-    reported = watcher.observe(planned, far, 0.7, FakeKinematics())
+    path, far = [np.zeros(7)], np.full(7, 0.05)
+    assert watcher.observe(path, far, 0.5, FakeKinematics()) is None
+    reported = watcher.observe(path, far, 0.7, FakeKinematics())
     assert reported is not None and reported['reason'] == 'MOTION_DEVIATION'
 
 
 def test_the_required_run_matches_the_samples_the_leg_will_produce():
     """A park leg yields two samples; the requirement must be two, not three."""
     watcher = reflex.DeviationReflex('left', 'park_arrival', threshold_m=0.02, expected_samples=2)
-    planned, far = np.zeros(7), np.full(7, 0.05)
-    first = watcher.observe(planned, far, 0.4, FakeKinematics())
-    second = watcher.observe(planned, far, 0.9, FakeKinematics())
+    path, far = [np.zeros(7)], np.full(7, 0.05)
+    first = watcher.observe(path, far, 0.4, FakeKinematics())
+    second = watcher.observe(path, far, 0.9, FakeKinematics())
     assert first is None and second is not None
 
 
@@ -120,3 +120,14 @@ def test_the_reorientation_tries_both_arcs_and_the_direct_move():
 
     source = inspect.getsource(robot_skills.SkillRunner._align_for_placement)
     assert "'short_arc'" in source and "'long_arc'" in source and "'direct'" in source
+
+
+def test_being_late_on_the_path_is_not_drift():
+    """A fast large move that trails its setpoint is still on the path, and must not be stopped for it."""
+    watcher = reflex.DeviationReflex('left', 'move_to_site', threshold_m=0.02, expected_samples=6)
+    # The path runs from 0 to 1 in joint 0; the arm is at 0.4 the whole time, which is *on* the path.
+    path = [np.array([value] + [0.] * 6) for value in np.linspace(0., 1., 24)]
+    actual = np.array([0.4] + [0.] * 6)
+    for _ in range(6):
+        assert watcher.observe(path, actual, 0.9, FakeKinematics()) is None
+    assert watcher.worst_m < reflex.PATH_SPACING_M, watcher.worst_m
