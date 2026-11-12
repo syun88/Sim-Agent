@@ -1,42 +1,270 @@
-"""Screen approach height and joint branches against the current physical scene."""
+"""Screen cube-grasp frames and joint paths against the current physical scene."""
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from backend.app.control.motion import joint_spline
-from backend.app.simulation.openarm_v2.definition import GRASP_ROTATION
+from backend.app.planning.angle_search import refine
+from backend.app.simulation.openarm_v2.definition import FINGERTIP_MIDPOINT, GRASP_ROTATION
 from backend.app.simulation.transform import orientation_error
 
 
-def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, staging_altitude):
-    start = env.arm_qpos(arm)
-    point = env.ee_pose(arm)[0]
+# Bounded exploration, not proof that every cube face can be pinched. The physical
+# finger-contact and follow checks after approach remain the success authority.
+#: Every 15 degrees, plus the half-steps between them. Measured 2026-11-09: in tight layouts the 15-degree
+#: grid was exhausted and no route was reported; a half-step can find a corridor between two blocked
+#: neighbours. The coarse values stay first so the cheap answer is found early.
+CUBE_GRASP_YAWS_DEG = (0, -15, 15, -30, 30, -45, 45, -60, 60, -75, 75, -90, 90, 180,
+                       -7.5, 7.5, -22.5, 22.5, -37.5, 37.5, -52.5, 52.5, -67.5, 67.5, -82.5, 82.5)
+#: The coarse pass: every 30 degrees. Tried first so a workable side is found without paying for all 26 frames;
+#: the full list follows when the coarse pass finds nothing, so a corridor that only exists at a fine angle is
+#: still found (measured 2026-11-10: a deep check spends 780 candidate routes, most of them on hopeless angles).
+CUBE_GRASP_YAWS_COARSE_DEG = (0, -30, 30, -60, 60, -90, 90, 180)
+#: Standoffs tried when the nominal distance yields no corridor: a shorter reach keeps the pads further from
+#: a neighbouring object.
+STANDOFF_VARIANTS_M = (0.05, 0.04)
+# Task 57efa442 moved a cube 248 mm after a no-margin path passed; with 8 mm
+# clearance task 22d8e6c7 still moved red 15.8 mm between motion samples.
+# Keep 20 mm around NON-contact geometry; target fingertip contact is exempt.
+NONCONTACT_CLEARANCE_M = .020
+# The target is approached intentionally; its non-fingertip geometry still needs
+# space, but a 20 mm exclusion there would forbid a normal close-in pinch.
+TARGET_BODY_CLEARANCE_M = .003
+# Above this the path is obviously not tight; the search does not need an exact distance.
+CLEARANCE_CEILING_M = .05
+
+
+def two_axis_frames(arm, center, standoff_m, *, world_x_offset=None):
+    """The same candidates as ``cube_approach_frames``, plus a lean of the approach axis.
+
+    Rotating about the vertical changes which side the hand comes from; leaning in the vertical plane
+    changes the angle it comes down at, and with it how high the hand sits while the fingers are beside the
+    object. Measured 2026-10-27: rotating about the frame's own approach axis was refused at every angle
+    from 15 to 90 degrees because the hand keeps the same height while it spins, so the lean is the axis
+    worth searching. Every candidate keeps the invariant that makes it the same grasp: the fingertip
+    midpoint still lands on the object centre.
+    """
+    from backend.app.skills.pinch_frames import pinch_frames
+
+    frames = []
+    for tilt, azimuth, rotation in pinch_frames():
+        offset = rotation @ FINGERTIP_MIDPOINT[arm]
+        if world_x_offset is not None:
+            offset = offset.copy()
+            offset[0] = world_x_offset
+        pinch = np.asarray(center, float) - offset
+        finger_direction = rotation @ np.array([0., 0., -1.])
+        frames.append({'yaw_deg': azimuth, 'tilt_deg': tilt, 'rotation': rotation, 'pinch': pinch,
+                       'standoff': pinch - standoff_m * finger_direction})
+    return frames
+
+
+def frame_at(arm, center, standoff_m, yaw_deg, *, world_x_offset=None, tilt_deg=0.):
+    """The grasp frame at one azimuth and lean. Any angle is a real frame, not an interpolation."""
+    from backend.app.skills.pinch_frames import grasp_rotation
+
+    rotation = grasp_rotation(tilt_deg, yaw_deg)
+    offset = rotation @ FINGERTIP_MIDPOINT[arm]
+    if world_x_offset is not None:
+        offset[0] = world_x_offset
+    pinch = np.asarray(center, float) - offset
+    finger_direction = rotation @ np.array([0., 0., -1.])
+    return {'yaw_deg':float(yaw_deg), 'tilt_deg':float(tilt_deg), 'rotation':rotation, 'pinch':pinch,
+            'standoff':pinch - standoff_m * finger_direction}
+
+
+def cube_approach_frames(arm, center, standoff_m, *, world_x_offset=None):
+    frames = [frame_at(arm, center, standoff_m, yaw, world_x_offset=world_x_offset)
+              for yaw in CUBE_GRASP_YAWS_DEG]
+    return frames
+
+
+def plan_cube_approach(env, controller, arm, obj, pinch, standoff, overfly, staging_altitude, *, frames=None,
+                       start_override=None):
+    """Plan a screened approach route.
+
+    `start_override` asks the question from a *given* configuration instead of the arm's current one. That
+    distinction is fundamental: "can this arm grasp this object in this layout" is a property of the layout and
+    must not change depending on where the arm happens to be standing, while "is there a route from here right
+    now" is a momentary question the motion itself answers. Measured 2026-11-09: a feasibility answer used as a
+    layout property flipped between attempts because it was computed from the current posture.
+    """
+    if start_override is not None:
+        start = np.asarray(start_override, float)
+        point, rotation_at_start, _, _ = env.arm_kinematics(arm).evaluate(start)
+    else:
+        start = env.arm_qpos(arm)
+        point = env.ee_pose(arm)[0]
     kin = env.arm_kinematics(arm)
     objects = {name:env.object_pose(name) for name in env.frame().objects}
     check = getattr(kin,'empty_arm_path_is_clear',None)
+    # The screen's clearance is not only the nominal 20 mm: an approach lands a few millimetres off its planned
+    # path (measured 2026-11-09: 6.7-9.1 mm of displacement on the object it was reaching for), so the route
+    # has to be screened with that much extra room. Refusing more routes is the intended trade - a route that
+    # brushes the user's object is not a route.
+    from backend.app.skills import motion_accuracy
+    from backend.app.planning.measurement_flags import enabled as _measured
+    screen_clearance = NONCONTACT_CLEARANCE_M + (motion_accuracy.expected_error(arm, 'approach')
+                                                 if _measured('approach_margin') else 0.)
+    # An absolute override, so "what does a perception budget of N mm cost?" is a measurement instead of an
+    # opinion: set OPENARM_APPROACH_MARGIN_MM and the screen asks for exactly that.
+    import os as _os
+    _override = _os.environ.get('OPENARM_APPROACH_MARGIN_MM')
+    if _override:
+        try:
+            screen_clearance = float(_override) / 1000.
+        except ValueError:
+            pass
+    # The clearance query ranks candidates; the route screen still decides. Where the two disagree the
+    # trace says so (rejected_by), because a measured win the screen refuses is not an improvement.
+    # The route must also keep clear of the object it is reaching for *until the last sample*: an approach
+    # lands a few millimetres off its planned path (measured 2026-11-09: 6.7-9.1 mm of displacement on the
+    # object it was reaching for), so a planned 3 mm is contact in execution. Measured 2026-11-10: a stacking
+    # approach displaced the cube by 8.1 mm and was refused afterwards with APPROACH_COLLISION, then repeated
+    # the same shove on retry. The target clearance therefore carries the same measured error the noncontact
+    # clearance does; the screen still lets the final sample close in on the grasp.
+    target_clearance = TARGET_BODY_CLEARANCE_M + (motion_accuracy.expected_error(arm, 'approach')
+                                                 if _measured('approach_margin') else 0.)
+    measure = getattr(kin,'path_minimum_clearance',None)
     allowed = {obj:{f'openarm_{arm}_ee_inner_finger',f'openarm_{arm}_ee_outer_finger'}}
     rejected = []
-    # Elevated objects need a different overflight than objects on the table.
-    # Start with the nominal clearance, then admit only reachable, clear routes.
-    for rise in np.linspace(overfly,0.,5):
-        high = standoff+np.array([0.,0.,rise])
-        for staged in (True,False) if staging_altitude-point[2]>.02 else (False,):
-            poses = ([np.r_[point[:2],staging_altitude]] if staged else [])+[high,standoff,pinch]
-            route = [start]
-            for target in poses:
-                solved = None
-                for seed in (route[-1],env.home_arm_qpos(arm)):
-                    q,_,_=controller.solve_ik(arm,target,GRASP_ROTATION,q_init=seed)
-                    if q is None:continue
-                    actual,rotation,_,_=kin.evaluate(q)
-                    if (np.linalg.norm(actual-target)<.004
-                            and np.linalg.norm(orientation_error(rotation,GRASP_ROTATION))<.04):
-                        solved=q;break
-                if solved is None:break
-                route.append(solved)
-            else:
-                curve=joint_spline(route,env.arm_velocity_limits(arm))
-                if check is None or check(route,objects,allowed_contacts=allowed,curve=curve):
-                    return route,{'approach_overfly_m':float(rise),'staging':staged,'rejected_routes':rejected}
-                rejected.append({'overfly_m':float(rise),'staging':staged,'error':'COLLISION_PATH'})
+    # Older callers screen only the calibrated nominal frame. The runtime
+    # explicitly supplies candidate frames, each with its own fingertip offset.
+    candidates = frames if frames is not None else [
+        {'yaw_deg':0, 'rotation':GRASP_ROTATION, 'pinch':pinch, 'standoff':standoff}]
+    def route_for(frame, rise, staged):
+        """Solve the joint route for one attitude and rise, reusing the accepted frame's offsets."""
+        attitude = frame['rotation']
+        high = frame['standoff']+np.array([0., 0., rise])
+        poses = ([np.r_[point[:2],staging_altitude]] if staged else [])+[
+            high, frame['standoff'], frame['pinch']]
+        route = [start]
+        for target in poses:
+            solved = None
+            for seed in (route[-1],env.home_arm_qpos(arm)):
+                q,_,_=controller.solve_ik(arm,target,attitude,q_init=seed)
+                if q is None:continue
+                actual,rotation,_,_=kin.evaluate(q)
+                if (np.linalg.norm(actual-target)<.004
+                        and np.linalg.norm(orientation_error(rotation,attitude))<.04):
+                    solved=q;break
+            if solved is None:
+                return None
+            route.append(solved)
+        return route, joint_spline(route,env.arm_velocity_limits(arm))
+
+    def clearance_of(frame, rise, staged):
+        """How much room this route leaves, in metres. None when it cannot be built or measured."""
+        if measure is None:
+            return None
+        built = route_for(frame, rise, staged)
+        if built is None:
+            return None
+        route, curve = built
+        return measure(route,objects,allowed_contacts=allowed,curve=curve,ceiling=CLEARANCE_CEILING_M)
+
+    found = None
+    for frame in candidates:
+        for rise in np.linspace(overfly,0.,5):
+            for staged in (True,False) if staging_altitude-point[2]>.02 else (False,):
+                built = route_for(frame, rise, staged)
+                if built is None:
+                    rejected.append({'yaw_deg':frame['yaw_deg'],'overfly_m':float(rise),
+                                     'staging':staged,'error':'IK_FAILURE'})
+                    continue
+                route, curve = built
+                # Screen first, measure second. Measured 2026-11-10 on real geometry: the boolean screen costs 3%
+                # of a candidate and the clearance measurement 49%, and the measurement is only needed for a
+                # candidate the screen already accepted (it ranks candidates and gates the numeric margin).
+                screened = (check is None or check(route,objects,allowed_contacts=allowed,curve=curve,
+                                                   minimum_object_clearance=screen_clearance,
+                                                   object_clearances={obj:target_clearance}))
+                measured = (measure(route, objects, allowed_contacts=allowed, curve=curve,
+                                    ceiling=CLEARANCE_CEILING_M)
+                            if screened and measure is not None else None)
+                # Both answers, because they answer different geometry (the screen also sees the table and the
+                # other arm; the number only sees the objects). Measured 2026-11-09: a route passed the screen
+                # while its nearest-object distance was 4.2 mm below the requirement, so the number is a gate
+                # too - a route that does not clear what the screen asks for is not a route.
+                enough = measured is None or measured >= screen_clearance
+                if screened and enough:
+                    found = (frame, float(rise), staged, route, curve)
+                    break
+                rejected.append({'yaw_deg':frame['yaw_deg'],'overfly_m':float(rise),
+                                 'staging':staged,'error':'COLLISION_PATH'})
+            if found: break
+        if found: break
+    if not found:
+        return None, {'error':'APPROACH_PATH_UNAVAILABLE','rejected_routes':rejected,
+                      'attempted_grasp_yaws_deg':[frame['yaw_deg'] for frame in candidates]}
+
+    # The listed yaws and the five rise values only got us a route that passes. Now the angle and the height
+    # are derived from the measurement: the same clearance query, maximised. A yaw or rise that cannot be
+    # reached scores None and loses, so the search cannot drift somewhere unattainable.
+    frame, rise, staged, route, curve = found
+    accepted_clearance = clearance_of(frame, rise, staged)
+    refinements = []
+    if measure is not None:
+        centre = frame['pinch'] + frame['rotation'] @ FINGERTIP_MIDPOINT[arm]
+        standoff_distance = float(np.linalg.norm(frame['standoff'] - frame['pinch']))
+        yaw_now = float(frame['yaw_deg'])
+        tilt_now = float(frame.get('tilt_deg', 0.))
+
+        def frame_with(yaw_deg, tilt_deg):
+            return frame_at(arm, centre, standoff_distance, yaw_deg, tilt_deg=tilt_deg)
+
+        # Lean and side are separate axes because they move the hand differently: the azimuth spins it about
+        # the vertical at one height, the lean changes that height. Each is searched against the same
+        # measurement, so whichever the body can actually reach better wins.
+        for name, axis, from_value, span, step in (
+                ('refine_grasp_yaw', 'yaw', yaw_now, 15., 5.),
+                ('refine_grasp_tilt', 'tilt', tilt_now, 15., 5.),
+                ('refine_overfly', 'overfly', rise, max(rise/2., .01), max(rise/4., .005))):
+            def rebuild(value, axis=axis):
+                if axis == 'yaw':
+                    return frame_with(value, tilt_now), rise
+                if axis == 'tilt':
+                    return frame_with(yaw_now, value), rise
+                return frame, value
+
+            trace = refine(lambda value: clearance_of(*rebuild(value), staged),
+                           from_value, span, step=step)
+            entry = {'query': name, **trace, 'accepted': False}
+            refinements.append(entry)
+            if trace['best_value'] is None or trace['best_score'] is None:
+                entry['rejected_by'] = 'UNMEASURED'
                 continue
-            rejected.append({'overfly_m':float(rise),'staging':staged,'error':'IK_FAILURE'})
-    return None,{'error':'APPROACH_PATH_UNAVAILABLE','rejected_routes':rejected}
+            if accepted_clearance is not None and trace['best_score'] <= accepted_clearance:
+                entry['rejected_by'] = 'NOT_BETTER_THAN_ACCEPTED'
+                continue
+            candidate_frame, candidate_rise = rebuild(trace['best_value'])
+            built = route_for(candidate_frame, candidate_rise, staged)
+            if built is None:
+                entry['rejected_by'] = 'IK_FAILURE'
+                continue
+            candidate_route, candidate_curve = built
+            if check is not None and not check(candidate_route, objects, allowed_contacts=allowed,
+                                               curve=candidate_curve,
+                                               minimum_object_clearance=screen_clearance,
+                                               object_clearances={obj:target_clearance}):
+                entry['rejected_by'] = 'COLLISION_PATH'
+                continue
+            entry['accepted'] = True
+            frame, rise, route, curve = candidate_frame, candidate_rise, candidate_route, candidate_curve
+            accepted_clearance = trace['best_score']
+            yaw_now = float(frame['yaw_deg'])
+            tilt_now = float(frame.get('tilt_deg', 0.))
+
+    attitude = frame['rotation']
+    return route, {'approach_overfly_m':float(rise),'staging':staged,
+                   'noncontact_clearance_m':NONCONTACT_CLEARANCE_M,
+                   'screen_clearance_m':screen_clearance,
+                   'expected_approach_error_m':motion_accuracy.expected_error(arm, 'approach'),
+                   'target_body_clearance_m':TARGET_BODY_CLEARANCE_M,
+                   'target_clearance_used_m':target_clearance,
+                   'grasp_yaw_deg':frame['yaw_deg'],
+                   'grasp_tilt_deg':frame.get('tilt_deg', 0.),
+                   'grasp_rotation':attitude.tolist(),
+                   'pinch_target':frame['pinch'].tolist(),
+                   'measured_clearance_m':accepted_clearance,
+                   'refinements':refinements,
+                   'rejected_routes':rejected}

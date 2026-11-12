@@ -16,8 +16,8 @@ VERBS = re.compile(
     r"(?P<throw>投げ(?:て|る|ろ)|放り(?:投げて|投げる)|上[にへ](?:軽く|ぽんと|そっと|少し|ちょっと|\s)*放(?:って|つ)|\bthrow\b|\btoss\b)"
     r"|(?P<pour>注(?:いで|ぐ|げ)|そそ(?:いで|ぐ)|\bpour\b)"
     r"|(?P<handover>受け渡(?:して|す)|渡(?:した|して|す|せ)|手渡(?:して|す)|\bhandover\b|\bhand[ -]over\b|\bpass(?:es)?\b|\bhand(?=\s+(?:it|the|that)))"
-    r"|(?P<place>置(?:いた|いて|く|け)|(?:乗|載)せ(?:て|る)|重ね(?:て|る)|積(?:んで|む)|入(?:れて|れる)|運(?:んで|ぶ)|\bplace\b|\bput(?:s)?\b|\bstack\b|\bset\s+down\b|\bleave\b)"
-    r"|(?P<pick>掴(?:んで|む|め)|つか(?:んで|む)|持ち上げ(?:て|る)|持って(?:いて|て)?|保持(?:して(?:おいて)?|する)?|握(?:って|る)|取(?:って|る)|と(?:って|る)|\bpick(?:s)?(?:\s+up)?\b|\bgrab\b|\bgrasp\b|\btake(?:s)?\b|\blift\b)"
+    r"|(?P<place>置(?:いた|いて|く|け)|(?<![てで])お(?:いた|いて|く|け)|(?:乗|載)せ(?:て|る)|重ね(?:て|る)|積(?:んで|む)|入(?:れて|れる)|運(?:んで|ぶ)|\bplace\b|\bput(?:s)?\b|\bstack\b|\bset\s+down\b|\bleave\b)"
+    r"|(?P<pick>掴(?:んで|む|め)|つか(?:んで|む)|持ち上げ(?:て|る)|持たせ(?:て|る)?|持って(?:いて|て)?|保持(?:して(?:おいて)?|する)?|握(?:って|る)|取(?:って|る)|と(?:って|る)|\bpick(?:s)?(?:\s+up)?\b|\bgrab\b|\bgrasp\b|\btake(?:s)?\b|\blift\b)"
     r"|(?P<approach>近づ(?:いて|けて|く)|アプローチ|\bapproach\b)"
     r"|(?P<open>開(?:いて|けて|く|け)|\bopen\b)"
     r"|(?P<close>閉(?:じて|めて|じる|める)|\bclose\b)"
@@ -38,12 +38,15 @@ def acting_arm(text: str) -> str | None:
     'on the right ... with the left hand' contains two sides but only one actor.
     Keep the broad mentions helper for receiver/direction references.
     """
+    # Exclude passive holding condition clauses (e.g. "右手で持っている状態を維持したまま")
+    # which specify the held reference, not the acting arm performing the placement.
+    cleaned_text = re.sub(r'[左右](?:手|腕)(?:で[^\s、,]*?)?(?:状態)?(?:を維持したまま|のまま|の状態で|を持ったまま)', ' ', text)
     patterns = [r'([左右])(?:手|腕|アーム|ハンド)(?:で|が|は)',
                 r'\b(?:with|using|by)\s+(?:your\s+|the\s+)?(left|right)\s+(?:hand|arm|gripper)\b',
                 r'\b(?:the\s+)?(left|right)\s+(?:hand|arm|gripper)\s+(?:picks?|grabs?|grasps?|takes?|holds?|lifts?|moves?)\b']
     sides = []
     for pattern in patterns:
-        for match in re.finditer(pattern, text, re.I):
+        for match in re.finditer(pattern, cleaned_text, re.I):
             value = match.group(1).lower()
             sides.append('left' if value in {'left','左'} else 'right')
     if len(set(sides)) > 1:
@@ -52,10 +55,17 @@ def acting_arm(text: str) -> str | None:
 
 
 def target_in(text: str) -> str | None:
+    from backend.app.planning import catalog as scene_catalog
+
     if re.search(r"グラス|\bglass\b", text, re.I):
         return "wine_glass"
     if re.search(r"そこに|同じ場所|\bthere\b|\bsame (?:place|target)\b", text):
         return "there"
+    # Catalog zones first: a zone the scene declares is reachable by any of its names, and the wording
+    # below is the spatial vocabulary that is not a zone in the catalog.
+    for target, pattern in scene_catalog.alias_patterns(scene_catalog.load().zones).items():
+        if re.search(pattern, text, re.I):
+            return target
     for target, pattern in {
         "blue_zone": r"blue[ _]*(?:zone|target)|青(?:い|の)?(?:ゾーン|エリア)",
         "green_zone": r"green[ _]*(?:zone|target)|緑(?:の|色の)?(?:ゾーン|エリア)",

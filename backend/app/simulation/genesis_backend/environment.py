@@ -37,6 +37,7 @@ from backend.app.simulation.openarm_v2.definition import (
     EE_LINKS,
     EE_SITES,
     GRIPPER_JOINTS,
+    LAUNCH_STROKES_MEASURED,
     OBJECTS,
     SPAWN_ARM_QPOS,
     ZONES,
@@ -61,6 +62,12 @@ NATIVE_CAMERA_POSITION = (0.78, 0.0, 1.70)
 NATIVE_CAMERA_LOOKAT = (0.30, 0.0, 1.13)
 #: Steps between two gravity-torque refreshes of the feed-forward (see `apply_gravity_compensation`).
 GRAVITY_TORQUE_REFRESH_STEPS = 5
+
+
+def _viewer_run_in_thread():
+    """Whether Genesis should serve the interactive viewer from a background thread."""
+    override = os.getenv("OPENARM_VIEWER_MAIN_THREAD", "0")
+    return False if override not in ("0", "", "false") else None
 
 
 def simulation_speed_from_environment() -> float:
@@ -95,6 +102,12 @@ def _ensure_genesis_init(prefer_gpu: bool):
             gs.destroy()
             _INITIALISED = False
         if not _INITIALISED:
+            if prefer_gpu:
+                # A ROCm build of torch needs one guarded lookup before Genesis can build a scene at all.
+                from backend.app.simulation import amd_compat
+                compat = amd_compat.apply()
+                if compat.get('applied'):
+                    print(f'AMD compatibility applied: {compat}', flush=True)
             gs.init(backend=gs.gpu if prefer_gpu else gs.cpu, precision="32", logging_level="error")
             _INITIALISED = True
     return gs
@@ -244,15 +257,19 @@ class GenesisOpenArmV2Environment(SimulationBackend):
             )
         self._gs = _ensure_genesis_init(prefer_gpu)
         self.compute_backend = self._gs.backend.name
-        if scene_profile not in {"cubes", "wine"}:
-            raise ValueError("Unknown scene profile")
+        from backend.app.simulation import scenes as scene_registry
+        scene_registry.check(scene_profile)
         self.scene_profile = scene_profile
         self._wine = None
         self._xml = resolved_scene_xml()
-        self._cube_names = tuple(OBJECTS) if scene_profile == "cubes" else ()
-        if scene_profile == "wine":
-            # Keep the official robot/cell attachment intact. Each task profile
-            # carries only its workpieces, rather than unused free cube joints.
+        # A scene says what it needs; the builder follows that instead of a hard-coded pair of names, so
+        # `mixed` (cubes and vessels together) needs no new branch here.
+        wants_cubes = 'cubes' in scene_registry.needs(scene_profile)
+        wants_wine = 'wine' in scene_registry.needs(scene_profile)
+        self._cube_names = tuple(OBJECTS) if wants_cubes else ()
+        if not wants_cubes:
+            # Keep the official robot/cell attachment intact. A scene without cubes carries only its
+            # workpieces, rather than unused free cube joints.
             import xml.etree.ElementTree as ET
             root = ET.fromstring(self._xml)
             world = root.find("worldbody")
@@ -263,30 +280,41 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         self._meta = _OfficialModelMetadata(self._xml)
         self._scene_xml = genesis_scene_xml(self._xml, self._meta)
         fluid_options = {}
-        if scene_profile == "wine":
+        fluid_settings = scene_registry.fluid(scene_profile) or {}
+        particle_size = fluid_dt = fluid_substeps = None
+        if wants_wine:
             from backend.app.simulation.genesis_backend.wine import (
                 PARTICLE_SIZE, LIQUID_MU, WINE_DT, WINE_SUBSTEPS, PRESSURE_SOLVER, HASH_GRID_SIZE, validate_fluid_timestep,
             )
-            validate_fluid_timestep(PARTICLE_SIZE, LIQUID_MU, WINE_DT / WINE_SUBSTEPS)
+            # The scene declares what its fluid costs; measured 2026-11-10, the engine defaults advanced 7.9 ms
+            # of simulated time per wall second, which made the scene unusable in practice.
+            particle_size = float(fluid_settings.get('particle_mm', PARTICLE_SIZE * 1000.)) / 1000.
+            fluid_dt = float(fluid_settings.get('dt_ms', WINE_DT * 1000.)) / 1000.
+            fluid_substeps = int(fluid_settings.get('substeps', WINE_SUBSTEPS))
+            validate_fluid_timestep(particle_size, LIQUID_MU, fluid_dt / max(1, fluid_substeps))
             fluid_options["sph_options"] = self._gs.options.SPHOptions(
-                particle_size=PARTICLE_SIZE, pressure_solver=PRESSURE_SOLVER, hash_grid_res=HASH_GRID_SIZE,
+                particle_size=particle_size, pressure_solver=PRESSURE_SOLVER, hash_grid_res=HASH_GRID_SIZE,
                 lower_bound=(.05, -.55, .80), upper_bound=(.9, .55, 1.75))
         self._scene = self._gs.Scene(
-            sim_options=self._gs.options.SimOptions(dt=WINE_DT if scene_profile == "wine" else .001,
-                                                  substeps=WINE_SUBSTEPS if scene_profile == "wine" else 1),
+            sim_options=self._gs.options.SimOptions(dt=fluid_dt if wants_wine else .001,
+                                                  substeps=fluid_substeps if wants_wine else 1),
             # The default viewer looks at the opaque front of the official cell.
             # Place the camera inside the cell so both hands and cubes stay visible.
             viewer_options=self._gs.options.ViewerOptions(
                 res=(1100, 760),
                 realtime_factor=self.simulation_speed,
-                camera_pos=(.78, 0., 1.75) if scene_profile == "wine" else NATIVE_CAMERA_POSITION,
-                camera_lookat=(.40, .07, 1.13) if scene_profile == "wine" else NATIVE_CAMERA_LOOKAT,
-                camera_fov=72. if scene_profile == "wine" else 65.,
+                # Genesis runs the viewer in a background thread on Linux by default. Measured 2026-11-10: under
+                # Xwayland that thread blocks forever in pyglet's `XlibWindow._map`, so the window never appears
+                # and the build never finishes. `OPENARM_VIEWER_MAIN_THREAD=1` builds it on the main thread instead.
+                run_in_thread=_viewer_run_in_thread(),
+                camera_pos=(.78, 0., 1.75) if wants_wine else NATIVE_CAMERA_POSITION,
+                camera_lookat=(.40, .07, 1.13) if wants_wine else NATIVE_CAMERA_LOOKAT,
+                camera_fov=72. if wants_wine else 65.,
             ),
             rigid_options=self._gs.options.RigidOptions(
                 constraint_solver=self._gs.constraint_solver.Newton,
-                contact_resolution=self._gs.contact_resolution.convex if scene_profile == "wine" else None,
-                impratio=10. if scene_profile == "wine" else None,
+                contact_resolution=self._gs.contact_resolution.convex if wants_wine else None,
+                impratio=10. if wants_wine else None,
                 friction_cone=self._gs.friction_cone.elliptic,
                 enable_torsional_friction=True,
                 enable_rolling_friction=True,
@@ -299,22 +327,35 @@ class GenesisOpenArmV2Environment(SimulationBackend):
             show_viewer=show_viewer,
             **fluid_options,
         )
-        material = self._gs.materials.Rigid(needs_coup=False) if scene_profile == "wine" else None
+        material = self._gs.materials.Rigid(needs_coup=False) if wants_wine else None
         self._entity = self._scene.add_entity(self._gs.morphs.MJCF(file=self._scene_xml), material=material)
-        if scene_profile == "wine":
+        if wants_wine:
             from backend.app.simulation.genesis_backend.wine import WineWorld
             # Same tabletop height, also a collision boundary for spilled particles.
             self._scene.add_entity(self._gs.morphs.MJCF(file='''<mujoco><worldbody>
                 <geom type="plane" size="1 1 .01" pos="0 0 1.006" contype="1073741824" conaffinity="0"/>
                 </worldbody></mujoco>''', visualization=False))
-            self._wine = WineWorld(self._scene, self._gs, async_surface=show_viewer)
-        self._camera = self._scene.add_camera(
-            res=camera_resolution,
-            pos=free_camera_position(),
-            lookat=list(CAMERA_LOOKAT),
-            fov=CAMERA_FOV,
-            GUI=False,
-        )
+            self._wine = WineWorld(self._scene, self._gs, async_surface=show_viewer,
+                                   sdf=scene_registry.sdf(scene_profile),
+                                   fluid={**fluid_settings, 'particle_mm': particle_size * 1000.,
+                                          'dt_ms': fluid_dt * 1000., 'substeps': fluid_substeps})
+        # The camera needs a renderer, and a renderer needs EGL. Measured 2026-11-10 on the ROCm path: EGL
+        # initialises (`eglInitialize` 1.5) but pyrender cannot create a context for the AMD device, which killed
+        # the whole environment including the physics that had nothing to do with rendering. A scene that cannot
+        # be drawn can still be simulated, so the camera is optional and its absence is reported.
+        try:
+            self._camera = self._scene.add_camera(
+                res=camera_resolution,
+                pos=free_camera_position(),
+                lookat=list(CAMERA_LOOKAT),
+                fov=CAMERA_FOV,
+                GUI=False,
+            )
+            self.render_error = None
+        except Exception as error:
+            self._camera = None
+            self.render_error = f'{type(error).__name__}: {str(error)[:200]}'
+            print(f'No camera for this scene (rendering disabled): {self.render_error}', flush=True)
         self._scene.build()
         self._index()
         if self._wine:
@@ -563,6 +604,16 @@ class GenesisOpenArmV2Environment(SimulationBackend):
         return self._link_pose(name)
 
     def object_bounds(self, name: str) -> np.ndarray:
+        if name not in self._links:
+            # A zone is a site, not a link: its extent comes from the model file's site radius, so a
+            # placement can be judged against the region it actually has instead of against a constant.
+            from backend.app.simulation.openarm_v2.scene import zone_site_radius
+            radius = zone_site_radius(name)
+            if radius is None:
+                raise KeyError(name)
+            centre = self.zone_position(name)
+            half = np.array([radius, radius, .001])
+            return np.stack([centre - half, centre + half])
         return self._links[name].get_AABB().cpu().numpy().astype(float).reshape(2, 3)
 
     def zone_position(self, name: str) -> np.ndarray:
@@ -677,6 +728,21 @@ class GenesisOpenArmV2Environment(SimulationBackend):
 
     def arm_kinematics(self, side: str) -> OfficialArmKinematics:
         return OfficialArmKinematics(self._meta.model, self._observed_model_qpos(), side)
+
+    def plan_arm_pose(self, side: str, position, rotation=None, *, q_init=None) -> dict:
+        """Plan a pose with the cell's own solve.
+
+        The policy and the measurements behind it - an under-actuated arm is not asked for an attitude,
+        the home posture is retried, other basins are searched - live in ``pose_planning.plan_pose``,
+        which ``OpenArmV2Controller.solve_ik`` also plans through, so the cell answers "can this arm
+        reach this pose" in one place rather than two.
+        """
+        from backend.app.simulation.openarm_v2.pose_planning import plan_pose
+        return plan_pose(self, side, position, rotation, q_init=q_init, planner_grade=True)
+
+    def launch_calibration(self):
+        """The launch strokes this cell was measured to throw with (see ``definition``)."""
+        return LAUNCH_STROKES_MEASURED
 
     def _observed_model_qpos(self) -> np.ndarray:
         qpos = self._meta.keyframe_qpos

@@ -5,6 +5,8 @@ through finger contacts and liquid moves through Genesis's rigid/SPH coupling.
 """
 from pathlib import Path
 from functools import lru_cache
+import os
+
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -12,7 +14,11 @@ ASSETS = Path(__file__).resolve().parents[4] / "assets" / "wine"
 BOTTLE_START = np.array([.44, .29, 1.091])
 GLASS_START = np.array([.62, .06, 1.006])
 BOTTLE_MOUTH = np.array([0., 0., .125])
-PARTICLE_SIZE = .0025
+#: Particle size and the fluid timestep decide what the wine scene costs. Measured 2026-11-10: 2.5 mm
+#: particles at dt=2 ms with 32 substeps made ordinary manipulation ~50x slower than the cube scene, which is
+#: why `wine` and `mixed` were reported as unusable in practice. Coarser and fewer substeps are faster and
+#: less accurate; the environment variables exist so that trade is made on purpose.
+PARTICLE_SIZE = float(os.environ.get("OPENARM_WINE_PARTICLE_MM", "2.5")) / 1000.
 # Small-scale resolved liquid coefficients; these are not calibrated wine data.
 # Genesis's explicit viscosity acts in its acceleration equation. At this
 # resolution mu=.003 requires a substep below 83.3 microseconds; the former
@@ -22,8 +28,8 @@ PARTICLE_SIZE = .0025
 LIQUID_MU = .003
 LIQUID_GAMMA = .00015
 LIQUID_STIFFNESS = 500.
-WINE_DT = .002
-WINE_SUBSTEPS = 32
+WINE_DT = float(os.environ.get("OPENARM_WINE_DT_MS", "2")) / 1000.
+WINE_SUBSTEPS = int(os.environ.get("OPENARM_WINE_SUBSTEPS", "32"))
 MAX_SPILL_ML = .1
 PRESSURE_SOLVER = "WCSPH"
 # This is the periodic neighbor-hash size, not the simulation boundary. Genesis
@@ -113,6 +119,13 @@ def vessel_xml(name: str, fixed: bool) -> str:
       </body></worldbody></mujoco>'''
 
 
+#: Fluid-coupling SDF resolution for the vessel shells. Defaults are the official cell's; the environment
+#: variables exist so the build cost can be traded against pour accuracy on purpose rather than by surprise.
+SDF_CELL_M = float(os.environ.get("OPENARM_WINE_SDF_CELL_MM", "0.4")) / 1000.
+SDF_MIN_RES = int(os.environ.get("OPENARM_WINE_SDF_MIN_RES", "128"))
+SDF_MAX_RES = int(os.environ.get("OPENARM_WINE_SDF_MAX_RES", "512"))
+
+
 class WineWorld:
     #: Defaults are the official cell's constants, as class attributes so an instance built without __init__ (tests do
     #: this to exercise the volume arithmetic) still has them.
@@ -120,16 +133,31 @@ class WineWorld:
     glass_start = GLASS_START
 
     def __init__(self, scene, gs, *, fixed_bottle=False, async_surface=True,
-                 bottle_position=None, glass_position=None):
+                 bottle_position=None, glass_position=None, sdf=None, fluid=None):
         # The vessel positions are the official cell's constants by default. An imported arm has its own table height
         # and its own reach, so the caller may place them: measured 2026-10-27, the official bottle sits 0.69 m from a
         # 0.3 m arm and every approach posture is rejected for want of reach, not for want of a fluid model.
         self.bottle_start = np.asarray(BOTTLE_START if bottle_position is None else bottle_position, float)
         self.glass_start = np.asarray(GLASS_START if glass_position is None else glass_position, float)
         self.scene = scene
+        # Per-scene fluid settings override the module defaults (which come from the environment).
+        settings = dict(fluid or {})
+        self.particle_size = float(settings.get('particle_mm', PARTICLE_SIZE * 1000.)) / 1000.
+        self.substeps = int(settings.get('substeps', WINE_SUBSTEPS))
+        self.timestep = float(settings.get('dt_ms', WINE_DT * 1000.)) / 1000.
+        validate_fluid_timestep(self.particle_size, LIQUID_MU, self.timestep / max(1, self.substeps))
         self.solver = "SPH"
-        material = gs.materials.Rigid(needs_coup=True, coup_friction=.2, coup_softness=.0003,
-                                     sdf_cell_size=.0004, sdf_min_res=128, sdf_max_res=512)
+        # The fluid-solid coupling SDF is the single most expensive thing this project builds: measured
+        # 2026-11-10, the defaults below produced a 696 MB cache file per shell and a build that had not
+        # finished after fifteen minutes at ~350% CPU, which is why the `wine` and `mixed` scenes were not
+        # selectable. The resolution is therefore a measurement knob, not a constant: coarser is faster and
+        # less accurate for the liquid, and which of those matters is a question to be answered by pouring.
+        settings = dict(sdf or {})
+        material = gs.materials.Rigid(
+            needs_coup=True, coup_friction=.2, coup_softness=.0003,
+            sdf_cell_size=float(settings.get('cell_mm', SDF_CELL_M * 1000.)) / 1000.,
+            sdf_min_res=int(settings.get('min_res', SDF_MIN_RES)),
+            sdf_max_res=int(settings.get('max_res', SDF_MAX_RES)))
         self.bottle = scene.add_entity(gs.morphs.MJCF(file=vessel_xml("wine_bottle", fixed_bottle), pos=tuple(self.bottle_start),
                                                     convexify=False, watertighten=None), material=material,
                                       surface=gs.surfaces.Default(vis_mode="visual", roughness=.15, double_sided=False))
@@ -187,12 +215,13 @@ class WineWorld:
         # actual inner profile so particles beside the neck aren't counted inside.
         inner_z = np.array([.007, .012, .208, .233, .257, .300]) * .70 - .085
         inner_r = np.array([0., .035, .035, .0285, .010, .010]) * .70
-        in_bottle = inside_cavity(local, inner_z, inner_r, PARTICLE_SIZE / 2)
+        in_bottle = inside_cavity(local, inner_z, inner_r, self.particle_size / 2)
         glass_local = (points - gp) @ gr
         # Radius of the source glass's inner bowl, interpolated from its mesh profile.
         profile = np.array([[.094, 0.], [.096, .016], [.102, .0232], [.116, .0338], [.130, .0392],
                             [.163, .0402], [.179, .03744], [.195, .0332], [.220, .0292]])
-        in_glass = ~in_bottle & inside_cavity(glass_local, profile[:, 0] * .65, profile[:, 1] * .65, PARTICLE_SIZE / 2)
+        in_glass = ~in_bottle & inside_cavity(glass_local, profile[:, 0] * .65, profile[:, 1] * .65,
+                                              self.particle_size / 2)
         spilled = active & ~in_glass & ~in_bottle & (points[:, 2] < gp[2] + .03)
         return {"solver": self.solver, "pressure_solver": self.scene.sph_solver._pressure_solver,
                 "particle_count": int(active.sum()), "initial_ml": len(points) * self.ml_per_particle,

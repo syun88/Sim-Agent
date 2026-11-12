@@ -11,6 +11,46 @@ from backend.app.planning.language_fallback import parse_fallback
 from backend.app.planning.task_program import ActionProposal, GroundingError, InstructionMeaning, TaskAction, TaskGoal, TaskProgram, compile_program
 
 
+def test_unreachable_support_is_handed_over_or_relocated_autonomously(world):
+    # Goal: "stack blue on red". Red is far left (y=0.25), blue is far right (y=-0.22).
+    # The search should autonomously find the detour (pick blue with right -> handover to left -> place on red)
+    set_pose(world, 'red_cube', [.44, .25, 1.031])
+    set_pose(world, 'blue_cube', [.50, -.22, 1.031])
+    program = TaskProgram(goals=[TaskGoal(type='relative_placement', object='blue_cube', target='red_cube', relation='on')])
+    plan = compile_goal_program(program, world)
+    actions = [(a['op'], a.get('object'), a.get('arm'), a.get('receiver'), a.get('target')) for a in plan.program['actions']]
+    # Either handover route or staging route
+    assert any(a[0] in {'handover', 'place'} for a in actions)
+    assert actions[-1] == ('place', 'blue_cube', 'left', None, 'red_cube')
+
+
+def test_handover_disabled_uses_table_staging_detour_to_stack_cube(world):
+    # When handover skill is disabled, the robot must autonomously detour via a table buffer (center):
+    # pick blue with right -> place blue at center -> pick blue with left -> place on red!
+    set_pose(world, 'red_cube', [.44, .25, 1.031])
+    set_pose(world, 'blue_cube', [.50, -.22, 1.031])
+    world['capabilities'] = {'skills': ['approach_object', 'grasp_object', 'lift_object',
+                                        'move_to_target', 'release_object', 'retreat',
+                                        'move_to_object', 'return_home', 'park_empty_arm']}
+    program = TaskProgram(goals=[TaskGoal(type='relative_placement', object='blue_cube', target='red_cube', relation='on')])
+    plan = compile_goal_program(program, world)
+    actions = [(a['op'], a.get('object'), a.get('arm'), a.get('target')) for a in plan.program['actions']]
+    assert ('place', 'blue_cube', 'right', 'center') in actions
+    assert ('pick', 'blue_cube', 'left', None) in actions
+    assert actions[-1] == ('place', 'blue_cube', 'left', 'red_cube')
+
+
+def test_explicit_keep_in_place_forbids_support_relocation(world):
+    # If the user explicitly demands keep_in_place for red_cube, red cannot be moved even if convenient.
+    set_pose(world, 'red_cube', [.44, .25, 1.031])
+    set_pose(world, 'blue_cube', [.50, -.22, 1.031])
+    program = TaskProgram(goals=[TaskGoal(type='relative_placement', object='blue_cube', target='red_cube', relation='on')],
+                          keep_in_place=['red_cube'])
+    plan = compile_goal_program(program, world)
+    # red_cube must never be picked
+    assert not any(a['op'] == 'pick' and a.get('object') == 'red_cube' for a in plan.program['actions'])
+
+
 def set_pose(world, name, position):
     obj = next(item for item in world['objects'] if item['id'] == name)
     obj.update(position=list(position), bounds=[[v-.023 for v in position], [v+.023 for v in position]])

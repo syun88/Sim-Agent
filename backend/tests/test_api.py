@@ -43,3 +43,25 @@ def test_factory_hands_the_gpu_setting_to_the_engine(monkeypatch):
     assert requested == [(True, "cubes")]
     simulation.create_backend("wine")
     assert requested[-1] == (True, "wine")
+
+
+def test_the_live_view_is_empty_until_the_owner_streams_a_frame():
+    from backend.app import main as api
+    api.app.state.view_frame = None
+    with TestClient(app) as client:
+        assert client.get('/api/view.jpg').status_code == 204
+
+
+def test_a_streamed_frame_is_served_as_an_image():
+    """The scene is rendered offscreen and posted by the owner: measured 0.19 s per frame on this host."""
+    from backend.app import main as api
+
+    api.app.state.view_frame = None
+    with TestClient(app) as client:
+        posted = client.post('/api/genesis/frame', content=b'\xff\xd8\xff\xd9',
+                             headers={'Content-Type': 'application/octet-stream'})
+        assert posted.status_code == 200 and posted.json()['bytes'] == 4
+        served = client.get('/api/view.jpg')
+        assert served.status_code == 200
+        assert served.headers['content-type'] == 'image/jpeg'
+        assert served.content == b'\xff\xd8\xff\xd9'

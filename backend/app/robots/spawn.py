@@ -276,9 +276,11 @@ class ReachableDeskSpawns:
         objects, omitted = {}, {}
         if randomize and base is not None and not base:
             raise SpawnSamplingError('The current scene has no reachable cubes to randomize')
-        assignments = [('red_cube', 'left'), ('blue_cube', 'right')]
+        from backend.app.planning import catalog as scene_catalog
+        preferred = scene_catalog.load().spawn_arms() or [('red_cube', 'left'), ('blue_cube', 'right')]
+        assignments = list(preferred)
         if randomize and shuffle_sides and rng.integers(2):
-            assignments=[('red_cube','right'),('blue_cube','left')]
+            assignments = [(name, 'right' if side == 'left' else 'left') for name, side in preferred]
         attempted={}
         measured_sampling=False
         for name, preferred_side in assignments:

@@ -1,0 +1,13 @@
+{
+  "id": "handover_then_place",
+  "description": "pick with one hand, pass it to the other, then place it in a zone",
+  "phrases": ["渡してから", "受け渡して", "hand it over then", "pass it to the other hand then"],
+  "slots": {"object": "object", "zone": "zone", "giver": "arm", "receiver": "arm"},
+  "requires": ["grasp", "handover", "place"],
+  "goal": {"type": "place_in_zone", "object": "{object}", "target": "{zone}"},
+  "actions": [
+    {"op": "pick", "object": "{object}", "arm": "{giver}"},
+    {"op": "handover", "object": "{object}", "arm": "{giver}", "receiver": "{receiver}"},
+    {"op": "place", "object": "{object}", "target": "{zone}"}
+  ]
+}

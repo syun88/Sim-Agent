@@ -77,7 +77,7 @@ def test_directional_next_to_is_a_valid_refinement_of_near():
 
 def test_a_held_reference_cannot_be_used_as_a_stationary_support():
     state = {**WORLD, 'robot': {'left_arm': {'held_object': 'red_cube'}}}
-    with pytest.raises(GroundingError, match='reference cube'):
+    with pytest.raises(GroundingError, match='REFERENCE_SUPPORT_HELD'):
         compile_program(TaskProgram(actions=[TaskAction(op='place', object='blue_cube', target='red_cube', relation='on')]), state)
 
 

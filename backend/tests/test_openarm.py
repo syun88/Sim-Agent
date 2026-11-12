@@ -225,3 +225,28 @@ def test_a_zone_position_survives_an_empty_spawn_layout():
     one_arm = SimpleNamespace(_object_start={"_cube": {"arm": "left", "position": [.1, 0., .8]}},
                               table_height=.76)
     assert np.isfinite(GenericURDFEnvironment._default_zone_position(one_arm, "right_side")).all()
+
+
+
+
+def test_the_cell_plans_a_pose_with_its_own_solver(env, controller):
+    """The capability the throw's wind-up and launch stroke ask for, answered by the cell itself.
+
+    Measured 2026-10-28: with the throw reading ``env.profile``, this robot's throw ended in an
+    AttributeError, so the capability has to exist here. Two things are pinned: that the cell's answer
+    and the controller's own solve cannot disagree (they are the same policy, in one place), and that an
+    unreachable pose comes back refused with its distance rather than as an exception.
+    """
+    site, rotation = env.ee_pose("left")
+    target = np.asarray(site, float) + np.array([0.0, 0.0, .01])
+    planned = env.plan_arm_pose("left", target, rotation)
+    assert planned["success"], planned
+    solution, _, _ = controller.solve_ik("left", target, rotation)
+    assert solution is not None
+    assert np.allclose(np.asarray(planned["q_rad"], float), solution, atol=1e-9), (
+        "the cell's plan and the controller's solve are the same policy")
+
+    far = np.asarray(site, float) + np.array([3.0, 0.0, 0.0])
+    refused = env.plan_arm_pose("left", far, rotation)
+    assert refused["success"] is False
+    assert refused["unreachable_by_m"] > .1, refused

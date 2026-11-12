@@ -6,7 +6,9 @@ from typing import Callable
 
 import numpy as np
 
+from backend.app.control import reflex
 from backend.app.simulation.base import SimulationBackend
+from backend.app.simulation.openarm_v2.pose_planning import ik_seeds, plan_pose, solve_from_seed
 from backend.app.simulation.openarm_v2.definition import (
     GRASP_ROTATION,
     GRIPPER_CLOSED,
@@ -63,6 +65,8 @@ class MotionResult:
     nominal_duration: float | None = None
     trajectory_duration: float | None = None
     settling_duration: float | None = None
+    #: What the deviation reflex observed on this leg (whether or not it acted).
+    reflex: dict | None = None
 
 
 class OpenArmV2Controller:
@@ -74,8 +78,14 @@ class OpenArmV2Controller:
     """
 
     def __init__(self, env: SimulationBackend, *, motion_speed: float | None = None, configure_motors: bool = True):
+        #: What the deviation reflex observed on every leg of the current skill, drained into the skill's
+        #: evidence. Without this a leg that stayed under threshold leaves nothing behind, and the reflex's
+        #: numbers can never be tuned from data - only its failures would be visible.
+        self.reflex_log: list[dict] = []
         self.env = env
-        self.motion_speed = float(os.getenv("OPENARM_MOTION_SPEED", "6")) if motion_speed is None else float(motion_speed)
+        # 1x is real time: the motors move at the speed the model says they can. The old default of 6x made
+        # the arm look like it teleported (measured 2026-11-10, reported from watching the cell).
+        self.motion_speed = float(os.getenv("OPENARM_MOTION_SPEED", "1")) if motion_speed is None else float(motion_speed)
         if not np.isfinite(self.motion_speed) or self.motion_speed <= 0:
             raise ValueError("OPENARM_MOTION_SPEED must be a finite positive number")
         if configure_motors:
@@ -98,68 +108,13 @@ class OpenArmV2Controller:
         self.cancelled = True
 
     def _solve_from_seed(self, kinematics, limits, target_position, target_rotation, seed, max_iterations):
-        """One damped least-squares solve from one seed, with joint-limit avoidance."""
-        rotation_tolerance_ok = getattr(self.env, "ik_rotation_tolerance", .015)
-        position_tolerance_ok = getattr(self.env, "ik_position_tolerance", .002)
-        q = np.clip(np.asarray(seed, float), limits[:, 0], limits[:, 1])
-        best_q, best_error = q.copy(), np.inf
-        for _ in range(max_iterations):
-            position, rotation, linear_jacobian, angular_jacobian = kinematics.evaluate(q)
-            perr = np.asarray(target_position, float) - position
-            oerr = np.zeros(3) if target_rotation is None else orientation_error(rotation, target_rotation)
-            error = float(np.linalg.norm(perr) + np.linalg.norm(oerr) * 0.2)
-            if error < best_error:
-                best_error = error
-                best_q = q.copy()
-            if np.linalg.norm(perr) < position_tolerance_ok and np.linalg.norm(oerr) < rotation_tolerance_ok:
-                break
-            J = np.vstack([linear_jacobian, angular_jacobian])
-            # Weighted task vector matching the official openarm_control cost ratio
-            # (position_cost=12.0, orientation_cost=1.5 → weight 1.5/12.0 = 0.125).
-            task = np.concatenate([perr, oerr * 0.125])
-            # Damping tuned between the official lm_damping (0.01) and the previous
-            # value (0.0007): large enough to avoid oscillation near singularities,
-            # small enough to converge to < 1e-3.
-            damping = 0.002
-            dq = J.T @ np.linalg.solve(J @ J.T + damping * np.eye(6), task)
-            step = np.linalg.norm(dq)
-            if step > 0.12:
-                dq *= 0.12 / step
-            # Joint limit avoidance: pull away from limits when close (official joint_limit_gain=0.95).
-            for j in range(len(q)):
-                margin = limits[j, 1] - limits[j, 0]
-                lower_dist = q[j] - limits[j, 0]
-                upper_dist = limits[j, 1] - q[j]
-                braking_distance = min(0.2, margin)
-                if lower_dist < braking_distance and dq[j] < 0.0:
-                    scale = max(0.0, (lower_dist / braking_distance) ** 2)
-                    dq[j] *= scale
-                elif upper_dist < braking_distance and dq[j] > 0.0:
-                    scale = max(0.0, (upper_dist / braking_distance) ** 2)
-                    dq[j] *= scale
-            q = np.clip(q + dq, limits[:, 0], limits[:, 1])
-        best_position, best_rotation, _, _ = kinematics.evaluate(best_q)
-        return {"q": best_q, "error": float(best_error),
-                "position_error": float(np.linalg.norm(np.asarray(target_position, float) - best_position)),
-                "attitude_error": (0. if target_rotation is None else
-                                   float(np.linalg.norm(orientation_error(best_rotation, target_rotation))))}
+        """One damped least-squares solve from one seed: the cell's own solve, in ``pose_planning``."""
+        return solve_from_seed(self.env, kinematics, limits, target_position, target_rotation, seed,
+                               max_iterations)
 
     def _ik_seeds(self, side, limits, count=12):
-        """Deterministic alternative seeds for an arm that has fewer joints than the task needs.
-
-        A damped local solve stalls wherever its Jacobian is flat for the requested task - measured
-        2026-10-25 on the four-joint OpenManipulator-X, where a 2 cm residual persisted for targets the
-        planner's IK solved exactly. The home posture alone does not cover the joint space, so the sweep
-        adds the middle of the range plus a fixed pseudo-random sample: fixed so a failure is
-        reproducible, sampled so the sweep does not depend on which posture the arm happens to be in.
-        """
-        seeds = [np.asarray(self.env.home_arm_qpos(side), float),
-                 (limits[:, 0] + limits[:, 1]) / 2.]
-        rng = np.random.default_rng(0)
-        for _ in range(count):
-            unit = rng.random(len(limits))
-            seeds.append(limits[:, 0] + unit * (limits[:, 1] - limits[:, 0]))
-        return seeds
+        """Deterministic alternative seeds for an arm with fewer joints than the task needs."""
+        return ik_seeds(self.env, side, limits, count)
 
     def solve_ik(
         self,
@@ -169,58 +124,20 @@ class OpenArmV2Controller:
         q_init: np.ndarray | None = None,
         max_iterations: int = 500,
     ) -> tuple[np.ndarray | None, float, float]:
-        limits = self.env.arm_limits(side)
-        # A robot with fewer than six joints cannot hold an arbitrary attitude, so its attitude is not
-        # asked for. Solving *with* one makes the least-squares task spend its freedom on a term it can
-        # never satisfy, and the iterate the mixed error keeps can be tens of millimetres off in
-        # position: measured 2026-10-25 on the four-joint OpenManipulator-X, every carry was refused
-        # with a 40-90 mm residual - including a carry to the very pose the arm was already holding -
-        # while the planner's IK, which asks for the position alone below six joints, solved the same
-        # poses with zero error. Six-joint arms still hold the attitude they are given.
-        under_actuated = len(limits) < 6
-        if under_actuated:
-            target_rotation = None
-        elif target_rotation is None:
-            target_rotation = self.env.ee_pose(side)[1]
-        kinematics = self.env.arm_kinematics(side)
-        position_tolerance = getattr(self.env, "ik_position_tolerance", .002)
+        """A joint solution that reaches the pose, or ``None`` and the best attempt's error.
 
-        def accepted(result):
-            # The mixed error still decides, except that an arm which cannot hold the attitude is not
-            # failed for it: its position is the task.
-            if result["error"] <= .02:
-                return True
-            return bool(under_actuated and result["position_error"] <= position_tolerance)
+        The policy (an under-actuated arm's attitude is not asked for, the home posture is retried, other
+        basins are searched) and every measurement behind it live in
+        ``simulation.openarm_v2.pose_planning.plan_pose``, which the builtin cell also plans through, so
+        a caller reaching the arm here and a skill planning a wind-up cannot disagree about what this arm
+        can reach. The two collaborators are this object's own methods because tests patch them.
+        """
+        planned = plan_pose(self.env, side, target_position, target_rotation, q_init=q_init,
+                            max_iterations=max_iterations, solve=self._solve_from_seed,
+                            seeds=lambda limits: self._ik_seeds(side, limits))
+        solution = np.asarray(planned['q'], float) if planned['success'] else None
+        return solution, planned['mixed_error'], planned['mixed_error']
 
-        attempts = []
-        seed = self.env.arm_qpos(side) if q_init is None else q_init
-        first = self._solve_from_seed(kinematics, limits, target_position, target_rotation, seed, max_iterations)
-        if accepted(first):
-            return first["q"], first["error"], first["error"]
-        attempts.append(first)
-        if q_init is None:
-            # A successful handover leaves a very different redundant-arm posture.
-            # Retry the official spawn posture before calling a reachable goal impossible.
-            home = self._solve_from_seed(kinematics, limits, target_position, target_rotation,
-                                         self.env.home_arm_qpos(side), max_iterations)
-            if accepted(home):
-                return home["q"], home["error"], home["error"]
-            attempts.append(home)
-            if not under_actuated:
-                return None, home["error"], home["error"]
-        elif not under_actuated:
-            return None, first["error"], first["error"]
-        # Fewer joints than the task asks for: a local solve is one basin among many, so search the
-        # others. This is the one owner for every skill - approach, lift, move, carry and the throw all
-        # reach the arm through this method.
-        for alternative in self._ik_seeds(side, limits):
-            attempt = self._solve_from_seed(kinematics, limits, target_position, target_rotation,
-                                            alternative, max_iterations)
-            if accepted(attempt):
-                return attempt["q"], attempt["error"], attempt["error"]
-            attempts.append(attempt)
-        best = min(attempts, key=lambda attempt: attempt["position_error"])
-        return None, best["error"], best["error"]
 
     def execute_joint_path(
         self,
@@ -270,6 +187,8 @@ class OpenArmV2Controller:
         via_rotations: list[np.ndarray] | None = None,
         on_sample: Callable[[], None] | None = None,
         planned_joints: list[np.ndarray] | None = None,
+        trajectory_speed: float | None = None,
+        phase: str = 'move_to_site',
     ) -> MotionResult:
         if rotation is None:
             # The official cell's grasp frame. An imported robot's own attitude is passed in explicitly by
@@ -277,6 +196,17 @@ class OpenArmV2Controller:
             # here: measured 2026-10-25, changing this default broke the official handover, whose right
             # arm is mirrored and depends on exactly this constant.
             rotation = GRASP_ROTATION.copy()
+        # The trajectory's speed and the servo's response are different questions. Coupling them was
+        # measured to be the wrong knob: capping the response deepens the penetration the approach allows
+        # (1.54 mm to 3.76 mm), while driving the same route at half speed with the response left as
+        # configured cleared both measured layouts with 10.18 and 15.01 mm of room (2026-10-28).
+        # `trajectory_speed` therefore replaces only the duration's divisor.
+        call_speed = self.motion_speed if scale_speed else 1.
+        if trajectory_speed is not None:
+            speed = float(trajectory_speed)
+            if not np.isfinite(speed) or speed <= 0:
+                raise ValueError('trajectory_speed must be a positive number')
+            call_speed = speed
         self.env.configure_motion_response(self.motion_speed if scale_speed else 1.)
         joint_waypoints = [self.env.arm_qpos(side)]
         q, pos_err = None, float("inf")
@@ -315,6 +245,7 @@ class OpenArmV2Controller:
             if joint_waypoints is None:
                 return MotionResult(False, "COLLISION_PATH", position.tolist(), pos_err)
         curved_path = bool(via) or len(joint_waypoints)>2
+        watcher = None
         self.target_rotations[side] = rotation.copy()
         start = self.env.arm_qpos(side)
         nominal_duration = duration
@@ -335,7 +266,7 @@ class OpenArmV2Controller:
                 else:
                     nominal_duration = sum(.56 + max(14, int(np.linalg.norm(b - a) / .005)) * self.timestep
                                            for a, b in zip(joint_waypoints, joint_waypoints[1:]))
-            trajectory_duration = nominal_duration / (self.motion_speed if scale_speed else 1.)
+            trajectory_duration = nominal_duration / call_speed
             curve = derivative = None
             if curved_path:
                 curve = joint_spline(joint_waypoints,velocity_limits)
@@ -356,13 +287,44 @@ class OpenArmV2Controller:
                 # The locally timed profile enforces motor limits too. Retain
                 # the caller's nominal pacing; remove the global worst-corner
                 # bound which would slow every other part of the motion.
-                trajectory_duration=max(nominal_duration/(self.motion_speed if scale_speed else 1.),timing.duration)
+                trajectory_duration=max(nominal_duration/call_speed,timing.duration)
             result = MotionResult(True)
             steps = max(2, int(np.ceil(trajectory_duration / self.timestep)))
             trajectory_duration = steps * self.timestep
             command_steps = max(1, int(round(MOTOR_COMMAND_PERIOD / self.timestep))) if scale_speed else 1
             indices = range(0, steps, command_steps) if scale_speed else range(1, steps + 1)
             completed = False
+            # Watch the leg while it happens. This is the one place every motion goes through, so a new skill
+            # inherits the reflex instead of writing its own tolerance (see control/reflex.py).
+            watch_every = max(1, round(reflex.CHECK_PERIOD_S / self.timestep))
+            # Count the samples the leg will actually produce, not the loop's iterations: the start of the leg is
+            # skipped and only every `watch_every`-th index is observed, so `len(indices)` overestimates and made
+            # the reflex demand three samples from a leg that can yield two (measured 2026-11-10, second time).
+            will_watch = sum(1 for index in indices
+                             if index / max(steps, 1) >= reflex.START_FRACTION and index % watch_every == 0)
+            watcher = (reflex.DeviationReflex(side, phase, expected_samples=will_watch)
+                       if reflex.enabled() else None)
+            if watcher is not None:
+                # The path, sampled once: the reflex asks "is the arm on it" rather than "is it on time". The
+                # sampling is dense enough that the samples themselves are not the accuracy limit - a fixed 24
+                # points put 8.7 mm of granularity into a one-metre leg, which is the size of the deviation the
+                # reflex is looking for (measured 2026-11-10).
+                try:
+                    kin = self.env.arm_kinematics(side)
+                    def point_at(alpha):
+                        joints = curve(alpha) if curve is not None else start + (q - start) * alpha
+                        return np.asarray(kin.evaluate(np.asarray(joints, float))[0], float)
+                    endpoints = [point_at(alpha) for alpha in np.linspace(0., 1., 9)]
+                    length = sum(float(np.linalg.norm(b - a)) for a, b in zip(endpoints, endpoints[1:]))
+                    count = int(min(reflex.MAX_PATH_SAMPLES,
+                                    max(reflex.MIN_PATH_SAMPLES, np.ceil(length / reflex.PATH_SPACING_M))))
+                    alphas = np.linspace(0., 1., count)
+                    watcher.path_points = [point_at(alpha) for alpha in alphas]
+                    if len(watcher.path_points) > 1:
+                        watcher.granularity_m = max(float(np.linalg.norm(b - a)) for a, b
+                                                    in zip(watcher.path_points, watcher.path_points[1:]))
+                except Exception:
+                    watcher = None
             try:
                 for index in indices:
                     if self.stop_requested():
@@ -380,6 +342,17 @@ class OpenArmV2Controller:
                     self.env.step(min(command_steps, steps - index) if scale_speed else 1)
                     if on_sample is not None and index % max(command_steps, round(.02 / self.timestep)) == 0:
                         on_sample()
+                    if watcher is not None and index % watch_every == 0:
+                        departure = watcher.observe(watcher.path_points, self.env.arm_qpos(side), fraction,
+                                                    self.env.arm_kinematics(side))
+                        if departure is not None:
+                            self.env.set_arm(side, self.env.arm_qpos(side))
+                            # Record it before returning: a stopped leg is exactly the leg whose numbers matter,
+                            # and returning early left the failing skills with empty evidence (measured
+                            # 2026-11-10: a MOTION_DEVIATION stop arrived with no phase or deviation attached).
+                            self.reflex_log.append(departure)
+                            return MotionResult(False, 'MOTION_DEVIATION', position.tolist(),
+                                                departure['deviation_m'], reflex=departure)
                 completed = True
             finally:
                 # A stop/error must also clear the velocity reference; otherwise
@@ -389,6 +362,9 @@ class OpenArmV2Controller:
             return result
         actual, actual_rotation = self.env.ee_pose(side)
         residual = float(np.linalg.norm(actual - position))
+        if watcher is not None:
+            result.reflex = watcher.evidence()
+            self.reflex_log.append(result.reflex)
         rotation_residual = float(np.linalg.norm(orientation_error(actual_rotation, rotation)))
         # Read a settled endpoint. The official wrist's damping can leave a short
         # orientation transient after a large handover rotation or lateral carry.
@@ -425,6 +401,10 @@ class OpenArmV2Controller:
             if require_stable and stable_steps * self.timestep >= .03:
                 break
         # Solving IK is not evidence that the motors reached it: a collision can block them.
+        # Whichever way it ended, this is a measurement of how far this body lands from its command.
+        from backend.app.skills import motion_accuracy
+        motion_accuracy.record(side, float(np.linalg.norm(actual - position)),
+                               source='move_to_site' if result.success else 'move_blocked')
         return MotionResult(residual <= position_tolerance and rotation_residual <= rotation_tolerance,
                             None if residual <= position_tolerance and rotation_residual <= rotation_tolerance else "MOTION_BLOCKED",
                             actual.tolist(), residual, rotation_residual,

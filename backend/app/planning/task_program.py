@@ -5,6 +5,8 @@ the same transitions against Genesis contacts; a compiler's belief is not physic
 """
 from __future__ import annotations
 
+from copy import deepcopy
+import re
 from typing import Literal
 
 from pydantic import field_validator, BaseModel, ConfigDict, Field, model_validator
@@ -190,8 +192,9 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
     if program.goals:
         from backend.app.planning.goal_search import compile_goal_program
         return compile_goal_program(program, state)
-    objects = {item["id"]: item for item in state["objects"]}
+    objects = {item["id"]: deepcopy(item) for item in state["objects"]}
     targets = {item["id"] for item in state["targets"]} | set(TABLE_TARGETS)
+    table_positions = {**TABLE_TARGETS, **{t["id"]: t["position"] for t in state.get("targets", []) if "position" in t}}
     held = observed_holds(state)
     discourse = state.get("discourse", {})
     last_object: str | None = discourse.get("last_object")
@@ -223,13 +226,14 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
 
     def auto_arm(obj: str) -> str:
         grippers = state.get("robot", {}).get("grippers")
-        admitted=objects[obj].get('admitted_grasp_arm')
-        if admitted in available_arms and (grippers is None or admitted in grippers):return admitted
+        position = objects[obj].get("position")
+        admitted = objects[obj].get('admitted_grasp_arm')
+        if admitted in available_arms and (grippers is None or admitted in grippers) and not objects[obj].get('_projected_moved'):
+            return admitted
         if grippers and len(grippers) == 1:
             return next(iter(grippers))
         if len(available_arms) == 1:
             return available_arms[0]
-        position = objects[obj].get("position")
         return ("left" if position[1] >= 0 else "right") if position else ("right" if obj == "blue_cube" else "left")
 
     def acquire(obj: str, arm: str, index: int, for_handover: bool = False):
@@ -251,9 +255,16 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             emit("handover_object", source, index, object=obj, receiver=arm)
             held[source] = None
         else:
-            handover_next = for_handover or program.actions[index].op == "handover" or any((a.op == "handover" and a.object in {obj, "it", "それ", None}) or (a.op == "pick" and a.arm and a.arm != arm and a.object in {obj, "it", "それ"}) for a in program.actions[index + 1:])
+            picker = arm
+            is_pick_or_handover = program.actions[index].op in {"pick", "handover"}
+            if is_pick_or_handover and auto_arm(obj) != arm and len(available_arms) == 2 and auto_arm(obj) in available_arms:
+                picker = auto_arm(obj)
+            handover_next = for_handover or (picker != arm) or program.actions[index].op == "handover" or any((a.op == "handover" and a.object in {obj, "it", "それ", None}) or (a.op == "pick" and a.arm and a.arm != arm and a.object in {obj, "it", "それ"}) for a in program.actions[index + 1:])
             for skill in (("approach_object", "grasp_object") if obj == "wine_bottle" else ("approach_object", "grasp_object", "lift_object")):
-                emit(skill, arm, index, object=obj, grasp_offset_x=-.015 if skill == "approach_object" and handover_next else 0.)
+                emit(skill, picker, index, object=obj, grasp_offset_x=-.015 if skill == "approach_object" and handover_next else 0.)
+            if picker != arm:
+                emit("handover_object", picker, index, object=obj, receiver=arm)
+                assumptions.append(f"Action {index + 1}: acquire with reachable {picker} arm, then transfer to requested {arm} arm")
         held[arm] = obj
 
     for index, original in enumerate(program.actions):
@@ -285,7 +296,13 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             raise GroundingError(f"Unknown object: {obj}")
         arm = action.arm or ((owner(obj) or auto_arm(obj)) if obj else last_arm)
         if action.op == "place" and action.relation and action.arm is None and action.target in objects:
-            arm = auto_arm(action.target)
+            holder = owner(action.target)
+            if holder:
+                arm = 'right' if holder == 'left' else 'left'
+            else:
+                target_arm = auto_arm(action.target)
+                carrier_arm = owner(obj) or auto_arm(obj) if obj else None
+                arm = carrier_arm if (carrier_arm and carrier_arm == target_arm) else target_arm
         if action.op != "approach":
             checks.pop(f"approach:{arm}", None)
         action.object, action.arm = obj, arm
@@ -306,6 +323,10 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             if obj == "wine_bottle":
                 raise GroundingError("Bottle handover is not supported; pour with the current holder")
             receiver = action.receiver
+            if receiver is None and len(available_arms) == 2 and arm in available_arms:
+                receiver = next(side for side in available_arms if side != arm)
+                action.receiver = receiver
+                assumptions.append(f"Action {index + 1}: recipient hand unspecified; use the {receiver} robot hand opposite the {arm} holder")
             if receiver not in SIDES or receiver == arm:
                 raise GroundingError(f"Action {index + 1}: handover needs two different hands")
             acquire(obj, arm, index)
@@ -360,8 +381,20 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
                     raise GroundingError("Relative placement needs a different known reference object")
                 if objects[obj].get("type", "cube") != "cube" or objects[target].get("type", "cube") != "cube":
                     raise GroundingError("Relative placement currently requires two cubes")
-                if owner(target):
-                    raise GroundingError("Place the reference cube on the table before placing another cube relative to it")
+                holder = owner(target)
+                if holder:
+                    if holder == arm:
+                        raise GroundingError(f"Action {index + 1}: {arm} hand cannot place onto an object it is already holding")
+                    inst = state.get('instruction', '')
+                    maintains_hold = bool(re.search(
+                        r'持ったまま|維持したまま|持っている状態|掴んだまま|つかんだまま|握ったまま|保持したまま|'
+                        r'掴んでいる状態|つかんでいる状態|握っている状態|保持している状態|while\s+holding|keep\s+holding',
+                        inst))
+                    if not maintains_hold:
+                        raise GroundingError("REFERENCE_SUPPORT_HELD: ground the reference before relative placement",
+                            preparation={'kind':'ground_held_reference', 'arm':holder, 'object':target,
+                                         'action_index':index, 'resolved_action':action.model_dump()})
+                    assumptions.append(f"Action {index + 1}: place directly onto {target} while {holder} arm maintains its in-hand hold")
             elif target not in targets:
                 raise GroundingError(f"Unknown placement target: {target}")
             if action.relation and owner(obj) is None and auto_arm(obj) != arm:
@@ -374,10 +407,24 @@ def compile_program(program: TaskProgram, state: dict) -> AgentPlan:
             for skill, args in (movement, ("release_object", {"object": obj}), ("retreat", {})):
                 emit(skill, arm, index, **args)
             held[arm] = None
+            # If a subsequent action uses a different arm, park the newly empty arm
+            # to clear the shared workspace and prevent arm-to-arm self-collision.
+            next_action = program.actions[index + 1] if index + 1 < len(program.actions) else None
+            next_arm = (next_action.arm or (auto_arm(next_action.object) if next_action.object else None)) if next_action else None
+            if next_arm and next_arm != arm and held[arm] is None:
+                emit("park_empty_arm", arm, index)
             checks[obj] = {"type": "relative_placement" if action.relation else "placement", "object": obj, "target": target}
             if action.relation:
                 checks[obj].update(relation=action.relation, distance_cm=action.distance_cm, arm=arm)
             action.target = target
+            if action.relation:
+                ref_pos = objects[target].get("position")
+                if ref_pos:
+                    objects[obj]["position"] = [ref_pos[0], ref_pos[1], ref_pos[2] + 0.05]
+                    objects[obj]["_projected_moved"] = True
+            elif target in table_positions:
+                objects[obj]["position"] = list(table_positions[target])
+                objects[obj]["_projected_moved"] = True
         elif action.op == "approach":
             if held[arm]:
                 raise GroundingError(f"{arm} hand must be empty before approach")

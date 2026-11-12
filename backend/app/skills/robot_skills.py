@@ -23,11 +23,14 @@ from __future__ import annotations
 import time
 from typing import Callable
 
+import os
+
 import numpy as np
 
-from backend.app.control.motion import OpenArmV2Controller
+from backend.app.control.motion import OpenArmV2Controller, orientation_error
 from backend.app.control.navigation import BasePose, WaypointController, clearance_to_aabbs
 from backend.app.simulation.base import SimulationBackend
+from backend.app.planning.capability_queries import attitude as attitude_for_yaw
 from backend.app.simulation.openarm_v2.definition import (
     FINGERTIP_MIDPOINT,
     GRASP_ROTATION,
@@ -48,6 +51,12 @@ VERIFICATION_LIFT = 0.03
 VERIFICATION_FOLLOW_RATIO = 0.6
 #: How far the gripper pulls back along the approach axis before the straight slide-in (m).
 APPROACH_STANDOFF = 0.06
+#: Half the width of one finger pad. A grasp offset may move the fingertip midpoint by the object's half face
+#: less this much, otherwise a pad is inside the object it is about to close on.
+GRASP_PAD_HALF_WIDTH_M = 0.005
+#: Where the receiving hand waits before the insertion, tried from comfortable to close. The first distance the
+#: receiver can actually solve is used, and the choice is recorded.
+RECEIVER_STANDOFF_CANDIDATES_M = (0.12, 0.09, 0.07, 0.05)
 #: Height of the swing waypoint above the approach-axis start (m), keeping the open fingers
 #: clear of the object during the swing from the staging altitude.
 APPROACH_OVERFLY = 0.10
@@ -60,9 +69,55 @@ APPROACH_OVERFLY = 0.10
 STAGING_ALTITUDE = 1.24
 #: A rise shorter than this is not worth a waypoint.
 MIN_STAGING_RISE = 0.02
+#: How far an in-hand support's pinch is slid down before another cube is stacked on it (m).
+#: A centred pinch leaves pad material 7.15 mm above the support's top face (measured 2026-11-07),
+#: so the stacked cube cannot reach it; 15 mm clears the pads while keeping the object between them.
+SUPPORT_REGRASP_DROP_M = 0.015
+#: Relief steps (fraction of the travel to full open) tried during a regrasp, smallest first. The
+#: largest step that still pinches is kept, because how much relief an object takes is not a constant.
+SUPPORT_REGRASP_RELIEF_STEPS = (0.05, 0.10, 0.15, 0.20, 0.25)
+#: A held support whose own fingers stand more than this above its top face cannot receive a cube.
+#: Measured live 2026-11-07: 40.5 mm, and no regrasp depth changed it.
+SUPPORT_FACE_BLOCKED_M = 0.004
+#: Whether to try lowering the pinch before refusing. The live measurement says the pad bodies stay
+#: ~40 mm above the face whatever the grip depth, so this is off by default and the refusal is immediate.
+SUPPORT_REGRASP_ENABLED = False
+
+
+def clearances_blocks(clearance_m: float) -> bool:
+    """Whether a measured clearance means the support's top face is occupied by its own grip."""
+    return clearance_m < -SUPPORT_FACE_BLOCKED_M
+
+
+#: A regrasp must not walk the object sideways; this is the tolerated lateral shift (m).
+SUPPORT_REGRASP_SHIFT_TOLERANCE = 0.010
+#: How fast the approach transit is driven, as a fraction of the nominal trajectory speed. The trajectory's
+#: speed and the servo's response are separate levers and only this one helps: at the default speed 6 a pad
+#: entered the cube by 0.74-1.54 mm during the transit on the two measured layouts, while the same route at
+#: 0.5 with the servo response unchanged cleared both with 10.18 and 15.01 mm of room (measured 2026-10-28).
+#: Softening the servo instead deepens the penetration, because a softer servo lags further behind.
+APPROACH_TRAJECTORY_SPEED = 0.5
+#: The final leg, which arrives on the object. Measured 2026-11-10: the impact that pushed a cube 8 mm happened
+#: in one sample at the end of that leg, so it is driven slower than the rest of the approach. A knob, because
+#: how slow is a measurement: OPENARM_PINCH_SPEED.
+APPROACH_PINCH_TRAJECTORY_SPEED = float(os.environ.get('OPENARM_PINCH_SPEED', '0.25'))
+#: A parked arm must land on the planned waypoint: the same tolerance the route was admitted with.
+#: How close a placement point has to be for the arm to be considered able to hold it: the same acceptance
+#: the capability queries use, so "reachable" means one thing in this codebase.
+PLACEMENT_REACH_TOLERANCE_M = 0.012
+#: A destination whose configuration sits this close to a joint limit is not commanded. Measured 2026-11-09:
+#: carries that stopped 27 mm short were at the edge of the workspace, where IK solves but the servo cannot
+#: hold the pose. 0.05 rad is about 3 degrees.
+JOINT_LIMIT_MARGIN_RAD = 0.05
+PARK_ARRIVAL_TOLERANCE_M = 0.005
+PARK_ARRIVAL_TOLERANCE_RAD = 0.04
 #: The approach may not displace the object by more than this (m); the object is only pinched
 #: after this check, so a shove here would fake nothing anyway, but the plan still fails loudly.
 APPROACH_DISTURBANCE_TOLERANCE = 0.005
+#: How far the object may slide *along the approach axis* while an offset grasp engages its face. Measured
+#: 2026-11-10: the pad slides 8.06 mm axially when the grasp point is 15 mm off centre, and the grasp still
+#: forms from the observed pose afterwards, so refusing it at 5 mm was refusing a grasp that works.
+APPROACH_SLIDE_TOLERANCE = 0.020
 #: World-frame deltas for human "right/left/forward/back" commands. Positive world y is the left
 #: side of the official Cell spawn pose; positive world x is toward the table/front.
 DIRECTION_VECTORS = {
@@ -81,6 +136,23 @@ class SkillRunner:
         self.controller = controller
 
     # -- grasp geometry ----------------------------------------------------------
+
+    def _bounded_grasp_shift(self, obj: str, shift: np.ndarray) -> tuple[np.ndarray, dict]:
+        """Keep a requested grasp offset inside the object's face, minus the pad it has to sit between."""
+        try:
+            bounds = self.env.object_bounds(obj)
+            half = np.array([0.5 * float(bounds[1][0] - bounds[0][0]),
+                             0.5 * float(bounds[1][1] - bounds[0][1])], float)
+        except Exception as error:
+            return shift, {'unknown': f'{type(error).__name__}: {error}'}
+        # The pads are a few millimetres wide and must stay outside the face, so the midpoint may move by the
+        # face's half extent less one pad and a millimetre of margin.
+        allowed = np.maximum(0., half - GRASP_PAD_HALF_WIDTH_M - 0.001)
+        used = np.array([float(np.clip(shift[0], -allowed[0], allowed[0])),
+                         float(np.clip(shift[1], -allowed[1], allowed[1])),
+                         0.], float)
+        return used, {'requested': np.asarray(shift, float).tolist(), 'used': used.tolist(),
+                      'half_extent': half.tolist(), 'allowed': allowed.tolist()}
 
     def _pinch_site_target(
         self, arm: str, object_center: np.ndarray, world_x_offset: float | None = None
@@ -117,12 +189,62 @@ class SkillRunner:
             raise SkillError("GRASP_LOST", f"{arm} no longer has both finger contacts with {obj}")
 
     def _skill(self, name: str, run: Callable[[], dict], started: float) -> dict:
+        log = getattr(self.controller, 'reflex_log', None)
+        if log is not None:
+            log.clear()
         try:
             result = run()
-            return {"skill": name, "success": True, "duration": time.perf_counter() - started, **result}
+            return {"skill": name, "success": True, "duration": time.perf_counter() - started, **result,
+                    **({'evidence': {'reflex_log': list(log)}} if log else {})}
         except SkillError as exc:
+            evidence = dict(exc.evidence or {})
+            if log:
+                evidence.setdefault('reflex_log', list(log))
             return {"skill": name, "success": False, "duration": time.perf_counter() - started, "error": exc.category,
-                    "detail": str(exc), **({"evidence": exc.evidence} if exc.evidence else {})}
+                    "detail": str(exc), **({'evidence': evidence} if evidence else {})}
+
+    def _raise_support_face_blocked(self, arm: str, support: str, clearance: dict, regrasp) -> None:
+        """Refuse a placement the hand's own geometry cannot allow, naming the measured reason."""
+        measured = clearance.get('clearance_m')
+        reason = ("the hand's own geometry was not measurable" if measured is None
+                  else f"{arm} hand's fingers rise {-measured * 1000:.1f} mm above {support}'s top face")
+        error = SkillError('SUPPORT_FACE_BLOCKED',
+                           f"a cube cannot land on {support} while it is held: {reason}")
+        error.evidence = {'clearance': clearance, 'support_regrasp': regrasp,
+                          'reference_object': support, 'phase': 'support_face'}
+        raise error
+
+    def _support_face_clearance(self, arm: str, support: str) -> dict:
+        """Measured room above a held support's top face, from the model's own finger geometry."""
+        from backend.app.skills.pad_clearance import support_face_clearance
+        try:
+            bounds = self.env.object_bounds(support)
+            centre = self.env.object_pose(support)[0]
+            half = float(max(bounds[1][0] - bounds[0][0], bounds[1][1] - bounds[0][1])) / 2.
+            return support_face_clearance(self.env, arm, centre, half, float(bounds[1][2]))
+        except Exception as error:
+            return {'clearance_m': None, 'unknown': f'{type(error).__name__}: {error}'}
+
+    def _motion_evidence(self, result, **extra):
+        """The residuals a blocked motion was judged with, so its mechanism can be named from numbers.
+
+        `control/motion.py` decides success from these residuals against the environment's tolerances;
+        copying them (and the tolerances that applied) into `SkillError.evidence` is what lets
+        `verification/failure_attribution` separate servo lag from an unreachable or occupied attitude
+        instead of repeating the error code.
+        """
+        evidence = {'position_error': getattr(result, 'position_error', None),
+                    'rotation_error': getattr(result, 'rotation_error', None),
+                    'position_tolerance_m': getattr(self.env, 'motion_position_tolerance', .012),
+                    'rotation_tolerance_m': getattr(self.env, 'motion_rotation_tolerance', .15)}
+        # The deviation reflex's own summary: without it a record cannot show whether the leg was watched at
+        # all, and "the reflex did not fire" is then indistinguishable from "the reflex never ran" (measured
+        # 2026-11-10: the first version left no trace, so the new path had to be proven before its silence
+        # could mean anything).
+        watched = getattr(result, 'reflex', None)
+        if watched:
+            evidence['reflex'] = watched
+        return {**{k: v for k, v in evidence.items() if v is not None}, **extra}
 
     # -- skills ------------------------------------------------------------------
 
@@ -147,16 +269,40 @@ class SkillRunner:
         # missed pinch needs is along the jaws' closing axis, which is not world x. The scalar x form stays
         # for the plan language, which has always expressed the offset that way.
         shift = np.asarray(grasp_offset, float) if grasp_offset is not None else np.array([grasp_offset_x, 0., 0.])
+        # A grasp offset is a request about where to hold the object, and the object's own size bounds it: past
+        # half the face the fingertip midpoint leaves the object and one pad sits inside it. Measured
+        # 2026-11-10: the planner's fixed -15 mm offset for a handover-to-come pushed a cube 8.06 mm during the
+        # approach, identically on every retry, while the same approach with no offset (the zone tasks) did not.
+        forced_offset = os.environ.get('OPENARM_GRASP_OFFSET_MM', '').strip()
+        if forced_offset:
+            # The offset exists to leave room for a second hand. Whether it costs contact is a measurement, so
+            # it can be forced: measured 2026-11-10, the planner's -15 mm offset for a handover-to-come pushed a
+            # 52 mm cube 8.06 mm during the approach while the same approach at 0 mm did not.
+            try:
+                shift = np.array([float(forced_offset) / 1000., shift[1], 0.], float)
+            except ValueError:
+                pass
+        shift, shift_bounds = self._bounded_grasp_shift(obj, shift)
         pinch = self._pinch_site_target(arm, obj_pos + shift, fault_offset)
         finger_direction = GRASP_ROTATION @ np.array([0.0, 0.0, -1.0])
+        # Back the grasp target off along the approach axis. Measured 2026-11-10: the *pinch* leg was the one
+        # that pushed a cube (8.1 mm, and again 5.3 mm on retry, against a 5 mm tolerance), so the hand arrives
+        # deeper than planned. The depth is a measurement question, not a preference, so it is a knob.
+        backoff_mm = os.environ.get('OPENARM_PINCH_BACKOFF_MM', '').strip()
+        if backoff_mm:
+            try:
+                pinch = pinch - (float(backoff_mm) / 1000.) * finger_direction
+            except ValueError:
+                pass
         standoff = pinch - APPROACH_STANDOFF * finger_direction
         high = standoff + np.array([0.0, 0.0, APPROACH_OVERFLY])
         before = obj_pos.copy()
         # Reject an unreachable pinch before starting the approach. Faster
         # staging must not turn an invalid target into a later contact failure.
-        pinch_q, _, _ = self.controller.solve_ik(arm, pinch, GRASP_ROTATION)
-        if pinch_q is None:
-            raise SkillError("IK_FAILURE", "The requested fingertip pinch pose is unreachable")
+        if not obj.endswith('_cube'):
+            pinch_q, _, _ = self.controller.solve_ik(arm, pinch, GRASP_ROTATION)
+            if pinch_q is None:
+                raise SkillError("IK_FAILURE", "The requested fingertip pinch pose is unreachable")
         # 1) open the gripper
         self.controller.wait_gripper(arm, False, 0.35)
         # 2) rise to the staging altitude above the current pose, so the lateral swing that
@@ -176,38 +322,158 @@ class SkillRunner:
         if obj != "wine_bottle":
             waypoints += (("pregrasp_high", high), ("pregrasp", standoff), ("pinch", pinch))
         approach_evidence = {}
+        stationary = {name:self.env.object_pose(name)[0].copy() for name in self.env.frame().objects}
+        initial_joints = ({side:self.env.arm_qpos(side).tolist() for side in ('left','right')}
+                          if hasattr(self.env,'arm_qpos') else None)
+        # The approach axis, so a slide along the face can be told from a shove across it.
+        approach = {'axis': None}
+        try:
+            direction = GRASP_ROTATION @ np.array([0.0, 0.0, -1.0])
+            approach['axis'] = direction / max(np.linalg.norm(direction), 1e-9)
+        except Exception:
+            approach['axis'] = None
+        leg_progress = {'leg': 'start', 'displacements': {}, 'trace': [], 'calls': 0}
+        def guard_undisturbed(after_leg: bool = False):
+            leg_progress['calls'] += 1
+            label = leg_progress['leg'] + ('+settle' if after_leg else '')
+            for name,position in stationary.items():
+                displacement=float(np.linalg.norm(self.env.object_pose(name)[0]-position))
+                # Which leg did it, not just that it happened: the same 8.06 mm shove came back on retry with
+                # the plan's clearance widened, which meant the contact was not the transit path at all
+                # (measured 2026-11-10). A displacement with no leg attached cannot say that.
+                if displacement > leg_progress['displacements'].get(name, 0.):
+                    leg_progress['displacements'][name] = displacement
+                    leg_progress['worst_leg'] = label
+                # And *when*: the leg name alone could not separate a push during the transit from one during
+                # the arrival, because the same 8.06 mm came back with the grasp target moved 10 mm. The trace
+                # records every half millimetre of growth with the label and the call index it happened on.
+                if displacement - leg_progress['trace'][-1][2] > .0005 if leg_progress['trace'] else True:
+                    leg_progress['trace'].append((label, leg_progress['calls'], round(displacement, 4)))
+                # Not every displacement is a shove. An offset grasp makes one pad slide along the face it is
+                # about to close on, and the screen deliberately does not police the grasping hand's contacts
+                # with its own object (allowed_contacts), so that slide is expected physics rather than an
+                # accident. Measured 2026-11-10: the slide is axial (8.06 mm, mostly along the approach axis).
+                axis = approach['axis']
+                vector = self.env.object_pose(name)[0] - position
+                axial = float(abs(np.dot(vector, axis))) if axis is not None else 0.
+                lateral = (float(np.linalg.norm(vector - np.dot(vector, axis) * axis)) if axis is not None
+                           else displacement)
+                if lateral > APPROACH_DISTURBANCE_TOLERANCE or axial > APPROACH_SLIDE_TOLERANCE:
+                    error=SkillError('APPROACH_COLLISION',
+                        f'Approach displaced {name} by {displacement * 1000:.1f} mm; stopping the arm')
+                    error.evidence={**approach_evidence,'object':name,'displacement_m':displacement,
+                                    'axial_m':axial,'lateral_m':lateral,
+                                    'axial_tolerance_m':APPROACH_SLIDE_TOLERANCE,
+                                    'lateral_tolerance_m':APPROACH_DISTURBANCE_TOLERANCE,
+                                    'worst_leg':leg_progress.get('worst_leg'),
+                                    'displacement_trace':leg_progress['trace'][:40],
+                                    'displacements_by_object':dict(leg_progress['displacements']),
+                                    'initial_object_positions':{key:value.tolist() for key,value in stationary.items()},
+                                    'observed_object_positions':{key:self.env.object_pose(key)[0].tolist()
+                                                                 for key in stationary},
+                                    'initial_arm_joints':initial_joints,'phase':'approach_trajectory'}
+                    raise error
         if obj.endswith('_cube'):
-            from backend.app.skills.approach import plan_cube_approach
+            from backend.app.skills.approach import (cube_approach_frames, plan_cube_approach,
+                                                     two_axis_frames)
+            centre = obj_pos + shift
+            frames = cube_approach_frames(arm, centre, APPROACH_STANDOFF, world_x_offset=fault_offset)
             route,approach_evidence=plan_cube_approach(self.env,self.controller,arm,obj,pinch,standoff,
-                                                       APPROACH_OVERFLY,STAGING_ALTITUDE)
+                                                       APPROACH_OVERFLY,STAGING_ALTITUDE,frames=frames)
+            if approach_evidence.get('grasp_rotation'):
+                planned_rotation = np.asarray(approach_evidence['grasp_rotation'], float)
+                axis = planned_rotation @ np.array([0.0, 0.0, -1.0])
+                approach['axis'] = axis / max(np.linalg.norm(axis), 1e-9)
             if route is None:
-                error=SkillError('IK_FAILURE','No reachable collision-screened cube approach from the current scene')
+                # The calibrated attitude with quarter turns is the cheap search. Only when it finds no
+                # corridor does the leaning search run, which costs 20 candidates instead of 14 and would
+                # otherwise change the attitude the existing layouts are measured with.
+                leaning = two_axis_frames(arm, centre, APPROACH_STANDOFF, world_x_offset=fault_offset)
+                route, approach_evidence = plan_cube_approach(
+                    self.env, self.controller, arm, obj, pinch, standoff, APPROACH_OVERFLY,
+                    STAGING_ALTITUDE, frames=leaning)
+                approach_evidence = {**approach_evidence, 'search': 'two_axis'}
+            if route is None:
+                # Before giving up: is there a posture from which this object *is* approachable? Measured
+                # 2026-11-09: 4 of 8 approach failures came from searching only from where the arm happened to
+                # be. The fixed posture set makes the question independent of the current stance, and when one
+                # answers yes the arm can simply go there first.
+                staged = self._stage_for_approach(arm, obj, centre, frames, approach_evidence)
+                if staged is not None:
+                    route, approach_evidence = staged
+            if route is None:
+                # A shorter standoff is a different question about the same grasp: the pads stop further from
+                # whatever is beside the object. Only tried after the nominal distance has failed.
+                from backend.app.skills.approach import STANDOFF_VARIANTS_M, frame_at
+                for variant in STANDOFF_VARIANTS_M:
+                    near = frame_at(arm, centre, variant, frames[0]['yaw_deg'], world_x_offset=fault_offset)
+                    trial_route, trial_evidence = plan_cube_approach(
+                        self.env, self.controller, arm, obj, near['pinch'], near['standoff'],
+                        APPROACH_OVERFLY, STAGING_ALTITUDE, frames=[near])
+                    if trial_route is not None:
+                        route, approach_evidence = trial_route, {**trial_evidence, 'standoff_variant_m': variant}
+                        break
+            if route is None:
+                rejected=approach_evidence.get('rejected_routes',[])
+                category='COLLISION_PATH' if rejected and all(r['error']=='COLLISION_PATH' for r in rejected) else 'IK_FAILURE'
+                error=SkillError(category,'No reachable collision-screened cube approach in the bounded grasp-frame search')
                 error.evidence=approach_evidence
                 raise error
-            destinations=[('pinch',pinch)]
+            destinations=[('pinch',np.asarray(approach_evidence['pinch_target']))]
         else:
             destinations = waypoints if self.controller.motion_speed == 1. else [waypoints[-1]]
         for name, target in destinations:
             via = [point for _, point in waypoints[:-1]] if self.controller.motion_speed != 1. and not approach_evidence else None
-            result = self.controller.move_to_site(arm, target, progress=progress, via=via,
-                                                  planned_joints=route if approach_evidence else None)
+            leg_progress['leg'] = name
+            # The last leg is the one that arrives on the object, and it is where the measurement put the
+            # impact: displacement sat at 0 for 133 samples, then jumped 2.8 -> 8.0 mm in a single sample
+            # (2026-11-10). The servo response is what overshoots, and the lever known to work on this cell is
+            # the trajectory speed of that leg, so the final approach gets its own, slower one.
+            if name == 'pinch':
+                # Re-aim at where the object *is*: the slide above happens during this approach's own transit,
+                # so a pinch computed from the initial pose is already stale by the time it is executed.
+                observed = np.asarray(self.env.object_pose(obj)[0], float)
+                moved_to = float(np.linalg.norm(observed - (obj_pos + shift)))
+                pinch = self._pinch_site_target(arm, observed + shift, fault_offset)
+                if moved_to > .001:
+                    leg_progress.setdefault('reaimed', []).append({'object': obj, 'slide_m': moved_to})
+            final_speed = APPROACH_PINCH_TRAJECTORY_SPEED if name == 'pinch' else APPROACH_TRAJECTORY_SPEED
+            result = self.controller.move_to_site(arm, target,
+                                                  np.asarray(approach_evidence['grasp_rotation']) if approach_evidence else None,
+                                                  progress=progress, via=via,
+                                                  planned_joints=route if approach_evidence else None,
+                                                  scale_speed=not approach_evidence or approach_evidence['grasp_yaw_deg']==0,
+                                                  # The transit is where a trailing pad reaches the cube; drive it
+                                                  # slowly while the servo keeps the response it was configured with.
+                                                  trajectory_speed=final_speed if approach_evidence else None,
+                                                  phase='approach',
+                                                  on_sample=guard_undisturbed)
+            guard_undisturbed(after_leg=True)
             if not result.success:
-                raise SkillError(result.error or "IK_FAILURE", f"Unable to reach the {name} pose "
+                error=SkillError(result.error or "IK_FAILURE", f"Unable to reach the {name} pose "
                                  f"(position error={result.position_error}, rotation error={result.rotation_error})")
+                error.evidence={**(approach_evidence or {}), **self._motion_evidence(result, phase='approach')}
+                raise error
         after = self.env.object_pose(obj)[0]
         disturbance = float(np.linalg.norm(after - before))
         if disturbance > APPROACH_DISTURBANCE_TOLERANCE:
-            raise SkillError(
+            error = SkillError(
                 "APPROACH_COLLISION",
                 f"The approach displaced {obj} by {disturbance * 1000:.1f} mm",
             )
-        midpoint_error = float(np.linalg.norm(after - (self.env.ee_pose(arm)[0] + GRASP_ROTATION @ FINGERTIP_MIDPOINT[arm])))
+            # The mechanism is named from these numbers, not from the code (see verification/failure_attribution).
+            error.evidence = {'object': obj, 'displacement_m': disturbance,
+                              'tolerance_m': APPROACH_DISTURBANCE_TOLERANCE, 'phase': 'approach'}
+            raise error
+        ee, measured_rotation = self.env.ee_pose(arm)
+        midpoint_error = float(np.linalg.norm(after - (ee + measured_rotation @ FINGERTIP_MIDPOINT[arm])))
         return {
-            "target": pinch.tolist(),
+            "target": destinations[-1][1].tolist(),
             "final": result.final_position,
             "fingertip_midpoint_error": midpoint_error,
             "object_displacement": disturbance,
             "grasp_offset_x": grasp_offset_x, "grasp_offset": shift.tolist(),
+            "grasp_offset_bounds": shift_bounds,
             "planning":approach_evidence,
         }
 
@@ -233,6 +499,7 @@ class SkillRunner:
         # 5) verify the hold physically: a short lift must carry the object with the gripper
         ee_position = self.env.ee_pose(arm)[0]
         lift = self.controller.move_to_site(arm, ee_position + np.array([0.0, 0.0, VERIFICATION_LIFT]),
+                                            self.env.ee_pose(arm)[1],
                                             duration=.8 if obj == "wine_bottle" else None)
         if not lift.success:
             raise SkillError(lift.error or "IK_FAILURE", "The hold-verification lift failed")
@@ -399,34 +666,130 @@ class SkillRunner:
         for other, position in self.env.frame().objects.items():
             if other != obj and np.linalg.norm(np.asarray(position)[:2] - zone[:2]) < .075 and abs(position[2] - zone[2]) < .06:
                 raise SkillError("TARGET_OCCUPIED", f"{other} occupies {target}; refusing to stack cubes accidentally")
-        desired_object = zone.copy()
-        desired_object[2] = RELEASE_HEIGHT
+        requested = zone.copy()
+        requested[2] = RELEASE_HEIGHT
+        # The grasp is reoriented *before* the destination is probed. Measured 2026-11-09: probing first meant
+        # the search judged the aim in one grasp attitude while the carry commanded another (the alignment
+        # changes the grasp offset), so the search called a point reachable that the carry then missed by
+        # 27 mm without moving at all. One question, one attitude.
         self._align_for_placement(arm, obj)
+        # The zone centre is a request, not a target the arm is assumed to reach: the same region search the
+        # relational placements use decides where inside the zone this body can actually put the object.
+        # Measured 2026-11-09: zone placements were the dominant failure (10 of 12) because this path carried
+        # to the centre with no reachability search at all.
+        desired_object, search = self._search_destination(arm, obj, target, requested, 'in')
+        if search.get('chosen') == 'unreachable' and search.get('stage_posture'):
+            # The zone is out of reach from where the arm is; it is not out of reach from everywhere.
+            self._stage_to_posture(arm, search['stage_posture'])
+            desired_object, search = self._search_destination(arm, obj, target, requested, 'in')
+            search['recovered_by_staging'] = True
+        if search.get('chosen') == 'unreachable':
+            error = SkillError('DESTINATION_UNREACHABLE',
+                               f'No reachable point inside {target} for this arm')
+            error.evidence = {'destination_search': search, 'reference_object': target, 'relation': 'in'}
+            raise error
+        from backend.app.skills import placement_accuracy
+        requirement = placement_accuracy.required_accuracy(self.env, obj, target, 'in')
+        allow = requirement.get('required_m')
         travel = desired_object.copy()
         travel[2] = 1.14
         self._carry_to(arm, obj, travel)
-        return self._carry_to(arm, obj, desired_object)
+        placed = self._carry_to(arm, obj, desired_object, allow_error_m=allow,
+                                q_init=search.get('chosen_joints'))
+        return {**placed, 'destination_search': search, 'placement_requirement': requirement}
 
-    def _align_for_placement(self, arm: str, obj: str) -> None:
+    def _align_for_placement(self, arm: str, obj: str, rotation=None) -> None:
+        """Rotate the held object's grasp to the placement attitude while it is still clear.
+
+        The calibrated table attitude is the default. An in-hand support held by the other arm needs the
+        opposite attitude instead: both hands approach a cube along their fingers' closing axis, so two
+        grippers meeting the same cube from the same side collide. Mirroring the attitude (180 deg about
+        world z) sends the placing hand in from the side the holder's palm is not on, which is the same
+        opposed-approach rule the handover already uses.
+        """
+        target_rotation = GRASP_ROTATION if rotation is None else np.asarray(rotation, float)
         _, rotation = self.env.ee_pose(arm)
-        if np.linalg.norm(rotation - GRASP_ROTATION) > .1:
-            # The handover attitude fits the shared centre workspace. Return to the
-            # calibrated table attitude while the cube is still high and clear.
-            ee, rotation = self.env.ee_pose(arm)
+        if np.linalg.norm(rotation - target_rotation) <= .1:
+            return
+        # Return to the calibrated attitude while the cube is still high and clear.
+        ee, rotation = self.env.ee_pose(arm)
+        center = self.env.object_pose(obj)[0]
+        offset = rotation.T @ (center - ee)
+        from backend.app.skills.reorientation import arc_samples
+        # Two arcs end at the same attitude. Only the short one was tried, so a wrist limit anywhere along it
+        # refused the reorientation even when the *other* way round was clear (measured 2026-11-10: the live
+        # failure "Cannot reorient the physical grasp for placement" was the short arc's via points failing IK,
+        # with both endpoints reachable). The direct move is the third option: nothing is in the way while the
+        # cube is held high, and a via chain is only there to keep the arc smooth.
+        attempts = [('short_arc', 'short'), ('long_arc', 'long'), ('direct', 'direct')]
+        failures = []
+        for label, sweep in attempts:
+            _, rotation = self.env.ee_pose(arm)
             center = self.env.object_pose(obj)[0]
-            offset = rotation.T @ (center - ee)
-            from scipy.spatial.transform import Rotation, Slerp
-            arc = Slerp([0., 1.], Rotation.from_matrix(np.stack([rotation, GRASP_ROTATION])))
-            orientations = [arc(alpha).as_matrix() for alpha in np.linspace(0., 1., 9)[1:]]
+            offset = rotation.T @ (center - self.env.ee_pose(arm)[0])
+            orientations = arc_samples(rotation, target_rotation, sweep)
             positions = [center - attitude @ offset for attitude in orientations]
-            for index in range(len(positions)) if self.controller.motion_speed == 1. else [len(positions) - 1]:
+            indeces = (range(len(positions)) if self.controller.motion_speed == 1.
+                       else [len(positions) - 1])
+            for index in indeces:
+                chained = sweep in ('short', 'long') and self.controller.motion_speed != 1.
+                # Turn the object at the nominal trajectory speed. It is a free-space manoeuvre with nothing to
+                # be fast for, and the same rule that fixed the park leg applies: at speed 6 the arc leg drifted
+                # far enough for the reflex to stop it (measured 2026-11-10).
                 result = self.controller.move_to_site(arm, positions[index], orientations[index],
-                    via=positions[:-1] if self.controller.motion_speed != 1. else None,
-                    via_rotations=orientations[:-1] if self.controller.motion_speed != 1. else None,
+                    via=positions[:-1] if chained else None,
+                    via_rotations=orientations[:-1] if chained else None,
+                    trajectory_speed=1., phase='carry',
                     on_sample=lambda: self._require_hold(arm, obj))
                 if not result.success:
-                    raise SkillError(result.error or "IK_FAILURE", "Cannot reorient the physical grasp for table placement")
+                    failures.append({'attempt': label, 'error': result.error,
+                                     'position_error': result.position_error})
+                    break
                 self._require_hold(arm, obj)
+            else:
+                if failures:
+                    self.last_reorientation = {'attempt': label, 'failures': failures}
+                return
+        raise SkillError(failures[-1]['error'] or "IK_FAILURE",
+                         "Cannot reorient the physical grasp for placement")
+
+    def _stacking_attitude(self, arm: str, obj: str, holder_arm: str, support_center):
+        """A grasp attitude that reaches the top of a held support from a different side than its holder.
+
+        Two grippers cannot share one approach axis: the placing hand's fingers and the holding hand's
+        fingers would occupy the same corridor. Measured 2026-11-07, the placing arm reached the top pose
+        kinematically (3.2 mm, 0.8 deg) yet the live motion stopped with an 11.7 deg attitude residual
+        because the holding hand was in that corridor. Sweeping the grasp yaw and keeping the reachable
+        candidate whose end effector sits farthest from the holder picks the opposed side from the arms'
+        own geometry, rather than hard-coding an angle for this cell.
+        """
+        from scipy.spatial.transform import Rotation
+
+        try:
+            holder_ee, _ = self.env.ee_pose(holder_arm)
+        except Exception:
+            return None
+        solve = getattr(self.controller, 'solve_ik', None)
+        if not callable(solve):
+            return None
+        offset_z = 0.
+        try:
+            bounds = self.env.object_bounds(obj)
+            offset_z = float(bounds[1][2] - bounds[0][2])
+        except Exception:
+            pass
+        support_top = np.asarray(support_center, float) + np.array([0., 0., offset_z])
+        best, best_gap = None, -1.
+        for yaw in (0., 90., 180., 270.):
+            candidate = Rotation.from_euler('z', yaw, degrees=True).as_matrix() @ GRASP_ROTATION
+            site = support_top - candidate @ FINGERTIP_MIDPOINT[arm]
+            solved, error, _ = solve(arm, site, candidate)
+            if solved is None or error > .012:
+                continue
+            gap = float(np.linalg.norm(site - np.asarray(holder_ee, float)))
+            if gap > best_gap:
+                best, best_gap = candidate, gap
+        return best
 
     def move_to_object(self, arm, obj, target, relation, distance_cm=None):
         def run():
@@ -434,17 +797,223 @@ class SkillRunner:
             self._require_hold(arm, obj)
             if target == obj or target not in self.env.frame().objects:
                 raise SkillError("INVALID_TARGET", "Choose another observed cube as the reference")
-            if self.env.object_contacts(target) or self.env.object_linear_speed(target) > .02:
-                raise SkillError("REFERENCE_MOVING", "The placement reference must be resting on the table")
-            self._align_for_placement(arm, obj)
-            desired = relative_destination(self.env, obj, target, relation, arm, distance_cm)
+            other_arm = "right" if arm == "left" else "left"
+            regrasp = None
+            strategy = None
+            planner_yaw = None
+            prepared_attitude = None
+            is_held_stationary = (self._pinch_established(target, other_arm)
+                                  and self.env.object_linear_speed(target) < .02)
+            if not is_held_stationary:
+                if self.env.object_contacts(target) or self.env.object_linear_speed(target) > .02:
+                    raise SkillError("REFERENCE_MOVING", "The placement reference must be resting stationary on the table or held stationary by the other arm")
+                self._align_for_placement(arm, obj)
+            else:
+                # Ask the model's own geometry, before moving anything, whether the holder's fingers leave
+                # room above the face the cube must land on. Measured live 2026-11-07: the pads stand
+                # 40.5 mm above a held cube's top face, so the placement would fail at the last step for a
+                # reason that has nothing to do with the plan; naming it here is cheaper and honest.
+                clearance = self._support_face_clearance(other_arm, target)
+                blocked_by_grip = (clearance.get('clearance_m') is not None
+                                   and clearances_blocks(clearance['clearance_m']))
+                if blocked_by_grip and not SUPPORT_REGRASP_ENABLED:
+                    self._raise_support_face_blocked(other_arm, target, clearance, None)
+                # Bimanual in-hand stacking: stage the held support at the shared sweet spot
+                # (x ≈ 0.45, y ≈ -0.04, z ≈ 1.06; both arms solve it to <3.2 mm and <0.8 deg),
+                # then choose a placing attitude that reaches the top from the holder's opposite side.
+                # Ask the body where this stack can happen, instead of inheriting the last measurement as
+                # a constant: the staging point, the placing attitude and whether the holder's own fingers
+                # cover the face are queries now (planning/strategy_search.py).
+                from backend.app.planning.strategy_search import plan_stack_on_held_support
+                strategy = plan_stack_on_held_support(self.env, self.controller, arm, target)
+                if strategy.get('ok') is False:
+                    if strategy['reason'] == 'SUPPORT_FACE_BLOCKED':
+                        self._raise_support_face_blocked(other_arm, target,
+                                                         {'clearance_m': strategy.get('clearance_m'),
+                                                          'measured': strategy.get('measured')}, None)
+                    error = SkillError(strategy['reason'], strategy.get('detail') or strategy['reason'])
+                    error.evidence = {'strategy': strategy, 'reference_object': target}
+                    raise error
+                if strategy.get('ok') is True:
+                    staging_pos = np.array(strategy['staging'], float)
+                    planner_yaw = strategy['placer_yaw_deg']
+                else:
+                    # Unmeasured: keep the previous staging point rather than inventing a refusal.
+                    staging_pos = np.array([0.45, 0.04 if arm == 'left' else -0.04, 1.06])
+                    planner_yaw = None
+                self._carry_to(other_arm, target, staging_pos, exclude_target=obj)
+                # Free the support's top face before the placing arm arrives: the holder's pads sit above
+                # the centre they pinch, so a centred grip would leave the stacked cube resting on them.
+                # Best effort and recorded: a regrasp this robot cannot achieve leaves the grip as it was,
+                # and the placement then has to prove itself against the verifier like any other.
+                try:
+                    regrasp = {'success': True, **self._regrasp(other_arm, target, -SUPPORT_REGRASP_DROP_M)}
+                except SkillError as error:
+                    regrasp = {'success': False, 'error': error.category, 'detail': str(error),
+                               **({'evidence': error.evidence} if error.evidence else {})}
+                if regrasp is not None and regrasp.get('success'):
+                    after = self._support_face_clearance(other_arm, target)
+                    if after.get('clearance_m') is not None and clearances_blocks(after['clearance_m']):
+                        self._raise_support_face_blocked(other_arm, target, after, regrasp)
+                staged_support = self.env.object_pose(target)[0]
+                attitude = (attitude_for_yaw(planner_yaw) if planner_yaw is not None
+                            else self._stacking_attitude(arm, obj, other_arm, staged_support))
+                prepared_attitude = attitude
+            desired, destination_search = self._reachable_destination(obj, target, relation, arm, distance_cm)
+            if (destination_search.get('chosen') == 'unreachable'
+                    and destination_search.get('stage_posture')):
+                self._stage_to_posture(arm, destination_search['stage_posture'])
+                desired, destination_search = self._reachable_destination(obj, target, relation, arm, distance_cm)
+                destination_search['recovered_by_staging'] = True
+            if destination_search.get('chosen') == 'unreachable':
+                # Nothing inside the region could be reached: refuse with the measurements, do not place
+                # somewhere else and call it the same task.
+                error = SkillError('DESTINATION_UNREACHABLE',
+                                   f'No reachable point inside {target} for this arm')
+                error.evidence = {'destination_search': destination_search, 'reference_object': target,
+                                  'relation': relation,
+                                  **({'support_regrasp': regrasp} if regrasp is not None else {})}
+                raise error
             travel = desired.copy()
-            travel[2] = max(1.14, desired[2] + .035)
-            self._carry_to(arm, obj, travel)
-            placed = self._carry_to(arm, obj, desired)
+            travel[2] = min(1.15, desired[2] + .02 if is_held_stationary else max(1.14, desired[2] + .035))
+            try:
+                # Reorienting the grasp belongs to the same placement: a failure there is part of this
+                # attempt, so the preparation's measurement must survive it as well.
+                if prepared_attitude is not None:
+                    self._align_for_placement(arm, obj, rotation=prepared_attitude)
+                from backend.app.skills import placement_accuracy as _accuracy
+                _allow = _accuracy.required_accuracy(self.env, obj, target, relation).get('required_m')
+                self._carry_to(arm, obj, travel, exclude_target=target)
+                placed = self._carry_to(arm, obj, desired, exclude_target=target, allow_error_m=_allow,
+                                        q_init=destination_search.get('chosen_joints'))
+            except SkillError as error:
+                # Keep what the preparation step measured. A placement that fails later must not hide
+                # whether the support regrasp happened (measured 2026-11-07: it did, and the report lost it).
+                if regrasp is not None:
+                    error.evidence = {**(error.evidence or {}), 'support_regrasp': regrasp,
+                                      'reference_object': target, 'relation': relation}
+                raise
             return {**placed, "reference_object": target, "relation": relation,
-                    "support_bounds": self.env.object_bounds(target).tolist()}
+                    "destination_search": destination_search,
+                    "support_bounds": self.env.object_bounds(target).tolist(),
+                    "support_regrasp": regrasp if is_held_stationary else None,
+                    "stack_strategy": strategy if is_held_stationary else None}
         return self._skill("move_to_object", run, time.perf_counter())
+
+    def _receiver_frames(self, receiver: str, cube, cube_rotation, geometry, bias):
+        """The receiving hand's attitude, chosen by screening the routes it would need.
+
+        The coupled solve gives one relative attitude; a cube is four-fold symmetric, so the same grasp exists
+        at quarter turns. Each candidate is screened from the receiver's current posture through its pre-grasp
+        to the pinch, with the same clearance the pick uses; the first that clears wins, and the others are
+        recorded with the reason they lost.
+        """
+        nominal = np.asarray(cube_rotation, float) @ np.asarray(geometry.receiver_relative_rotation, float)
+        if not callable(getattr(self.env, 'arm_kinematics', None)):
+            # A body without kinematics cannot answer this question; keep the coupled solve's attitude rather
+            # than failing the handover for want of a query.
+            return nominal, {'searched': False, 'unknown': 'no kinematics on this body'}
+        kin = self.env.arm_kinematics(receiver)
+        check = getattr(kin, 'empty_arm_path_is_clear', None)
+        measure = getattr(kin, 'path_minimum_clearance', None)
+        from backend.app.planning.capability_queries import attitude as _attitude
+        from backend.app.skills.motion_accuracy import required_clearance
+        from backend.app.skills.approach import NONCONTACT_CLEARANCE_M
+        needed = NONCONTACT_CLEARANCE_M + required_clearance(receiver)
+        objects = {name: self.env.object_pose(name) for name in self.env.frame().objects}
+        allowed = {receiver: {f'openarm_{receiver}_ee_inner_finger', f'openarm_{receiver}_ee_outer_finger'}}
+        considered = []
+        best = None
+        for turn in (0., 90., -90., 180.):
+            rotation = nominal if turn == 0. else _attitude(turn) @ nominal
+            site = (np.asarray(cube, float) + rotation @ np.array([0., 0., bias])
+                    - rotation @ FINGERTIP_MIDPOINT[receiver])
+            pregrasp = site + rotation[:, 2] * .12
+            route = [self.env.arm_qpos(receiver)]
+            solved = True
+            for target in (pregrasp, site):
+                q, _, _ = self.controller.solve_ik(receiver, target, rotation)
+                if q is None:
+                    solved = False
+                    break
+                route.append(q)
+            if not solved:
+                considered.append({'turn_deg': turn, 'error': 'IK_FAILURE'})
+                continue
+            gap = measure(route, objects, ceiling=.05) if measure is not None else None
+            screened = check is None or check(route, objects, allowed_contacts=allowed,
+                                              minimum_object_clearance=needed)
+            considered.append({'turn_deg': turn, 'clearance_m': gap, 'screened': bool(screened),
+                               'needed_m': needed})
+            if screened and (best is None or (gap is not None and gap > (best[1] or -9))):
+                best = (rotation, gap, turn)
+        if best is None:
+            return nominal, {'chosen_turn_deg': 0., 'searched': True, 'considered': considered,
+                             'fallback': 'nominal attitude (no candidate screened)'}
+        return best[0], {'chosen_turn_deg': best[2], 'clearance_m': best[1], 'searched': True,
+                         'considered': considered}
+
+    def _stage_for_approach(self, arm: str, obj: str, centre, frames, evidence):
+        """Find a posture from which the approach has a route, move there, and plan again.
+
+        The question "is this object approachable at all" is answered from a fixed posture set, so the answer
+        does not depend on where the arm is standing; "can I get there from here" is what the planning itself
+        answers. When the second fails but the first says yes, the arm goes to the posture that works.
+        """
+        from backend.app.planning.capability_queries import canonical_postures
+        from backend.app.skills.approach import plan_cube_approach
+        for index, posture in enumerate(canonical_postures(self.env, arm)):
+            try:
+                trial, planning = plan_cube_approach(
+                    self.env, self.controller, arm, obj, frames[0]['pinch'], frames[0]['standoff'],
+                    APPROACH_OVERFLY, STAGING_ALTITUDE, frames=frames,
+                    start_override=np.asarray(posture, float))
+            except Exception:
+                continue
+            if trial is None:
+                continue
+            try:
+                staged = self._stage_to_posture(arm, posture)
+            except SkillError as error:
+                error.evidence = {**(error.evidence or {}), 'stage_posture': index, 'phase': 'approach_staging'}
+                raise
+            # Plan again from the posture the arm is now in: the route has to start where the arm is.
+            route, approach_evidence = plan_cube_approach(
+                self.env, self.controller, arm, obj, frames[0]['pinch'], frames[0]['standoff'],
+                APPROACH_OVERFLY, STAGING_ALTITUDE, frames=frames)
+            approach_evidence = {**approach_evidence, 'recovered_by_staging': True,
+                                 'stage_posture_index': index, 'staged_to': staged['position'],
+                                 'layout_question_asked_from': index}
+            return (route, approach_evidence) if route is not None else None
+        return None
+
+    def _stage_to_posture(self, arm: str, posture) -> dict:
+        """Move the arm, holding its grasp, to a configuration from which the placement is reachable."""
+        kin = self.env.arm_kinematics(arm)
+        point, attitude, _, _ = kin.evaluate(np.asarray(posture, float))
+        result = self.controller.move_to_site(arm, point, attitude,
+                                              planned_joints=[self.env.arm_qpos(arm), np.asarray(posture, float)])
+        if not result.success:
+            error = SkillError(result.error or 'MOTION_BLOCKED', 'Could not stage the arm for this placement')
+            error.evidence = self._motion_evidence(result, phase='staging')
+            raise error
+        return {'position': np.asarray(point, float).tolist(), 'posture': np.asarray(posture, float).tolist()}
+
+    @staticmethod
+    def _carry_trace(samples: list, desired: np.ndarray, *, keep: int = 40) -> dict:
+        """Summarise where the carried object went, so "stopped short" can be told from "never tracked"."""
+        if not samples:
+            return {'samples': 0}
+        distances = [float(np.linalg.norm(np.asarray(item['object'], float) - desired)) for item in samples]
+        step = max(1, len(samples) // keep)
+        tail = [{'object': [round(v, 4) for v in item['object']],
+                 'distance_to_target_m': round(distance, 4)}
+                for item, distance in list(zip(samples, distances))[::step]]
+        moved_at_end = (float(np.linalg.norm(np.asarray(samples[-1]['object'], float)
+                                             - np.asarray(samples[-2]['object'], float)))
+                        if len(samples) > 1 else None)
+        return {'samples': len(samples), 'closest_m': min(distances), 'final_m': distances[-1],
+                'movement_at_end_m': moved_at_end, 'path': tail}
 
     def _carry_aim(self, arm: str, obj: str, desired, *, attitude: str = "pinned"):
         """The end-effector pose a carry to ``desired`` (the object's pose) commands, and its rotation.
@@ -492,8 +1061,14 @@ class SkillRunner:
             path.append(seed)
         return path, np.asarray(env.arm_kinematics(arm).evaluate(seed)[1], float)
 
-    def _carry_to(self, arm: str, obj: str, desired: np.ndarray, *, attitude: str = "pinned") -> dict:
+    def _carry_to(self, arm: str, obj: str, desired: np.ndarray, *, attitude: str = "pinned",
+                  exclude_target: str | None = None, allow_error_m: float | None = None,
+                  q_init=None) -> dict:
         """Carry the held object to a pose. ``attitude="free"`` lets the arm choose its orientation.
+
+        `allow_error_m` is how far off the target this *task* tolerates, from the region the object is landing
+        in (`placement_accuracy`). Without it the carry's own 8 mm and the controller's 12 mm decide, which
+        measured 2026-11-09 refused placements whose 27 mm shortfall still landed inside a 35 mm zone.
 
         A six-joint arm carries the attitude its pinch was validated in, and that is the default. An arm
         whose pinch frame is only achievable near the object cannot carry it any higher while keeping
@@ -506,6 +1081,32 @@ class SkillRunner:
         start = self.env.object_pose(obj)[0].copy()
         target, commanded_rotation, offset = self._carry_aim(arm, obj, desired, attitude=attitude)
         aim = rotation if commanded_rotation is None else commanded_rotation
+        ignored = {obj}
+        if exclude_target:
+            ignored.add(exclude_target)
+        stationary = {name: self.env.object_pose(name)[0].copy()
+                      for name in self.env.frame().objects if name not in ignored}
+        trace = []
+
+        def guard_carry():
+            self._require_hold(arm, obj)
+            # Where the arm and the carried object actually are at this instant: a command that is not being
+            # tracked shows up here as a gap that stops shrinking, which a final residual alone cannot tell
+            # apart from a pose that could never be reached.
+            try:
+                ee_now, _rotation_now = self.env.ee_pose(arm)
+                trace.append({'ee': [float(value) for value in ee_now],
+                              'object': [float(value) for value in self.env.object_pose(obj)[0]]})
+            except Exception:
+                pass
+            for name, position in stationary.items():
+                displacement = float(np.linalg.norm(self.env.object_pose(name)[0] - position))
+                if displacement > APPROACH_DISTURBANCE_TOLERANCE:
+                    error = SkillError("CARRY_COLLISION",
+                                       f"Carrying {obj} disturbed resting {name} by {displacement * 1000:.1f} mm; stopping")
+                    error.evidence = {'object': name, 'carrying': obj, 'displacement_m': displacement,
+                                      'tolerance_m': APPROACH_DISTURBANCE_TOLERANCE, 'phase': 'carry'}
+                    raise error
         # Keep the carried cube on a Cartesian clearance path. A joint interpolation
         # between two high endpoints can still dip the palm through a table object.
         count = max(1, int(np.ceil(np.linalg.norm(np.asarray(desired) - start) / .025)))
@@ -513,10 +1114,11 @@ class SkillRunner:
                for alpha in np.linspace(0., 1., count + 1)[1:-1]]
         if self.controller.motion_speed == 1.:
             for waypoint in via:
-                result = self.controller.move_to_site(arm, waypoint, commanded_rotation)
+                result = self.controller.move_to_site(arm, waypoint, commanded_rotation, phase='carry',
+                                                     on_sample=guard_carry)
                 if not result.success:
                     raise SkillError(result.error or "IK_FAILURE", "Cartesian carry was blocked")
-                self._require_hold(arm, obj)
+                guard_carry()
             via = []
         # An imported arm with fewer than six joints is carried along a planner-solved path: its own
         # solver cannot reach the wind-up candidates the planner accepts (see ``_planned_carry``).
@@ -530,27 +1132,343 @@ class SkillRunner:
         for attempt in range(3):
             if attempt == 1 and planned is not None:
                 result = self.controller.move_to_site(arm, target, planned[1], planned_joints=planned[0],
-                                                      on_sample=lambda: self._require_hold(arm, obj))
+                                                      phase='carry',
+                                                      on_sample=guard_carry)
             else:
+                # The configuration the destination search already accepted is the seed for the motion's own
+                # IK. Measured 2026-11-09: without it the motion re-solved from the current pose and landed on
+                # a different local solution 27 mm short of the same aim the probe had solved to 2 mm.
                 result = self.controller.move_to_site(arm, target, commanded_rotation,
-                    via=via if attempt == 0 else None, on_sample=lambda: self._require_hold(arm, obj))
+                    via=via if attempt == 0 else None,
+                    on_sample=guard_carry, **({'q_init': q_init} if q_init is not None else {}))
+            guard_carry()
             if not result.success:
+                # A controller refusal is measured against the *task's* requirement before it fails the task:
+                # the arm landing 27 mm short inside a 35 mm zone is a placement, not a failure.
+                achieved = float(np.linalg.norm(self.env.object_pose(obj)[0] - np.asarray(desired, float)))
+                if allow_error_m is not None and achieved <= allow_error_m:
+                    return {"object": obj, "target": np.asarray(desired).tolist(),
+                            "position": self.env.object_pose(obj)[0].tolist(), "position_error": achieved,
+                            "accepted_within_task_tolerance_m": float(allow_error_m)}
                 # The controller's own solve failing is what the planner-solved path is for: without this
                 # the fallback sits behind a raise that never lets it run (measured: the residuals were
                 # bit-identical with and without the plan, which is how the dead path was found).
                 if attempt == 0 and planned is not None:
                     continue
-                raise SkillError(result.error or "IK_FAILURE", f"Cannot carry {obj} to {np.round(desired, 4).tolist()} (EE {np.round(target, 4).tolist()}, position residual {result.position_error}, rotation residual {result.rotation_error})")
+                error = SkillError(result.error or "IK_FAILURE", f"Cannot carry {obj} to {np.round(desired, 4).tolist()} (EE {np.round(target, 4).tolist()}, position residual {result.position_error}, rotation residual {result.rotation_error})")
+                error.evidence = self._motion_evidence(result, object=obj, phase='carry')
+                # Ask the same question twice - once the way the destination search asked it, once the way the
+                # motion asked it - so a disagreement between them is a number in the record instead of an
+                # argument. Measured 2026-11-09: the search called a point reachable, the carry then reported
+                # 28 mm without moving, and there was no way to see which solve produced which number.
+                probes = {}
+                for label, kwargs in (('unseeded', {}),
+                                      ('seeded', {'q_init': q_init} if q_init is not None else None)):
+                    if kwargs is None:
+                        continue
+                    try:
+                        solution, residual, _ = self.controller.solve_ik(arm, target, commanded_rotation, **kwargs)
+                        probes[label] = {'solved': solution is not None,
+                                         'residual_m': None if residual is None else float(residual)}
+                    except Exception as probe_error:
+                        probes[label] = {'error': f'{type(probe_error).__name__}: {probe_error}'}
+                error.evidence = {**error.evidence, 'achieved_offset_m': achieved,
+                                  'carry_trace': self._carry_trace(trace, np.asarray(desired, float)),
+                                  'carry_aim': np.asarray(target, float).tolist(),
+                                  'carry_desired_object': np.asarray(desired, float).tolist(),
+                                  'ik_probes': probes,
+                                  'seeded': q_init is not None,
+                                  **({'task_tolerance_m': allow_error_m} if allow_error_m is not None else {})}
+                raise error
             self._require_hold(arm, obj)
             actual = self.env.object_pose(obj)[0]
             error = float(np.linalg.norm(actual - desired))
-            if error <= .008:
-                return {"object": obj, "target": np.asarray(desired).tolist(), "position": actual.tolist(), "position_error": error}
+            # How far a carry lands from its target is a property of this body and this phase; the next
+            # placement feasibility question is judged against it.
+            from backend.app.skills import motion_accuracy
+            motion_accuracy.record(arm, error, source='carry')
+            if error <= max(.008, allow_error_m or 0.):
+                return {"object": obj, "target": np.asarray(desired).tolist(), "position": actual.tolist(),
+                        "position_error": error,
+                        **({'accepted_within_task_tolerance_m': float(allow_error_m)}
+                           if allow_error_m is not None and error > .008 else {})}
             target += np.asarray(desired) - actual
         raise SkillError("GRASP_SLIP", f"{obj} deviated from carry target by {error * 1000:.1f} mm")
 
-    def handover_object(self, arm: str, obj: str, receiver: str) -> dict:
+    def regrasp_object(self, arm: str, obj: str, drop_m: float = -SUPPORT_REGRASP_DROP_M) -> dict:
+        """Slide this arm's pinch down the held object, so its top face becomes reachable.
+
+        A cube gripped at its centre is held by pads that stand above that centre, so a second cube
+        placed on top cannot reach the top face: measured 2026-11-07, the stacked cube stopped 7.15 mm
+        above the support and rested on the holder's own fingers (`support_contact=false`). Gripping the
+        support low is not possible while it rests on the table (the pads would hit the table), so the
+        grip is lowered **after** the object is in the air.
+
+        The jaws are opened only part way, so the object stays between the pads; the arm then slides
+        down and closes again. Every step is verified: if the pinch is lost while opening, the skill stops
+        before moving, and if the object shifts or does not follow a short lift, it raises rather than
+        reporting a regrasp it did not achieve.
+        """
+        return self._skill("regrasp_object", lambda: self._regrasp(arm, obj, drop_m), time.perf_counter())
+
+    def _regrasp(self, arm: str, obj: str, drop_m: float) -> dict:
+        self._require_hold(arm, obj)
+        if drop_m >= 0.:
+            raise SkillError("INVALID_PLAN", "A regrasp lowers the pinch; the offset must be negative")
+        before = self.env.object_pose(obj)[0].copy()
+        closed_aperture = self.env.gripper_position(arm)
+        open_aperture = self.env.gripper_target(arm, False)
+        # How far the jaws may be relieved is a property of this object and this grip, not a constant:
+        # measured 2026-11-07, relieving 35% of the travel dropped the cube from the pinch entirely.
+        # Search upward in small steps and keep the last relief that still pinched.
+        kept, kept_fraction = closed_aperture, 0.
+        for step in SUPPORT_REGRASP_RELIEF_STEPS:
+            candidate = closed_aperture + step * (open_aperture - closed_aperture)
+            self.env.set_gripper(arm, candidate)
+            self.env.step(max(1, round(120 / self.controller.motion_speed)))
+            if not self._pinch_established(obj, arm):
+                break
+            kept, kept_fraction = candidate, step
+        self.env.set_gripper(arm, kept)
+        self.env.step(max(1, round(120 / self.controller.motion_speed)))
+        if kept_fraction == 0. or not self._pinch_established(obj, arm):
+            # Never slide on a lost pinch: close again and report, leaving the object where it was.
+            self.controller.wait_gripper(arm, True, .5)
+            raise SkillError("REGRASP_LOST", f"{obj} left the pinch when the jaws were relieved; not sliding")
+        partial = kept
+        ee, rotation = self.env.ee_pose(arm)
+        slide = self.controller.target_rotations.get(arm, rotation)
+        result = self.controller.move_to_site(arm, ee + np.array([0., 0., drop_m]), slide,
+                                              on_sample=lambda: self._require_hold(arm, obj))
+        if not result.success:
+            raise SkillError(result.error or "IK_FAILURE", "Could not slide the pinch along the object")
+        self.controller.wait_gripper(arm, True, .5)
+        if not self._pinch_established(obj, arm):
+            raise SkillError("REGRASP_NO_PINCH", f"{obj} is no longer pinched after closing at the lower point")
+        after = self.env.object_pose(obj)[0]
+        shifted = float(np.linalg.norm((after - before)[:2]))
+        if shifted > SUPPORT_REGRASP_SHIFT_TOLERANCE:
+            raise SkillError("REGRASP_MOVED", f"{obj} moved {shifted * 1000:.1f} mm sideways during the regrasp")
+        dropped = float(before[2] - after[2])
+        if dropped > SUPPORT_REGRASP_SHIFT_TOLERANCE:
+            # The object rode down with the hand: the pads never slid along it, so the grip point on the
+            # object is unchanged and the top face is still blocked.
+            raise SkillError("REGRASP_NO_SLIDE",
+                             f"{obj} followed the hand down {dropped * 1000:.1f} mm instead of staying put")
+        lift = self.controller.move_to_site(arm, self.env.ee_pose(arm)[0] + np.array([0., 0., VERIFICATION_LIFT]),
+                                           self.env.ee_pose(arm)[1], on_sample=lambda: self._require_hold(arm, obj))
+        if not lift.success:
+            raise SkillError(lift.error or "IK_FAILURE", "The hold did not survive the regrasp verification lift")
+        self.controller.move_to_site(arm, self.env.ee_pose(arm)[0] - np.array([0., 0., VERIFICATION_LIFT]),
+                                     self.env.ee_pose(arm)[1], on_sample=lambda: self._require_hold(arm, obj))
+        self._require_hold(arm, obj)
+        return {"object": obj, "arm": arm, "drop_m": drop_m, "relief_fraction": kept_fraction,
+                "aperture_before": closed_aperture, "aperture_relieved": partial, "aperture_open": open_aperture,
+                "sideways_shift_m": shifted, "vertical_shift_m": dropped,
+                "pinch_contacts": sorted(self._contact_fingers(obj, arm))}
+
+    def handover_object(self, arm: str | None, obj: str, receiver: str | None = None) -> dict:
+        if arm is None:
+            arm = next((side for side in ("left", "right") if self.held_object(side) == obj), None)
+            if arm is None:
+                raise SkillError("HOLD_NOT_FOUND", f"Neither hand holds {obj} for handover")
+        if receiver is None:
+            available = ["left", "right"]
+            candidates = [side for side in available if side != arm and not self.held_object(side)]
+            if not candidates:
+                raise SkillError("NO_RECEIVER_AVAILABLE", f"No empty arm available opposite {arm} to receive {obj}")
+            receiver = candidates[0]
         return self._skill("handover_object", lambda: self._handover(arm, obj, receiver), time.perf_counter())
+
+    def _reachable_destination(self, obj: str, target: str, relation: str, arm: str, distance_cm=None):
+        """Where to put the object, choosing among measured options inside the requested region.
+
+        `relative_destination` gives the point the instruction asks for. It is used when the arm can reach it.
+        When it cannot, the request is still satisfiable *inside the same region* (a zone has an area, a
+        support has a face), so nearby points are tried and the one with the best measured IK margin wins.
+        A point outside the region is never tried: that would be a different task.
+        """
+        from backend.app.skills.spatial_placement import relative_destination
+        requested = relative_destination(self.env, obj, target, relation, arm, distance_cm)
+        return self._search_destination(arm, obj, target, requested, relation)
+
+    def _search_destination(self, arm: str, obj: str, target: str, requested, relation: str):
+        """The same measurement for any requested placement point: a zone centre, a support offset, ..."""
+        from backend.app.planning.measurement_flags import enabled as _measured
+        search = {'requested': np.asarray(requested, float).tolist(), 'chosen': 'requested', 'considered': []}
+        if not _measured('destination_search'):
+            search['search'] = 'disabled_by_flag'
+            return requested, search
+        solve = getattr(self.controller, 'solve_ik', None)
+        if not callable(solve):
+            return requested, search
+
+        from backend.app.skills import motion_accuracy
+        # The probe answers "can the IK put the end effector there". What the placement needs is "can the arm
+        # put it there and still land within tolerance" - so the probe has to leave room for how far this
+        # body actually lands when carrying. Measured 2026-11-09: an IK residual of 12 mm and an executed
+        # residual of 26 mm on the same carry, which is why the probe alone called an impossible point fine.
+        # The probe answers "can the IK put the end effector there". It does not answer "will the carry land
+        # within tolerance": measured 2026-11-09, an IK residual of 12 mm and an executed residual of 26 mm on
+        # the same carry. Gating on both would make almost every practical point infeasible while the motion
+        # tolerance itself is 12 mm, so the risk is *recorded* here and the carry remains the authority. A
+        # hard gate needs a per-task placement accuracy, which is not measured yet.
+        expected_carry_error = motion_accuracy.expected_error(arm, 'carry')
+        search['expected_carry_error_m'] = expected_carry_error
+        headroom = PLACEMENT_REACH_TOLERANCE_M
+
+        def _feasible(probe_margin):
+            """Whether landing here would be precise enough for this region (unknown counts as pass)."""
+            from backend.app.skills import placement_accuracy
+            answer = placement_accuracy.feasibility(
+                self.env, obj, target, relation, probe_residual_m=-probe_margin,
+                expected_error_m=expected_carry_error)
+            verdict = answer.get('feasible')
+            return True if verdict is None else bool(verdict)
+
+        def limit_margin_rad(configuration):
+            """How far the solved configuration sits from any joint limit, or None if unmeasurable."""
+            try:
+                limits = np.asarray(self.env.arm_limits(arm), float)
+            except Exception:
+                return None
+            q = np.asarray(configuration, float)
+            if q.shape != (limits.shape[0],):
+                return None
+            return float(np.min(np.minimum(q - limits[:, 0], limits[:, 1] - q)))
+
+        solutions = {}
+
+        def probe(point):
+            """Both halves of "can the arm hold this pose": IK residual and room left in the joints.
+
+            `solve_ik` returning no solution is a *measurement* - this arm cannot put its hand there - and must
+            not be read as "unknown". Measured 2026-11-09: it was read as unknown, the search gave up, and the
+            carry was then commanded to a point 254 mm out of reach, moving nothing.
+            """
+            aim, rotation, _offset = self._carry_aim(arm, obj, np.asarray(point, float))
+            from backend.app.planning.body_solver import pose_feasible
+            # The same owner the capability queries use, from the same posture policy, so "reachable here" and
+            # "reachable for this placement" cannot disagree about the same pose.
+            # Asked from where the arm is, because this answer decides a motion it is about to make; the
+            # layout question ("would any posture do?") is asked separately when staging.
+            answer = pose_feasible(self.env, self.controller, arm, aim, rotation, posture='current')
+            if answer.get('feasible') is None:
+                return None, None
+            if answer.get('solution') is None:
+                return BLOCKED, None
+            solutions[tuple(np.round(np.asarray(point, float), 6))] = np.asarray(answer['solution'], float)
+            return -float(answer['residual_m']), answer.get('joint_limit_margin_rad')
+
+        #: Returned when the pose *was* solved but cannot be held: measured, and unusable - not unknown.
+        BLOCKED = object()
+
+        def usable(point):
+            value, limit = probe(point)
+            if value is None:
+                return None
+            if limit is not None and limit < JOINT_LIMIT_MARGIN_RAD:
+                # The IK solves, but the arm would have to sit on a joint limit to hold it. Measured
+                # 2026-11-09: a pose like this was declared unmeasurable, the search gave up, and the carry
+                # then failed 28 mm short of the point it should never have been sent to.
+                return BLOCKED
+            return value
+
+        def margin(point):
+            return usable(point)
+
+        def numeric(value):
+            """A JSON-safe number for the evidence, and whether the sample was usable."""
+            if value is BLOCKED:
+                return None, False
+            return value, True
+
+        requested_value = margin(requested)
+        best_point = np.asarray(requested, float)
+        best_margin, usable_requested = numeric(requested_value)
+        _requested_value, _requested_limit = probe(requested)
+        search['considered'].append({'offset': [0., 0.], 'margin_m': best_margin,
+                                     'blocked_by_joint_limit': requested_value is BLOCKED,
+                                     'joint_limit_margin_rad': _requested_limit})
+        chosen_joints = solutions.get(tuple(np.round(best_point, 6)))
+        search['chosen_joints'] = None if chosen_joints is None else chosen_joints.tolist()
+        if usable_requested and best_margin is not None:
+            from backend.app.skills import placement_accuracy
+            # How precisely this placement has to land, measured from the region it lands on: a zone has
+            # tens of millimetres of freedom, a cube stacked on a cube needs its centre over the support.
+            search['feasibility'] = placement_accuracy.feasibility(
+                self.env, obj, target, relation, probe_residual_m=-best_margin,
+                expected_error_m=expected_carry_error)
+            search['feasible_within_tolerance'] = search['feasibility']['feasible']
+        if requested_value is None:
+            # Reachability could not be measured here; the carry itself is the authority, as before.
+            search['chosen'] = 'unmeasured'
+            return requested, search
+        if usable_requested and best_margin >= -headroom and _feasible(best_margin):
+            return requested, search
+        if requested_value is BLOCKED:
+            # Known to be unusable (it would need a joint limit): search the region instead of commanding it.
+            search['chosen'] = 'requested_blocked'
+        # How much room the region itself has: a zone's own extent, or the support face minus the object.
+        try:
+            region = np.asarray(self.env.object_bounds(target), float)
+            half = (region[1, :2] - region[0, :2]) / 2.
+        except Exception:
+            half = np.zeros(2)
+        if relation == 'on':
+            try:
+                support = np.asarray(self.env.object_bounds(target), float)
+                held = np.asarray(self.env.object_bounds(obj), float)
+                half = np.maximum(0., (support[1, :2] - support[0, :2] - (held[1, :2] - held[0, :2])) / 2. - .003)
+            except Exception:
+                half = np.zeros(2)
+        # Before giving up: would standing somewhere else reach it? A fixed set of postures, so the answer does
+        # not depend on the current stance (see capability_queries.canonical_postures).
+        stage_posture = None
+        try:
+            from backend.app.planning.capability_queries import canonical_postures
+            aim_now, rotation_now, _ = self._carry_aim(arm, obj, np.asarray(requested, float))
+            for posture in canonical_postures(self.env, arm):
+                try:
+                    candidate, residual, _ = solve(arm, aim_now, rotation_now, q_init=posture)
+                except Exception:
+                    continue
+                if candidate is not None and residual is not None and residual <= PLACEMENT_REACH_TOLERANCE_M:
+                    stage_posture = np.asarray(posture, float).tolist()
+                    search['stage_residual_m'] = float(residual)
+                    break
+        except Exception:
+            stage_posture = None
+        search['stage_posture'] = stage_posture
+
+        reach = float(min(.02, np.max(half))) if np.any(half > 0) else 0.
+        if reach <= 0:
+            # The region has no room beyond the object, so there is no alternative to measure: the requested
+            # point is the only one, and it is not reachable.
+            search['chosen'] = 'unreachable'
+            search['reason'] = 'REGION_HAS_NO_ALTERNATIVE'
+            return requested, search
+        for step in (reach, reach / 2.):
+            for axis, sign in ((0, 1.), (0, -1.), (1, 1.), (1, -1.)):
+                offset = np.zeros(3)
+                offset[axis] = sign * step
+                point = np.asarray(requested, float) + offset
+                value, value_usable = numeric(margin(point))
+                search['considered'].append({'offset': offset.tolist(), 'margin_m': value,
+                                             'blocked_by_joint_limit': margin(point) is BLOCKED})
+                if value is not None and value_usable and (best_margin is None or value > best_margin):
+                    best_point, best_margin = point, value
+            if best_margin is not None and best_margin >= -headroom and _feasible(best_margin):
+                break
+        requested_margin, _ = numeric(margin(requested))
+        if (best_margin is not None and best_margin >= -headroom and _feasible(best_margin)
+                and (requested_margin is None or best_margin > requested_margin)):
+            search['chosen'] = 'offset_inside_region'
+            search['chosen_point'] = best_point.tolist()
+            search['margin_m'] = best_margin
+            return best_point, search
+        search['chosen'] = 'unreachable'
+        return requested, search
 
     def _handover(self, arm: str, obj: str, receiver: str) -> dict:
         if receiver not in {"left", "right"} or receiver == arm:
@@ -582,23 +1500,65 @@ class SkillRunner:
                 center = (1. - alpha) * cube + alpha * geometry.position
                 donor_positions.append(center - attitude @ offset)
                 donor_rotations.append(attitude)
+        # Nominal trajectory speed: a handover is a large, free-space swing, and at 6x the arm trailed its own
+        # planned path by 110 mm on the park leg and 78 mm here (measured 2026-11-10). Speed buys nothing on a
+        # leg that ends in a two-handed meeting, and the reflex refuses it.
         moved = self.controller.move_to_site(arm, donor_site, geometry.donor_rotation,
             q_init=geometry.donor_seed, via=donor_positions, via_rotations=donor_rotations,
-            on_sample=lambda: self._require_hold(arm, obj))
+            trajectory_speed=1., phase='carry', on_sample=lambda: self._require_hold(arm, obj))
         if not moved.success:
-            raise SkillError(moved.error or "IK_FAILURE", "Donor could not reach the coupled handover pose")
+            error = SkillError(moved.error or "IK_FAILURE", "Donor could not reach the coupled handover pose")
+            error.evidence = self._motion_evidence(moved, object=obj, phase='handover_donor')
+            raise error
         self.env.step(max(1, round(600 / self.controller.motion_speed)))
         self._require_hold(arm, obj)
         self.controller.wait_gripper(receiver, False, .5)
         cube, cube_rotation = self.env.object_pose(obj)
-        receiving_rotation = cube_rotation @ geometry.receiver_relative_rotation
+        # Which way the receiving hand comes in is a measured choice, the same way the pick attitude is: the
+        # mirrored attitude from the coupled solve is the nominal one, and the other three quarter turns are
+        # equivalent for a cube. Measured 2026-11-10: a fixed receiving attitude is what made handover fail
+        # with HANDOVER_UNREACHABLE in layouts where another approach was clear.
+        receiving_rotation, receiver_search = self._receiver_frames(
+            receiver, cube, cube_rotation, geometry, bias)
         site = cube + receiving_rotation @ np.array([0., 0., bias]) - receiving_rotation @ FINGERTIP_MIDPOINT[receiver]
-        pregrasp = site + receiving_rotation[:, 2] * .12
+        # How far back the receiving hand waits is a reachability question, not a constant: the nominal 120 mm
+        # is where a comfortable approach starts, but a layout where the receiver is near the end of its reach
+        # cannot solve there while it can solve closer in. Measured 2026-11-10: a fixed 120 mm is what failed as
+        # "Receiver could not reach the handover standoff", and that refusal is what keeps the donor grasping
+        # 15 mm off centre (which in turn pushes the cube 8 mm during the donor's approach).
+        pregrasp, receiver_standoff = None, {'candidates': [], 'chosen_m': None}
+        solve = getattr(self.controller, 'solve_ik', None)
+        if not callable(solve):
+            # A controller that cannot answer an IK question gets the nominal distance rather than a refusal:
+            # the question is unavailable, and unavailable is not a measured no.
+            pregrasp = site + receiving_rotation[:, 2] * RECEIVER_STANDOFF_CANDIDATES_M[0]
+            receiver_standoff.update({'chosen_m': RECEIVER_STANDOFF_CANDIDATES_M[0],
+                                      'unsolved': 'controller has no IK solver'})
+        for distance in (RECEIVER_STANDOFF_CANDIDATES_M if pregrasp is None and callable(solve) else ()):
+            candidate = site + receiving_rotation[:, 2] * distance
+            solved, residual, _ = self.controller.solve_ik(receiver, candidate, receiving_rotation,
+                                                          q_init=geometry.receiver_seed)
+            reachable = solved is not None and residual is not None and residual < .012
+            receiver_standoff['candidates'].append({'distance_m': float(distance), 'reachable': reachable})
+            if reachable:
+                pregrasp, receiver_standoff['chosen_m'] = candidate, float(distance)
+                break
+        if pregrasp is None:
+            error = SkillError("HANDOVER_UNREACHABLE",
+                               "Receiver cannot reach any handover standoff")
+            error.evidence = {'receiver_standoff': receiver_standoff, 'object': obj,
+                              'phase': 'handover_standoff'}
+            raise error
         # A joint interpolation straight to the cube sweeps an open finger through it.
         # First stay outside the donor, then insert along a measured Cartesian line.
-        result = self.controller.move_to_site(receiver, pregrasp, receiving_rotation, q_init=geometry.receiver_seed)
+        result = self.controller.move_to_site(receiver, pregrasp, receiving_rotation,
+                                              q_init=geometry.receiver_seed, trajectory_speed=1.,
+                                              phase='carry')
         if not result.success:
-            raise SkillError(result.error or "IK_FAILURE", "Receiver could not reach the handover standoff")
+            error = SkillError(result.error or "IK_FAILURE", "Receiver could not reach the handover standoff")
+            error.evidence = {**self._motion_evidence(result, object=obj, phase='handover_receiver'),
+                              'receiver_standoff': receiver_standoff}
+            raise error
         self.env.step(max(1, round(200 / self.controller.motion_speed)))
         self._require_hold(arm, obj)
         insertion = [(1 - alpha) * pregrasp + alpha * site for alpha in np.linspace(0., 1., 13)[1:]]
@@ -606,7 +1566,7 @@ class SkillRunner:
         for target in destinations:
             result = self.controller.move_to_site(receiver, target, receiving_rotation,
                 via=insertion[:-1] if self.controller.motion_speed != 1. else None,
-                on_sample=lambda: self._require_hold(arm, obj))
+                trajectory_speed=1., phase='carry', on_sample=lambda: self._require_hold(arm, obj))
             if not result.success:
                 raise SkillError(result.error or "IK_FAILURE", "Receiver was blocked during the straight insertion")
             self._require_hold(arm, obj)
@@ -615,6 +1575,20 @@ class SkillRunner:
             raise SkillError("HANDOVER_APPROACH_COLLISION", f"Receiver displaced the held cube by {displacement * 1000:.1f} mm")
         self.controller.wait_gripper(receiver, True, .65)
         receiving_contacts = sorted(self._contact_fingers(obj, receiver))
+        # Adaptive pinch recovery for irregular contact geometry:
+        # If the initial pinch touches only one finger pad (or misses slightly due to angle/offset),
+        # do not rigidly abort. Perform local adaptive micro-adjustments in depth before giving up.
+        if not self._pinch_established(obj, receiver):
+            for retry in range(3):
+                self.controller.wait_gripper(receiver, False, .35)
+                self.env.step(max(1, round(50 / self.controller.motion_speed)))
+                adjustment = receiving_rotation @ np.array([0., 0., 0.003 * (retry + 1)])
+                self.controller.move_to_site(receiver, site + adjustment, receiving_rotation,
+                                             on_sample=lambda: self._require_hold(arm, obj))
+                self.controller.wait_gripper(receiver, True, .65)
+                receiving_contacts = sorted(self._contact_fingers(obj, receiver))
+                if self._pinch_established(obj, receiver):
+                    break
         if not self._pinch_established(obj, receiver):
             raise SkillError("HANDOVER_NO_RECEIVER_PINCH", f"No two-finger pinch by {receiver}: {receiving_contacts}")
         donor_contacts = sorted(self._contact_fingers(obj, arm))
@@ -633,6 +1607,7 @@ class SkillRunner:
         if rose < VERIFICATION_LIFT * VERIFICATION_FOLLOW_RATIO:
             raise SkillError("HANDOVER_LOST", "Cube did not follow the receiver after donor released")
         return {"object": obj, "giver": arm, "receiver": receiver,
+                "meeting": geometry.meeting,
                 "giver_contacts_before_release": donor_contacts, "receiver_pinch_contacts": receiving_contacts,
                 "giver_released": True, "receiver_contacts_after_lift": sorted(self._contact_fingers(obj, receiver)),
                 "object_rose": rose, "approach_displacement": displacement,
@@ -689,19 +1664,56 @@ class SkillRunner:
                 error = SkillError(planning['error'], 'No reachable clear route to the model home posture')
                 error.evidence = planning
                 raise error
+            executed = []
+            sampled = []
+
             def guard():
                 for other, obj in others.items():
                     if obj:
                         self._require_hold(other, obj)
+                # Where the arm actually is at this instant: a model that says the route has 30 mm has to be
+                # checked against what the pads did, not against itself.
+                ee, _ = self.env.ee_pose(arm)
+                joints_now = [float(value) for value in self.env.arm_qpos(arm)]
+                executed.append({'ee': [float(value) for value in ee], 'joints': joints_now})
+                # Ask the same model about the segment just travelled, at every sample: that is what turns
+                # "the model said 30 mm and it touched" into a curve showing where the two disagree.
+                if sampled:
+                    query = getattr(self.env.arm_kinematics(arm), 'path_clearance_detail', None)
+                    if query is not None:
+                        report = query([sampled[-1]['joints'], joints_now],
+                                       {name: self.env.object_pose(name)
+                                        for name in self.env.frame().objects}, ceiling=.02)
+                        sampled.append({'joints': joints_now, 'ee': [float(v) for v in ee],
+                                        'gap_m': None if report is None else report.get('gap_m')})
+                    else:
+                        sampled.append({'joints': joints_now, 'ee': [float(v) for v in ee], 'gap_m': None})
+                else:
+                    sampled.append({'joints': joints_now, 'ee': [float(v) for v in ee], 'gap_m': None})
                 for obj, position in stationary.items():
                     if (self.env.object_contacts(obj, arm)
                             or np.linalg.norm(self.env.object_pose(obj)[0]-position) > .002):
                         error = SkillError('PARK_COLLISION', f'Empty-arm parking disturbed {obj}')
+                        # Re-ask the model about the configurations the arm actually passed through, so
+                        # "the model says 30 mm" can be compared with the same model on the real path.
+                        joints = [item['joints'] for item in executed[-200:]]
+                        detail = None
+                        kin = self.env.arm_kinematics(arm)
+                        query = getattr(kin, 'path_clearance_detail', None)
+                        if query is not None and len(joints) >= 2:
+                            detail = query(joints, {name: self.env.object_pose(name)
+                                                    for name in self.env.frame().objects}, ceiling=.05)
                         error.evidence = {**planning,'object':obj,'contacts':self.env.object_contacts(obj,arm),
-                                          'displacement_m':float(np.linalg.norm(self.env.object_pose(obj)[0]-position))}
+                                          'displacement_m':float(np.linalg.norm(self.env.object_pose(obj)[0]-position)),
+                                          'executed_ee_path':[item['ee'] for item in executed[-200:]],
+                                          'executed_path_clearance':detail,
+                                          'clearance_trace':[{k: item[k] for k in ('ee', 'gap_m')}
+                                                             for item in sampled[::max(1, len(sampled)//40)]],
+                                          'object_position':[float(v) for v in self.env.object_pose(obj)[0]]}
                         raise error
             # Execute only an admitted route. Exact final joint targets preserve
             # the canonical home branch of a redundant arm; normal motors move it.
+            previous = self.env.arm_qpos(arm)
             for joints in route[1:]:
                 kin = self.env.arm_kinematics(arm)
                 position, attitude, _, _ = kin.evaluate(joints)
@@ -709,9 +1721,48 @@ class SkillRunner:
                 edge = [self.env.arm_qpos(arm), joints]
                 if check and not check(edge, {o:self.env.object_pose(o) for o in self.env.frame().objects}):
                     raise SkillError('PARK_COLLISION', 'Home route is no longer clear in the observed scene')
-                moved = self.controller.move_to_site(arm, position, attitude, planned_joints=edge, on_sample=guard)
+                # Park is a free-space leg with nothing to be fast for, and the reflex showed what speed 6 costs
+                # it: a single sample past 62 mm (110 mm at worst), which is 35 mm off plan on arrival - the
+                # mechanism behind PARK_COLLISION. Drive it at the nominal trajectory speed instead.
+                moved = self.controller.move_to_site(arm, position, attitude, planned_joints=edge,
+                                                     phase='park_arrival', trajectory_speed=1.,
+                                                     on_sample=guard)
                 if not moved.success:
                     raise SkillError(moved.error or 'MOTION_BLOCKED', 'Empty arm could not clear the handover workspace')
+                # A successful move_to_site means the *site* reached its target; it does not mean the arm
+                # followed the planned joint path. Measured 2026-11-09: the planned route cleared the object
+                # by 30.8 mm, the arm stopped short, and the posture it stopped in was 4.7 mm inside the cube
+                # while the site read as arrived. So the traversed segment is screened and the arrival checked
+                # against the plan, and the two failures are labelled apart.
+                arrived = self.env.arm_qpos(arm)
+                objects_now = {o: self.env.object_pose(o) for o in self.env.frame().objects}
+                detail = getattr(kin, 'path_clearance_detail', None)
+                travelled = detail([previous, arrived], objects_now, ceiling=.05) if detail else None
+                if travelled is not None and travelled.get('gap_m') is not None and travelled['gap_m'] < 0:
+                    error = SkillError('PARK_PATH_UNCLEAR',
+                                       'The arm passed through geometry that the planned route did not')
+                    error.evidence = {'traversed': travelled, 'planned_joints': np.asarray(joints).tolist(),
+                                      'arrived_joints': np.asarray(arrived).tolist(), **planning}
+                    raise error
+                actual_position, actual_attitude, _, _ = kin.evaluate(arrived)
+                deviation = float(np.linalg.norm(actual_position - position))
+                rotation_error = float(np.linalg.norm(orientation_error(actual_attitude, attitude)))
+                joint_error = float(np.max(np.abs(np.asarray(arrived) - np.asarray(joints))))
+                if deviation > PARK_ARRIVAL_TOLERANCE_M or rotation_error > PARK_ARRIVAL_TOLERANCE_RAD:
+                    error = SkillError('HOME_SHORT_STOP',
+                                       f'Parking stopped {deviation*1000:.1f} mm short of the planned waypoint')
+                    error.evidence = {'planned_position': np.asarray(position).tolist(),
+                                      'actual_position': np.asarray(actual_position).tolist(),
+                                      'deviation_m': deviation, 'rotation_error_rad': rotation_error,
+                                      'joint_error_rad': joint_error,
+                                      'planned_joints': np.asarray(joints).tolist(),
+                                      'arrived_joints': np.asarray(arrived).tolist(),
+                                      'traversed': travelled, **planning}
+                    raise error
+                # Every arrival is a free measurement of how far this body lands from its command.
+                from backend.app.skills import motion_accuracy
+                motion_accuracy.record(arm, deviation, source='park_arrival')
+                previous = arrived
                 guard()
             joint_error = float(np.max(abs(self.env.arm_qpos(arm)-route[-1])))
             if joint_error > .025:

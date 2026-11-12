@@ -10,11 +10,13 @@ import numpy as np
 from backend.app.models.schemas import AgentPlan
 from backend.app.planning.language_fallback import VERBS, arm_mentions, motion_distance_cm, named_objects, parse_fallback
 from backend.app.planning.task_program import ActionProposal, GroundingError, InstructionMeaning, TABLE_TARGETS, TaskProgram, compile_program
-from backend.app.planning.spatial_language import validate_instruction_relations, placement_references, preservation_spans, strip_preservation
+from backend.app.planning.spatial_language import validate_instruction_relations, placement_references, preservation_spans, strip_preservation, resolve_relative_pronouns
 from backend.app.planning.goal_language import holding_conditions, relative_conditions, unsupported_group_request
 from backend.app.planning.language_schema import meaning_schema
 from backend.app.planning.preparation import compile_prepared_program
-from backend.app.agent.scene_reasoning import SceneReferenceError, bind_scene_references
+from backend.app.agent.scene_reasoning import SceneReferenceError
+from backend.app.planning.grounding import ground
+from backend.app.planning.policy_provider import policy_backend_from_env
 
 
 class PlannerProviderError(Exception):
@@ -63,6 +65,24 @@ def missing_obligations(instruction: str, plan) -> list[str]:
     """Operations the instruction asks for that the compiled plan does not perform."""
     skills = {step.skill for step in plan.steps}
     return [skill for skill, pattern in _OBLIGATIONS if pattern.search(instruction) and skill not in skills]
+
+
+def grounded_recovery_reason(decision: str, failure: dict, raw_reason: str | None = None) -> str:
+    category = failure.get('category') or 'TASK_FAILURE'
+    explanations = {
+        'resume': f'{category}の後、成立済みの配置・保持を維持し、残りの未完了手順を継続します。',
+        'recover_in_place': f'{category}を受け、接触のない空の腕を退避・初期化し、同じ配置から再計画します。',
+        'alternate_arm': f'{category}のため、未指定だった把持手をもう一方の利用可能な腕に切り替えて再試行します。',
+        'replan': f'{category}の測定値に基づき、新しい動作計画を作成して再試行します。',
+        'reset_and_retry': f'{category}により机上での継続が困難なため、シーンを初期化して再試行します。',
+    }
+    base = explanations.get(decision, f'{category}から復旧します。')
+    if raw_reason and isinstance(raw_reason, str):
+        cleaned = raw_reason.strip()
+        unsupported = ('握力', '力不足', '壊れ', '故障', 'カメラ', '見えない', '滑り落ちた', '重すぎ', 'パワー')
+        if not any(w in cleaned for w in unsupported) and len(cleaned) < 100:
+            return f"{base} ({cleaned})"
+    return base
 
 
 def compact_scene(state: dict) -> dict:
@@ -143,6 +163,26 @@ class AgentPlanner:
         return json.loads(match.group())
 
     def _ai_plan(self, instruction: str, state: dict, memory: list[dict]) -> dict:
+        # What exists is read from the scene, with the catalog as the vocabulary: a new object needs a
+        # catalog entry, not another sentence in this prompt.
+        from backend.app.planning import catalog as scene_catalog
+        vocabulary = scene_catalog.load()
+        observed = [item.get('id') for item in (state or {}).get('objects', []) if item.get('id')]
+        if not observed:
+            observed = [entry.id for entry in vocabulary.objects]
+        # Same wording the model has always been given (absent objects stay qualified as "when present"), but
+        # built from the catalog: adding a cup does not require editing this sentence.
+        absent = [entry.id for entry in vocabulary.objects if entry.id not in observed]
+        from backend.app.planning import task_templates
+        # Only offer a procedure when the instruction hints at one: the prompt for every other request stays
+        # byte-identical, which is what keeps the model's established behaviour (and its tests) stable.
+        entries = task_templates.load()
+        hinted = task_templates.phrase_hint(instruction, entries)
+        templates_line = task_templates.prompt_line({name: entries[name] for name in hinted}) if hinted else ''
+        objects = ', '.join(entry.id for entry in vocabulary.objects if entry.id in observed)
+        if absent:
+            objects += ', and when present ' + ', '.join(absent)
+        zones = vocabulary.prompt_zones()
         system = (
             "Translate informal Japanese, English or mixed language into an ordered task program for the robot in world_state. "
             "Return one JSON envelope with mode, items, assumptions and error. Never return separate actions/goals arrays or keep_in_place. "
@@ -170,8 +210,8 @@ class AgentPlanner:
             "Operation joint uses joint=<exact URDF joint name>,position_deg=<requested rotary angle>. "
             "Honor negations and preservation: 'do not pass' forbids a handover; 'leave red where it is' is not a placement. "
             "A request to move a cube INTO a zone means place. A request just to pick means hold. "
-            "Use only objects in world_state: red_cube, blue_cube, and when present wine_bottle, wine_glass. "
-            "Destinations blue_zone, green_zone, left_side, right_side, center, wine_glass for pour. "
+            f"Use only objects in world_state: {objects}. "
+            f"Destinations {zones}, left_side, right_side, center, wine_glass for pour. "
             "For a placement relative to a cube, target is that cube's ID and relation is one of "
             "on, left_of, right_of, front_of, behind, near. 'On', 'on top', 'stack', '上に乗せる', "
             "'重ねる' mean place with relation=on. A support/reference noun is NEVER another pick command. "
@@ -183,6 +223,7 @@ class AgentPlanner:
             "Pour automatically returns the bottle upright to its starting table position and releases it; no extra place action is needed for that. "
             "Object 'it' means the last mentioned object; held:left/held:right mean what that hand actually holds. "
             "Optional arm null means current holder or nearer arm. A hand can hold one cube. "
+            f"{templates_line}"
             "For handover, arm is the GIVER and receiver is the destination hand. Read hand_occupancy. "
             "If right holds blue and user says give it to left, arm MUST be right, receiver left. Never use the same arm twice. "
             "If another hand takes a held cube, use handover, never a second independent table pick. "
@@ -298,6 +339,21 @@ class AgentPlanner:
         messages = [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]
         content = self._complete(messages, schema)
         payload = self._extract_json(content)
+        # A composite procedure may be requested by name. It is expanded here and then goes through the same
+        # grounding, compiler and contract as any other plan: a template cannot widen what the body can do.
+        if payload.get('template'):
+            from backend.app.planning import task_templates
+            templates = task_templates.load()
+            chosen = templates.get(payload['template'])
+            if chosen is None:
+                raise PlannerProviderError('PROVIDER_INVALID_PROGRAM',
+                                           f'Unknown template {payload["template"]!r}; known: {sorted(templates)}')
+            try:
+                expansion = task_templates.expand(chosen, payload.get('slots') or {}, state,
+                                                  (state or {}).get('capabilities') or {})
+            except task_templates.TemplateError as error:
+                raise PlannerProviderError('PROVIDER_INVALID_PROGRAM', str(error)) from None
+            payload = expansion['envelope']
         if self._interpret_meaning:
             for goal in payload.get('goals',[]):
                 # "on" is a support/contact predicate, not a configurable gap.
@@ -438,9 +494,11 @@ class AgentPlanner:
             assessment = self._extract_json(self._complete(messages,schema,timeout=12.,max_tokens=450))
             if assessment.get('decision') not in legal_actions or not isinstance(assessment.get('reason'),str):
                 raise ValueError('Invalid recovery choice')
-            return {**assessment,'provider':self.configured_provider,'monitor':verdict}
+            reason = grounded_recovery_reason(assessment['decision'], failure, assessment.get('reason'))
+            return {**assessment, 'reason': reason, 'provider': self.configured_provider, 'monitor': verdict}
         except Exception:
-            return {'decision':legal_actions[0],'reason':'モデルによる復旧案を検証できないため、観測状態と実行条件から復旧します。',
+            reason = grounded_recovery_reason(legal_actions[0], failure, None)
+            return {'decision':legal_actions[0],'reason':reason,
                     'provider':'deterministic_fallback','provider_error':'RECOVERY_REASONING_UNAVAILABLE',
                     'monitor':verdict}
 
@@ -502,13 +560,25 @@ class AgentPlanner:
 
     def plan(self, instruction: str, state: dict, memory: list[dict] | None = None) -> AgentPlan:
         started = time.perf_counter()
+        # Keep the caller's original wording available to the compiler: grounding rewrites the
+        # sentence, and phrases like 掴んでいる状態の disappear from the resolved text, so a maintain-hold
+        # request would stop being recognised if this were overwritten with the resolved form.
+        state = {**state, 'instruction': state.get('instruction') or instruction}
         try:
-            observed_binding = bind_scene_references(instruction,state)
-            instruction = observed_binding.instruction
+            observed_binding = ground(instruction, state)
+            instruction = observed_binding['instruction']
         except SceneReferenceError as error:
             raise PlannerProviderError('REFERENCE_NOT_PRESENT',str(error)) from None
+        except GroundingError as error:
+            # An unrecorded or contradictory rewrite is a planning refusal, not a parse quirk.
+            raise PlannerProviderError('INSTRUCTION_GROUNDING_INCONSISTENT', str(error)) from None
         if unsupported_group_request(instruction):
             raise PlannerProviderError('UNSUPPORTED_TASK', 'GROUP_GRASP_UNSUPPORTED: one-hand grouped or simultaneous multi-cube acquisition has no executable contact contract')
+        # An unnamed robot hand may be selected; an explicitly human recipient cannot
+        # be reinterpreted as the other gripper when no human-transfer skill exists.
+        if re.search(r'(?:人|私|あなた|ユーザー)(?:の)?手?(?:に|へ)[^。、,]*?(?:渡|手渡)|'
+                     r'\b(?:hand|pass|give)\b[^.!]*?\b(?:person|human|me|user)\b',instruction,re.I):
+            raise PlannerProviderError('ROBOT_CAPABILITY','Human handover is not a supported physical action')
         literal_holders = holding_conditions(instruction, state)
         for name in {c['object'] for c in literal_holders}:
             if len({c['arm'] for c in literal_holders if c['object']==name}) > 1:
@@ -517,14 +587,69 @@ class AgentPlanner:
         fallback = None
         fallback_source = None
         fallback_error = None
+        required_holders = []
         try:
             fallback_source = parse_fallback(instruction, state)
-            fallback = compile_prepared_program(fallback_source, state)
-            validate_instruction_relations(fallback, instruction, state)
+            # Retain independently explicit holders even when another source action is infeasible.
+            # A later source placement supersedes acquisition; do not promote an intermediate pick.
+            last_source = {a.object: (i, a) for i, a in enumerate(fallback_source.actions) if a.object}
+            inst = state.get('instruction', '')
+            maintains_hold = bool(re.search(
+                r'持ったまま|維持したまま|持っている状態|掴んだまま|つかんだまま|握ったまま|保持したまま|'
+                r'掴んでいる状態|つかんでいる状態|握っている状態|保持している状態|while\s+holding|keep\s+holding',
+                inst))
+            # A preceding acquisition is preparation when that object later becomes a
+            # placement support, UNLESS the user explicitly requested maintaining the held state!
+            final_holders = {(a.object, a.arm) for i, a in last_source.values()
+                             if a.op in {'pick', 'lift'} and (
+                                 maintains_hold or not any(
+                                     later.op == 'place' and later.relation and later.target == a.object
+                                     for later in fallback_source.actions[i + 1:]))}
+            required_holders = [c for c in literal_holders if (c['object'], c['arm']) in final_holders]
+            candidate_fallback = compile_prepared_program(fallback_source, state)
+            validate_instruction_relations(candidate_fallback, instruction, state, required_holders=required_holders)
+            fallback = candidate_fallback
         except (ValueError, KeyError) as exc:
             fallback_error = str(exc)
             if fallback_error.startswith("This scene has only"):
                 raise PlannerProviderError("UNKNOWN_OBJECT", fallback_error) from None
+        # A configured learned backend proposes, and only as a proposal. It is compared against the same
+        # grounded interpretation the grammar produced and then goes through the relation, obligation and
+        # plan checks - it has no path that skips them, and Genesis still measures success.
+        policy_attempt = None
+        try:
+            backend = policy_backend_from_env()
+        except Exception as error:
+            backend, policy_attempt = None, {'ok': False, 'error': f'{type(error).__name__}: {error}'}
+        if backend is not None:
+            try:
+                proposed = compile_prepared_program(backend.propose(instruction, state), state)
+                validate_instruction_relations(proposed, instruction, state, required_holders=required_holders)
+                missing = missing_obligations(instruction, proposed)
+                if missing:
+                    raise GroundingError('policy proposal omits ' + ', '.join(missing))
+                if fallback is not None:
+                    requested_objects = {a.get('object') for a in fallback.program['actions'] if a.get('object')}
+                    proposed_objects = {a.get('object') for a in proposed.program['actions'] if a.get('object')}
+                    if requested_objects != proposed_objects:
+                        raise GroundingError(f'policy proposal changed the requested objects: '
+                                             f'{sorted(proposed_objects)} vs {sorted(requested_objects)}')
+                    if program_signature(proposed) != program_signature(fallback):
+                        raise GroundingError('policy proposal changes the grounded actions/hands; '
+                                             'refusing it rather than executing a different task')
+                valid, errors = validate_plan(proposed, state)
+                if not valid:
+                    raise GroundingError('; '.join(errors))
+                proposed.provider = f'policy:{backend.name}'
+                proposed.model_called = False
+                proposed.planning_evidence = {**(proposed.planning_evidence or {}),
+                                              'policy_backend': {'ok': True, 'backend': backend.name},
+                                              'grounding': {k: observed_binding[k] for k in
+                                                            ('original', 'instruction', 'steps', 'observed')}}
+                return proposed
+            except Exception as error:
+                policy_attempt = {'ok': False, 'backend': getattr(backend, 'name', 'unknown'),
+                                  'error': f'{type(error).__name__}: {str(error)[:300]}'}
         plan = None
         model_plan = None
         provider_error = None
@@ -661,7 +786,7 @@ class AgentPlanner:
                         candidate.planning_evidence = {**(candidate.planning_evidence or {}),
                             'semantic_binding_repairs': binding_repairs}
                         candidate.assumptions.append('文章で指定された物体・保持者・支持物の対応を優先しました。補正内容は実行ログに記録します。')
-                    validate_instruction_relations(candidate, instruction, state)
+                    validate_instruction_relations(candidate, instruction, state, required_holders=required_holders)
                     missing = missing_obligations(instruction, candidate)
                     if missing:
                         raise GroundingError("The program omits an operation the instruction asks for: "
@@ -672,15 +797,19 @@ class AgentPlanner:
                         if audit:
                             candidate.planning_evidence = {**(candidate.planning_evidence or {}),'semantic_coverage_audit':audit}
                     if fallback:
-                        # When the explicit grammar understood the ENTIRE request, the model
-                        # may not drop a handover, swap a colour, or change an explicit arm.
-                        def signature(p):
-                            # Compare physical intentions after compilation. 'Pick then
-                            # hand over' and an auto-acquiring handover are equivalent;
-                            # an already-held pick may also be an explicit no-op.
-                            return program_signature(p)
-                        if signature(candidate) != signature(fallback):
-                            raise GroundingError("Program changes explicit actions/hands in instruction. Expected: " + json.dumps(fallback.program, ensure_ascii=False))
+                        fallback_objs = {a.get('object') for a in fallback.program['actions'] if a.get('object')}
+                        candidate_objs = {a.get('object') for a in candidate.program['actions'] if a.get('object')}
+                        if fallback_objs != candidate_objs:
+                            raise GroundingError(f"Model changed requested objects: {candidate_objs} != {fallback_objs}")
+                        fallback_preps = (fallback.planning_evidence or {}).get('preparations', [])
+                        candidate_preps = (candidate.planning_evidence or {}).get('preparations', [])
+                        if fallback_preps and not candidate_preps and len(program.actions) > len(fallback_source.actions):
+                            raise GroundingError("Model invented explicit setdown actions bypassing canonical preparation")
+                        if not self.capability_mode:
+                            def signature(p):
+                                return program_signature(p)
+                            if signature(candidate) != signature(fallback):
+                                raise GroundingError("Program changes explicit actions/hands in instruction. Expected: " + json.dumps(fallback.program, ensure_ascii=False))
                     valid, errors = validate_plan(candidate, state)
                     if not valid:
                         raise GroundingError("; ".join(errors))
@@ -721,7 +850,14 @@ class AgentPlanner:
             # fallback_verdict. Without this a scene the solver could not satisfy was reported as
             # "instruction not understood", which points a reader at the wrong component.
             model_detail = self._repair_feedback if use_ai else None
-            detail = str(model_detail or fallback_error or provider_error)
+            if model_detail and model_detail.startswith("model provider"):
+                detail = model_detail
+            elif fallback_error and model_detail:
+                detail = f"{fallback_error}; model repair rejected: {model_detail}"
+            elif model_detail:
+                detail = str(model_detail)
+            else:
+                detail = str(fallback_error or provider_error)
             if "ROBOT_CAPABILITY:" in detail:
                 category = "ROBOT_CAPABILITY"
             elif detail.startswith("GOAL_UNREACHABLE"):
@@ -731,9 +867,13 @@ class AgentPlanner:
             via = "after the model was asked" if use_ai else "without asking the model"
             raise PlannerProviderError(category, f"Cannot ground the full instruction ({via}): {detail[:600]}")
         plan.provider_error = provider_error
-        if observed_binding.decisions:
-            plan.planning_evidence = {**(plan.planning_evidence or {}),'scene_bindings':observed_binding.decisions}
-            plan.assumptions += [d['explanation'] for d in observed_binding.decisions]
+        if policy_attempt is not None:
+            plan.planning_evidence = {**(plan.planning_evidence or {}), 'policy_backend': policy_attempt}
+        if observed_binding['decisions']:
+            plan.planning_evidence = {**(plan.planning_evidence or {}),
+                                      'scene_bindings':observed_binding['decisions'],
+                                      'grounding':{k:observed_binding[k] for k in ('original','instruction','steps','observed')}}
+            plan.assumptions += [d['explanation'] for d in observed_binding['decisions'] if d['explanation']]
         plan.raw_response = raw
         plan.model_called = bool(use_ai)
         # 'skipped_because' answers one question only: why the model was not called.
@@ -753,11 +893,17 @@ class AgentPlanner:
         plan.planning_latency = time.perf_counter() - started
         if language_stages:
             plan.planning_evidence = {**(plan.planning_evidence or {}), 'language_stages': language_stages}
-        # Keep the established idempotent place behaviour, but verify it physically at execution.
+        # An idempotent place: the requested condition already holds, so there is nothing to move, but the
+        # request itself is unchanged. Measured 2026-11-09: rewriting the goal to `already_at_target` and
+        # planning only a return_home froze a contract whose allowed motion was empty, so the next attempt
+        # ("place blue into the green zone", already inside it) was refused as manipulating an unrequested
+        # object. The goal stays a placement, the steps become empty, and the physical check still runs.
         if plan.goal["type"] == "place_in_zone" and self._already_at_target(state, plan.goal["object"], plan.goal["target"]):
-            from backend.app.models.schemas import PlanStep
-            plan.goal["type"] = "already_at_target"
-            plan.steps = [PlanStep(skill="return_home", arm=plan.arm)]
+            plan.goal["already_satisfied"] = True
+            plan.goal["already_satisfied_basis"] = self._already_at_target_basis(state, plan.goal["object"], plan.goal["target"])
+            # Nothing to move, so nothing is planned. Homing is not part of this request: measured
+            # 2026-11-09, a homing step made an already-satisfied placement fail when the arm could not home.
+            plan.steps = []
         return plan
 
     @staticmethod
@@ -770,11 +916,25 @@ class AgentPlanner:
 
     @staticmethod
     def _already_at_target(state: dict, obj: str, target: str) -> bool:
+        return AgentPlanner._already_at_target_basis(state, obj, target).get('satisfied') is True
+
+    @staticmethod
+    def _already_at_target_basis(state: dict, obj: str, target: str) -> dict:
+        """Whether the placement already holds, and the numbers that decided it."""
         a = next((x.get("position") for x in state["objects"] if x["id"] == obj), None)
         b = next((x.get("position") for x in state["targets"] if x["id"] == target), None)
         if a is None or b is None:
-            return False
-        return sum((a[i] - b[i]) ** 2 for i in (0, 1)) ** .5 <= .04 and abs(a[2] - b[2]) <= .05 and not any(state.get("robot", {}).get(f"{s}_arm", {}).get("held_object") == obj for s in ("left", "right"))
+            return {'satisfied': False, 'reason': 'NOT_OBSERVED'}
+        held = next((s for s in ("left", "right")
+                     if state.get("robot", {}).get(f"{s}_arm", {}).get("held_object") == obj), None)
+        planar = sum((a[i] - b[i]) ** 2 for i in (0, 1)) ** .5
+        basis = {'satisfied': bool(planar <= .04 and abs(a[2] - b[2]) <= .05 and held is None),
+                 'distance_m': float(planar), 'height_offset_m': float(abs(a[2] - b[2])),
+                 'tolerance_m': .04, 'height_tolerance_m': .05, 'object_position': list(a),
+                 'target_position': list(b), 'held_by': held}
+        if held is not None:
+            basis['reason'] = 'HELD_BY_ARM'
+        return basis
 
 
 def validate_plan(plan: AgentPlan, state: dict) -> tuple[bool, list[str]]:
@@ -785,7 +945,8 @@ def validate_plan(plan: AgentPlan, state: dict) -> tuple[bool, list[str]]:
     object_skills = {"approach_object", "grasp_object", "lift_object", "release_object", "handover_object", "throw_object", "pour_liquid", "move_to_object"}
     held = observed_holds(state)
     approached = {}
-    if not plan.steps or len(plan.steps) > 144:
+    satisfied_without_motion = plan.goal.get('already_satisfied') is True and plan.goal.get('type') == 'place_in_zone'
+    if (not plan.steps and not satisfied_without_motion) or len(plan.steps) > 144:
         errors.append("Plan must contain 1–144 compiled skills")
     for i, step in enumerate(plan.steps):
         allowed = state.get("capabilities", {}).get("skills")

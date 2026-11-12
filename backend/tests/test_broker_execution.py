@@ -83,9 +83,14 @@ def test_agent_diagnosis_and_failed_attempts_survive_broker_updates():
         trace=[{'kind':'reset_and_retry','explanation':'実測の失敗を記録して初期化します。'}]
         client.post('/api/genesis/state',json={'viewer_id':'owner','task_id':task,'agent_trace':trace})
         assert client.get('/api/tasks/'+task).json()['agent_trace']==trace
-        attempts=[{'result':{'success':False}},{'result':{'success':True}}]
+        evidence=[{'id':'task/epoch/0/attempt/1/skill/0/0','classification':'UNKNOWN'}]
+        attempts=[{'result':{'success':False},'failure_evidence_id':evidence[0]['id']},
+                  {'result':{'success':True}}]
+        trace=[{'kind':'execution_failed','explanation':'実測の失敗','evidence_id':evidence[0]['id']}]
         client.post('/api/genesis/result',json={'viewer_id':'owner','task_id':task,'success':True,
-            'agent_trace':trace,'agent_attempts':attempts,'diagnosis':{'category':'MOTION_BLOCKED'}})
+            'agent_trace':trace,'agent_attempts':attempts,'evidence_ledger':evidence,
+            'diagnosis':{'category':'MOTION_BLOCKED'}})
         stored=client.get('/api/tasks/'+task).json()
         assert stored['success'] and stored['agent_attempts']==attempts
+        assert stored['evidence_ledger']==evidence and stored['agent_trace']==trace
         assert stored['diagnosis']['category']=='MOTION_BLOCKED'

@@ -9,7 +9,7 @@ from typing import Any
 from dotenv import load_dotenv
 import os
 
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -120,6 +120,76 @@ def diagnose_pinch(object: str = 'red_cube', arm: str = 'left', observer: bool =
     return _enqueue({'action': 'diagnose_pinch', 'object': object, 'arm': arm,
                      'observer': bool(observer),
                      'instruction': f'pinch diagnostic: {object}'})
+
+
+@app.get('/api/catalog')
+def catalog_vocabulary():
+    """What exists and what each thing is called - the page labels itself from here."""
+    from backend.app.planning import catalog
+    loaded = catalog.load()
+    return {'source': loaded.source,
+            'objects': [{'id': entry.id, 'kind': entry.kind, 'graspable': entry.graspable,
+                         'label': entry.label, 'aliases': entry.aliases} for entry in loaded.objects],
+            'zones': [{'id': entry.id, 'label': entry.label, 'aliases': entry.aliases}
+                      for entry in loaded.zones]}
+
+
+#: The most recent rendered frame, if the owner streams one. A live view is an observation, not a command.
+app.state.view_frame = None
+
+
+@app.get('/api/view.jpg')
+def live_view():
+    """The latest frame the owner rendered, or 204 until it has one.
+
+    The native viewer window needs a GPU backend, and this host's Genesis resolves `gs.gpu` to `gs.cpu`
+    (measured 2026-11-10), so the interactive window never appears. The scene can still be rendered offscreen
+    in 0.19 s, so the browser is the view.
+    """
+    frame = app.state.view_frame
+    if not frame:
+        return Response(status_code=204)
+    return Response(content=frame['jpeg'], media_type='image/jpeg',
+                    headers={'Cache-Control': 'no-store', 'X-Frame-Time': f"{frame['time']:.3f}"})
+
+
+@app.post('/api/genesis/frame')
+async def genesis_frame(request: Request):
+    """Accept one rendered frame from the simulation owner."""
+    payload = await request.body()
+    if not payload:
+        raise HTTPException(400, 'empty frame')
+    app.state.view_frame = {'jpeg': bytes(payload), 'time': time.time()}
+    return {'status': 'ok', 'bytes': len(payload)}
+
+
+@app.get('/api/scenes')
+def scene_list():
+    """Which scenes exist, and which one is running (from the owner's last published state)."""
+    from backend.app.simulation import scenes as scene_registry
+    active = (app.state.world_state or {}).get('scene_profile')
+    return {'scenes': scene_registry.describe(active), 'active': active}
+
+
+@app.post('/api/scenes/select')
+def scene_select(scene: str, force: bool = False):
+    """Ask the simulation owner to rebuild the scene.
+
+    A scene that has never been built is refused: measured 2026-11-10, the `mixed` scene ran for over ten
+    minutes without finishing, and offering that as a button is a trap. `force=true` overrides it for someone
+    who wants to measure exactly that.
+    """
+    from backend.app.simulation import scenes as scene_registry
+    try:
+        scene_registry.check(scene)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from None
+    if not scene_registry.is_selectable(scene, force=force):
+        entry = scene_registry.SCENES[scene]
+        raise HTTPException(409, f'scene {scene!r} is registered but has not been built yet: '
+                                 f'{entry.get("note") or "no build recorded"}')
+    record = _enqueue({'action': 'select_scene', 'scene': scene})
+    return {'status': 'queued', 'scene': scene, 'task_id': record['task_id']}
 
 
 @app.post('/api/scene/reset')
@@ -246,7 +316,8 @@ def viewer_state(body: dict):
 def genesis_result(result: dict[str, Any]):
     _owns_scene(result.get('viewer_id'))
     record = _record(result.get('task_id', ''))
-    for field in ('plan', 'skills', 'verification', 'detail', 'retry_count', 'total_duration', 'initial_world_state', 'final_world_state', 'agent_trace', 'agent_attempts', 'agent_recoveries', 'post_task_homing', 'diagnosis'):
+    for field in ('plan', 'skills', 'verification', 'detail', 'reachability', 'retry_count', 'total_duration', 'initial_world_state', 'final_world_state', 'agent_trace', 'agent_attempts', 'agent_recoveries', 'evidence_ledger', 'task_contract',
+                  'post_task_homing', 'diagnosis'):
         if field in result:
             record[field] = result[field]
     stopped = record['status'] == 'STOP_REQUESTED' or result.get('status') == 'STOPPED'
@@ -311,6 +382,35 @@ def physics_evaluate(request: dict):
         return evaluate(request.get('relation', ''), **(request.get('arguments') or {}))
     except KeyError as error:
         raise HTTPException(status_code=400, detail=str(error)) from None
+
+
+@app.get('/api/config/models')
+def list_models():
+    """List available local models from Ollama and the currently active model."""
+    import urllib.request, json
+    current = os.getenv('OPENARM_OLLAMA_MODEL', 'qwen2.5:3b').strip()
+    available = []
+    try:
+        req = urllib.request.Request('http://127.0.0.1:11434/api/tags')
+        with urllib.request.urlopen(req, timeout=2) as res:
+            data = json.load(res)
+            available = [m['name'] for m in data.get('models', [])]
+    except Exception:
+        available = [current]
+    if current not in available:
+        available.insert(0, current)
+    return {'current': current, 'available': available}
+
+
+@app.post('/api/config/model')
+def set_model(request: dict):
+    model_name = request.get('model', '').strip()
+    if not model_name:
+        raise HTTPException(status_code=400, detail='Model name is required')
+    os.environ['OPENARM_OLLAMA_MODEL'] = model_name
+    if hasattr(app.state, 'viewer') and isinstance(app.state.viewer, dict):
+        app.state.viewer['model'] = model_name
+    return {'status': 'ok', 'selected_model': model_name}
 
 
 @app.get('/api/config/status')

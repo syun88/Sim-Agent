@@ -23,3 +23,24 @@ def reset_evidence(state, source):
                     'reason':'対象が机上操作の範囲から落下し、机の下から回収する動作が実装されていません。'}
     # Ordinary reachable-scene grasp/path failures never certify a reset.
     return None
+
+
+def admit_reset(certificate, review, *, legal_is_empty, reset_allowed, resets, max_resets):
+    """Whether the irreversible recovery may be offered as a candidate, and why not.
+
+    A scene reset throws the layout away, so it needs both an observed cause (the certificate) and an
+    uncontested mechanism. A second opinion that disagrees with the rule table's mechanism withholds it;
+    nothing else can change this decision, and no reviewer answer can add a candidate.
+    """
+    if certificate is None:
+        return False, 'no certificate for the scene state'
+    if not legal_is_empty:
+        return False, 'other recoveries are available'
+    if not reset_allowed:
+        return False, 'a reset is not allowed for this task'
+    if resets >= max_resets:
+        return False, 'the reset budget is spent'
+    if review.get('verdict') == 'disagree':
+        return False, (f'the mechanism is contested: rule={review.get("mechanism")}, '
+                       f'reviewer={review.get("reviewer_mechanism")}')
+    return True, 'certified and uncontested'

@@ -27,6 +27,13 @@ INSTALL_HINT = (
 _FRESH_STATE: dict[str, Any] = {}
 
 
+@pytest.fixture
+def upward_flight():
+    """Synthetic recorded ballistic measurements, not a live simulation success claim."""
+    return [{'t':.24+i*.002, 'position':[0.,0.,1.2+i*.002-4.905*(i*.002)**2],
+             'velocity':[0.,0.,1.-9.81*i*.002], 'contacts':[]} for i in range(65)]
+
+
 @pytest.fixture(scope="session")
 def genesis_env():
     if not genesis_available():
@@ -61,3 +68,19 @@ def controller(env):
     from backend.app.control.motion import OpenArmV2Controller
 
     return OpenArmV2Controller(env)
+
+
+@pytest.fixture(autouse=True)
+def _clean_body_measurements():
+    """The body's recorded landing errors are process-global: reset them around every test.
+
+    Without this, one test's blocked carry raises the expected error for the next test and gates its
+    placements off - a real hazard in the live process too, which is why the estimate needs several samples.
+    """
+    from backend.app.planning import body_solver
+    from backend.app.skills import motion_accuracy
+    motion_accuracy.reset()
+    body_solver.clear_cache()
+    yield
+    motion_accuracy.reset()
+    body_solver.clear_cache()

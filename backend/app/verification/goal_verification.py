@@ -15,9 +15,20 @@ import numpy as np
 from backend.app.simulation.base import SimulationBackend
 
 
+def _truth(env):
+    """Verification judges the truth, not the estimate the planner was given.
+
+    When a perception bias is installed for a measurement run (see `simulation/perception.py`) this wrapper
+    makes the difference explicit: the skills plan on the biased pose, the checks read the real one.
+    """
+    from backend.app.simulation.perception import truth_view
+    return truth_view(env)
+
+
 def verify_place_goal(
     env: SimulationBackend, object_id: str, target_id: str, tolerance: float = 0.04
 ) -> dict:
+    env = _truth(env)
     before = env.object_pose(object_id)[0].copy()
     env.step(100)
     position, _ = env.object_pose(object_id)
@@ -49,6 +60,7 @@ def verify_place_goal(
 
 
 def verify_task_goal(env: SimulationBackend, plan, results: list[dict], initial_state: dict | None = None) -> dict:
+    env = _truth(env)
     """Read every final predicate, including the objects placed earlier in a sequence."""
     complete = len(results) == len(plan.steps) and all(r.get("success") for r in results)
     checks = plan.goal.get("checks", [])
@@ -82,22 +94,11 @@ def verify_task_goal(env: SimulationBackend, plan, results: list[dict], initial_
             position, rotation = env.ee_pose(check["arm"])
             error = float(np.linalg.norm(env.object_pose(obj)[0] - (position + rotation @ (np.zeros(3) if getattr(env, "robot_id", "openarm_v2") != "openarm_v2" else FINGERTIP_MIDPOINT[check["arm"]]))))
             evidence = {"success": error < .012, "fingertip_midpoint_error": error}
-        elif check["type"] == "throw":
-            from backend.app.skills.dynamic_skills import evaluate_throw
+        elif check["type"] in {"throw", "hit"}:
+            from backend.app.verification.event_evidence import verify_recorded_flight
             event = next((r for r in results if r.get("skill") == "throw_object" and
                           r.get("action_index") == check["action_index"] and r.get("object") == obj), {})
-            evidence = evaluate_throw(event.get("trajectory", []), check["min_height"])
-        elif check["type"] == "hit":
-            from backend.app.skills.dynamic_skills import HIT_TOLERANCE_M
-            event = next((r for r in results if r.get("skill") == "throw_object" and
-                          r.get("action_index") == check["action_index"]), {})
-            from backend.app.skills.dynamic_skills import closest_approach
-            closest = closest_approach(event.get("trajectory") or [], env.object_pose(check["target"])[0])
-            # Re-derived from the recorded trajectory and the target's live pose: the skill's own verdict
-            # is not the evidence here.
-            evidence = {"success": bool(closest is not None and closest <= HIT_TOLERANCE_M),
-                        "closest_approach_m": closest, "tolerance": HIT_TOLERANCE_M,
-                        "target": check["target"]}
+            evidence = verify_recorded_flight(check, event)
         elif check["type"] == "pour":
             event = next((r for r in results if r.get("skill") == "pour_liquid" and
                           r.get("action_index") == check["action_index"]), {})

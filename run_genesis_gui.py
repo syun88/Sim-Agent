@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import uuid
 
 from dotenv import load_dotenv
 import httpx
+import numpy as np
 
 from backend.app.agent.world_state import build_world_state
 from backend.app.agent.task_agent import TaskAgent
@@ -31,13 +33,29 @@ def make_executor(env):
     return ImportedRobotExecutor(env)
 
 
+def _install_thread_dump() -> bool:
+    """Let SIGUSR1 dump every thread's stack.
+
+    A hung viewer gives no Python-level clue, and attaching a profiler needs elevated ptrace permissions here.
+    Registering faulthandler means `kill -USR1 <pid>` writes all stacks to stderr, which lands in the journal.
+    """
+    if os.environ.get('OPENARM_THREAD_DUMP', '0') == '0':
+        return False
+    import faulthandler
+    import signal
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    print('Thread dump enabled: kill -USR1 <pid>', flush=True)
+    return True
+
+
 def main() -> None:
     from backend.app.simulation.runtime_owner import acquire_genesis_owner
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--headless', action='store_true', help='Same real physics/executor without a native window')
     parser.add_argument('--once', action='store_true', help='Exit after executing one command (integration verification)')
     parser.add_argument('--backend-url', default=BACKEND_URL)
-    parser.add_argument('--scene', choices=['cubes', 'wine'], default='cubes', help='Initial Genesis scene')
+    parser.add_argument('--scene', choices=['cubes', 'wine', 'mixed'], default=None,
+                        help='Initial Genesis scene (defaults to OPENARM_SCENE, then cubes)')
     parser.add_argument('--robot', help='Imported robot ID; default is the saved selection or OpenArm')
     args = parser.parse_args()
     acquire_genesis_owner()
@@ -61,9 +79,38 @@ def main() -> None:
     else:
         os.environ.setdefault('GENESIS_SHOW_VIEWER', '1')
     robot_id = get_profile(args.robot or selected_robot())['id']
+    _install_thread_dump()
     print(f'Building {robot_id} on Genesis...', flush=True)
-    env = create_backend(args.scene if robot_id == 'openarm_v2' else 'cubes', robot_id=robot_id)
+    initial_scene = args.scene or os.environ.get('OPENARM_SCENE') or 'cubes'
+    env = create_backend(initial_scene if robot_id == 'openarm_v2' else 'cubes', robot_id=robot_id)
     env.step(200)
+    # Ask the body itself whether it answers everything the skills will drive it with, and leave the answer
+    # where a person or a port can read it. A real arm's backend is validated the same way.
+    # A measurement harness, not a feature: bias what the planner reads so "would this survive a real camera?"
+    # becomes a number. Loud on purpose - a harness that quietly lies to its own controller is worse than none.
+    _perception_mm = os.environ.get('OPENARM_PERCEPTION_ERROR_MM')
+    if _perception_mm:
+        try:
+            from backend.app.simulation import perception
+            installed = perception.install(env, float(_perception_mm) / 1000.,
+                                           seed=int(os.environ.get('OPENARM_PERCEPTION_SEED', '0')))
+            print(f'PERCEPTION BIAS INSTALLED: {installed["error_m"]*1000:.1f} mm '
+                  f'(seed {installed["seed"]}); verification still reads the truth', flush=True)
+        except Exception as error:
+            print(f'Perception bias could not be installed: {type(error).__name__}: {error}', flush=True)
+    try:
+        from backend.app.simulation import conformance
+        problems = conformance.check(env)
+        report = {'robot_id': robot_id, 'scene': env.scene_profile, 'problems': problems,
+                  'contract_operations': len(conformance.describe())}
+        path = os.environ.get('SIM_AGENT_CONFORMANCE_OUT', '/tmp/sim-agent-conformance.json')
+        with open(path, 'w') as handle:
+            json.dump(report, handle, ensure_ascii=False, indent=2)
+        print(f'Body conformance: {len(problems)} problem(s) -> {path}', flush=True)
+        for problem in problems[:6]:
+            print(f'  {problem["operation"]}: {problem["problem"]} {problem["detail"]}', flush=True)
+    except Exception as error:  # a conformance failure must never stop the cell from running
+        print(f'Body conformance could not run: {type(error).__name__}: {error}', flush=True)
     executor = make_executor(env)
     active_id = None
     last_publish = 0.0
@@ -106,6 +153,29 @@ def main() -> None:
                 pass
         return stop_cache
 
+    # A live view for the browser: the native window needs a GPU backend this host does not provide, and an
+    # offscreen frame costs 0.19 s (measured 2026-11-10), so one frame a second is cheap and enough to see what
+    # the cell is doing.
+    stream_view = os.environ.get('OPENARM_STREAM_VIEW', '1') != '0'
+
+    last_frame = 0.0
+
+    def stream_frame():
+        if not stream_view:
+            return
+        try:
+            image = env.render(720, 480)
+            if image is None:
+                return
+            import io as _io
+            from PIL import Image
+            buffer = _io.BytesIO()
+            Image.fromarray(np.asarray(image).astype('uint8')).save(buffer, format='JPEG', quality=80)
+            httpx.post(f'{args.backend_url}/api/genesis/frame', content=buffer.getvalue(), timeout=2.)
+        except Exception:
+            # A view that cannot be rendered must never disturb the run.
+            pass
+
     def emit(event, **payload):
         status = payload.pop('status', 'VERIFYING' if event == 'verifying' else 'EXECUTING')
         publish(event, force=True, status=status, **payload)
@@ -119,6 +189,10 @@ def main() -> None:
 
     env.step_observer = observe_step
     env.planning_pulse=should_stop
+
+    #: Set when a person picked the scene; from then on an instruction may only rebuild the world if the
+    #: current scene cannot host it (the objects it needs are missing).
+    explicit_scene = None
 
     def prepare_scene(profile):
         nonlocal env, executor, last_publish
@@ -212,6 +286,9 @@ def main() -> None:
             if not command.get('action'):
                 env.step(5)
                 time.sleep(.04)
+                if time.monotonic() - last_frame > 1.0:
+                    last_frame = time.monotonic()
+                    stream_frame()
                 continue
             active_id = command['task_id']
             stop_cache, last_control = False, 0.0
@@ -221,11 +298,48 @@ def main() -> None:
                     body.update(success=False, status='STOPPED')
                 elif command['action'] == 'reset':
                     publish('scene_preparing',force=True,status='PREPARING_SCENE',detail='Sampling reachable desk positions')
-                    env.reset(randomize=bool(command.get('randomize')),seed=command.get('seed'),
-                              shuffle_sides=command.get('shuffle_sides',True))
-                    executor.reset_context()
-                    scene_has_tasks = False
+                    # A layout every arm must be able to reach at least one object in. Measured 2026-11-10: 6,971 of
+                    # 7,312 rejected approach routes were IK failures, i.e. the object was out of reach for the arm
+                    # that had to grasp it - so the layout is checked here, before a task is ever planned on it.
+                    from backend.app.planning.capability_queries import layout_grasp_admission
+                    seed = command.get('seed')
+                    admission = None
+                    attempts = 0
+                    _admission_started = time.monotonic()
+                    for attempts in range(1, 6):
+                        env.reset(randomize=bool(command.get('randomize')), seed=seed if seed is None else seed + attempts - 1,
+                                  shuffle_sides=command.get('shuffle_sides', True))
+                        executor.reset_context()
+                        scene_has_tasks = False
+                        if not command.get('randomize'):
+                            break
+                        # Default off: the deep check costs ~90 s per reset (measured), which is right for building a
+                        # corpus and wrong for interactive use. `OPENARM_ADMISSION=deep|ik|off`.
+                        # `off` (default) | `ik` | `cheap` | `waypoints` (IK over the route waypoints, no
+                        # clearance sweep) | `deep` (full screened routes, ~89 s per reset).
+                        mode = os.environ.get('OPENARM_ADMISSION', 'off')
+                        if mode == 'off':
+                            break
+                        try:
+                            admission = layout_grasp_admission(env, getattr(executor, 'controller', None),
+                                                               deep=(mode != 'ik'))
+                        except Exception as error:  # an admission is advice, not a step: never fail the reset
+                            admission = {'admitted': None, 'error': f'{type(error).__name__}: {error}'}
+                            print(f'Layout admission unavailable: {admission["error"]}', flush=True)
+                        body['admission_seconds'] = round(time.monotonic() - _admission_started, 1)
+                        if admission.get('admitted') is not False:
+                            break
+                        publish('scene_preparing', force=True, status='PREPARING_SCENE',
+                                detail=f'Resampling: an object was out of reach (attempt {attempts})')
                     env.step(200)
+                    # `verification` is what the API record keeps, so the layout decision travels there.
+                    body['verification'] = {**(body.get('verification') or {}), 'goal_type': 'scene_reset',
+                                            'randomization': env.spawn_validation.get('randomization'),
+                                            'admission': admission,
+                                            'admission_attempts': attempts,
+                                            'admission_seconds': round(time.monotonic() - _admission_started, 1)}
+                    if seed is not None:
+                        body['seed'] = seed + attempts - 1
                     body.update(success=True, verification={'success': True, 'goal_type': 'scene_reset',
                         'randomization':env.spawn_validation.get('randomization')}, final_world_state=build_world_state(env))
                 elif command['action'] == 'diagnose_pinch':
@@ -253,13 +367,28 @@ def main() -> None:
                     body.update(success=all(row['success'] for row in rows), verification={'success': True,
                         'goal_type': 'pinch_diagnostic', 'observer': command.get('observer') is not False,
                         'rows': rows}, final_world_state=build_world_state(env))
+                elif command['action'] == 'select_scene':
+                    prepare_scene(command['scene'])
+                    explicit_scene = command['scene']
+                    body.update(success=True, verification={'success': True, 'goal_type': 'scene_selection',
+                                                            'scene': env.scene_profile},
+                                final_world_state=build_world_state(env))
                 elif command['action'] == 'select_robot':
                     prepare_robot(command['robot_id'])
                     body.update(success=True, verification={'success': True, 'goal_type': 'robot_selection', 'robot_id': command['robot_id']},
                                 final_world_state=build_world_state(env))
                 else:
                     if getattr(env, 'robot_id', 'openarm_v2') == 'openarm_v2':
-                        prepare_scene(scene_for_instruction(command['instruction'], env.scene_profile))
+                        from backend.app.simulation import scenes as scene_registry
+                        wanted = scene_for_instruction(command['instruction'], env.scene_profile)
+                        if wanted == env.scene_profile:
+                            pass
+                        elif explicit_scene and scene_registry.hosts(env.scene_profile, wanted):
+                            # The chosen scene already has what this instruction needs: keep it.
+                            publish('scene_kept', force=True,
+                                    detail=f'{env.scene_profile} already hosts this instruction')
+                        else:
+                            prepare_scene(wanted)
                     if command.get('randomize'):
                         publish('scene_preparing',force=True,status='PREPARING_SCENE',detail='Sampling reachable desk positions')
                         env.reset(randomize=True,seed=command.get('seed'),shuffle_sides=command.get('shuffle_sides',True))

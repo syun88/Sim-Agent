@@ -227,6 +227,22 @@ class GenericURDFEnvironment(SimulationBackend):
                     snapshot[name] = 0.
         return snapshot
 
+    def plan_arm_pose(self, side: str, position, rotation=None, *, q_init=None) -> dict:
+        """Plan a pose with the planner that reads this package's profile.
+
+        Returned ``q_rad`` is continuous with the posture it was planned from - the joints of an imported
+        arm may be continuous - so a caller that holds the object can command it directly instead of
+        unwrapping the joints itself.
+        """
+        from backend.app.robots.urdf import solve_profile_ik
+        reference = self.arm_qpos(side) if q_init is None else np.asarray(q_init, float)
+        planned = solve_profile_ik(self.profile, side, np.asarray(position, float), rotation,
+                                   model=self.model, q_init=reference, snapshot=self.joint_snapshot())
+        names = self.profile['chains'][side]['joints']
+        planned['q_rad'] = np.asarray(
+            self.model.nearest_continuous(names, planned['q_rad'], reference), float).tolist()
+        return planned
+
     def ik_joint_limits(self,side):
         limits = np.array(self._spawn_sampler.arm_joint_limits(side), dtype=float)
         # A continuous arm joint in a CAD export declares no range at all,
