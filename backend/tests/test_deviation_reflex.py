@@ -131,3 +131,12 @@ def test_being_late_on_the_path_is_not_drift():
     for _ in range(6):
         assert watcher.observe(path, actual, 0.9, FakeKinematics()) is None
     assert watcher.worst_m < reflex.PATH_SPACING_M, watcher.worst_m
+
+
+def test_the_receiver_standoff_is_searched_from_comfortable_to_close():
+    """The standoff was a constant, and a receiver at the edge of its reach could not solve there."""
+    from backend.app.skills.robot_skills import RECEIVER_STANDOFF_CANDIDATES_M
+
+    assert RECEIVER_STANDOFF_CANDIDATES_M[0] == 0.12, 'the comfortable distance is still tried first'
+    assert list(RECEIVER_STANDOFF_CANDIDATES_M) == sorted(RECEIVER_STANDOFF_CANDIDATES_M, reverse=True)
+    assert all(0. < distance < 0.12 for distance in RECEIVER_STANDOFF_CANDIDATES_M[1:])

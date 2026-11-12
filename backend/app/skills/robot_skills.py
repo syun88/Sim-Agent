@@ -54,6 +54,9 @@ APPROACH_STANDOFF = 0.06
 #: Half the width of one finger pad. A grasp offset may move the fingertip midpoint by the object's half face
 #: less this much, otherwise a pad is inside the object it is about to close on.
 GRASP_PAD_HALF_WIDTH_M = 0.005
+#: Where the receiving hand waits before the insertion, tried from comfortable to close. The first distance the
+#: receiver can actually solve is used, and the choice is recorded.
+RECEIVER_STANDOFF_CANDIDATES_M = (0.12, 0.09, 0.07, 0.05)
 #: Height of the swing waypoint above the approach-axis start (m), keeping the open fingers
 #: clear of the object during the swing from the staging altitude.
 APPROACH_OVERFLY = 0.10
@@ -1480,13 +1483,41 @@ class SkillRunner:
         receiving_rotation, receiver_search = self._receiver_frames(
             receiver, cube, cube_rotation, geometry, bias)
         site = cube + receiving_rotation @ np.array([0., 0., bias]) - receiving_rotation @ FINGERTIP_MIDPOINT[receiver]
-        pregrasp = site + receiving_rotation[:, 2] * .12
+        # How far back the receiving hand waits is a reachability question, not a constant: the nominal 120 mm
+        # is where a comfortable approach starts, but a layout where the receiver is near the end of its reach
+        # cannot solve there while it can solve closer in. Measured 2026-11-10: a fixed 120 mm is what failed as
+        # "Receiver could not reach the handover standoff", and that refusal is what keeps the donor grasping
+        # 15 mm off centre (which in turn pushes the cube 8 mm during the donor's approach).
+        pregrasp, receiver_standoff = None, {'candidates': [], 'chosen_m': None}
+        solve = getattr(self.controller, 'solve_ik', None)
+        if not callable(solve):
+            # A controller that cannot answer an IK question gets the nominal distance rather than a refusal:
+            # the question is unavailable, and unavailable is not a measured no.
+            pregrasp = site + receiving_rotation[:, 2] * RECEIVER_STANDOFF_CANDIDATES_M[0]
+            receiver_standoff.update({'chosen_m': RECEIVER_STANDOFF_CANDIDATES_M[0],
+                                      'unsolved': 'controller has no IK solver'})
+        for distance in (RECEIVER_STANDOFF_CANDIDATES_M if pregrasp is None and callable(solve) else ()):
+            candidate = site + receiving_rotation[:, 2] * distance
+            solved, residual, _ = self.controller.solve_ik(receiver, candidate, receiving_rotation,
+                                                          q_init=geometry.receiver_seed)
+            reachable = solved is not None and residual is not None and residual < .012
+            receiver_standoff['candidates'].append({'distance_m': float(distance), 'reachable': reachable})
+            if reachable:
+                pregrasp, receiver_standoff['chosen_m'] = candidate, float(distance)
+                break
+        if pregrasp is None:
+            error = SkillError("HANDOVER_UNREACHABLE",
+                               "Receiver cannot reach any handover standoff")
+            error.evidence = {'receiver_standoff': receiver_standoff, 'object': obj,
+                              'phase': 'handover_standoff'}
+            raise error
         # A joint interpolation straight to the cube sweeps an open finger through it.
         # First stay outside the donor, then insert along a measured Cartesian line.
         result = self.controller.move_to_site(receiver, pregrasp, receiving_rotation, q_init=geometry.receiver_seed)
         if not result.success:
             error = SkillError(result.error or "IK_FAILURE", "Receiver could not reach the handover standoff")
-            error.evidence = self._motion_evidence(result, object=obj, phase='handover_receiver')
+            error.evidence = {**self._motion_evidence(result, object=obj, phase='handover_receiver'),
+                              'receiver_standoff': receiver_standoff}
             raise error
         self.env.step(max(1, round(200 / self.controller.motion_speed)))
         self._require_hold(arm, obj)
